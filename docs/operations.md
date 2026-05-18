@@ -138,6 +138,8 @@ hijack DNS or BGP for `vps.example.net` from silently switching keys.
 ### Prometheus metrics
 
 Exported on `[metrics] listen` (default `127.0.0.1:9090`, path `/metrics`).
+The same listener also serves health-probe endpoints — see
+[Health endpoints](#health-endpoints) below.
 
 | Metric                                              | Type    | Labels             | Meaning                                                                                    |
 | --------------------------------------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------ |
@@ -160,6 +162,45 @@ Suggested alerts:
 
 `huginn` does not currently export Prometheus metrics — it logs the
 relevant fields (handshake outcomes, heartbeat seq, errors) on stdout.
+
+### Health endpoints
+
+The `[metrics] listen` address also serves liveness and readiness probes,
+so that Kubernetes, Docker `HEALTHCHECK`, load balancers, and shell
+scripts can drive on `yggdrasil` with a single curl. All endpoints are
+plain `text/plain`, HTTP/1.1, `GET`-only.
+
+| Path       | Status              | Body          | Meaning                                                                                                                             |
+| ---------- | ------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `/metrics` | 200                 | exposition    | Prometheus scrape target (see table above).                                                                                         |
+| `/healthz` | 200                 | `ok\n`        | **Liveness.** Always 200 while the process is responding to HTTP. Use for "should I restart this container?" checks.                |
+| `/readyz`  | 200 or 503          | `ready\n` / `not ready\n` | **Readiness.** Flips to 200 once all subsystems (heartbeat socket in relay mode, proxy supervisor's initial rule load, control UDS) are bound. Use for "should the LB send me traffic?" checks. |
+| `/`        | 200                 | index page    | Human-readable list of the above.                                                                                                   |
+
+Other paths return 404. Readiness is one-way: once flipped to ready the
+daemon never marks itself unready again. If a critical subsystem fails
+after startup the process exits and relies on the supervisor (systemd /
+Kubernetes / `docker --restart`) to relaunch it.
+
+Examples:
+
+```sh
+# kubelet probe equivalent
+curl -fsS http://127.0.0.1:9090/readyz || echo "not yet"
+
+# wait for the daemon to come up in a script
+until curl -fsS http://127.0.0.1:9090/readyz >/dev/null; do sleep 1; done
+```
+
+Docker compose:
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/readyz"]
+  interval: 10s
+  timeout: 2s
+  retries: 3
+```
 
 ### Logs
 

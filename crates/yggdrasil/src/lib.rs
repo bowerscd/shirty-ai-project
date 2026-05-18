@@ -19,6 +19,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod control;
+pub mod health;
 pub mod heartbeat;
 pub mod log;
 pub mod metrics;
@@ -146,7 +147,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
 
     // 4. Metrics exporter. Set up before anything emits metrics so the global
     //    recorder is the prometheus one and not the no-op fallback.
-    if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Relay) {
+    if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Relay).await {
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
@@ -203,6 +204,9 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
 
     // 7b. All subsystems are up; notify systemd we are ready. No-op when
     //     NOTIFY_SOCKET is unset (local dev, docker without --systemd).
+    //     Mirror the same fact into the process-local readiness flag so
+    //     /readyz on the metrics listener flips to 200.
+    health::mark_ready();
     systemd::notify_ready();
 
     // 8. Wait for shutdown signal, then bring everything down cleanly.
@@ -248,7 +252,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
 
     // 3. Metrics exporter. Set up before anything emits metrics so the global
     //    recorder is the prometheus one and not the no-op fallback.
-    if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Terminal) {
+    if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Terminal).await {
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
@@ -293,6 +297,9 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
 
     // 5b. All subsystems are up; notify systemd we are ready. No-op when
     //     NOTIFY_SOCKET is unset (local dev, docker without --systemd).
+    //     Mirror the same fact into the process-local readiness flag so
+    //     /readyz on the metrics listener flips to 200.
+    health::mark_ready();
     systemd::notify_ready();
 
     // 6. Wait for shutdown signal, then bring everything down cleanly.
