@@ -112,10 +112,11 @@ unified rule set with global uniqueness checks.
 | `name`           | string                     | ✓   | ✓   | ✓     | **required**  | Globally unique across all rule files. No whitespace or control characters.                            |
 | `listen`         | `host:port`                | ✓   | ✓   | ✓     | **required**  | Listen socket on the VPS. `port` must be non-zero. Globally unique by `(ip, port, protocol)`.          |
 | `protocol`       | `"tcp"`/`"udp"`/`"https"` | ✓   | ✓   | ✓     | **required**  | Determines whether this is a TCP listener, a UDP receiver, or the HTTPS frontend.                      |
-| `upstream_port`  | u16                        | ✓   | ✓   | —     | one of these  | Port on the home box. The IP comes from the heartbeat. Mutually exclusive with `upstream_addr`.        |
-| `upstream_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Literal upstream socket address — used by terminal-mode rules and tests. Mutually exclusive with `upstream_port`. |
+| `upstream_port`  | u16                        | ✓   | ✓   | —     | one of these  | Port on the home box. The IP comes from the heartbeat. Mutually exclusive with `upstream_addr` and `upstream_host`. |
+| `upstream_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Literal upstream socket address — used by terminal-mode rules and tests. Mutually exclusive with `upstream_port` and `upstream_host`. |
+| `upstream_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | DNS-resolved upstream — terminal-mode only. Re-resolves every 30s; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `upstream_port` and `upstream_addr`. |
 | `idle_timeout`   | `humantime`                | —   | ✓   | —     | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP / HTTPS rules. |
-| `proxy_protocol` | `"v1"`/`"v2"`             | ✓   | —   | —     | absent        | TCP only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and when `upstream_addr` is set. |
+| `proxy_protocol` | `"v1"`/`"v2"`             | ✓   | —   | —     | absent        | TCP only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and when `upstream_addr` or `upstream_host` is set. |
 | `cert_dir`       | path                       | —   | —   | ✓     | inherits from `[server]` | HTTPS only. Per-rule override of the convention cert directory.                                       |
 | `[[rule.route]]` | table                      | —   | —   | ✓     | **required**  | HTTPS only. One entry per virtual host — see the HTTPS section below.                                  |
 
@@ -176,6 +177,19 @@ name          = "ssh-local"
 listen        = "127.0.0.1:2222"
 protocol      = "tcp"
 upstream_addr = "192.168.1.10:22"
+```
+
+```toml
+# A terminal-mode rule that forwards to a DNS hostname. The resolver
+# re-queries the system DNS every 30s; on lookup failure it retains the
+# last-good address. Rebinds apply to *new* flows only — long-lived TCP
+# sessions and UDP flows are not torn down when the address changes
+# (matching nginx / haproxy semantics).
+[[rule]]
+name          = "printer"
+listen        = "0.0.0.0:9100"
+protocol      = "tcp"
+upstream_host = "printer.lan:9100"
 ```
 
 ### HTTPS rules

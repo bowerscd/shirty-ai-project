@@ -931,6 +931,7 @@ mod tests {
             protocol: Protocol::Https,
             upstream_port: None,
             upstream_addr: None,
+            upstream_host: None,
             proxy_protocol: None,
             idle_timeout: None,
             routes: Some(routes),
