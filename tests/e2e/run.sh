@@ -203,6 +203,80 @@ echo "$status_json" | grep -q '"rule_count": 2'          || fail "status: expect
 echo "$status_json" | grep -q '"peer_ip": "172.30.0.20"'   || fail "status: peer_ip wrong"
 echo "    [ok] status JSON consistent"
 
+# -------- test 6: health + metrics HTTP listener ----------------------------
+
+echo "==> [health] /healthz, /readyz, /, /metrics, 404"
+
+# All endpoints share the [metrics].listen socket (0.0.0.0:9090 in the e2e
+# config). Reachable from the `client` container via the wan network; not
+# exposed to the host.
+http_probe() {
+    local path="$1"
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T client python3 - "$path" <<'PY'
+import sys, urllib.request, urllib.error
+url = "http://172.30.0.10:9090" + sys.argv[1]
+req = urllib.request.Request(url, method="GET")
+try:
+    with urllib.request.urlopen(req, timeout=5) as r:
+        sys.stdout.write(f"{r.status}\n")
+        sys.stdout.write(r.read().decode("utf-8", "replace"))
+except urllib.error.HTTPError as e:
+    sys.stdout.write(f"{e.code}\n")
+    sys.stdout.write(e.read().decode("utf-8", "replace"))
+PY
+}
+
+# /healthz: always 200, body "ok\n".
+healthz=$(http_probe /healthz) || fail "/healthz request failed"
+[[ "$(echo "$healthz" | head -n 1)" == "200" ]] || fail "/healthz status: $(echo "$healthz" | head -n 1)"
+[[ "$(echo "$healthz" | tail -n +2)" == "ok" ]] || fail "/healthz body: $(echo "$healthz" | tail -n +2)"
+echo "    [ok] /healthz 200 ok"
+
+# /readyz: 200 once the daemon has marked itself ready (post-subsystem-bind).
+# The peer-enrolled gate above guarantees the daemon is well past that point.
+readyz=$(http_probe /readyz) || fail "/readyz request failed"
+[[ "$(echo "$readyz" | head -n 1)" == "200" ]] || fail "/readyz status: $(echo "$readyz" | head -n 1)"
+[[ "$(echo "$readyz" | tail -n +2)" == "ready" ]] || fail "/readyz body: $(echo "$readyz" | tail -n +2)"
+echo "    [ok] /readyz 200 ready"
+
+# /: HTML index listing the routes.
+root=$(http_probe /) || fail "/ request failed"
+[[ "$(echo "$root" | head -n 1)" == "200" ]] || fail "/ status: $(echo "$root" | head -n 1)"
+echo "$root" | grep -q '/metrics' || fail "/ body missing /metrics link"
+echo "$root" | grep -q '/healthz' || fail "/ body missing /healthz link"
+echo "$root" | grep -q '/readyz'  || fail "/ body missing /readyz link"
+echo "    [ok] / 200 with route index"
+
+# /nope: 404.
+nope=$(http_probe /nope) || fail "/nope request failed"
+[[ "$(echo "$nope" | head -n 1)" == "404" ]] || fail "/nope status: $(echo "$nope" | head -n 1)"
+echo "    [ok] /nope 404"
+
+# -------- test 7: /metrics scrape -------------------------------------------
+
+echo "==> [metrics] /metrics exposes build_info + last_heartbeat gauge"
+metrics=$(http_probe /metrics) || fail "/metrics request failed"
+[[ "$(echo "$metrics" | head -n 1)" == "200" ]] || fail "/metrics status: $(echo "$metrics" | head -n 1)"
+metrics_body=$(echo "$metrics" | tail -n +2)
+
+# Sanity: build_info gauge is always exported.
+echo "$metrics_body" | grep -q 'yggdrasil_build_info' \
+    || fail "/metrics missing yggdrasil_build_info"
+
+# The heartbeat gauge is set on every accepted heartbeat. Huginn beats once
+# a second in this stack, so it must be present and within ~30s of now.
+heartbeat_line=$(echo "$metrics_body" | grep -E '^yggdrasil_last_heartbeat_timestamp_seconds ' || true)
+[[ -n "$heartbeat_line" ]] || fail "/metrics missing yggdrasil_last_heartbeat_timestamp_seconds"
+heartbeat_ts=$(echo "$heartbeat_line" | awk '{print $2}')
+now_ts=$(date +%s)
+# Floor the floating-point timestamp to an integer.
+heartbeat_int=${heartbeat_ts%.*}
+age=$(( now_ts - heartbeat_int ))
+if (( age < 0 || age > 30 )); then
+    fail "yggdrasil_last_heartbeat_timestamp_seconds=$heartbeat_ts is stale (age ${age}s)"
+fi
+echo "    [ok] yggdrasil_last_heartbeat_timestamp_seconds fresh (age ${age}s)"
+
 # -------- done --------------------------------------------------------------
 
 echo
