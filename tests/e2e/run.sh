@@ -91,7 +91,7 @@ fail() {
 
 # -------- gating: wait for first authenticated heartbeat --------------------
 
-echo "==> waiting for ratatoskr to enrol and heartbeat"
+echo "==> waiting for huginn to enrol and heartbeat"
 peer_enrolled() {
     local out; out=$(ctl_json status 2>/dev/null || true)
     echo "$out" | grep -q '"peer_enrolled": true' && \
@@ -147,7 +147,7 @@ echo "    [ok] UDP echo via 172.30.0.10:7001 → home:7101"
 
 echo "==> [hot-reload] dropping a new branch file"
 
-"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps bash -c "cat >/etc/yggdrasil/branches/tcp-echo-alt.toml" <<'EOF'
+"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps bash -c "cat >/etc/yggdrasil/rules/tcp-echo-alt.toml" <<'EOF'
 [[rule]]
 name          = "tcp-echo-alt"
 listen        = "0.0.0.0:7010"
@@ -155,10 +155,10 @@ protocol      = "tcp"
 upstream_port = 7100
 EOF
 
-branch_visible() {
-    ctl branches list | grep -q '^tcp-echo-alt '
+rule_visible() {
+    ctl rules list | grep -q '^tcp-echo-alt '
 }
-WAIT_TIMEOUT=10 wait_for "supervisor picked up tcp-echo-alt rule" branch_visible
+WAIT_TIMEOUT=10 wait_for "supervisor picked up tcp-echo-alt rule" rule_visible
 
 # Now drive traffic through the freshly-added rule.
 run_alt_tcp_echo() {
@@ -181,12 +181,12 @@ echo "    [ok] traffic flows through hot-reloaded rule"
 echo "==> [invariance] removing one rule does not break another"
 
 # Remove the alt rule and verify the supervisor picks it up.
-"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps rm -f /etc/yggdrasil/branches/tcp-echo-alt.toml
+"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps rm -f /etc/yggdrasil/rules/tcp-echo-alt.toml
 
-branch_gone() {
-    ! ctl branches list | grep -q '^tcp-echo-alt '
+rule_gone() {
+    ! ctl rules list | grep -q '^tcp-echo-alt '
 }
-WAIT_TIMEOUT=10 wait_for "supervisor removed tcp-echo-alt rule" branch_gone
+WAIT_TIMEOUT=10 wait_for "supervisor removed tcp-echo-alt rule" rule_gone
 
 # Original rule must still forward — its listener should never have been
 # touched. (Proper in-flight-connection invariance is covered by the
@@ -199,7 +199,7 @@ echo "    [ok] original rule still works post-reload"
 echo "==> [status] yggdrasilctl status returns sensible data"
 status_json=$(ctl_json status)
 echo "$status_json" | grep -q '"peer_enrolled": true'      || fail "status: peer_enrolled not true"
-echo "$status_json" | grep -q '"branch_count": 2'          || fail "status: expected 2 branches (tcp-echo + udp-echo)"
+echo "$status_json" | grep -q '"rule_count": 2'          || fail "status: expected 2 rules (tcp-echo + udp-echo)"
 echo "$status_json" | grep -q '"peer_ip": "172.30.0.20"'   || fail "status: peer_ip wrong"
 echo "    [ok] status JSON consistent"
 

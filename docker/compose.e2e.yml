@@ -1,4 +1,4 @@
-# End-to-end network-stack test for the yggdrasil + ratatoskr pair.
+# End-to-end network-stack test for the yggdrasil + huginn pair.
 #
 # Topology:
 #
@@ -12,16 +12,16 @@
 #                                                            │ proxied
 #                                                            ▼
 #                                                 ┌─────────────────────┐
-#                                                 │  home (ratatoskr +  │
+#                                                 │  home (huginn +  │
 #                                                 │  echo backends on   │
 #                                                 │  :7100/tcp, :7101/udp)│
 #                                                 └─────────────────────┘
 #
 # Notes on the topology:
-# - In real deployment the home box runs *both* ratatoskr and the upstream
+# - In real deployment the home box runs *both* huginn and the upstream
 #   service in the same network namespace, because yggdrasil dials
 #   peer_ip:upstream_port — `peer_ip` is the source of the most recent
-#   heartbeat (i.e. ratatoskr's IP) and `upstream_port` is whatever the
+#   heartbeat (i.e. huginn's IP) and `upstream_port` is whatever the
 #   rule says. Same arrangement here: the `home` container runs both.
 # - The `init` service performs one-shot key generation and config writes
 #   into the shared volumes; daemons wait for it to complete cleanly.
@@ -44,7 +44,7 @@ volumes:
   yggdrasil_etc:
   yggdrasil_run:
   yggdrasil_state:
-  ratatoskr_etc:
+  huginn_etc:
 
 services:
   init:
@@ -53,7 +53,7 @@ services:
     entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/bootstrap.sh"]
     volumes:
       - yggdrasil_etc:/etc/yggdrasil
-      - ratatoskr_etc:/etc/ratatoskr
+      - huginn_etc:/etc/huginn
     restart: "no"
     networks:
       - wan
@@ -84,6 +84,7 @@ services:
     expose:
       - "7000/tcp"
       - "7001/udp"
+      - "8443/tcp"
       - "51820/udp"
       - "9090/tcp"
 
@@ -96,12 +97,12 @@ services:
     command:
       - /usr/local/bin/home-entrypoint.sh
     environment:
-      RATATOSKR_LOG: info
-      RATATOSKR_LOG_FORMAT: pretty
+      HUGINN_LOG: info
+      HUGINN_LOG_FORMAT: pretty
       ECHO_TCP_PORT: "7100"
       ECHO_UDP_PORT: "7101"
     volumes:
-      - ratatoskr_etc:/etc/ratatoskr
+      - huginn_etc:/etc/huginn
     networks:
       wan:
         ipv4_address: 172.30.0.20
