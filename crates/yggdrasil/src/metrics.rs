@@ -22,20 +22,25 @@
 //! - `yggdrasil_udp_packets_outbound_total{rule}` — upstream→client datagrams.
 //!
 //! Gauges:
-//! - `yggdrasil_branches_loaded` — number of currently-supervised rules.
+//! - `yggdrasil_rules_loaded` — number of currently-supervised rules.
 //! - `yggdrasil_udp_flows_active{rule}` — current size of a rule's flow table.
 //! - `yggdrasil_build_info{version}` — always set to `1`, used to expose the build version
 //!   as a label.
+//! - `yggdrasil_mode{mode}` — always `1`, the `mode` label is one of
+//!   `"relay"` / `"terminal"`. Cardinality 1 per daemon. Lets dashboards
+//!   filter and color by mode without joining against external metadata.
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
+use ratatoskr::control::Mode;
+
 /// Install the prometheus exporter listening on `listen`. Should be called
 /// exactly once per process before any metric is emitted (otherwise that
 /// metric goes to the no-op recorder).
-pub fn init(listen: SocketAddr) -> Result<()> {
+pub fn init(listen: SocketAddr, mode: Mode) -> Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(listen)
         .install()
@@ -48,6 +53,14 @@ pub fn init(listen: SocketAddr) -> Result<()> {
     )
     .set(1.0);
 
-    tracing::info!(%listen, "prometheus exporter listening");
+    // Mode gauge — always 1, the label carries the relay/terminal split.
+    // Cardinality is 1 per daemon (a process has exactly one mode).
+    metrics::gauge!(
+        "yggdrasil_mode",
+        "mode" => mode.as_str(),
+    )
+    .set(1.0);
+
+    tracing::info!(%listen, mode = mode.as_str(), "prometheus exporter listening");
     Ok(())
 }

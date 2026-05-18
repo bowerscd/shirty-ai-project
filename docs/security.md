@@ -88,8 +88,8 @@ If you don't control the VPS, the VPS root user can:
 - Modify or drop the proxied stream silently.
 - Steal the VPS's long-term identity key from
   `/etc/yggdrasil/identity.key` and pose as the VPS to any future
-  ratatoskr.
-- Add new branch rules in `/etc/yggdrasil/branches/` to expose ports on
+  huginn.
+- Add new rules in `/etc/yggdrasil/conf.d/` to expose ports on
   your home box that you never approved.
 
 This is the same trust model as **any** reverse proxy. yggdrasil does not
@@ -124,7 +124,7 @@ isn't hidden.
 
 If your home box is rooted, the attacker gets:
 
-- The home identity secret (`/etc/ratatoskr/identity.key`). They can now
+- The home identity secret (`/etc/huginn/identity.key`). They can now
   send valid heartbeats from any source IP to the configured VPS,
   redirecting your proxy at their attacker-controlled upstream.
 - Any data your home services were holding.
@@ -155,7 +155,7 @@ The enrollment token emitted by `yggdrasil enroll-token` contains:
 ```
 postcard {
     yggdrasil_public: [u8; 32],   // VPS's X25519 pubkey
-    peer_public:      [u8; 32],   // ratatoskr's X25519 pubkey (passed in as --peer-pubkey)
+    peer_public:      [u8; 32],   // huginn's X25519 pubkey (passed in as --peer-pubkey)
     endpoint_hint:    String,     // host:port — where to send heartbeats
     issued_at:        i64,        // unix seconds, informational
 }
@@ -173,7 +173,7 @@ The token is **not** authenticated end-to-end; an active MITM on the
 transfer channel could substitute a different token. The mitigation is
 the fingerprint cross-check in step 4 of
 [quickstart.md](quickstart.md#4-apply-the-token-on-the-home-box): after
-running `ratatoskr enroll`, verify the printed `yggdrasil fingerprint`
+running `huginn enroll`, verify the printed `yggdrasil fingerprint`
 matches what the VPS operator told you via a second channel (phone,
 in-person, signed email). If you skip that check, you're trusting
 whoever can intercept your transfer mechanism.

@@ -31,8 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use yggdrasil_proto::auth::{public_key_fingerprint, PUBLIC_KEY_LEN};
-use yggdrasil_proto::control::PendingCandidate;
+use ratatoskr::auth::{public_key_fingerprint, PUBLIC_KEY_LEN};
+use ratatoskr::control::PendingCandidate;
 
 /// On-disk record for one pending TOFU candidate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

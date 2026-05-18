@@ -12,7 +12,7 @@ name = "yggdrasil"
 path = "src/main.rs"
 
 [dependencies]
-yggdrasil-proto = { workspace = true }
+ratatoskr = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
@@ -44,6 +44,19 @@ notify-debouncer-mini = { workspace = true }
 
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+
+# L7 HTTP(S) frontend (Phase 6).
+hyper           = { workspace = true }
+hyper-util      = { workspace = true }
+http            = { workspace = true }
+http-body-util  = { workspace = true }
+tokio-rustls    = { workspace = true }
+rustls          = { workspace = true }
+rustls-pemfile  = { workspace = true }
+rcgen           = { workspace = true }
+url             = { workspace = true }
+bytes           = { workspace = true }
+pin-project-lite = { workspace = true }
 
 [dev-dependencies]
 tempfile  = { workspace = true }

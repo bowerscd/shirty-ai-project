@@ -1,6 +1,6 @@
 //! End-to-end hot-reload test.
 //!
-//! Verifies that dropping a new `*.toml` rule file into the branches
+//! Verifies that dropping a new `*.toml` rule file into the rules
 //! directory causes the supervisor to add a new listener within
 //! debounce + a small safety margin, and that existing rules are not
 //! disturbed by the reload.
@@ -12,17 +12,17 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::StaticKeyPair;
+use ratatoskr::auth::StaticKeyPair;
 
 use yggdrasil::heartbeat::PeerState;
 
 use crate::common::{
     drive_handshake, echo_udp_socket, pick_free_udp_port, send_heartbeat, spawn_supervisor,
-    spawn_udp_echo, write_branch, HeartbeatHarness,
+    spawn_udp_echo, write_rule, HeartbeatHarness,
 };
 
 #[tokio::test]
-async fn dropping_a_new_branch_file_adds_a_listener_live() {
+async fn dropping_a_new_rule_file_adds_a_listener_live() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
     let peer_state = PeerState::new(*client_keys.public_key());
@@ -37,13 +37,13 @@ async fn dropping_a_new_branch_file_adds_a_listener_live() {
     let echo_b_handle = spawn_udp_echo(echo_b);
 
     let tmp = tempfile::tempdir().unwrap();
-    let branch_dir = tmp.path().join("branches");
-    std::fs::create_dir_all(&branch_dir).unwrap();
+    let rules_dir = tmp.path().join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
 
-    // Initial branch: just rule A.
+    // Initial rule: just rule A.
     let listen_a = pick_free_udp_port().await;
-    write_branch(
-        &branch_dir,
+    write_rule(
+        &rules_dir,
         "a.toml",
         "rule-a",
         "udp",
@@ -53,7 +53,7 @@ async fn dropping_a_new_branch_file_adds_a_listener_live() {
 
     let debounce = Duration::from_millis(100);
     let supervisor = spawn_supervisor(
-        branch_dir.clone(),
+        rules_dir.clone(),
         debounce,
         peer_state.clone(),
         shutdown.clone(),
@@ -83,10 +83,10 @@ async fn dropping_a_new_branch_file_adds_a_listener_live() {
         .unwrap();
     assert_eq!(&reply[..n], b"a-pre");
 
-    // Drop a new branch file: rule B.
+    // Drop a new rule file: rule B.
     let listen_b = pick_free_udp_port().await;
-    write_branch(
-        &branch_dir,
+    write_rule(
+        &rules_dir,
         "b.toml",
         "rule-b",
         "udp",

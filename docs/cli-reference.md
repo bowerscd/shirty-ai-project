@@ -25,7 +25,9 @@ Start the daemon. The foreground process you'll wire into systemd.
 | Flag                | Env var                  | Default                              | Notes                                                                  |
 | ------------------- | ------------------------ | ------------------------------------ | ---------------------------------------------------------------------- |
 | `--config`          | `YGGDRASIL_CONFIG`       | `/etc/yggdrasil/config.toml`         | Path to the server config file.                                        |
-| `--branches-dir`    | `YGGDRASIL_BRANCHES_DIR` | (value from `config.toml`)           | Override `server.branches_dir` without editing the config — useful for tests. |
+| `--rules-dir`       | `YGGDRASIL_RULES_DIR`    | (value from `config.toml`)           | Override `server.rules_dir` without editing the config — useful for tests. |
+| `--mode`            | —                        | (value from `config.toml`)           | Override `server.mode`. `relay` or `terminal`. No aliases.             |
+| `--bind`            | —                        | (value from `config.toml`)           | Override `server.default_bind`. Rewrites wildcard rule listens to this IP. |
 
 Exits 0 on SIGTERM/SIGINT, non-zero on startup error (bad config, key not
 loadable, port already in use).
@@ -44,15 +46,15 @@ leaves the file.
 
 ### `yggdrasil enroll-token`
 
-Mint an out-of-band enrollment token for a ratatoskr peer. Also stamps
+Mint an out-of-band enrollment token for a huginn peer. Also stamps
 `peer.public_key_hex` into the yggdrasil config so the peer is "official"
 right away.
 
 | Flag              | Default                          | Notes                                                                                                  |
 | ----------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `--peer-pubkey`   | **required**                     | Hex-encoded X25519 pubkey of the ratatoskr peer (64 chars).                                            |
-| `--endpoint`      | **required**                     | `host:port` ratatoskr should heartbeat to. Embedded in the token.                                      |
-| `-o, --output`    | `ratatoskr-enrollment.token`     | Where to write the binary token.                                                                       |
+| `--peer-pubkey`   | **required**                     | Hex-encoded X25519 pubkey of the huginn peer (64 chars).                                            |
+| `--endpoint`      | **required**                     | `host:port` huginn should heartbeat to. Embedded in the token.                                      |
+| `-o, --output`    | `huginn-enrollment.token`     | Where to write the binary token.                                                                       |
 | `--config`        | `/etc/yggdrasil/config.toml`     | Server config; used to look up the local identity and to write back `peer.public_key_hex`.             |
 | `--force`         | (off)                            | Overwrite `peer.public_key_hex` even if a different peer is already enrolled.                          |
 
@@ -64,52 +66,52 @@ Print the build version. Identical to `yggdrasil --version`.
 
 ---
 
-## `ratatoskr`
+## `huginn`
 
 The heartbeat client daemon. Runs on the home box.
 
-### `ratatoskr run`
+### `huginn run`
 
 Start the daemon. Connects to the configured `yggdrasil_endpoint`, performs
 the Noise_IK handshake, then sends a heartbeat every `heartbeat_interval`.
 
 | Flag        | Env var               | Default                          | Notes                       |
 | ----------- | --------------------- | -------------------------------- | --------------------------- |
-| `--config`  | `RATATOSKR_CONFIG`    | `/etc/ratatoskr/config.toml`     | Client config path.         |
+| `--config`  | `HUGINN_CONFIG`    | `/etc/huginn/config.toml`     | Client config path.         |
 
 Exits on SIGTERM/SIGINT; restarts handshake transparently if the server
 moves or rejects the session.
 
-### `ratatoskr keygen`
+### `huginn keygen`
 
 Generate the client's long-term X25519 identity.
 
 | Flag              | Default                          | Notes                                                                |
 | ----------------- | -------------------------------- | -------------------------------------------------------------------- |
-| `--identity-file` | `/etc/ratatoskr/identity.key`    | Output path, mode 0600.                                              |
+| `--identity-file` | `/etc/huginn/identity.key`    | Output path, mode 0600.                                              |
 | `--force`         | (off)                            | Overwrite an existing file.                                          |
 
 Prints the pubkey and short fingerprint. You'll paste the pubkey into the
 VPS operator's `yggdrasil enroll-token --peer-pubkey` invocation.
 
-### `ratatoskr pubkey`
+### `huginn pubkey`
 
 Print the local pubkey (hex). Reads `--identity-file` if you haven't enrolled yet.
 
 | Flag              | Default                          | Notes                            |
 | ----------------- | -------------------------------- | -------------------------------- |
-| `--identity-file` | `/etc/ratatoskr/identity.key`    |                                  |
+| `--identity-file` | `/etc/huginn/identity.key`    |                                  |
 
-### `ratatoskr fingerprint`
+### `huginn fingerprint`
 
 Print the local short fingerprint (BLAKE2s-128 of the pubkey). Useful for
 out-of-band verification.
 
 | Flag              | Default                          |
 | ----------------- | -------------------------------- |
-| `--identity-file` | `/etc/ratatoskr/identity.key`    |
+| `--identity-file` | `/etc/huginn/identity.key`    |
 
-### `ratatoskr enroll <token>`
+### `huginn enroll <token>`
 
 Apply an enrollment token. Reads the token, cross-checks the embedded
 `peer_public` against the local identity (catches "wrong token file"
@@ -119,13 +121,13 @@ into the config.
 | Positional / flag    | Default                          | Notes                                                                                              |
 | -------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `<token>` (positional) | **required**                   | Path to the token file produced by `yggdrasil enroll-token`.                                       |
-| `--config`           | `/etc/ratatoskr/config.toml`     | Config file to update in place.                                                                    |
+| `--config`           | `/etc/huginn/config.toml`     | Config file to update in place.                                                                    |
 
 The config file must already exist with at least `[client]` and an `identity_file`
 key. `enroll` updates only two fields; placeholders in the other fields are
 preserved.
 
-### `ratatoskr version`
+### `huginn version`
 
 Print the build version.
 
@@ -146,18 +148,24 @@ subcommands are read-only by default — the only mutating one is `peer approve`
 ### `yggdrasilctl status`
 
 High-level server status. Shows the current peer IP (from the most recent
-authenticated heartbeat), milliseconds since that heartbeat, branch count,
-uptime, and whether a peer is enrolled.
+authenticated heartbeat), milliseconds since that heartbeat, rule count,
+uptime, and whether a peer is enrolled. In terminal mode the heartbeat-
+and peer-related fields are suppressed.
 
-### `yggdrasilctl branches list`
+### `yggdrasilctl rules list`
 
-Print loaded branch rules with their listen sockets and upstream ports.
+Print loaded rules with their listen sockets and upstream targets.
 
-### `yggdrasilctl branches reload`
+### `yggdrasilctl rules reload`
 
-Force a re-scan of `branches_dir`. The inotify watcher already handles most
+Force a re-scan of `rules_dir`. The inotify watcher already handles most
 cases — use this when the filesystem stack doesn't deliver events
 (NFS, some FUSE filesystems, container bind mounts on macOS).
+
+### `yggdrasilctl certs list`
+
+List currently-loaded HTTPS certificates with their source (path,
+ephemeral, convention, or default) and load timestamp. HTTPS rules only.
 
 ### `yggdrasilctl peer show`
 

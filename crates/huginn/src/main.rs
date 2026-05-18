@@ -1,4 +1,4 @@
-//! ratatoskr — heartbeat client for yggdrasil.
+//! huginn — heartbeat client for yggdrasil.
 
 mod cli;
 mod commands;
@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::{StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::auth::{StaticKeyPair, PUBLIC_KEY_LEN};
 
 use crate::heartbeat::{HeartbeatClient, HeartbeatClientConfig};
 
@@ -45,7 +45,7 @@ async fn run(args: cli::RunArgs) -> Result<()> {
         endpoint = %config.client.yggdrasil_endpoint,
         heartbeat_interval = ?config.client.heartbeat_interval,
         rekey_interval = ?config.client.rekey_interval,
-        "ratatoskr starting"
+        "huginn starting"
     );
 
     let local_keys = StaticKeyPair::load_from_file(&config.client.identity_file)
@@ -74,7 +74,7 @@ async fn run(args: cli::RunArgs) -> Result<()> {
     let client_handle = tokio::spawn(async move { client.run().await });
 
     wait_for_shutdown().await;
-    tracing::info!("ratatoskr shutting down");
+    tracing::info!("huginn shutting down");
     cancel.cancel();
     match client_handle.await {
         Ok(Ok(())) => {}
@@ -109,7 +109,7 @@ fn decode_pubkey_hex(hex_str: &str) -> Result<[u8; PUBLIC_KEY_LEN]> {
 }
 
 fn print_version() -> Result<()> {
-    println!("ratatoskr {}", env!("CARGO_PKG_VERSION"));
+    println!("huginn {}", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-//! Ratatoskr heartbeat client.
+//! Huginn heartbeat client.
 //!
 //! Maintains a single Noise_IK session against yggdrasil and emits an
 //! authenticated heartbeat every `heartbeat_interval`. Re-handshakes
@@ -20,8 +20,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::{Initiator, Session, StaticKeyPair, PUBLIC_KEY_LEN};
-use yggdrasil_proto::wire::{self, PacketType, SessionId};
+use ratatoskr::auth::{Initiator, Session, StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::wire::{self, PacketType, SessionId};
 
 /// Build-time defaults that callers can override.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -278,8 +278,8 @@ mod tests {
     ///
     /// We can't pull in the real `yggdrasil` crate (binary crate; reaching
     /// across creates a cycle), so we re-implement the responder side with
-    /// only `yggdrasil_proto` primitives.
-    use yggdrasil_proto::auth::Responder;
+    /// only `ratatoskr` primitives.
+    use ratatoskr::auth::Responder;
 
     struct TestServer {
         addr: SocketAddr,

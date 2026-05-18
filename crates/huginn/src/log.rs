@@ -1,4 +1,4 @@
-//! Tracing/logging setup for the ratatoskr client.
+//! Tracing/logging setup for the huginn client.
 
 use anyhow::{Context, Result};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -6,7 +6,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::cli::LogFormat;
 
 pub fn init_tracing(format: LogFormat) -> Result<()> {
-    let env_filter = EnvFilter::try_from_env("RATATOSKR_LOG")
+    let env_filter = EnvFilter::try_from_env("HUGINN_LOG")
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     let registry = tracing_subscriber::registry().with(env_filter);

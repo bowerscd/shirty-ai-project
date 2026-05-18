@@ -1,6 +1,6 @@
 //! Noise_IK + AEAD micro-benchmarks.
 //!
-//! Run with `cargo bench -p yggdrasil-proto --bench noise`.
+//! Run with `cargo bench -p ratatoskr --bench noise`.
 //!
 //! Measures:
 //! - `handshake/full`: full Initiator → Responder → Initiator round trip
@@ -14,8 +14,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use yggdrasil_proto::auth::{Initiator, Responder, Session, StaticKeyPair};
-use yggdrasil_proto::wire::{self, SessionId};
+use ratatoskr::auth::{Initiator, Responder, Session, StaticKeyPair};
+use ratatoskr::wire::{self, SessionId};
 
 /// Build an established session pair for the AEAD benches. Returns (client, server).
 fn established_pair() -> (Session, Session) {

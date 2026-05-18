@@ -27,8 +27,8 @@ use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::{Responder, Session, StaticKeyPair};
-use yggdrasil_proto::wire::{self, PacketType, PacketView};
+use ratatoskr::auth::{Responder, Session, StaticKeyPair};
+use ratatoskr::wire::{self, PacketType, PacketView};
 
 use super::peer_state::{HeartbeatEffect, PeerState};
 use crate::pending_peers::PendingPeerStore;
@@ -310,8 +310,8 @@ fn current_unix_millis() -> u64 {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use yggdrasil_proto::auth::{Initiator, StaticKeyPair};
-    use yggdrasil_proto::wire::SessionId;
+    use ratatoskr::auth::{Initiator, StaticKeyPair};
+    use ratatoskr::wire::SessionId;
 
     /// Spawn a server bound to `127.0.0.1:0` and return the (server-pubkey,
     /// peer-state, server-addr, shutdown-token, client-keys) tuple, plus the

@@ -1,9 +1,9 @@
-//! Shared error types for the yggdrasil/ratatoskr crates.
+//! Shared error types for the yggdrasil/huginn crates.
 
 use std::io;
 use std::path::PathBuf;
 
-/// All recoverable errors raised inside `yggdrasil-proto`.
+/// All recoverable errors raised inside `ratatoskr`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     // ---- I/O & filesystem ----
@@ -34,8 +34,8 @@ pub enum Error {
     Base64(#[from] base64::DecodeError),
 
     // ---- Configuration / validation ----
-    #[error("invalid branch configuration: {0}")]
-    InvalidBranch(String),
+    #[error("invalid rule configuration: {0}")]
+    InvalidRule(String),
 
     #[error("invalid enrollment token: {0}")]
     InvalidEnrollmentToken(String),

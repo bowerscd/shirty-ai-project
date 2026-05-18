@@ -8,7 +8,7 @@
 //!   port across N heartbeats.
 //! - `peer_state.watch()` fires **once** for the initial None→Some(IP)
 //!   transition and zero more times across the whole storm.
-//! - The supervisor's branch snapshot stays unchanged.
+//! - The supervisor's rule snapshot stays unchanged.
 //!
 //! This is the integration-level analogue of
 //! `proxy::udp::tests::same_ip_heartbeats_do_not_drain_flow_table` plus
@@ -21,15 +21,15 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::StaticKeyPair;
-use yggdrasil_proto::branch::Protocol;
-use yggdrasil_proto::wire;
+use ratatoskr::auth::StaticKeyPair;
+use ratatoskr::rule::Protocol;
+use ratatoskr::wire;
 
 use yggdrasil::heartbeat::PeerState;
 
 use crate::common::{
     drive_handshake, echo_udp_socket, pick_free_udp_port, spawn_supervisor, spawn_udp_echo,
-    write_branch, HeartbeatHarness,
+    write_rule, HeartbeatHarness,
 };
 
 #[tokio::test]
@@ -47,13 +47,13 @@ async fn full_stack_heartbeat_storm_does_not_disturb_udp_data_plane() {
     let (echo_sock, echo_addr) = echo_udp_socket().await;
     let echo_handle = spawn_udp_echo(echo_sock);
 
-    // 3. Write a single UDP branch file pointing at `echo_addr.port()`.
+    // 3. Write a single UDP rule file pointing at `echo_addr.port()`.
     let tmp = tempfile::tempdir().unwrap();
-    let branch_dir = tmp.path().join("branches");
-    std::fs::create_dir_all(&branch_dir).unwrap();
+    let rules_dir = tmp.path().join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
     let listen_port = pick_free_udp_port().await;
-    write_branch(
-        &branch_dir,
+    write_rule(
+        &rules_dir,
         "echo.toml",
         "echo",
         "udp",
@@ -63,7 +63,7 @@ async fn full_stack_heartbeat_storm_does_not_disturb_udp_data_plane() {
 
     // 4. Spawn the proxy supervisor and wait for the proxy to come up.
     let supervisor = spawn_supervisor(
-        branch_dir.clone(),
+        rules_dir.clone(),
         Duration::from_millis(50),
         peer_state.clone(),
         shutdown.clone(),
@@ -153,7 +153,7 @@ async fn full_stack_heartbeat_storm_does_not_disturb_udp_data_plane() {
     assert_eq!(
         supervisor.snapshot(),
         initial_snapshot,
-        "branch supervisor snapshot must remain identical across the storm"
+        "rule supervisor snapshot must remain identical across the storm"
     );
 
     // 9. Tear down cleanly.

@@ -14,12 +14,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::{Initiator, Session, StaticKeyPair};
-use yggdrasil_proto::wire::{self, SessionId};
+use ratatoskr::auth::{Initiator, Session, StaticKeyPair};
+use ratatoskr::wire::{self, SessionId};
 
 use yggdrasil::heartbeat::{HeartbeatServer, PeerState};
 use yggdrasil::pending_peers::PendingPeerStore;
-use yggdrasil::proxy::supervisor::ProxySupervisor;
+use yggdrasil::proxy::resolver::ResolverFactory;
+use yggdrasil::proxy::supervisor::{CertConfig, ProxySupervisor};
 
 /// Test-only `StaticKeyPair` clone via raw bytes.
 ///
@@ -135,10 +136,10 @@ pub async fn send_heartbeat(
     Ok(())
 }
 
-/// Write a single TOML rule into `branch_dir/<filename>`. Caller is
-/// responsible for first creating `branch_dir`.
-pub fn write_branch(
-    branch_dir: &Path,
+/// Write a single TOML rule into `rules_dir/<filename>`. Caller is
+/// responsible for first creating `rules_dir`.
+pub fn write_rule(
+    rules_dir: &Path,
     filename: &str,
     name: &str,
     protocol: &str,
@@ -154,7 +155,31 @@ listen = "127.0.0.1:{listen_port}"
 upstream_port = {upstream_port}
 "#,
     );
-    std::fs::write(branch_dir.join(filename), toml).unwrap();
+    std::fs::write(rules_dir.join(filename), toml).unwrap();
+}
+
+/// Write a terminal-mode TOML rule (`upstream_addr` form) into
+/// `rules_dir/<filename>`. Caller is responsible for first creating
+/// `rules_dir`. Terminal rules dial a static `host:port` on the LAN; the
+/// `upstream` arg is passed through verbatim (e.g. `"127.0.0.1:9001"`).
+pub fn write_terminal_rule(
+    rules_dir: &Path,
+    filename: &str,
+    name: &str,
+    protocol: &str,
+    listen_port: u16,
+    upstream: &str,
+) {
+    let toml = format!(
+        r#"
+[[rule]]
+name = "{name}"
+protocol = "{protocol}"
+listen = "127.0.0.1:{listen_port}"
+upstream_addr = "{upstream}"
+"#,
+    );
+    std::fs::write(rules_dir.join(filename), toml).unwrap();
 }
 
 /// Convenient bundle that owns the heartbeat server and its tempdir-backed
@@ -192,17 +217,67 @@ impl HeartbeatHarness {
     }
 }
 
-/// Spawn a proxy supervisor over the given branch dir. Caller controls the
+/// Spawn a proxy supervisor over the given rules dir. Caller controls the
 /// shutdown token.
 pub async fn spawn_supervisor(
-    branch_dir: PathBuf,
+    rules_dir: PathBuf,
     debounce: Duration,
     peer_state: Arc<PeerState>,
     shutdown: CancellationToken,
 ) -> ProxySupervisor {
-    ProxySupervisor::spawn(branch_dir, debounce, peer_state, shutdown)
-        .await
-        .unwrap()
+    // All integration tests run in relay mode; bind override defaults to
+    // None (rules carry explicit listen addresses in test fixtures).
+    ProxySupervisor::spawn(
+        rules_dir,
+        debounce,
+        ResolverFactory::new_relay(peer_state),
+        None,
+        CertConfig::default(),
+        shutdown,
+    )
+    .await
+    .unwrap()
+}
+
+/// Spawn a proxy supervisor in **terminal** mode. The supervisor uses a
+/// static resolver factory; each rule must carry `upstream_addr` (the helper
+/// [`write_terminal_rule`] writes rules of that shape).
+pub async fn spawn_terminal_supervisor(
+    rules_dir: PathBuf,
+    debounce: Duration,
+    shutdown: CancellationToken,
+) -> ProxySupervisor {
+    ProxySupervisor::spawn(
+        rules_dir,
+        debounce,
+        ResolverFactory::new_terminal(),
+        None,
+        CertConfig::default(),
+        shutdown,
+    )
+    .await
+    .unwrap()
+}
+
+/// Spawn a proxy supervisor in **terminal** mode with the given
+/// [`CertConfig`]. Used by the HTTPS integration tests so they can point
+/// `cert_dir` at a per-test scratch directory.
+pub async fn spawn_terminal_supervisor_with_certs(
+    rules_dir: PathBuf,
+    debounce: Duration,
+    cert_config: CertConfig,
+    shutdown: CancellationToken,
+) -> ProxySupervisor {
+    ProxySupervisor::spawn(
+        rules_dir,
+        debounce,
+        ResolverFactory::new_terminal(),
+        None,
+        cert_config,
+        shutdown,
+    )
+    .await
+    .unwrap()
 }
 
 /// Read N bytes from a TCP stream into a heap buffer with a sensible timeout.

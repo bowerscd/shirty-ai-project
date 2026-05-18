@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/yggdrasil-proto",
+    "crates/ratatoskr",
     "crates/yggdrasil",
     "crates/yggdrasilctl",
-    "crates/ratatoskr",
+    "crates/huginn",
     "crates/loadgen",
 ]
 
@@ -63,10 +63,23 @@ humantime-serde = "1"
 humantime       = "2"
 hdrhistogram    = "7"
 tempfile        = "3"
+url             = { version = "2", features = ["serde"] }
 criterion       = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+# L7 HTTP frontend (Phase 6)
+hyper           = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util      = { version = "0.1", features = ["server", "client", "client-legacy", "http1", "http2", "tokio"] }
+http            = "1"
+http-body-util  = "0.1"
+tokio-rustls    = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls          = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+rustls-pemfile  = "2"
+rcgen           = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+bytes           = "1"
+pin-project-lite = "0.2"
+
 # Internal crates
-yggdrasil-proto = { path = "crates/yggdrasil-proto" }
+ratatoskr = { path = "crates/ratatoskr" }
 
 [profile.release]
 opt-level     = 3

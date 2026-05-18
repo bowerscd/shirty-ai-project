@@ -7,34 +7,36 @@
 //! Per-connection lifecycle:
 //!
 //! 1. `accept()` returns `(client, client_addr)`.
-//! 2. Snapshot the current peer IP from [`PeerState::current_ip`]. If `None`
-//!    (no heartbeat yet), accept-then-close with a `debug` log so listeners
-//!    stay up for debugging. Bump `tcp_connect_no_peer_total` (Phase 9).
-//! 3. `TcpStream::connect((peer_ip, rule.upstream_port))`. On error, log +
-//!    close the client. Bump `tcp_connect_failed_total`.
+//! 2. Resolve the current dial target via [`UpstreamResolver::current_target`].
+//!    `None` (relay before first heartbeat) → accept-then-close with a `debug`
+//!    log so listeners stay up for debugging. Bump `tcp_connect_no_peer_total`
+//!    (Phase 9).
+//! 3. `TcpStream::connect(target)`. On error, log + close the client. Bump
+//!    `tcp_connect_failed_total`.
 //! 4. If `rule.proxy_protocol` is set, write the header to the upstream
 //!    stream before any application bytes.
 //! 5. `tokio::io::copy_bidirectional(client, upstream)` until either side
 //!    EOFs or errors. Bump byte counters in both directions (Phase 9).
 //!
-//! On IP change (peer_state watch fires), in-flight TCP connections are
+//! On dial-target change (relay IP-change), in-flight TCP connections are
 //! **left alone** — the application layer is already broken because the
 //! upstream IP changed; force-closing the socket adds no signal beyond what
-//! the network already delivered. New accepts pick up the new IP.
+//! the network already delivered. New accepts pick up the new target.
+//! Terminal-mode resolvers never change their target, so the question is
+//! moot there.
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::branch::Rule;
+use ratatoskr::rule::Rule;
 
 use super::proxy_protocol;
-use crate::heartbeat::PeerState;
+use super::resolver::UpstreamResolver;
 
 /// Handle to a running per-rule TCP proxy. Drop to stop (the cancellation
 /// token cascade aborts the listener task and lets in-flight connections
@@ -50,7 +52,7 @@ impl TcpProxy {
     /// Bind the listener and spawn the accept loop. Returns once the socket
     /// is listening so callers can rely on connect attempts succeeding
     /// immediately after this resolves.
-    pub async fn spawn(rule: Rule, peer_state: Arc<PeerState>) -> Result<Self> {
+    pub async fn spawn(rule: Rule, resolver: UpstreamResolver) -> Result<Self> {
         let listener = TcpListener::bind(rule.listen)
             .await
             .with_context(|| format!("bind TCP listener for rule {:?} on {}", rule.name, rule.listen))?;
@@ -59,17 +61,17 @@ impl TcpProxy {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task_rule = rule.clone();
-        let task_peer = peer_state.clone();
+        let task_resolver = resolver.clone();
         let task_local = local_addr;
 
         let handle = tokio::spawn(async move {
-            run_accept_loop(task_rule, task_peer, listener, task_local, task_cancel).await;
+            run_accept_loop(task_rule, task_resolver, listener, task_local, task_cancel).await;
         });
 
         tracing::info!(
             rule = %rule.name,
             listen = %local_addr,
-            upstream_port = rule.upstream_port,
+            upstream = %resolver.describe(),
             proxy_protocol = ?rule.proxy_protocol,
             "TCP rule listening"
         );
@@ -108,7 +110,7 @@ impl TcpProxy {
 
 async fn run_accept_loop(
     rule: Rule,
-    peer_state: Arc<PeerState>,
+    resolver: UpstreamResolver,
     listener: TcpListener,
     local_addr: SocketAddr,
     cancel: CancellationToken,
@@ -133,20 +135,20 @@ async fn run_accept_loop(
                     }
                 };
 
-                let peer_ip = match peer_state.current_ip() {
-                    Some(ip) => ip,
+                let upstream_addr = match resolver.current_target() {
+                    Some(addr) => addr,
                     None => {
+                        // Relay before first heartbeat. (Static resolvers
+                        // always return Some.)
                         tracing::debug!(
                             rule = %rule.name,
                             client = %client_addr,
-                            "drop connection: no peer IP yet (no heartbeat received)"
+                            "drop connection: upstream not yet resolvable (no heartbeat received)"
                         );
                         // Tokio drops `client` here → socket close.
                         continue;
                     }
                 };
-
-                let upstream_addr = SocketAddr::new(peer_ip, rule.upstream_port);
                 let conn_rule = rule.clone();
                 let conn_cancel = cancel.child_token();
                 tokio::spawn(async move {
@@ -269,9 +271,27 @@ fn is_benign_close(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use yggdrasil_proto::branch::ProxyProto;
+    use ratatoskr::rule::ProxyProto;
+
+    use crate::heartbeat::PeerState;
+
+    /// Build a dynamic resolver for relay tests — mirrors the production
+    /// `ResolverFactory::new_relay(...).build(rule)` path without dragging
+    /// the factory machinery into per-proxy unit tests.
+    fn dynamic_resolver(peer: Arc<PeerState>, port: u16) -> UpstreamResolver {
+        UpstreamResolver::Dynamic {
+            peer_state: peer,
+            port,
+        }
+    }
+
+    /// Static resolver for terminal-style tests.
+    fn static_resolver(addr: SocketAddr) -> UpstreamResolver {
+        UpstreamResolver::Static { addr }
+    }
 
     async fn echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -291,7 +311,7 @@ mod tests {
     /// forwards to `127.0.0.1:upstream_port`.
     fn rule(name: &str, upstream_port: u16, proxy_protocol: Option<ProxyProto>) -> Rule {
         use std::str::FromStr;
-        let f = yggdrasil_proto::branch::BranchFile::from_toml(
+        let f = ratatoskr::rule::RuleFile::from_toml(
             "test.toml",
             &format!(
                 r#"
@@ -328,9 +348,12 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
 
-        let proxy = TcpProxy::spawn(rule("echo", upstream.port(), None), peer)
-            .await
-            .unwrap();
+        let proxy = TcpProxy::spawn(
+            rule("echo", upstream.port(), None),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
         let listen = proxy.local_addr();
 
         let mut client = TcpStream::connect(listen).await.unwrap();
@@ -348,9 +371,12 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         // Note: no record_heartbeat call → current_ip is None.
 
-        let proxy = TcpProxy::spawn(rule("nopeer", upstream.port(), None), peer)
-            .await
-            .unwrap();
+        let proxy = TcpProxy::spawn(
+            rule("nopeer", upstream.port(), None),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
         let listen = proxy.local_addr();
 
         // The accept succeeds (we want listeners up for debugging), then
@@ -411,7 +437,7 @@ mod tests {
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         let proxy = TcpProxy::spawn(
             rule("v1head", upstream_addr.port(), Some(ProxyProto::V1)),
-            peer,
+            dynamic_resolver(peer, upstream_addr.port()),
         )
         .await
         .unwrap();
@@ -437,7 +463,7 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         // Port 1 is reserved and won't have anything listening on a normal box.
-        let proxy = TcpProxy::spawn(rule("noupstream", 1, None), peer)
+        let proxy = TcpProxy::spawn(rule("noupstream", 1, None), dynamic_resolver(peer, 1))
             .await
             .unwrap();
         let listen = proxy.local_addr();
@@ -467,9 +493,12 @@ mod tests {
         let (upstream, _us) = echo_server().await;
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
-        let proxy = TcpProxy::spawn(rule("cancel", upstream.port(), None), peer)
-            .await
-            .unwrap();
+        let proxy = TcpProxy::spawn(
+            rule("cancel", upstream.port(), None),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
         let listen = proxy.local_addr();
         let mut client = TcpStream::connect(listen).await.unwrap();
         client.write_all(b"ping").await.unwrap();

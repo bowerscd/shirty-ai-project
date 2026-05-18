@@ -1,11 +1,11 @@
-//! Client configuration schema (`/etc/ratatoskr/config.toml`).
+//! Client configuration schema (`/etc/huginn/config.toml`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use yggdrasil_proto::Error as ProtoError;
+use ratatoskr::Error as ProtoError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,7 +21,7 @@ pub struct ClientSection {
     pub yggdrasil_endpoint: String,
     /// Hex-encoded X25519 public key of the yggdrasil server.
     pub yggdrasil_pubkey_hex: String,
-    /// Path to this client's static X25519 identity file (created by `ratatoskr keygen`).
+    /// Path to this client's static X25519 identity file (created by `huginn keygen`).
     #[serde(default = "default_identity_file")]
     pub identity_file: PathBuf,
     /// How often to emit a heartbeat. Default: 5s.
@@ -32,7 +32,7 @@ pub struct ClientSection {
     pub rekey_interval: Duration,
 }
 
-fn default_identity_file() -> PathBuf       { PathBuf::from("/etc/ratatoskr/identity.key") }
+fn default_identity_file() -> PathBuf       { PathBuf::from("/etc/huginn/identity.key") }
 fn default_heartbeat_interval() -> Duration { Duration::from_secs(5) }
 fn default_rekey_interval() -> Duration     { Duration::from_secs(3600) }
 
@@ -56,7 +56,7 @@ impl ClientConfig {
         }
         let bytes = hex::decode(&self.client.yggdrasil_pubkey_hex)
             .map_err(|_| ConfigError::Invalid("client.yggdrasil_pubkey_hex is not valid hex"))?;
-        if bytes.len() != yggdrasil_proto::auth::PUBLIC_KEY_LEN {
+        if bytes.len() != ratatoskr::auth::PUBLIC_KEY_LEN {
             return Err(ConfigError::Invalid(
                 "client.yggdrasil_pubkey_hex must decode to exactly 32 bytes",
             ));

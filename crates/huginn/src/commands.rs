@@ -1,11 +1,11 @@
-//! Implementations of the non-`run` CLI subcommands for ratatoskr.
+//! Implementations of the non-`run` CLI subcommands for huginn.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use yggdrasil_proto::auth::{StaticKeyPair, PUBLIC_KEY_LEN};
-use yggdrasil_proto::enrollment::EnrollmentBody;
+use ratatoskr::auth::{StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::enrollment::EnrollmentBody;
 
 use crate::cli::{EnrollArgs, IdentityArgs, KeygenArgs};
 
@@ -34,7 +34,7 @@ pub fn keygen(args: KeygenArgs) -> Result<()> {
         "  Send the pubkey above to the yggdrasil operator. They will run"
     );
     println!("  `yggdrasil enroll-token --peer-pubkey <hex> ...` and send back");
-    println!("  a token file for `ratatoskr enroll`.");
+    println!("  a token file for `huginn enroll`.");
     Ok(())
 }
 
@@ -108,8 +108,8 @@ pub fn enroll(args: EnrollArgs) -> Result<()> {
     println!("updated {}", args.config.display());
     println!("  client.yggdrasil_pubkey_hex = {}", hex::encode(body.yggdrasil_public));
     println!("  client.yggdrasil_endpoint   = {}", body.endpoint_hint);
-    println!("  yggdrasil fingerprint       = {}", yggdrasil_proto::auth::public_key_fingerprint(&body.yggdrasil_public));
-    println!("Start the daemon with `ratatoskr run`.");
+    println!("  yggdrasil fingerprint       = {}", ratatoskr::auth::public_key_fingerprint(&body.yggdrasil_public));
+    println!("Start the daemon with `huginn run`.");
     Ok(())
 }
 
@@ -186,7 +186,7 @@ fn decode_pubkey_hex(hex_str: &str) -> Result<[u8; PUBLIC_KEY_LEN]> {
 mod tests {
     use super::*;
     use crate::cli::{EnrollArgs, IdentityArgs, KeygenArgs};
-    use yggdrasil_proto::enrollment::EnrollmentBody;
+    use ratatoskr::enrollment::EnrollmentBody;
 
     fn write_baseline_client_config(dir: &Path, identity_file: &Path) -> PathBuf {
         let cfg_path = dir.join("config.toml");

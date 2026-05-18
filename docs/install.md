@@ -29,10 +29,10 @@ You'll get four binaries under `target/release/`:
 | --------------- | ---------------- | -------------------------------------------------------- |
 | `yggdrasil`     | VPS              | The reverse-proxy daemon.                                |
 | `yggdrasilctl`  | VPS              | Admin CLI over Unix socket.                              |
-| `ratatoskr`     | Home box         | Heartbeat client daemon.                                 |
+| `huginn`     | Home box         | Heartbeat client daemon.                                 |
 | `loadgen`       | (only on bench hosts) | UDP/TCP load generator used by `bench/`.            |
 
-You generally only need the first two on the VPS and `ratatoskr` on the home
+You generally only need the first two on the VPS and `huginn` on the home
 box. `loadgen` is build-time-only for the benchmark harness.
 
 ## Filesystem layout
@@ -49,17 +49,17 @@ if you want to deviate.
 | `/usr/local/bin/yggdrasilctl`     | root:root 0755  | Admin CLI binary.                                                |
 | `/etc/yggdrasil/config.toml`      | root:root 0644  | Daemon config (see [configuration.md](configuration.md)).        |
 | `/etc/yggdrasil/identity.key`     | root:root 0600  | Long-term X25519 secret key. Never copy off the host.            |
-| `/etc/yggdrasil/branches/*.toml`  | root:root 0644  | One file per logical group of rules. Hot-reloaded.               |
+| `/etc/yggdrasil/conf.d/*.toml`  | root:root 0644  | One file per logical group of rules. Hot-reloaded.               |
 | `/var/lib/yggdrasil/`             | root:root 0755  | Per-host state (TOFU candidates, runtime markers).               |
 | `/run/yggdrasil/control.sock`     | root:admin 0660 | Unix socket for `yggdrasilctl`. Restrict to admin group.         |
 
-**Home box (ratatoskr)**:
+**Home box (huginn)**:
 
 | Path                              | Owner / mode    | Purpose                                                          |
 | --------------------------------- | --------------- | ---------------------------------------------------------------- |
-| `/usr/local/bin/ratatoskr`        | root:root 0755  | Daemon binary.                                                   |
-| `/etc/ratatoskr/config.toml`      | root:root 0644  | Daemon config.                                                   |
-| `/etc/ratatoskr/identity.key`     | root:root 0600  | Long-term X25519 secret key. Never copy off the host.            |
+| `/usr/local/bin/huginn`        | root:root 0755  | Daemon binary.                                                   |
+| `/etc/huginn/config.toml`      | root:root 0644  | Daemon config.                                                   |
+| `/etc/huginn/identity.key`     | root:root 0600  | Long-term X25519 secret key. Never copy off the host.            |
 
 Create them once:
 
@@ -67,12 +67,12 @@ Create them once:
 # VPS
 sudo install -m 0755 target/release/yggdrasil    /usr/local/bin/
 sudo install -m 0755 target/release/yggdrasilctl /usr/local/bin/
-sudo mkdir -p /etc/yggdrasil/branches /var/lib/yggdrasil /run/yggdrasil
-sudo chmod 0755 /etc/yggdrasil /etc/yggdrasil/branches /var/lib/yggdrasil
+sudo mkdir -p /etc/yggdrasil/conf.d /var/lib/yggdrasil /run/yggdrasil
+sudo chmod 0755 /etc/yggdrasil /etc/yggdrasil/conf.d /var/lib/yggdrasil
 
 # Home
-sudo install -m 0755 target/release/ratatoskr /usr/local/bin/
-sudo mkdir -p /etc/ratatoskr
+sudo install -m 0755 target/release/huginn /usr/local/bin/
+sudo mkdir -p /etc/huginn
 ```
 
 ## Service files
@@ -124,18 +124,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now yggdrasil
 ```
 
-### systemd — `ratatoskr.service`
+### systemd — `huginn.service`
 
 ```ini
-# /etc/systemd/system/ratatoskr.service
+# /etc/systemd/system/huginn.service
 [Unit]
-Description=ratatoskr heartbeat client
+Description=huginn heartbeat client
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ratatoskr run
+ExecStart=/usr/local/bin/huginn run
 Restart=always
 RestartSec=2s
 
@@ -144,7 +144,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
-ReadOnlyPaths=/etc/ratatoskr
+ReadOnlyPaths=/etc/huginn
 
 StandardOutput=journal
 StandardError=journal
@@ -163,15 +163,15 @@ config and key files.
 **VPS** needs inbound:
 
 - UDP `:51820` (or whatever `server.heartbeat_listen` you chose) from the open
-  internet — ratatoskr can roam, so you can't tighten this to a single IP.
-- TCP/UDP for every `listen` port in `branches/*.toml`.
+  internet — huginn can roam, so you can't tighten this to a single IP.
+- TCP/UDP for every `listen` port in `conf.d/*.toml`.
 - Nothing for the control socket — it's `AF_UNIX`, not a TCP port.
 
 **Home box** needs outbound to the VPS only:
 
 - UDP `:51820` to `VPS_IP`.
 
-If the home box is double-NATted / behind CGNAT, that's fine — ratatoskr
+If the home box is double-NATted / behind CGNAT, that's fine — huginn
 initiates the heartbeats, so it punches through. Just don't block outbound
 UDP at your residential router.
 
@@ -181,9 +181,9 @@ The control protocol uses `#[serde(tag = "kind")]`-tagged unions, so binary
 compatibility within `0.x` is best-effort. The general upgrade order is:
 
 1. Upgrade `yggdrasilctl` and `yggdrasil` on the VPS together.
-2. Upgrade `ratatoskr` on the home box on its own schedule — the heartbeat
+2. Upgrade `huginn` on the home box on its own schedule — the heartbeat
    wire format only changes in major versions and yggdrasil is always
-   backwards-compatible with previous-minor ratatoskr.
+   backwards-compatible with previous-minor huginn.
 
 Identity keys do **not** rotate on upgrade — they're long-term and survive
 arbitrary upgrades. To rotate them deliberately, see [operations.md](operations.md#rotating-keys).

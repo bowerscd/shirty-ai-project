@@ -3,25 +3,25 @@
 Day-to-day runbook. Assumes both daemons are already installed
 ([install.md](install.md)) and you finished [quickstart.md](quickstart.md).
 
-## Adding, changing, removing branch rules
+## Adding, changing, removing rules
 
-Branches are live-reloadable. Edit, add, or `rm` files under
-`server.branches_dir` and yggdrasil picks the change up within ~250 ms.
+Rules are live-reloadable. Edit, add, or `rm` files under
+`server.rules_dir` and yggdrasil picks the change up within ~250 ms.
 
 ```bash
 # Add a new rule.
-sudo $EDITOR /etc/yggdrasil/branches/web.toml
+sudo $EDITOR /etc/yggdrasil/conf.d/web.toml
 
 # Confirm it was picked up.
-sudo yggdrasilctl branches list
+sudo yggdrasilctl rules list
 
 # If you suspect inotify dropped the event (NFS, FUSE, container bind mounts on macOS):
-sudo yggdrasilctl branches reload
+sudo yggdrasilctl rules reload
 ```
 
 Validation rules to remember (see [configuration.md](configuration.md#-rule----repeatable)):
 
-- `name` is globally unique across all branch files.
+- `name` is globally unique across all rule files.
 - `listen` is globally unique per `(ip, port, protocol)`.
 - `idle_timeout` only applies to UDP rules; `proxy_protocol` only to TCP.
 
@@ -29,7 +29,7 @@ If the reload fails validation, **all** rules from the previous good
 configuration keep serving. The error appears in the daemon log:
 
 ```
-ERROR yggdrasil::proxy::supervisor: branch reload rejected
+ERROR yggdrasil::proxy::supervisor: rule reload rejected
   error=duplicate rule name "ssh"
 ```
 
@@ -41,15 +41,15 @@ if a peer attempts a handshake whose pubkey isn't in `[peer]`, the daemon
 stages it and you approve it manually.
 
 ```bash
-# 1. Start ratatoskr (which will fail handshake but leave a candidate).
+# 1. Start huginn (which will fail handshake but leave a candidate).
 # 2. Observe staged candidates on the VPS.
 sudo yggdrasilctl peer pending
 # fingerprint                       observed_at           handshake_attempts
 # 1234abcd5678efgh90ij12klmn34op56  2024-08-12T10:34:01Z  3
 
-# 3. Verify the fingerprint matches what `ratatoskr fingerprint` shows on
+# 3. Verify the fingerprint matches what `huginn fingerprint` shows on
 #    the home box — out-of-band, e.g. by phone.
-ssh home.example.lan -- sudo ratatoskr fingerprint
+ssh home.example.lan -- sudo huginn fingerprint
 # 1234abcd5678efgh90ij12klmn34op56
 
 # 4. Approve.
@@ -85,7 +85,7 @@ compromise, or you're decommissioning the home box):
 1. On the home box, generate a new identity (don't overwrite the old one yet):
 
    ```bash
-   sudo ratatoskr keygen --identity-file /etc/ratatoskr/identity.key.new
+   sudo huginn keygen --identity-file /etc/huginn/identity.key.new
    # pubkey:      ...
    # fingerprint: ...
    ```
@@ -98,15 +98,15 @@ compromise, or you're decommissioning the home box):
        --peer-pubkey <new-pubkey-hex> \
        --endpoint vps.example.net:51820 \
        --force \
-       -o /tmp/ratatoskr.token
+       -o /tmp/huginn.token
    ```
 
 3. Copy and apply on the home box:
 
    ```bash
-   sudo ratatoskr enroll /tmp/ratatoskr.token
-   sudo mv /etc/ratatoskr/identity.key{.new,}
-   sudo systemctl restart ratatoskr
+   sudo huginn enroll /tmp/huginn.token
+   sudo mv /etc/huginn/identity.key{.new,}
+   sudo systemctl restart huginn
    ```
 
 4. Restart yggdrasil to apply the updated `peer.public_key_hex`:
@@ -145,7 +145,7 @@ Exported on `[metrics] listen` (default `127.0.0.1:9090`, path `/metrics`).
 | `yggdrasil_heartbeats_received_total`               | counter | `result=accepted\|rejected` | Heartbeat decoder outcomes. A non-zero `rejected` rate usually means a misconfigured peer. |
 | `yggdrasil_handshakes_completed_total`              | counter | —                  | Successful Noise_IK handshakes. Should at least match `rekey_interval`.                    |
 | `yggdrasil_peer_ip_changes_total`                   | counter | —                  | Times the peer's source IP changed between consecutive heartbeats. Each change drains the affected UDP flow table. |
-| `yggdrasil_branches_loaded`                         | gauge   | —                  | Number of rules currently active.                                                          |
+| `yggdrasil_rules_loaded`                         | gauge   | —                  | Number of rules currently active.                                                          |
 | `yggdrasil_udp_flows_drained_on_ip_change_total`    | counter | —                  | UDP flows dropped because the peer IP moved while the flow was in-flight.                  |
 
 Suggested alerts:
@@ -157,7 +157,7 @@ Suggested alerts:
 - **Handshake storm**: `rate(yggdrasil_handshakes_completed_total[5m]) > 0.1`.
   A healthy link rehandshakes about once an hour.
 
-`ratatoskr` does not currently export Prometheus metrics — it logs the
+`huginn` does not currently export Prometheus metrics — it logs the
 relevant fields (handshake outcomes, heartbeat seq, errors) on stdout.
 
 ### Logs
@@ -169,11 +169,11 @@ fields:
 | ------------------ | -------------------- | -------------------------------------------------------------------------------------- |
 | `peer_ip`          | yggdrasil heartbeat  | Source IP of the most recent authenticated heartbeat.                                  |
 | `seq`              | both heartbeat sides | Monotonic heartbeat sequence number. Skipped values may indicate UDP loss.             |
-| `branch_name`      | yggdrasil proxy      | Which `[[rule]]` triggered this log line.                                              |
+| `rule_name`      | yggdrasil proxy      | Which `[[rule]]` triggered this log line.                                              |
 | `flow_id`          | yggdrasil UDP proxy  | Stable identifier for a UDP flow within the flow table.                                |
-| `handshake_attempt`| ratatoskr            | Increments each failed handshake; useful for "stuck in retry loop" alerts.             |
+| `handshake_attempt`| huginn            | Increments each failed handshake; useful for "stuck in retry loop" alerts.             |
 
-Set `YGGDRASIL_LOG=debug` or `RATATOSKR_LOG=debug` (standard `tracing`
+Set `YGGDRASIL_LOG=debug` or `HUGINN_LOG=debug` (standard `tracing`
 `EnvFilter` syntax) to lift the verbosity. Both env vars accept the usual
 `module::path=level,other::path=trace` syntax.
 
@@ -185,8 +185,8 @@ The server hasn't yet seen a valid heartbeat. Most common causes:
 
 | Symptom                                                     | Likely cause                                                                                                        |
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| ratatoskr log: "connection refused" / "no route to host"    | VPS firewall is blocking UDP `heartbeat_listen`. Open it for inbound UDP.                                           |
-| ratatoskr log: "handshake response decode failed"           | `client.yggdrasil_pubkey_hex` does not match the server. Re-run `ratatoskr enroll` with a fresh token.              |
+| huginn log: "connection refused" / "no route to host"    | VPS firewall is blocking UDP `heartbeat_listen`. Open it for inbound UDP.                                           |
+| huginn log: "handshake response decode failed"           | `client.yggdrasil_pubkey_hex` does not match the server. Re-run `huginn enroll` with a fresh token.              |
 | yggdrasil log: "rejected: unknown peer"                     | `peer.public_key_hex` is wrong or empty on the server. Re-run `yggdrasil enroll-token`.                             |
 | Nothing on either side                                      | Home-side outbound UDP blocked, or `client.yggdrasil_endpoint` resolves to wrong IP. Check `dig`, then `nc -u -v`.  |
 
@@ -205,11 +205,11 @@ sudo usermod -aG yggdrasil-admin <your-login>
 The systemd unit in [install.md](install.md#systemd-units) sets
 `RuntimeDirectoryMode=0750` and `Group=yggdrasil-admin` for this.
 
-### Branch file parse errors
+### Rule file parse errors
 
 ```
-ERROR yggdrasil::config::branches: branch reload rejected
-  file=/etc/yggdrasil/branches/web.toml
+ERROR yggdrasil::config::rules: rule reload rejected
+  file=/etc/yggdrasil/conf.d/web.toml
   error=missing field `upstream_port`
 ```
 
@@ -222,7 +222,7 @@ watcher picks up the change.
 is normal for a residential link. Sustained churn (one per minute) usually
 means:
 
-- Two ratatoskr instances are sharing the same identity and racing each
+- Two huginn instances are sharing the same identity and racing each
   other from different networks. Move one to a different identity.
 - A NAT in front of the home box is rotating its public IP very
   aggressively (some CGNAT setups). Lower `heartbeat_interval` so the flow
@@ -230,12 +230,12 @@ means:
 
 ### Hot-reload not picking up changes
 
-If `branches_dir` lives on NFS, FUSE, or a container bind mount, inotify
+If `rules_dir` lives on NFS, FUSE, or a container bind mount, inotify
 events may not be delivered. Use:
 
 ```bash
-sudo yggdrasilctl branches reload
+sudo yggdrasilctl rules reload
 ```
 
 to force a re-scan. As a permanent fix, prefer running yggdrasil with its
-branches directory on a local filesystem.
+rules directory on a local filesystem.

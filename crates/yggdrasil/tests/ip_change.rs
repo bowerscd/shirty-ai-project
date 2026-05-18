@@ -26,14 +26,14 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::StaticKeyPair;
-use yggdrasil_proto::branch::Protocol;
-use yggdrasil_proto::wire::{self, SessionId};
+use ratatoskr::auth::StaticKeyPair;
+use ratatoskr::rule::Protocol;
+use ratatoskr::wire::{self, SessionId};
 
 use yggdrasil::heartbeat::PeerState;
 
 use crate::common::{
-    pick_free_udp_port, spawn_supervisor, write_branch, HeartbeatHarness,
+    pick_free_udp_port, spawn_supervisor, write_rule, HeartbeatHarness,
 };
 
 #[tokio::test]
@@ -86,13 +86,13 @@ async fn ip_change_drains_inflight_udp_flow() {
         })
     };
 
-    // Write the UDP branch.
+    // Write the UDP rule.
     let tmp = tempfile::tempdir().unwrap();
-    let branch_dir = tmp.path().join("branches");
-    std::fs::create_dir_all(&branch_dir).unwrap();
+    let rules_dir = tmp.path().join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
     let listen_port = pick_free_udp_port().await;
-    write_branch(
-        &branch_dir,
+    write_rule(
+        &rules_dir,
         "echo.toml",
         "echo",
         "udp",
@@ -101,7 +101,7 @@ async fn ip_change_drains_inflight_udp_flow() {
     );
 
     let supervisor = spawn_supervisor(
-        branch_dir,
+        rules_dir,
         Duration::from_millis(50),
         peer_state.clone(),
         shutdown.clone(),
@@ -120,7 +120,7 @@ async fn ip_change_drains_inflight_udp_flow() {
     let sock_hb_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock_hb_a.connect(hb.addr).await.unwrap();
     let sid = SessionId::random();
-    let (init, hs1) = yggdrasil_proto::auth::Initiator::start(&client_keys, &server_pub, sid)
+    let (init, hs1) = ratatoskr::auth::Initiator::start(&client_keys, &server_pub, sid)
         .unwrap();
     sock_hb_a.send(&hs1).await.unwrap();
     let mut buf = [0u8; 2048];

@@ -1,8 +1,8 @@
 # yggdrasil
 
-A residential reverse proxy. Run **yggdrasil** on a VPS with a stable public IP; run **ratatoskr** on your home server behind a dynamic IP and CGNAT. Inbound TCP and UDP from the internet are forwarded to your home box without you ever exposing it directly.
+A residential reverse proxy. Run **yggdrasil** on a VPS with a stable public IP; run **huginn** on your home server behind a dynamic IP and CGNAT. Inbound TCP and UDP from the internet are forwarded to your home box without you ever exposing it directly.
 
-It is **not** a tunnel. There is no overlay network, no kernel module, no userspace TUN. Yggdrasil is a plain L4 reverse proxy that learns where to send traffic from authenticated heartbeats: ratatoskr signs a heartbeat with its long-term key, yggdrasil verifies it and remembers the source IP, and any rules pointing at that peer route to whatever IP the heartbeat came from. When your residential IP changes, the next heartbeat updates the mapping.
+It is **not** a tunnel. There is no overlay network, no kernel module, no userspace TUN. Yggdrasil is a plain L4 reverse proxy that learns where to send traffic from authenticated heartbeats: huginn signs a heartbeat with its long-term key, yggdrasil verifies it and remembers the source IP, and any rules pointing at that peer route to whatever IP the heartbeat came from. When your residential IP changes, the next heartbeat updates the mapping.
 
 ## Get up and running
 
@@ -18,47 +18,47 @@ cargo build --release --workspace
 ```bash
 sudo install -m 0755 target/release/yggdrasil    /usr/local/bin/
 sudo install -m 0755 target/release/yggdrasilctl /usr/local/bin/
-sudo mkdir -p /etc/yggdrasil/branches /var/lib/yggdrasil /run/yggdrasil
+sudo mkdir -p /etc/yggdrasil/conf.d /var/lib/yggdrasil /run/yggdrasil
 sudo yggdrasil keygen --identity-file /etc/yggdrasil/identity.key
 
 # Minimal /etc/yggdrasil/config.toml
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-heartbeat_listen = "0.0.0.0:51820"     # UDP, the only port ratatoskr talks to
-branches_dir     = "/etc/yggdrasil/branches"
+heartbeat_listen = "0.0.0.0:51820"     # UDP, the only port huginn talks to
+rules_dir     = "/etc/yggdrasil/conf.d"
 
 [control]
 socket = "/run/yggdrasil/control.sock"
 EOF
 ```
 
-**On the home box** (where `ratatoskr` will run):
+**On the home box** (where `huginn` will run):
 
 ```bash
-sudo install -m 0755 target/release/ratatoskr /usr/local/bin/
-sudo mkdir -p /etc/ratatoskr
-sudo ratatoskr keygen --identity-file /etc/ratatoskr/identity.key
+sudo install -m 0755 target/release/huginn /usr/local/bin/
+sudo mkdir -p /etc/huginn
+sudo huginn keygen --identity-file /etc/huginn/identity.key
 
-# Seed a config so `ratatoskr enroll` has something to update.
-sudo tee /etc/ratatoskr/config.toml >/dev/null <<'EOF'
+# Seed a config so `huginn enroll` has something to update.
+sudo tee /etc/huginn/config.toml >/dev/null <<'EOF'
 [client]
 yggdrasil_endpoint   = "placeholder:1"
 yggdrasil_pubkey_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-identity_file        = "/etc/ratatoskr/identity.key"
+identity_file        = "/etc/huginn/identity.key"
 EOF
 
-# Copy the ratatoskr pubkey it printed and run, ON THE VPS:
+# Copy the huginn pubkey it printed and run, ON THE VPS:
 #     yggdrasil enroll-token --peer-pubkey <hex> \
-#         --endpoint <VPS_IP>:51820 -o ratatoskr.token
-# Then scp ratatoskr.token back to the home box and:
-sudo ratatoskr enroll /tmp/ratatoskr.token --config /etc/ratatoskr/config.toml
+#         --endpoint <VPS_IP>:51820 -o huginn.token
+# Then scp huginn.token back to the home box and:
+sudo huginn enroll /tmp/huginn.token --config /etc/huginn/config.toml
 ```
 
 Add a forwarding rule on the VPS:
 
 ```bash
-# /etc/yggdrasil/branches/ssh.toml — listens on :2222, forwards to home :22
-sudo tee /etc/yggdrasil/branches/ssh.toml >/dev/null <<'EOF'
+# /etc/yggdrasil/conf.d/ssh.toml — listens on :2222, forwards to home :22
+sudo tee /etc/yggdrasil/conf.d/ssh.toml >/dev/null <<'EOF'
 [[rule]]
 name          = "ssh"
 listen        = "0.0.0.0:2222"
@@ -74,7 +74,7 @@ Start both daemons (systemd unit files in [docs/install.md](docs/install.md), or
 sudo yggdrasil run
 
 # Home:
-sudo ratatoskr run
+sudo huginn run
 ```
 
 Verify it's working:
@@ -89,14 +89,14 @@ sudo yggdrasilctl status
 ssh -p 2222 user@<VPS_IP>
 ```
 
-That's the whole thing. Drop more `*.toml` files into `branches/` for more rules; they're picked up live.
+That's the whole thing. Drop more `*.toml` files into `conf.d/` for more rules; they're picked up live.
 
 ## Documentation
 
 - [docs/install.md](docs/install.md) — building, systemd units, file layout, upgrades
 - [docs/quickstart.md](docs/quickstart.md) — the walkthrough above in more depth
 - [docs/configuration.md](docs/configuration.md) — full schema reference for every config file
-- [docs/cli-reference.md](docs/cli-reference.md) — every subcommand and flag for `yggdrasil`, `ratatoskr`, `yggdrasilctl`
+- [docs/cli-reference.md](docs/cli-reference.md) — every subcommand and flag for `yggdrasil`, `huginn`, `yggdrasilctl`
 - [docs/operations.md](docs/operations.md) — day-to-day runbook (peer rotation, hot reload, metrics, troubleshooting)
 - [docs/architecture.md](docs/architecture.md) — why the design looks the way it does
 - [docs/security.md](docs/security.md) — threat model, crypto, enrollment-token format
@@ -106,11 +106,11 @@ That's the whole thing. Drop more `*.toml` files into `branches/` for more rules
 
 | Binary          | Where it runs   | What it does                                                                 |
 | --------------- | --------------- | ---------------------------------------------------------------------------- |
-| `yggdrasil`     | VPS             | Listens for heartbeats, runs the proxy listeners defined in `branches/*.toml`. |
-| `ratatoskr`     | Home box        | Sends authenticated heartbeats to yggdrasil at a fixed interval.               |
-| `yggdrasilctl`  | VPS (admin CLI) | Inspects status, manages peers, forces branch reloads. Talks to yggdrasil over a Unix socket. |
+| `yggdrasil`     | VPS             | Listens for heartbeats, runs the proxy listeners defined in `conf.d/*.toml`. |
+| `huginn`     | Home box        | Sends authenticated heartbeats to yggdrasil at a fixed interval.               |
+| `yggdrasilctl`  | VPS (admin CLI) | Inspects status, manages peers, forces rule reloads. Talks to yggdrasil over a Unix socket. |
 
-The `yggdrasil-proto` crate contains the shared wire formats and the `loadgen` crate is a benchmark tool used by [bench/](bench/README.md).
+The `ratatoskr` crate contains the shared wire formats and the `loadgen` crate is a benchmark tool used by [bench/](bench/README.md).
 
 ## Threat model in one paragraph
 

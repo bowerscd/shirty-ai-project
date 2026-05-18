@@ -13,14 +13,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::StaticKeyPair;
-use yggdrasil_proto::branch::Protocol;
+use ratatoskr::auth::StaticKeyPair;
+use ratatoskr::rule::Protocol;
 
 use yggdrasil::heartbeat::PeerState;
 
 use crate::common::{
     drive_handshake, echo_tcp_listener, pick_free_tcp_port, send_heartbeat, spawn_supervisor,
-    spawn_tcp_echo, write_branch, HeartbeatHarness,
+    spawn_tcp_echo, write_rule, HeartbeatHarness,
 };
 
 #[tokio::test]
@@ -37,11 +37,11 @@ async fn full_stack_heartbeat_storm_does_not_disturb_tcp_connection() {
     let echo_handle = spawn_tcp_echo(echo_listener);
 
     let tmp = tempfile::tempdir().unwrap();
-    let branch_dir = tmp.path().join("branches");
-    std::fs::create_dir_all(&branch_dir).unwrap();
+    let rules_dir = tmp.path().join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
     let listen_port = pick_free_tcp_port().await;
-    write_branch(
-        &branch_dir,
+    write_rule(
+        &rules_dir,
         "echo.toml",
         "echo",
         "tcp",
@@ -50,7 +50,7 @@ async fn full_stack_heartbeat_storm_does_not_disturb_tcp_connection() {
     );
 
     let supervisor = spawn_supervisor(
-        branch_dir,
+        rules_dir,
         Duration::from_millis(50),
         peer_state.clone(),
         shutdown.clone(),
@@ -114,7 +114,7 @@ async fn full_stack_heartbeat_storm_does_not_disturb_tcp_connection() {
     assert_eq!(
         supervisor.snapshot(),
         initial_snapshot,
-        "branch supervisor snapshot must remain identical across the storm"
+        "rule supervisor snapshot must remain identical across the storm"
     );
 
     shutdown.cancel();

@@ -52,7 +52,7 @@ sudo sysctl -w net.ipv4.tcp_tw_reuse=1
 
 ```bash
 # Build once, then run the full matrix.
-cargo build --release -p yggdrasil -p ratatoskr -p loadgen
+cargo build --release -p yggdrasil -p huginn -p loadgen
 bench/run-all.sh
 ```
 
@@ -108,7 +108,7 @@ For each non-direct subject, the harness:
 
 1. Spawns a Python echo (`bench/lib/echo_{udp,tcp}.py`) on `127.0.0.1:<echo_port>`.
 2. Renders a fresh config + identity into a `mktemp -d` workspace:
-   - **yggdrasil**: full keygen → enroll-token → ratatoskr enroll → spawns both daemons and waits one heartbeat interval. The branch TOML uses `upstream_port = <echo_port>`.
+   - **yggdrasil**: full keygen → enroll-token → huginn enroll → spawns both daemons and waits one heartbeat interval. The branch TOML uses `upstream_port = <echo_port>`.
    - **nginx**: a minimal `stream { server { listen <listen>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }` config, started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
 3. Runs `loadgen` against `127.0.0.1:<listen_port>` (or `<echo_port>` for the direct leg).
 4. SIGTERMs everything, removes the tmpdir, and pauses briefly to let TIME_WAIT clear before the next leg.

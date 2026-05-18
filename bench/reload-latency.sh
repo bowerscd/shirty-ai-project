@@ -3,7 +3,7 @@
 #
 # Measures the time from "I dropped a new config" to "the proxy serves traffic
 # under the new rule". For yggdrasil that's a new branch TOML appearing in the
-# branches dir (notify+debounce-driven hot reload). For nginx that's `nginx -s
+# rules dir (notify+debounce-driven hot reload). For nginx that's `nginx -s
 # reload` (SIGHUP / new worker fork). Direct has no equivalent and is skipped.
 #
 # Reported per subject: mean/p95/p99 reload-to-serve latency across N iterations.
@@ -121,7 +121,7 @@ run_yggdrasil() {
     for (( i = 1; i <= ITERATIONS; i++ )); do
         local p; p="$(pick_free_tcp_port)"
         local t0_ns; t0_ns="$(date +%s%N)"
-        cat > "$tmp/branches/iter-$i.toml" <<EOF
+        cat > "$tmp/rules/iter-$i.toml" <<EOF
 [[rule]]
 name = "iter-$i"
 listen = "127.0.0.1:$p"

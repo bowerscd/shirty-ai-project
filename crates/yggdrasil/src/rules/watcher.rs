@@ -1,14 +1,14 @@
-//! Hot-reload watcher for `/etc/yggdrasil/branches/*.toml`.
+//! Hot-reload watcher for `/etc/yggdrasil/conf.d/*.toml`.
 //!
-//! The watcher emits a stream of [`BranchUpdate`]s on every successful reload.
+//! The watcher emits a stream of [`RuleUpdate`]s on every successful reload.
 //! Reloads are triggered by:
 //!
-//! 1. `notify` filesystem events on the branches directory (debounced via
+//! 1. `notify` filesystem events on the rules directory (debounced via
 //!    `notify-debouncer-mini`, default 300 ms).
-//! 2. Explicit [`BranchWatcher::force_reload`] calls — wired to the
-//!    `yggdrasilctl branches reload` admin command in Phase 9.
+//! 2. Explicit [`RuleWatcher::force_reload`] calls — wired to the
+//!    `yggdrasilctl rules reload` admin command in Phase 9.
 //!
-//! On startup the watcher emits one [`BranchUpdate`] immediately with the
+//! On startup the watcher emits one [`RuleUpdate`] immediately with the
 //! initial set treated as "everything added", so downstream consumers don't
 //! need a separate bootstrap path.
 //!
@@ -28,22 +28,22 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent, Debouncer};
 use tokio::sync::mpsc;
 
-use yggdrasil_proto::branch::{BranchDiff, BranchSet};
+use ratatoskr::rule::{RuleDiff, RuleSet};
 
 use super::load_dir;
 
 /// A single reload event delivered to the supervisor.
 #[derive(Debug, Clone)]
-pub struct BranchUpdate {
+pub struct RuleUpdate {
     /// The new, validated set as currently on disk.
-    pub set: BranchSet,
+    pub set: RuleSet,
     /// What changed since the previous successful update.
-    pub diff: BranchDiff,
+    pub diff: RuleDiff,
 }
 
 /// Hot-reload watcher handle. Drop to stop watching.
-pub struct BranchWatcher {
-    updates_rx: mpsc::Receiver<BranchUpdate>,
+pub struct RuleWatcher {
+    updates_rx: mpsc::Receiver<RuleUpdate>,
     reload_tx: mpsc::Sender<()>,
     dir: PathBuf,
     // Order matters: the debouncer holds the notify watcher which feeds the
@@ -54,22 +54,22 @@ pub struct BranchWatcher {
     _worker: tokio::task::JoinHandle<()>,
 }
 
-impl BranchWatcher {
+impl RuleWatcher {
     /// Spawn the watcher. Performs an initial successful [`load_dir`] before
-    /// returning, so callers can assume the first [`BranchWatcher::recv`] will
+    /// returning, so callers can assume the first [`RuleWatcher::recv`] will
     /// resolve to a valid update.
     pub fn spawn(dir: impl Into<PathBuf>, debounce: Duration) -> Result<Self> {
         let dir: PathBuf = dir.into();
 
         // Initial load — propagate parse/validation errors so the daemon
-        // refuses to start with a broken branch directory rather than running
+        // refuses to start with a broken rules directory rather than running
         // with an empty set.
         let initial = load_dir(&dir)
-            .with_context(|| format!("initial branch load from {}", dir.display()))?;
+            .with_context(|| format!("initial rule load from {}", dir.display()))?;
 
         // Bounded so multiple rapid events collapse to a single pending reload.
         let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
-        let (updates_tx, updates_rx) = mpsc::channel::<BranchUpdate>(8);
+        let (updates_tx, updates_rx) = mpsc::channel::<RuleUpdate>(8);
 
         // notify → std mpsc → tokio mpsc bridge.
         let (notify_tx, notify_rx) = std::sync::mpsc::channel::<NotifyResult>();
@@ -83,7 +83,7 @@ impl BranchWatcher {
         let bridge_reload_tx = reload_tx.clone();
         let bridge_dir = dir.clone();
         let bridge = std::thread::Builder::new()
-            .name("branch-watch-bridge".into())
+            .name("rule-watch-bridge".into())
             .spawn(move || bridge_notify_events(notify_rx, bridge_reload_tx, bridge_dir))
             .context("failed to spawn watcher bridge thread")?;
 
@@ -91,12 +91,12 @@ impl BranchWatcher {
         let worker = tokio::spawn(async move {
             // Emit the initial state eagerly so consumers don't need a separate
             // bootstrap path.
-            let init = BranchUpdate {
+            let init = RuleUpdate {
                 diff: initial.as_initial_diff(),
                 set: initial.clone(),
             };
             if updates_tx.send(init).await.is_err() {
-                tracing::debug!("branch update receiver dropped before initial emit");
+                tracing::debug!("rule update receiver dropped before initial emit");
                 return;
             }
 
@@ -108,7 +108,7 @@ impl BranchWatcher {
                         if diff.is_noop() {
                             tracing::trace!(
                                 dir = %worker_dir.display(),
-                                "branch reload: no semantic change"
+                                "rule reload: no semantic change"
                             );
                             continue;
                         }
@@ -118,15 +118,15 @@ impl BranchWatcher {
                             removed = diff.removed.len(),
                             changed = diff.changed.len(),
                             unchanged = diff.unchanged.len(),
-                            "branch set reloaded"
+                            "rule set reloaded"
                         );
                         current = next.clone();
                         if updates_tx
-                            .send(BranchUpdate { set: next, diff })
+                            .send(RuleUpdate { set: next, diff })
                             .await
                             .is_err()
                         {
-                            tracing::debug!("branch update receiver dropped; watcher exiting");
+                            tracing::debug!("rule update receiver dropped; watcher exiting");
                             break;
                         }
                     }
@@ -134,7 +134,7 @@ impl BranchWatcher {
                         tracing::warn!(
                             error = %err,
                             dir = %worker_dir.display(),
-                            "branch reload failed; keeping previous set"
+                            "rule reload failed; keeping previous set"
                         );
                     }
                 }
@@ -151,9 +151,9 @@ impl BranchWatcher {
         })
     }
 
-    /// Receive the next [`BranchUpdate`]. Returns `None` when the watcher's
+    /// Receive the next [`RuleUpdate`]. Returns `None` when the watcher's
     /// internal channels are closed (e.g. the worker has exited).
-    pub async fn recv(&mut self) -> Option<BranchUpdate> {
+    pub async fn recv(&mut self) -> Option<RuleUpdate> {
         self.updates_rx.recv().await
     }
 
@@ -163,7 +163,7 @@ impl BranchWatcher {
     }
 
     /// Clone-friendly trigger that callers outside this struct can use to
-    /// request a reload (e.g. `yggdrasilctl branches reload`). Safe to share
+    /// request a reload (e.g. `yggdrasilctl rules reload`). Safe to share
     /// across threads.
     pub fn reload_trigger(&self) -> ReloadTrigger {
         ReloadTrigger {
@@ -176,7 +176,7 @@ impl BranchWatcher {
     }
 }
 
-/// Lightweight, cheap-to-clone handle for requesting branch reloads from
+/// Lightweight, cheap-to-clone handle for requesting rule reloads from
 /// other subsystems (e.g. the UDS control surface).
 #[derive(Debug, Clone)]
 pub struct ReloadTrigger {
@@ -202,7 +202,7 @@ fn bridge_notify_events(
                 tracing::trace!(
                     dir = %dir.display(),
                     events = events.len(),
-                    "branch dir change"
+                    "rules dir change"
                 );
             }
             Ok(_) => continue, // empty batch — debouncer occasionally emits
@@ -234,13 +234,13 @@ mod tests {
         std::fs::write(dir.join(name), body).expect("write fixture");
     }
 
-    /// Wait up to `timeout` for the next [`BranchUpdate`], failing the test
+    /// Wait up to `timeout` for the next [`RuleUpdate`], failing the test
     /// with a clear message on timeout instead of hanging.
     async fn next_update(
-        w: &mut BranchWatcher,
+        w: &mut RuleWatcher,
         timeout: Duration,
         ctx: &str,
-    ) -> BranchUpdate {
+    ) -> RuleUpdate {
         tokio::time::timeout(timeout, w.recv())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {ctx}"))
@@ -250,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn initial_update_for_empty_directory() {
         let d = tempfile::tempdir().unwrap();
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
         let init = next_update(&mut w, Duration::from_secs(2), "initial").await;
         assert!(init.set.is_empty());
         assert!(init.diff.is_noop());
@@ -269,7 +269,7 @@ mod tests {
             upstream_port = 1
             "#,
         );
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
         let init = next_update(&mut w, Duration::from_secs(2), "initial").await;
         assert_eq!(init.set.len(), 1);
         assert_eq!(init.diff.added.len(), 1);
@@ -279,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn detects_added_file() {
         let d = tempfile::tempdir().unwrap();
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
         let _init = next_update(&mut w, Duration::from_secs(2), "initial").await;
 
         write_file(
@@ -313,7 +313,7 @@ mod tests {
             upstream_port = 22
             "#,
         );
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
         let _init = next_update(&mut w, Duration::from_secs(2), "initial").await;
 
         write_file(
@@ -331,8 +331,8 @@ mod tests {
         assert!(upd.diff.added.is_empty());
         assert!(upd.diff.removed.is_empty());
         assert_eq!(upd.diff.changed.len(), 1);
-        assert_eq!(upd.diff.changed[0].old.upstream_port, 22);
-        assert_eq!(upd.diff.changed[0].new.upstream_port, 23);
+        assert_eq!(upd.diff.changed[0].old.upstream_port, Some(22));
+        assert_eq!(upd.diff.changed[0].new.upstream_port, Some(23));
     }
 
     #[tokio::test]
@@ -348,7 +348,7 @@ mod tests {
             upstream_port = 1
             "#,
         );
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
         let _init = next_update(&mut w, Duration::from_secs(2), "initial").await;
 
         std::fs::remove_file(d.path().join("g.toml")).unwrap();
@@ -371,7 +371,7 @@ mod tests {
             upstream_port = 1
             "#,
         );
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
         let init = next_update(&mut w, Duration::from_secs(2), "initial").await;
         assert_eq!(init.set.len(), 1);
 
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn force_reload_triggers_an_emit_when_state_changed() {
         let d = tempfile::tempdir().unwrap();
-        let mut w = BranchWatcher::spawn(d.path(), Duration::from_millis(500)).unwrap();
+        let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(500)).unwrap();
         let _init = next_update(&mut w, Duration::from_secs(2), "initial").await;
 
         // Write a file then immediately force a reload, bypassing the debouncer.
@@ -433,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn missing_directory_at_spawn_is_an_error() {
         let err =
-            BranchWatcher::spawn("/this/does/not/exist/branches", Duration::from_millis(50)).err();
+            RuleWatcher::spawn("/this/does/not/exist/rules", Duration::from_millis(50)).err();
         assert!(err.is_some());
     }
 }

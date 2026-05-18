@@ -22,7 +22,7 @@
 //! existing IP do not fire the watch and therefore do not disturb the
 //! table — every existing flow keeps its upstream socket pair, preserving
 //! stateful UDP sessions like Factorio dedicated servers across the
-//! ratatoskr heartbeat cadence.
+//! huginn heartbeat cadence.
 //!
 //! The IP-change watcher uses `watch::Receiver::changed().await`, so it is
 //! literally impossible for unchanged values to wake it up.
@@ -42,12 +42,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::branch::Rule;
+use ratatoskr::rule::Rule;
 
-use crate::heartbeat::PeerState;
+use super::resolver::{UpstreamResolver, WatchHandle};
 
 /// Default cap on concurrent client flows per UDP rule. Sized to cover any
 /// realistic residential workload while bounding FD / memory cost.
@@ -80,8 +79,8 @@ pub struct UdpProxy {
 
 impl UdpProxy {
     /// Bind the frontend socket and spawn the proxy tasks.
-    pub async fn spawn(rule: Rule, peer_state: Arc<PeerState>) -> Result<Self> {
-        Self::spawn_with_cap(rule, peer_state, MAX_FLOWS_PER_RULE_DEFAULT).await
+    pub async fn spawn(rule: Rule, resolver: UpstreamResolver) -> Result<Self> {
+        Self::spawn_with_cap(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT).await
     }
 
     /// Same as [`UdpProxy::spawn`] but with an explicit flow cap; intended
@@ -89,7 +88,7 @@ impl UdpProxy {
     /// thousands of sockets.
     pub async fn spawn_with_cap(
         rule: Rule,
-        peer_state: Arc<PeerState>,
+        resolver: UpstreamResolver,
         max_flows: usize,
     ) -> Result<Self> {
         let frontend = UdpSocket::bind(rule.listen)
@@ -106,7 +105,7 @@ impl UdpProxy {
         let inner = UdpProxyInner {
             rule: rule.clone(),
             frontend: frontend.clone(),
-            peer_state: peer_state.clone(),
+            resolver: resolver.clone(),
             flows: flows.clone(),
             cancel: cancel.clone(),
             start,
@@ -119,7 +118,7 @@ impl UdpProxy {
         tracing::info!(
             rule = %rule.name,
             listen = %local_addr,
-            upstream_port = rule.upstream_port,
+            upstream = %resolver.describe(),
             idle_timeout_secs = idle_timeout.as_secs(),
             max_flows,
             "UDP rule listening"
@@ -160,7 +159,7 @@ impl UdpProxy {
 struct UdpProxyInner {
     rule: Rule,
     frontend: Arc<UdpSocket>,
-    peer_state: Arc<PeerState>,
+    resolver: UpstreamResolver,
     flows: Arc<DashMap<SocketAddr, Arc<FlowEntry>>>,
     cancel: CancellationToken,
     start: Instant,
@@ -178,14 +177,26 @@ impl UdpProxyInner {
             let s = self.clone_ctx();
             tokio::spawn(async move { s.reaper_loop().await })
         };
-        let ipchange_task = {
+        // Only dynamic resolvers (relay mode) can change their dial target,
+        // so static (terminal) resolvers don't need an ipchange watcher at
+        // all — it would just park on a NeverFires future, wasting a task.
+        let ipchange_task = if self.resolver.is_dynamic() {
             let s = self.clone_ctx();
-            tokio::spawn(async move { s.ipchange_loop().await })
+            Some(tokio::spawn(async move { s.ipchange_loop().await }))
+        } else {
+            None
         };
 
-        // Cancellation propagates to all three via the shared token. Wait
-        // for all of them to wind down before returning.
-        let _ = tokio::join!(frontend_task, reaper_task, ipchange_task);
+        // Cancellation propagates to all spawned tasks via the shared
+        // token. Wait for them to wind down before returning.
+        match ipchange_task {
+            Some(ipc) => {
+                let _ = tokio::join!(frontend_task, reaper_task, ipc);
+            }
+            None => {
+                let _ = tokio::join!(frontend_task, reaper_task);
+            }
+        }
 
         // Final flow-table cleanup: aborts any straggler upstream tasks.
         for entry in self.flows.iter() {
@@ -199,7 +210,7 @@ impl UdpProxyInner {
         Self {
             rule: self.rule.clone(),
             frontend: self.frontend.clone(),
-            peer_state: self.peer_state.clone(),
+            resolver: self.resolver.clone(),
             flows: self.flows.clone(),
             cancel: self.cancel.clone(),
             start: self.start,
@@ -250,12 +261,12 @@ impl UdpProxyInner {
             return;
         }
 
-        // No flow yet. Need a peer IP and capacity.
-        let Some(peer_ip) = self.peer_state.current_ip() else {
+        // No flow yet. Need a resolved dial target and capacity.
+        let Some(upstream_addr) = self.resolver.current_target() else {
             tracing::debug!(
                 rule = %self.rule.name,
                 client = %client_addr,
-                "drop UDP datagram: no peer IP yet"
+                "drop UDP datagram: upstream not yet resolvable (no heartbeat received)"
             );
             return;
         };
@@ -270,7 +281,6 @@ impl UdpProxyInner {
             return;
         }
 
-        let upstream_addr = SocketAddr::new(peer_ip, self.rule.upstream_port);
         let entry = match self.create_flow(client_addr, upstream_addr).await {
             Some(e) => e,
             None => return,
@@ -416,23 +426,27 @@ impl UdpProxyInner {
     }
 
     async fn ipchange_loop(self) {
-        let mut rx: watch::Receiver<Option<IpAddr>> = self.peer_state.watch();
-        // Consume whatever the initial value is so changed().await fires only
-        // on real subsequent changes. NOTE: this means we do not treat the
-        // initial None→Some as a "drain" event, which is correct: at that
-        // moment there are no flows to drain anyway (no flows can have been
-        // created before peer_state had a Some(ip) value).
-        let _ = rx.borrow_and_update();
+        // Only spawned for Dynamic resolvers. The watch handle's initial
+        // `borrow_and_update` consumption mirrors what the old peer_state
+        // path did: do NOT treat the initial None→Some as a "drain" event,
+        // because at that moment there are no flows to drain anyway (no
+        // flow can have been created before the resolver had a target).
+        let mut handle: WatchHandle = self.resolver.watch_ip_changes();
+        if let WatchHandle::Dynamic(ref mut rx) = handle {
+            let _ = rx.borrow_and_update();
+        }
         loop {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return,
-                changed = rx.changed() => {
+                changed = handle.changed() => {
                     if changed.is_err() {
                         return; // sender dropped → shutdown imminent
                     }
-                    let new_ip = *rx.borrow_and_update();
-                    self.drain_all_flows(new_ip);
+                    // Read the post-change target for logging only; the
+                    // drain itself is target-agnostic.
+                    let new_target = self.resolver.current_target();
+                    self.drain_all_flows(new_target.map(|a| a.ip()));
                 }
             }
         }
@@ -516,6 +530,18 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use crate::heartbeat::PeerState;
+
+    /// Wrap a peer state in a Dynamic resolver — mirrors the production
+    /// `ResolverFactory::new_relay(...).build(rule)` path without dragging
+    /// the factory machinery into per-proxy unit tests.
+    fn dynamic_resolver(peer: Arc<PeerState>, port: u16) -> UpstreamResolver {
+        UpstreamResolver::Dynamic {
+            peer_state: peer,
+            port,
+        }
+    }
+
     /// Background UDP echo server. Returns its bound addr.
     async fn echo_server() -> SocketAddr {
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -534,7 +560,7 @@ mod tests {
     }
 
     fn udp_rule(name: &str, upstream_port: u16, idle_secs: u64) -> Rule {
-        let f = yggdrasil_proto::branch::BranchFile::from_toml(
+        let f = ratatoskr::rule::RuleFile::from_toml(
             "test.toml",
             &format!(
                 r#"
@@ -567,9 +593,12 @@ mod tests {
         let upstream = echo_server().await;
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
-        let proxy = UdpProxy::spawn(udp_rule("echo", upstream.port(), 60), peer)
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn(
+            udp_rule("echo", upstream.port(), 60),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let got = send_recv(&client, proxy.local_addr(), b"hello").await;
@@ -584,9 +613,12 @@ mod tests {
         let upstream = echo_server().await;
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
-        let proxy = UdpProxy::spawn(udp_rule("multi", upstream.port(), 60), peer)
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn(
+            udp_rule("multi", upstream.port(), 60),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
 
         let c1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let c2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -606,9 +638,12 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         // No record_heartbeat → current_ip is None.
 
-        let proxy = UdpProxy::spawn(udp_rule("nopeer", upstream.port(), 60), peer)
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn(
+            udp_rule("nopeer", upstream.port(), 60),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client
@@ -634,7 +669,7 @@ mod tests {
             r.idle_timeout = Some(Duration::from_millis(200));
             r
         };
-        let proxy = UdpProxy::spawn(rule, peer).await.unwrap();
+        let proxy = UdpProxy::spawn(rule, dynamic_resolver(peer, upstream.port())).await.unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let _ = send_recv(&client, proxy.local_addr(), b"x").await;
@@ -656,9 +691,12 @@ mod tests {
         let upstream = echo_server().await;
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
-        let proxy = UdpProxy::spawn(udp_rule("drain", upstream.port(), 60), peer.clone())
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn(
+            udp_rule("drain", upstream.port(), 60),
+            dynamic_resolver(peer.clone(), upstream.port()),
+        )
+        .await
+        .unwrap();
 
         // Establish 3 flows.
         let c1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -697,9 +735,12 @@ mod tests {
         let upstream = echo_server().await;
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:1000".parse().unwrap());
-        let proxy = UdpProxy::spawn(udp_rule("invariance", upstream.port(), 60), peer.clone())
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn(
+            udp_rule("invariance", upstream.port(), 60),
+            dynamic_resolver(peer.clone(), upstream.port()),
+        )
+        .await
+        .unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let _ = send_recv(&client, proxy.local_addr(), b"start").await;
@@ -745,9 +786,13 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         // cap = 2.
-        let proxy = UdpProxy::spawn_with_cap(udp_rule("cap", upstream.port(), 60), peer, 2)
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn_with_cap(
+            udp_rule("cap", upstream.port(), 60),
+            dynamic_resolver(peer, upstream.port()),
+            2,
+        )
+        .await
+        .unwrap();
 
         let c1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let c2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -772,9 +817,12 @@ mod tests {
         let upstream = echo_server().await;
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
-        let proxy = UdpProxy::spawn(udp_rule("stop", upstream.port(), 60), peer)
-            .await
-            .unwrap();
+        let proxy = UdpProxy::spawn(
+            udp_rule("stop", upstream.port(), 60),
+            dynamic_resolver(peer, upstream.port()),
+        )
+        .await
+        .unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let _ = send_recv(&client, proxy.local_addr(), b"x").await;
         assert_eq!(proxy.active_flows(), 1);

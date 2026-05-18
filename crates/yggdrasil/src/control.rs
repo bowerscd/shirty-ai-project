@@ -1,7 +1,7 @@
 //! UDS control surface for `yggdrasilctl`.
 //!
 //! Wire format: one newline-delimited JSON object per request, one per
-//! response. Backed by [`yggdrasil_proto::control`]. The listener binds the
+//! response. Backed by [`ratatoskr::control`]. The listener binds the
 //! socket with mode `0o660`; group ownership is left to the operator (we don't
 //! ship a packaging story yet).
 //!
@@ -22,14 +22,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use yggdrasil_proto::auth::public_key_fingerprint;
-use yggdrasil_proto::branch::Protocol;
-use yggdrasil_proto::control::{
-    error_codes, BranchInfo, BranchesResponse, PeerResponse, PendingResponse, Request, Response,
-    StatusResponse,
+use ratatoskr::auth::public_key_fingerprint;
+use ratatoskr::control::{
+    error_codes, RuleInfo, RulesResponse, CertInfo, CertsListResponse, Mode, PeerResponse,
+    PendingResponse, Request, Response, StatusResponse,
 };
 
-use crate::branches::ReloadTrigger;
+use crate::rules::ReloadTrigger;
 use crate::heartbeat::PeerState;
 use crate::pending_peers::PendingPeerStore;
 use crate::proxy::supervisor::ProxySupervisor;
@@ -42,14 +41,26 @@ pub struct ControlServer {
 }
 
 /// Shared state every connection task sees.
+///
+/// `peer_state` and `pending_store` are `Option` so the same control surface
+/// can serve both relay-mode daemons (peer enrolled, heartbeat live) and
+/// terminal-mode daemons (no peer concept). When `None`, any `peer ...`
+/// request returns [`error_codes::NOT_SUPPORTED_IN_TERMINAL_MODE`].
 struct ControlState {
     started_at: Instant,
-    peer_state: Arc<PeerState>,
+    /// The mode the daemon was started in. Surfaced verbatim in
+    /// [`StatusResponse::mode`] and used as the gate for the
+    /// `peer ...` request family.
+    mode: Mode,
+    peer_state: Option<Arc<PeerState>>,
     snapshot_rx: tokio::sync::watch::Receiver<Vec<crate::proxy::supervisor::ProxySnapshot>>,
     reload_trigger: ReloadTrigger,
-    pending_store: Arc<PendingPeerStore>,
+    /// Shared cert store handle; surfaces via `Request::CertsList`.
+    cert_store: Arc<crate::proxy::certs::CertStore>,
+    pending_store: Option<Arc<PendingPeerStore>>,
     /// Path to the main server config; the approve flow rewrites
-    /// `[peer].public_key_hex` atomically (tmp + rename).
+    /// `[peer].public_key_hex` atomically (tmp + rename). Held even in
+    /// terminal mode (unused; cheap to carry).
     config_path: PathBuf,
 }
 
@@ -60,11 +71,15 @@ impl ControlServer {
     /// If the path already exists it is removed first; that matches the
     /// systemd convention of "the daemon owns the socket file" and avoids
     /// the common "previous run crashed, EADDRINUSE" footgun.
+    ///
+    /// `peer_state` and `pending_store` are `None` in terminal mode. All
+    /// `peer ...` requests then return `not_supported_in_terminal_mode`.
     pub async fn bind(
         socket_path: impl Into<PathBuf>,
-        peer_state: Arc<PeerState>,
+        mode: Mode,
+        peer_state: Option<Arc<PeerState>>,
         supervisor: &ProxySupervisor,
-        pending_store: Arc<PendingPeerStore>,
+        pending_store: Option<Arc<PendingPeerStore>>,
         config_path: PathBuf,
         shutdown: CancellationToken,
     ) -> Result<Self> {
@@ -100,6 +115,7 @@ impl ControlServer {
         let cancel = shutdown.child_token();
         let state = Arc::new(ControlState {
             started_at: Instant::now(),
+            mode,
             peer_state,
             snapshot_rx: {
                 // The supervisor exposes only a `snapshot()` snapshot getter.
@@ -108,6 +124,7 @@ impl ControlServer {
                 supervisor.snapshot_receiver()
             },
             reload_trigger: supervisor.reload_trigger(),
+            cert_store: supervisor.cert_store(),
             pending_store,
             config_path,
         });
@@ -209,54 +226,63 @@ fn handle_request_text(line: &str, state: &ControlState) -> Response {
 fn dispatch(req: Request, state: &ControlState) -> Response {
     match req {
         Request::Status => {
-            let last_heartbeat_age_ms = state
-                .peer_state
-                .last_heartbeat_ms()
-                .and_then(|ts| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .map(|now| now.as_millis() as u64)
-                        .map(|now| now.saturating_sub(ts))
-                });
-            let branch_count = state.snapshot_rx.borrow().len();
+            // Relay mode: report `peer_ip`, `last_heartbeat_age_ms`, and
+            // `peer_enrolled` from the live peer state. Terminal mode has no
+            // peer concept; emit `None` for the heartbeat fields and
+            // `peer_enrolled = false`.
+            let (peer_ip, last_heartbeat_age_ms, peer_enrolled) = match &state.peer_state {
+                Some(ps) => {
+                    let age = ps.last_heartbeat_ms().and_then(|ts| {
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .ok()
+                            .map(|now| now.as_millis() as u64)
+                            .map(|now| now.saturating_sub(ts))
+                    });
+                    (ps.current_ip(), age, ps.is_peer_enrolled())
+                }
+                None => (None, None, false),
+            };
+            let rule_count = state.snapshot_rx.borrow().len();
             Response::Status(StatusResponse {
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                peer_ip: state.peer_state.current_ip(),
+                mode: state.mode,
+                peer_ip,
                 last_heartbeat_age_ms,
-                branch_count,
+                rule_count,
                 uptime_secs: state.started_at.elapsed().as_secs(),
-                peer_enrolled: state.peer_state.is_peer_enrolled(),
+                peer_enrolled,
             })
         }
-        Request::BranchesList => {
+        Request::RulesList => {
             let snapshot = state.snapshot_rx.borrow().clone();
-            let branches = snapshot
+            let rules = snapshot
                 .into_iter()
-                .map(|s| BranchInfo {
+                .map(|s| RuleInfo {
                     name: s.name,
-                    protocol: match s.protocol {
-                        Protocol::Tcp => "tcp".to_string(),
-                        Protocol::Udp => "udp".to_string(),
-                    },
+                    protocol: s.protocol.as_str().to_string(),
                     listen: s.listen.to_string(),
-                    upstream_port: s.upstream_port,
+                    upstream: s.upstream_description,
                 })
                 .collect();
-            Response::Branches(BranchesResponse { branches })
+            Response::Rules(RulesResponse { rules })
         }
-        Request::BranchesReload => {
+        Request::RulesReload => {
             state.reload_trigger.force_reload();
             // Synchronous count of what's currently loaded; the reload itself
             // is asynchronous so we don't try to report the new count here.
             let reloaded_rule_count = state.snapshot_rx.borrow().len();
-            Response::BranchesReloaded {
+            Response::RulesReloaded {
                 reloaded_rule_count,
             }
         }
         Request::PeerShow => {
-            let enrolled = state.peer_state.is_peer_enrolled();
-            let pubkey = state.peer_state.peer_static_key();
+            let peer_state = match &state.peer_state {
+                Some(ps) => ps,
+                None => return terminal_mode_unsupported("peer show"),
+            };
+            let enrolled = peer_state.is_peer_enrolled();
+            let pubkey = peer_state.peer_static_key();
             let public_key_hex = if enrolled { hex::encode(pubkey) } else { String::new() };
             let fingerprint = if enrolled {
                 public_key_fingerprint(&pubkey)
@@ -270,16 +296,48 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
             })
         }
         Request::PeerPending => {
+            let pending_store = match &state.pending_store {
+                Some(ps) => ps,
+                None => return terminal_mode_unsupported("peer pending"),
+            };
             Response::PeerPending(PendingResponse {
-                candidates: state.pending_store.list(),
+                candidates: pending_store.list(),
             })
         }
         Request::PeerApprove { fingerprint } => approve_peer(state, &fingerprint),
+        Request::CertsList => {
+            let certs = state
+                .cert_store
+                .list_full()
+                .into_iter()
+                .map(|(hostname, origin, loaded_at_unix_ms)| CertInfo {
+                    hostname,
+                    cert_source: origin.as_label(),
+                    loaded_at_unix_ms,
+                })
+                .collect();
+            Response::Certs(CertsListResponse { certs })
+        }
+    }
+}
+
+/// Build the canonical "not supported in terminal mode" error response.
+fn terminal_mode_unsupported(verb: &str) -> Response {
+    Response::Error {
+        code: error_codes::NOT_SUPPORTED_IN_TERMINAL_MODE.into(),
+        message: format!(
+            "`{verb}` is not supported on a terminal-mode daemon \
+             (terminal daemons have no peer identity)"
+        ),
     }
 }
 
 fn approve_peer(state: &ControlState, fingerprint: &str) -> Response {
-    let key = match state.pending_store.approve(fingerprint) {
+    let (peer_state, pending_store) = match (&state.peer_state, &state.pending_store) {
+        (Some(ps), Some(store)) => (ps, store),
+        _ => return terminal_mode_unsupported("peer approve"),
+    };
+    let key = match pending_store.approve(fingerprint) {
         Ok(Some(k)) => k,
         Ok(None) => {
             return Response::Error {
@@ -306,7 +364,7 @@ fn approve_peer(state: &ControlState, fingerprint: &str) -> Response {
             ),
         };
     }
-    state.peer_state.set_peer_static_key(key);
+    peer_state.set_peer_static_key(key);
     tracing::info!(
         fingerprint = fingerprint,
         "peer approved via control surface; key is now live"
@@ -349,7 +407,8 @@ fn update_server_peer_config(config_path: &Path, peer_pubkey_hex: &str) -> Resul
 mod tests {
     use super::*;
     use crate::heartbeat::PeerState;
-    use crate::proxy::supervisor::ProxySupervisor;
+    use crate::proxy::resolver::ResolverFactory;
+    use crate::proxy::supervisor::{CertConfig, ProxySupervisor};
     use std::net::IpAddr;
     use std::time::Duration;
 
@@ -370,7 +429,9 @@ mod tests {
         let supervisor = ProxySupervisor::spawn(
             dir,
             Duration::from_millis(50),
-            peer_state.clone(),
+            ResolverFactory::new_relay(peer_state.clone()),
+            None,
+            CertConfig::default(),
             shutdown.clone(),
         )
         .await
@@ -407,15 +468,40 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// Bind a relay-mode `ControlServer` for tests. Wraps the
+    /// peer-state/pending-store args in `Some(...)` so individual tests stay
+    /// terse. Terminal-mode tests (which want `None` for both) bind
+    /// directly.
+    async fn bind_relay_control(
+        socket: PathBuf,
+        peer_state: Arc<PeerState>,
+        supervisor: &ProxySupervisor,
+        pending: Arc<PendingPeerStore>,
+        cfg: PathBuf,
+        shutdown: CancellationToken,
+    ) -> ControlServer {
+        ControlServer::bind(
+            socket,
+            Mode::Relay,
+            Some(peer_state),
+            supervisor,
+            Some(pending),
+            cfg,
+            shutdown,
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn status_reports_initial_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
 
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -423,14 +509,13 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let resp = send_request(&socket, &Request::Status).await;
         match resp {
             Response::Status(s) => {
                 assert_eq!(s.peer_ip, None);
-                assert_eq!(s.branch_count, 0);
+                assert_eq!(s.rule_count, 0);
                 assert!(!s.peer_enrolled);
             }
             other => panic!("unexpected response: {other:?}"),
@@ -443,12 +528,12 @@ mod tests {
     #[tokio::test]
     async fn status_reflects_heartbeat() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
+        let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) =
-            make_supervisor_with_enrolled(&branches, true).await;
+            make_supervisor_with_enrolled(&rules, true).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -456,8 +541,7 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let ip: IpAddr = "192.0.2.5".parse().unwrap();
         peer_state.record_heartbeat(std::net::SocketAddr::new(ip, 7117));
@@ -479,12 +563,12 @@ mod tests {
     #[tokio::test]
     async fn peer_show_returns_pubkey_when_enrolled() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
+        let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) =
-            make_supervisor_with_enrolled(&branches, true).await;
+            make_supervisor_with_enrolled(&rules, true).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -492,8 +576,7 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let resp = send_request(&socket, &Request::PeerShow).await;
         match resp {
@@ -512,11 +595,11 @@ mod tests {
     #[tokio::test]
     async fn peer_show_returns_empty_when_not_enrolled() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -524,8 +607,7 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let resp = send_request(&socket, &Request::PeerShow).await;
         match resp {
@@ -542,13 +624,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branches_reload_returns_current_count() {
+    async fn rules_reload_returns_current_count() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -556,12 +638,11 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
-        let resp = send_request(&socket, &Request::BranchesReload).await;
+        let resp = send_request(&socket, &Request::RulesReload).await;
         match resp {
-            Response::BranchesReloaded {
+            Response::RulesReloaded {
                 reloaded_rule_count,
             } => {
                 assert_eq!(reloaded_rule_count, 0);
@@ -576,11 +657,11 @@ mod tests {
     #[tokio::test]
     async fn invalid_json_returns_error_response() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -588,8 +669,7 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         stream.write_all(b"not json at all\n").await.unwrap();
@@ -609,13 +689,13 @@ mod tests {
     #[tokio::test]
     async fn peer_pending_lists_staged_candidates() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
         pending.record_candidate([0xAAu8; 32]).unwrap();
         pending.record_candidate([0xBBu8; 32]).unwrap();
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -623,8 +703,7 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let resp = send_request(&socket, &Request::PeerPending).await;
         match resp {
@@ -641,18 +720,18 @@ mod tests {
     #[tokio::test]
     async fn peer_approve_writes_config_and_swaps_live_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
 
         let candidate = [0x42u8; 32];
         pending.record_candidate(candidate).unwrap();
-        let fp = yggdrasil_proto::auth::public_key_fingerprint(&candidate);
+        let fp = ratatoskr::auth::public_key_fingerprint(&candidate);
 
         assert!(!peer_state.is_peer_enrolled());
 
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -660,8 +739,7 @@ mod tests {
             cfg.clone(),
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let resp = send_request(
             &socket,
@@ -692,11 +770,11 @@ mod tests {
     #[tokio::test]
     async fn peer_approve_unknown_fingerprint_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let branches = tmp.path().join("branches");
-        let (supervisor, peer_state, shutdown) = make_supervisor(&branches).await;
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
-        let server = ControlServer::bind(
+        let server = bind_relay_control(
             socket.clone(),
             peer_state.clone(),
             &supervisor,
@@ -704,8 +782,7 @@ mod tests {
             cfg,
             shutdown.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let resp = send_request(
             &socket,
@@ -720,6 +797,36 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+        shutdown.cancel();
+        server.stop().await;
+        supervisor.stop().await;
+    }
+
+    #[tokio::test]
+    async fn certs_list_returns_empty_when_no_https_rules_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+        let socket = tmp.path().join("control.sock");
+        let (pending, cfg) = aux_state(tmp.path());
+        let server = bind_relay_control(
+            socket.clone(),
+            peer_state.clone(),
+            &supervisor,
+            pending,
+            cfg,
+            shutdown.clone(),
+        )
+        .await;
+
+        let resp = send_request(&socket, &Request::CertsList).await;
+        match resp {
+            Response::Certs(c) => {
+                assert!(c.certs.is_empty(), "expected empty certs list, got {:?}", c.certs);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
         shutdown.cancel();
         server.stop().await;
         supervisor.stop().await;

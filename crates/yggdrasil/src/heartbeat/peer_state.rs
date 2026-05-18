@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::watch;
 
-use yggdrasil_proto::auth::{public_key_fingerprint, PUBLIC_KEY_LEN};
+use ratatoskr::auth::{public_key_fingerprint, PUBLIC_KEY_LEN};
 
 /// Sentinel value meaning "no peer enrolled yet". X25519 rejects the all-zeros
 /// point as a public key (low-order), so this is unambiguously distinct from

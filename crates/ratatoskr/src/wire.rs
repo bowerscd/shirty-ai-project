@@ -1,4 +1,4 @@
-//! Wire format for the control-plane channel between ratatoskr and yggdrasil.
+//! Wire format for the control-plane channel between huginn and yggdrasil.
 //!
 //! Every packet starts with a 5-byte preamble:
 //!

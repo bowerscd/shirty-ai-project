@@ -1,43 +1,43 @@
-//! Branches subsystem — directory loading and (later) hot reloading.
+//! Rules subsystem — directory loading and (later) hot reloading.
 //!
-//! This module bridges the on-disk `/etc/yggdrasil/branches/*.toml` layout to
-//! the schema types in [`yggdrasil_proto::branch`]. The file-by-file parsing,
+//! This module bridges the on-disk `/etc/yggdrasil/conf.d/*.toml` layout to
+//! the schema types in [`ratatoskr::rule`]. The file-by-file parsing,
 //! per-rule validation, and cross-file uniqueness checks all live in the
 //! proto crate; this module just walks the filesystem and produces a single
-//! aggregated [`BranchSet`].
+//! aggregated [`RuleSet`].
 //!
 //! The hot-reload watcher lives in [`watcher`]; consumers typically interact
-//! with this subsystem through [`BranchWatcher`].
+//! with this subsystem through [`RuleWatcher`].
 
 mod watcher;
 
 #[allow(unused_imports)] // re-exports used by Phase 4/5 proxy modules
-pub use yggdrasil_proto::branch::{
-    BranchDiff, BranchFile, BranchSet, Protocol, ProxyProto, Rule, RuleChange,
+pub use ratatoskr::rule::{
+    RuleDiff, Protocol, ProxyProto, Rule, RuleChange, RuleFile, RuleSet,
     DEFAULT_UDP_IDLE_TIMEOUT,
 };
 #[allow(unused_imports)]
-pub use watcher::{BranchUpdate, BranchWatcher, ReloadTrigger};
+pub use watcher::{RuleUpdate, RuleWatcher, ReloadTrigger};
 
 use std::path::{Path, PathBuf};
 
-use yggdrasil_proto::error::Result as ProtoResult;
-use yggdrasil_proto::Error;
+use ratatoskr::error::Result as ProtoResult;
+use ratatoskr::Error;
 
 /// Walk `dir` for `*.toml` files (non-recursive, sorted by filename), parse and
-/// validate each, then aggregate into a single [`BranchSet`].
+/// validate each, then aggregate into a single [`RuleSet`].
 ///
 /// A missing directory is a hard error — operators should provision an empty
 /// directory rather than leave it absent. An empty directory is OK and
-/// produces an empty [`BranchSet`].
+/// produces an empty [`RuleSet`].
 #[allow(dead_code)] // wired into run() in Phase 4
-pub fn load_dir(dir: &Path) -> ProtoResult<BranchSet> {
+pub fn load_dir(dir: &Path) -> ProtoResult<RuleSet> {
     let files = read_toml_files(dir)?;
-    let parsed: Vec<BranchFile> = files
+    let parsed: Vec<RuleFile> = files
         .iter()
-        .map(|(path, contents)| BranchFile::from_toml(path.clone(), contents))
+        .map(|(path, contents)| RuleFile::from_toml(path.clone(), contents))
         .collect::<ProtoResult<_>>()?;
-    BranchSet::from_files(parsed)
+    RuleSet::from_files(parsed)
 }
 
 /// List `*.toml` files in `dir` (non-recursive), return `(path, contents)`
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn missing_directory_is_an_error() {
-        let path = Path::new("/nonexistent/branches/dir/x");
+        let path = Path::new("/nonexistent/rules/dir/x");
         let err = load_dir(path).err();
         assert!(matches!(err, Some(Error::ReadFile { .. })));
     }
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn non_toml_files_are_ignored() {
         let d = tmpdir();
-        write(d.path(), "README.md", "not a branch");
+        write(d.path(), "README.md", "not a rule");
         write(d.path(), "valid.toml", "");
         // No rules in the empty toml file, no panic on README.
         let set = load_dir(d.path()).unwrap();
@@ -177,6 +177,6 @@ mod tests {
             "#,
         );
         let err = load_dir(d.path()).err();
-        assert!(matches!(err, Some(Error::InvalidBranch(s)) if s.contains("duplicate")));
+        assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("duplicate")));
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! ## Operator flow
 //!
-//! 1. Ratatoskr operator runs `ratatoskr keygen` and `ratatoskr pubkey` to
+//! 1. Huginn operator runs `huginn keygen` and `huginn pubkey` to
 //!    obtain the residential side's static X25519 keypair and publishes the
 //!    public half to the yggdrasil operator.
 //! 2. The yggdrasil operator runs `yggdrasil enroll-token --peer-pubkey <hex>
@@ -14,9 +14,9 @@
 //!    not itself a secret, but operators should still avoid handing it to
 //!    untrusted parties — the `peer_public` it carries is the entry on
 //!    yggdrasil's allow-list.
-//! 4. `ratatoskr enroll token.txt` parses the token, verifies that
+//! 4. `huginn enroll token.txt` parses the token, verifies that
 //!    `peer_public` matches the locally generated identity, and writes
-//!    `yggdrasil_public` + `endpoint_hint` into `/etc/ratatoskr/config.toml`.
+//!    `yggdrasil_public` + `endpoint_hint` into `/etc/huginn/config.toml`.
 //!
 //! A wrong-token-by-mistake fails fast at the next handshake attempt (Noise_IK
 //! key mismatch produces `Error::Noise`).
@@ -50,14 +50,14 @@ pub const TEXT_PREFIX: &str = "YGG1-v1.";
 /// Body of an enrollment token, serialised with `postcard`.
 ///
 /// Contains only public material. The peer secret never leaves the residential
-/// host where `ratatoskr keygen` ran.
+/// host where `huginn keygen` ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentBody {
-    /// Long-term public key of the yggdrasil server. Ratatoskr pins this.
+    /// Long-term public key of the yggdrasil server. Huginn pins this.
     pub yggdrasil_public: [u8; PUBLIC_KEY_LEN],
-    /// Public key of the peer (ratatoskr) — used as a sanity-check on enrollment.
+    /// Public key of the peer (huginn) — used as a sanity-check on enrollment.
     pub peer_public: [u8; PUBLIC_KEY_LEN],
-    /// `host:port` (or `[ipv6]:port`) hint for ratatoskr to dial first.
+    /// `host:port` (or `[ipv6]:port`) hint for huginn to dial first.
     pub endpoint_hint: String,
     /// Unix epoch seconds when the operator minted the token.
     pub issued_at: i64,
@@ -65,7 +65,7 @@ pub struct EnrollmentBody {
 
 impl EnrollmentBody {
     /// Construct a token body. Caller (yggdrasil operator) supplies the
-    /// peer's pubkey received out-of-band from the ratatoskr operator.
+    /// peer's pubkey received out-of-band from the huginn operator.
     pub fn new(
         yggdrasil_public: [u8; PUBLIC_KEY_LEN],
         peer_public: [u8; PUBLIC_KEY_LEN],

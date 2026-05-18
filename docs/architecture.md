@@ -11,7 +11,7 @@ home with the application you want to expose, but its IP changes every time
 the ISP renews its DHCP lease. You want internet traffic to reach
 `vps.example.net:443` and end up at your home box's port 443 — without
 running TLS-MITM, without a custom client, without paying for a static
-residential IP. yggdrasil is a Linux daemon for the VPS side; ratatoskr is
+residential IP. yggdrasil is a Linux daemon for the VPS side; huginn is
 its companion daemon for the home side.
 
 ## High-level shape
@@ -22,7 +22,7 @@ its companion daemon for the home side.
                   |          source IP = current home IP           |
                   v                                                |
         +-----------------+                              +-----------------+
-clients |    yggdrasil    |   forwarded TCP / UDP        |   ratatoskr     | home services
+clients |    yggdrasil    |   forwarded TCP / UDP        |   huginn     | home services
 ------> | (VPS, public)   | ---------------------------> | (home, NAT'd)   | --------------> 22, 25565, ...
         +-----------------+                              +-----------------+
             ^      ^
@@ -35,12 +35,30 @@ yggdrasil binds three things:
 
 1. **Heartbeat UDP socket** (`server.heartbeat_listen`). One per host.
    Carries Noise_IK control traffic only — no application data.
-2. **Per-rule data-plane sockets**. Each `[[rule]]` in `branches/*.toml`
+2. **Per-rule data-plane sockets**. Each `[[rule]]` in `conf.d/*.toml`
    creates exactly one TCP listener or one UDP listener.
 3. **Unix control socket** (`control.socket`). Talks to `yggdrasilctl`.
 
-ratatoskr binds nothing. It only opens an outbound UDP connection to
+huginn binds nothing. It only opens an outbound UDP connection to
 `yggdrasil_endpoint`, performs the handshake, and sends heartbeats.
+
+## Cast of characters
+
+The four binaries are named after pieces of the Norse world-tree myth.
+The metaphor is a navigation aid, not a load-bearing detail:
+
+- **yggdrasil** — the world-tree itself. The VPS-side daemon that
+  terminates listeners, forwards traffic, and roots the deployment in a
+  stable public address.
+- **huginn** — one of Odin's two ravens; a scout. The home-side daemon
+  that flies out to the world-tree at regular intervals (the heartbeat)
+  so yggdrasil always knows where home is.
+- **ratatoskr** — the squirrel that runs messages up and down the
+  world-tree. The shared library crate carrying the wire format,
+  authenticated session layer, control-plane messages, and rule schema
+  — the protocol everyone speaks.
+- **yggdrasilctl** — the operator's hand on the trunk. A local admin
+  CLI that talks to a running yggdrasil over its Unix socket.
 
 ## Crypto: Noise_IK
 
@@ -56,7 +74,7 @@ The control channel uses **Noise_IK_25519_ChaChaPoly_BLAKE2s** via the
   side, so we don't have to invent a fragmentation/reassembly story.
 
 After the handshake completes both sides hold a `snow::TransportState`
-which we wrap as `Session` in `yggdrasil-proto/src/auth.rs`. Every
+which we wrap as `Session` in `ratatoskr/src/auth.rs`. Every
 heartbeat is `Session::encode_heartbeat(now_ms, flags)` → a single AEAD-
 sealed UDP datagram; every ack is `Session::encode_heartbeat_ack`.
 
@@ -89,11 +107,11 @@ Two enrollment paths, both documented in detail in
 [quickstart.md](quickstart.md) and [security.md](security.md#enrollment-token-format):
 
 - **Out-of-band token** — operator runs `yggdrasil enroll-token` against
-  ratatoskr's pubkey, transfers the resulting `*.token` file, ratatoskr
+  huginn's pubkey, transfers the resulting `*.token` file, huginn
   applies it. The token contains both pubkeys and the endpoint hint;
   it's not a secret.
 - **TOFU** — start yggdrasil with `peer.public_key_hex = ""`, let
-  ratatoskr try to handshake, then `yggdrasilctl peer pending` /
+  huginn try to handshake, then `yggdrasilctl peer pending` /
   `yggdrasilctl peer approve <fingerprint>` to admit the candidate after
   out-of-band fingerprint verification.
 
@@ -185,22 +203,22 @@ channel never fires for them — `ipchange_loop` is parked, the reaper is
 unaffected, and the frontend recv loop never even reads `peer_state` for
 known clients (it just hashes into `DashMap`).
 
-## Branches: hot reload
+## Rules: hot reload
 
-`branches_dir` is watched via `notify-debouncer-mini` with a 250 ms
+`rules_dir` is watched via `notify-debouncer-mini` with a 250 ms
 debounce. The worker task:
 
-1. On filesystem event → `load_dir(branches_dir)` → returns a fresh
-   `BranchSet` (validated, cross-file uniqueness checked).
-2. `previous.diff(&new) → BranchDiff { added, removed, changed, unchanged }`.
+1. On filesystem event → `load_dir(rules_dir)` → returns a fresh
+   `RuleSet` (validated, cross-file uniqueness checked).
+2. `previous.diff(&new) → RuleDiff { added, removed, changed, unchanged }`.
 3. **Unchanged rules are strictly untouched.** The supervisor doesn't
    even look at them. Editing rule B never disturbs rule A's listener or
    its in-flight UDP flows. This is the branch-level analogue of
    heartbeat invariance.
-4. Validation failures keep the previous `BranchSet` live. There is no
+4. Validation failures keep the previous `RuleSet` live. There is no
    "partial apply" mode — half-good reloads are worse than no reload.
 
-Force a re-scan with `yggdrasilctl branches reload` (for filesystems where
+Force a re-scan with `yggdrasilctl rules reload` (for filesystems where
 inotify is unreliable).
 
 ## Control plane: yggdrasilctl over UDS
@@ -210,7 +228,7 @@ delimited JSON. We chose NDJSON specifically because it makes
 `socat - UNIX-CONNECT:/run/yggdrasil/control.sock` and `jq` viable for
 debugging — no length-prefixed framing.
 
-Request/response definitions live in `crates/yggdrasil-proto/src/control.rs`
+Request/response definitions live in `crates/ratatoskr/src/control.rs`
 so `yggdrasilctl` and the server share the type surface verbatim.
 
 Filesystem permissions are the access boundary. Run yggdrasil as a
@@ -226,7 +244,7 @@ no fork, no privileged child, no helper subprocess. Capabilities-wise:
 - yggdrasil needs `CAP_NET_BIND_SERVICE` if any rule listens on a port
   < 1024 (e.g. `0.0.0.0:443`). The systemd unit in
   [install.md](install.md#systemd-units) grants this and nothing else.
-- ratatoskr needs only the ability to open one outbound UDP socket.
+- huginn needs only the ability to open one outbound UDP socket.
   Standard unprivileged user, no caps.
 
 Identity files are mode 0600 and owned by the daemon user. The
@@ -235,7 +253,7 @@ on drop even if a panic unwinds the stack.
 
 ## Why one peer
 
-yggdrasil supports exactly **one** ratatoskr peer per instance.
+yggdrasil supports exactly **one** huginn peer per instance.
 Multi-peer is intentionally out of scope:
 
 - It would force per-rule peer selection ("rule X goes to peer A"), which
@@ -252,23 +270,23 @@ the same VPS bound to different `heartbeat_listen` ports.
 ## Observability inventory
 
 Logs (both daemons): `tracing` JSON to stdout. Configure verbosity per
-`tracing-subscriber` env-filter via `YGGDRASIL_LOG` / `RATATOSKR_LOG`.
+`tracing-subscriber` env-filter via `YGGDRASIL_LOG` / `HUGINN_LOG`.
 
 Metrics (yggdrasil only): Prometheus on `metrics.listen`, default
 `127.0.0.1:9090/metrics`. Full list in
 [operations.md → Prometheus metrics](operations.md#prometheus-metrics).
 
-Admin: `yggdrasilctl status / branches / peer`. Reference in
+Admin: `yggdrasilctl status / rules / peer`. Reference in
 [cli-reference.md](cli-reference.md#yggdrasilctl).
 
 ## Build artefacts
 
 | Crate           | Output                              | Linkage                |
 | --------------- | ----------------------------------- | ---------------------- |
-| `yggdrasil-proto` | (lib only)                        | shared types + crypto  |
-| `yggdrasil`     | bin `yggdrasil` + lib               | depends on proto       |
-| `yggdrasilctl`  | bin `yggdrasilctl`                  | depends on proto       |
-| `ratatoskr`     | bin `ratatoskr`                     | depends on proto       |
+| `ratatoskr`     | (lib only)                          | shared types + crypto  |
+| `yggdrasil`     | bin `yggdrasil` + lib               | depends on `ratatoskr` |
+| `yggdrasilctl`  | bin `yggdrasilctl`                  | depends on `ratatoskr` |
+| `huginn`        | bin `huginn`                        | depends on `ratatoskr` |
 | `loadgen`       | bin `loadgen` (workspace-internal)  | depends on nothing     |
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency. The
@@ -277,9 +295,9 @@ implementations.
 
 ## Where to look next
 
-- Wire format: `crates/yggdrasil-proto/src/wire.rs`.
-- Authenticated session: `crates/yggdrasil-proto/src/auth.rs`.
+- Wire format: `crates/ratatoskr/src/wire.rs`.
+- Authenticated session: `crates/ratatoskr/src/auth.rs`.
 - Heartbeat invariance test: `crates/yggdrasil/tests/heartbeat_invariance_udp.rs`.
 - UDP flow table: `crates/yggdrasil/src/proxy/udp.rs`.
-- Branch watcher: `crates/yggdrasil/src/branches/watcher.rs`.
-- Control-plane request/response: `crates/yggdrasil-proto/src/control.rs`.
+- Rule watcher: `crates/yggdrasil/src/rules/watcher.rs`.
+- Control-plane request/response: `crates/ratatoskr/src/control.rs`.

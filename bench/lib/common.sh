@@ -170,14 +170,14 @@ bench_spawn_tcp_echo() {
 
 # ---------- yggdrasil stack orchestration ----------
 #
-# bench_spin_yggdrasil <tmpdir> <listen_port> <upstream_port> <protocol> [extra_branch_toml]
+# bench_spin_yggdrasil <tmpdir> <listen_port> <upstream_port> <protocol> [extra_rule_toml]
 #
-# Builds and runs the full yggdrasil + ratatoskr stack:
+# Builds and runs the full yggdrasil + huginn stack:
 #   1. keygen both
 #   2. enroll-token + enroll
 #   3. write configs and branch
-#   4. start yggdrasil + ratatoskr in background
-#   5. wait until the proxy listener is up AND ratatoskr has heartbeat'd through
+#   4. start yggdrasil + huginn in background
+#   5. wait until the proxy listener is up AND huginn has heartbeat'd through
 #
 # Exports:
 #   YGG_LISTEN_PORT, YGG_HB_PORT, YGG_CTRL_SOCK, YGG_CONFIG, RAT_CONFIG
@@ -189,26 +189,26 @@ bench_spin_yggdrasil() {
     root="$(bench_workspace_root)"
 
     local ygg_bin="$root/target/release/yggdrasil"
-    local rat_bin="$root/target/release/ratatoskr"
+    local rat_bin="$root/target/release/huginn"
     [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
-    [[ -x "$rat_bin" ]] || die "missing $rat_bin — run: cargo build --release -p ratatoskr"
+    [[ -x "$rat_bin" ]] || die "missing $rat_bin — run: cargo build --release -p huginn"
 
-    mkdir -p "$tmp"/{yggdrasil,ratatoskr,branches,state,run,logs}
+    mkdir -p "$tmp"/{yggdrasil,huginn,rules,state,run,logs}
     local hb_port; hb_port="$(pick_free_udp_port)"
     local metrics_port; metrics_port="$(pick_free_tcp_port)"
 
     # Keys.
     "$ygg_bin" keygen --identity-file "$tmp/yggdrasil/identity.key" >/dev/null
-    "$rat_bin" keygen --identity-file "$tmp/ratatoskr/identity.key" >/dev/null
+    "$rat_bin" keygen --identity-file "$tmp/huginn/identity.key" >/dev/null
 
     local rat_pub
-    rat_pub="$("$rat_bin" pubkey --identity-file "$tmp/ratatoskr/identity.key" | tr -d '\r\n[:space:]')"
+    rat_pub="$("$rat_bin" pubkey --identity-file "$tmp/huginn/identity.key" | tr -d '\r\n[:space:]')"
 
     # Write yggdrasil config FIRST (peer.public_key_hex empty for now).
     cat > "$tmp/yggdrasil/config.toml" <<EOF
 [server]
 heartbeat_listen = "127.0.0.1:$hb_port"
-branches_dir = "$tmp/branches"
+rules_dir = "$tmp/rules"
 state_dir = "$tmp/state"
 identity_file = "$tmp/yggdrasil/identity.key"
 
@@ -230,19 +230,19 @@ EOF
         --config "$tmp/yggdrasil/config.toml" \
         -o "$tmp/enroll.token" --force >/dev/null
 
-    # Ratatoskr config skeleton + enroll applies the server pubkey + endpoint.
-    cat > "$tmp/ratatoskr/config.toml" <<EOF
+    # Huginn config skeleton + enroll applies the server pubkey + endpoint.
+    cat > "$tmp/huginn/config.toml" <<EOF
 [client]
 yggdrasil_endpoint = "placeholder:1"
 yggdrasil_pubkey_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-identity_file = "$tmp/ratatoskr/identity.key"
+identity_file = "$tmp/huginn/identity.key"
 heartbeat_interval = "200ms"
 rekey_interval = "1h"
 EOF
-    "$rat_bin" enroll "$tmp/enroll.token" --config "$tmp/ratatoskr/config.toml" >/dev/null
+    "$rat_bin" enroll "$tmp/enroll.token" --config "$tmp/huginn/config.toml" >/dev/null
 
     # Branch file.
-    cat > "$tmp/branches/scenario.toml" <<EOF
+    cat > "$tmp/rules/scenario.toml" <<EOF
 [[rule]]
 name = "bench"
 listen = "127.0.0.1:$listen_port"
@@ -252,18 +252,18 @@ $extra
 EOF
 
     bench_spawn YGG_PID  "$tmp/logs/yggdrasil.log" -- "$ygg_bin"  --log-format pretty run --config "$tmp/yggdrasil/config.toml"
-    bench_spawn RAT_PID  "$tmp/logs/ratatoskr.log" -- "$rat_bin" --log-format pretty run --config "$tmp/ratatoskr/config.toml"
+    bench_spawn RAT_PID  "$tmp/logs/huginn.log" -- "$rat_bin" --log-format pretty run --config "$tmp/huginn/config.toml"
 
     if [[ "$proto" == "tcp" ]]; then
         bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
     else
         bench_wait_listen_udp 127.0.0.1 "$listen_port" 5
     fi
-    # Give ratatoskr a couple of heartbeats so the proxy has the peer IP.
+    # Give huginn a couple of heartbeats so the proxy has the peer IP.
     sleep 0.6
 
     export YGG_LISTEN_PORT="$listen_port" YGG_HB_PORT="$hb_port" YGG_CTRL_SOCK="$tmp/run/control.sock"
-    export YGG_CONFIG="$tmp/yggdrasil/config.toml" RAT_CONFIG="$tmp/ratatoskr/config.toml"
+    export YGG_CONFIG="$tmp/yggdrasil/config.toml" RAT_CONFIG="$tmp/huginn/config.toml"
 }
 
 # ---------- nginx orchestration ----------

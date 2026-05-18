@@ -4,8 +4,8 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use yggdrasil_proto::auth::{self, StaticKeyPair, PUBLIC_KEY_LEN};
-use yggdrasil_proto::enrollment::EnrollmentBody;
+use ratatoskr::auth::{self, StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::enrollment::EnrollmentBody;
 
 use crate::cli::{EnrollTokenArgs, KeygenArgs};
 use crate::config::ServerConfig;
@@ -98,10 +98,10 @@ pub fn enroll_token(args: EnrollTokenArgs) -> Result<()> {
     println!();
     println!("Recorded peer.public_key_hex in {}.", args.config.display());
     println!(
-        "  Transfer {} to the ratatoskr host over a trusted channel,",
+        "  Transfer {} to the huginn host over a trusted channel,",
         args.output.display()
     );
-    println!("  then run `ratatoskr enroll <token-file>` there.");
+    println!("  then run `huginn enroll <token-file>` there.");
     Ok(())
 }
 
@@ -188,7 +188,7 @@ mod tests {
             r#"
 [server]
 heartbeat_listen = "127.0.0.1:0"
-branches_dir = "{}"
+rules_dir = "{}"
 identity_file = "{}"
 
 [peer]

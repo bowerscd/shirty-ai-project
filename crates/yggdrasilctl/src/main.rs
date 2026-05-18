@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use yggdrasil_proto::control::{Request, Response};
+use ratatoskr::control::{Mode, Request, Response};
 
 #[derive(Debug, Parser)]
 #[command(name = "yggdrasilctl", version, about, propagate_version = true)]
@@ -28,25 +28,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show the high-level server status (peer IP, last heartbeat, branch count).
+    /// Show the high-level server status (peer IP, last heartbeat, rule count).
     Status,
-    /// Inspect or manage loaded branches.
-    Branches {
+    /// Inspect or manage loaded rules.
+    Rules {
         #[command(subcommand)]
-        action: BranchAction,
+        action: RuleAction,
     },
     /// Inspect or manage the enrolled peer.
     Peer {
         #[command(subcommand)]
         action: PeerAction,
     },
+    /// Inspect loaded TLS certificates (HTTPS L7 frontend).
+    Certs {
+        #[command(subcommand)]
+        action: CertAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
-enum BranchAction {
-    /// List loaded branches.
+enum RuleAction {
+    /// List loaded rules.
     List,
-    /// Force a reload of the branches directory (in addition to inotify).
+    /// Force a reload of the rules directory (in addition to inotify).
     Reload,
 }
 
@@ -64,6 +69,12 @@ enum PeerAction {
 struct ApproveArgs {
     /// Short BLAKE2s-128 fingerprint (hex) of the peer to approve.
     fingerprint: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum CertAction {
+    /// List loaded certificates (one entry per hostname).
+    List,
 }
 
 fn main() -> Result<()> {
@@ -88,9 +99,9 @@ fn main() -> Result<()> {
 fn build_request(cmd: &Command) -> Request {
     match cmd {
         Command::Status => Request::Status,
-        Command::Branches { action } => match action {
-            BranchAction::List => Request::BranchesList,
-            BranchAction::Reload => Request::BranchesReload,
+        Command::Rules { action } => match action {
+            RuleAction::List => Request::RulesList,
+            RuleAction::Reload => Request::RulesReload,
         },
         Command::Peer { action } => match action {
             PeerAction::Show => Request::PeerShow,
@@ -98,6 +109,9 @@ fn build_request(cmd: &Command) -> Request {
             PeerAction::Approve(a) => Request::PeerApprove {
                 fingerprint: a.fingerprint.clone(),
             },
+        },
+        Command::Certs { action } => match action {
+            CertAction::List => Request::CertsList,
         },
     }
 }
@@ -138,41 +152,55 @@ fn print_json(response: &Response) -> Result<()> {
 fn print_human(request: &Request, response: &Response) -> Result<()> {
     match response {
         Response::Status(s) => {
+            // `mode` controls which fields are meaningful: terminal-mode
+            // daemons have no peer concept, so we omit the heartbeat /
+            // enrollment lines.
+            let mode_str = match s.mode {
+                Mode::Relay => "relay",
+                Mode::Terminal => "terminal",
+            };
             println!("version:        {}", s.version);
-            println!(
-                "peer_ip:        {}",
-                s.peer_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "(none)".to_string())
-            );
-            println!(
-                "last_heartbeat: {}",
-                match s.last_heartbeat_age_ms {
-                    Some(ms) => format!("{ms} ms ago"),
-                    None => "(none)".to_string(),
-                }
-            );
-            println!("branches:       {}", s.branch_count);
+            println!("mode:           {mode_str}");
+            if matches!(s.mode, Mode::Relay) {
+                println!(
+                    "peer_ip:        {}",
+                    s.peer_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                );
+                println!(
+                    "last_heartbeat: {}",
+                    match s.last_heartbeat_age_ms {
+                        Some(ms) => format!("{ms} ms ago"),
+                        None => "(none)".to_string(),
+                    }
+                );
+            }
+            println!("rules:          {}", s.rule_count);
             println!("uptime:         {} s", s.uptime_secs);
-            println!("peer_enrolled:  {}", s.peer_enrolled);
+            if matches!(s.mode, Mode::Relay) {
+                println!("peer_enrolled:  {}", s.peer_enrolled);
+            }
         }
-        Response::Branches(b) => {
-            if b.branches.is_empty() {
-                println!("(no branches loaded)");
+        Response::Rules(b) => {
+            if b.rules.is_empty() {
+                println!("(no rules loaded)");
             } else {
-                println!("{:<24}  {:<5}  {:<24}  upstream_port", "name", "proto", "listen");
-                for br in &b.branches {
+                println!("{:<24}  {:<5}  {:<24}  upstream", "name", "proto", "listen");
+                for br in &b.rules {
                     println!(
                         "{:<24}  {:<5}  {:<24}  {}",
-                        br.name, br.protocol, br.listen, br.upstream_port
+                        br.name, br.protocol, br.listen, br.upstream
                     );
                 }
             }
         }
-        Response::BranchesReloaded {
+        Response::RulesReloaded {
             reloaded_rule_count,
         } => {
             println!(
-                "reload requested ({reloaded_rule_count} branches currently loaded; \
-                 new state visible on next `branches list`)"
+                "reload requested ({reloaded_rule_count} rules currently loaded; \
+                 new state visible on next `rules list`)"
             );
         }
         Response::Peer(p) => {
@@ -198,6 +226,19 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
         }
         Response::PeerApproved { fingerprint } => {
             println!("approved {fingerprint}");
+        }
+        Response::Certs(c) => {
+            if c.certs.is_empty() {
+                println!("(no certificates loaded)");
+            } else {
+                println!("{:<32}  {:<48}  loaded_unix_ms", "hostname", "source");
+                for entry in &c.certs {
+                    println!(
+                        "{:<32}  {:<48}  {}",
+                        entry.hostname, entry.cert_source, entry.loaded_at_unix_ms,
+                    );
+                }
+            }
         }
         Response::Error { code, message } => {
             // Annotate which command triggered it so error output is greppable.

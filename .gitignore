@@ -12,3 +12,6 @@ __pycache__/
 identity.key
 *.identity
 *.token
+
+# VS Code workspace settings
+.vscode/
