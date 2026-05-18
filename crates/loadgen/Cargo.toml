@@ -1,0 +1,23 @@
+[package]
+name        = "loadgen"
+description = "TCP/UDP load generator for yggdrasil end-to-end benchmarks"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "loadgen"
+path = "src/main.rs"
+
+[dependencies]
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+hdrhistogram = { workspace = true }
+humantime-serde = { workspace = true }
+humantime    = { workspace = true }

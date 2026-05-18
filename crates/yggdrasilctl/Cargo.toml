@@ -1,0 +1,28 @@
+[package]
+name        = "yggdrasilctl"
+description = "Admin CLI for yggdrasil; speaks JSON over a Unix domain socket"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "yggdrasilctl"
+path = "src/main.rs"
+
+[dependencies]
+yggdrasil-proto = { workspace = true }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+hex         = { workspace = true }
+
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+humantime-serde = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

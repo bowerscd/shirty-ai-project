@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Config reload latency scenario.
+#
+# Measures the time from "I dropped a new config" to "the proxy serves traffic
+# under the new rule". For yggdrasil that's a new branch TOML appearing in the
+# branches dir (notify+debounce-driven hot reload). For nginx that's `nginx -s
+# reload` (SIGHUP / new worker fork). Direct has no equivalent and is skipped.
+#
+# Reported per subject: mean/p95/p99 reload-to-serve latency across N iterations.
+# Output JSON shape matches loadgen reports (so compare.py treats it uniformly).
+
+set -euo pipefail
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/common.sh
+source "$HERE/lib/common.sh"
+bench_install_traps
+ensure_results_dir
+
+readonly SCENARIO="reload-latency"
+readonly ITERATIONS="${BENCH_ITERATIONS:-20}"
+readonly OUTDIR="$(bench_results_dir)"
+
+# A helper: probe a TCP port — return 0 on first successful connect+ping-pong.
+probe_tcp_until_serving() {
+    local host="$1" port="$2" deadline_s="$3"
+    local deadline=$(( SECONDS + deadline_s ))
+    while (( SECONDS < deadline )); do
+        if python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.socket()
+s.settimeout(0.05)
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+    s.sendall(b"x")
+    s.recv(1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+        then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# python helper that records ns timestamps and emits a tiny json report
+record_iterations() {
+    local subject="$1"; shift
+    local out="$1"; shift
+    local samples_csv="$1"; shift  # comma-separated nanoseconds
+    python3 - "$subject" "$out" "$samples_csv" <<'PY'
+import json, statistics, sys, time
+
+subject, out, samples_csv = sys.argv[1], sys.argv[2], sys.argv[3]
+samples_ns = [int(x) for x in samples_csv.split(",") if x]
+if not samples_ns:
+    raise SystemExit("no samples")
+samples_us = sorted(s / 1000.0 for s in samples_ns)
+
+
+def pct(p):
+    idx = max(0, min(len(samples_us) - 1, int(round((p / 100.0) * (len(samples_us) - 1)))))
+    return samples_us[idx]
+
+
+report = {
+    "scenario": "reload-latency",
+    "subject":  subject,
+    "target":   "n/a",
+    "params":   {"iterations": len(samples_us)},
+    "stats": {
+        "duration_s": 0,
+        "tx_packets": len(samples_us),
+        "rx_packets": len(samples_us),
+        "tx_bytes": 0,
+        "rx_bytes": 0,
+        "errors": 0,
+        "loss_pct": 0.0,
+        "pps_tx": 0,
+        "pps_rx": 0,
+        "bytes_per_sec_tx": 0,
+        "bytes_per_sec_rx": 0,
+        "latency_us": {
+            "samples": len(samples_us),
+            "min":  samples_us[0],
+            "p50":  pct(50),
+            "p90":  pct(90),
+            "p99":  pct(99),
+            "p999": pct(99.9),
+            "max":  samples_us[-1],
+            "mean": statistics.fmean(samples_us),
+        },
+    },
+    "ts_start_unix_ms": int(time.time() * 1000),
+    "ts_end_unix_ms":   int(time.time() * 1000),
+}
+with open(out, "w") as f:
+    json.dump(report, f, indent=2)
+PY
+}
+
+# ---------- yggdrasil ----------
+
+run_yggdrasil() {
+    local tmp; tmp="$(bench_mktempdir)"
+    local echo_port_a; echo_port_a="$(pick_free_tcp_port)"
+    local echo_port_b; echo_port_b="$(pick_free_tcp_port)"
+    local listen_a;    listen_a="$(pick_free_tcp_port)"
+    local listen_b;    listen_b="$(pick_free_tcp_port)"
+
+    bench_spawn_tcp_echo ECHO_A_PID "$echo_port_a" "$tmp/echo-a.log"
+    bench_spawn_tcp_echo ECHO_B_PID "$echo_port_b" "$tmp/echo-b.log"
+
+    # Start with one rule (rule-a) already in place.
+    bench_spin_yggdrasil "$tmp" "$listen_a" "$echo_port_a" tcp
+
+    # We'll add additional branch files for rule-b<i> on each iteration.
+    local samples=""
+    local i
+    for (( i = 1; i <= ITERATIONS; i++ )); do
+        local p; p="$(pick_free_tcp_port)"
+        local t0_ns; t0_ns="$(date +%s%N)"
+        cat > "$tmp/branches/iter-$i.toml" <<EOF
+[[rule]]
+name = "iter-$i"
+listen = "127.0.0.1:$p"
+protocol = "tcp"
+upstream_port = $echo_port_b
+EOF
+        if ! probe_tcp_until_serving 127.0.0.1 "$p" 3; then
+            die "yggdrasil iter $i: listener never came up"
+        fi
+        local t1_ns; t1_ns="$(date +%s%N)"
+        samples+="$(( t1_ns - t0_ns )),"
+    done
+    record_iterations yggdrasil "$OUTDIR/$SCENARIO-yggdrasil.json" "$samples"
+}
+
+# ---------- nginx ----------
+
+run_nginx() {
+    local tmp; tmp="$(bench_mktempdir)"
+    local echo_port_a; echo_port_a="$(pick_free_tcp_port)"
+    local echo_port_b; echo_port_b="$(pick_free_tcp_port)"
+    bench_spawn_tcp_echo ECHO_A_PID "$echo_port_a" "$tmp/echo-a.log"
+    bench_spawn_tcp_echo ECHO_B_PID "$echo_port_b" "$tmp/echo-b.log"
+    local nginx_bin
+    nginx_bin="${BENCH_NGINX:-$(command -v nginx || true)}"
+    [[ -x "$nginx_bin" ]] || die "nginx binary not found; set BENCH_NGINX=/path/to/nginx"
+
+    mkdir -p "$tmp/nginx/logs"
+    local listen_a; listen_a="$(pick_free_tcp_port)"
+
+    write_conf() {
+        local extra="$1"
+        cat > "$tmp/nginx/nginx.conf" <<EOF
+worker_processes auto;
+pid $tmp/nginx/nginx.pid;
+error_log $tmp/nginx/error.log warn;
+events { worker_connections 4096; }
+stream {
+    server {
+        listen 127.0.0.1:$listen_a;
+        proxy_pass 127.0.0.1:$echo_port_a;
+    }
+$extra
+}
+EOF
+    }
+    write_conf ""
+
+    bench_spawn NGINX_PID "$tmp/nginx/spawn.log" -- "$nginx_bin" -p "$tmp/nginx" -c "$tmp/nginx/nginx.conf" -g "daemon off;"
+    bench_wait_listen_tcp 127.0.0.1 "$listen_a" 5
+
+    local samples=""
+    local i
+    for (( i = 1; i <= ITERATIONS; i++ )); do
+        local p; p="$(pick_free_tcp_port)"
+        local extra="    server { listen 127.0.0.1:$p; proxy_pass 127.0.0.1:$echo_port_b; }"
+        write_conf "$extra"
+        local t0_ns; t0_ns="$(date +%s%N)"
+        "$nginx_bin" -p "$tmp/nginx" -c "$tmp/nginx/nginx.conf" -s reload >/dev/null 2>&1
+        if ! probe_tcp_until_serving 127.0.0.1 "$p" 5; then
+            die "nginx iter $i: listener never came up"
+        fi
+        local t1_ns; t1_ns="$(date +%s%N)"
+        samples+="$(( t1_ns - t0_ns )),"
+    done
+    record_iterations nginx "$OUTDIR/$SCENARIO-nginx.json" "$samples"
+}
+
+log "$SCENARIO/yggdrasil: starting"
+run_yggdrasil
+bench_leg_teardown
+log "$SCENARIO/nginx: starting"
+run_nginx
+bench_leg_teardown
+log "$SCENARIO: done. results in $OUTDIR/"

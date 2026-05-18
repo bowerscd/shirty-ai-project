@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yggdrasil-proto",
+    "crates/yggdrasil",
+    "crates/yggdrasilctl",
+    "crates/ratatoskr",
+    "crates/loadgen",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/example/yggdrasil"
+
+[workspace.dependencies]
+# Async runtime
+tokio        = { version = "1.40", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+futures      = "0.3"
+
+# Serialization
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = { version = "0.8", features = ["preserve_order"] }
+postcard     = { version = "1", features = ["use-std"] }
+hex          = { version = "0.4", features = ["serde"] }
+base64       = "0.22"
+
+# Errors / utility
+thiserror    = "1"
+anyhow       = "1"
+
+# CLI
+clap         = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Crypto
+snow         = { version = "0.9", default-features = false, features = ["default-resolver"] }
+rand         = "0.8"
+blake2       = "0.10"
+zeroize      = { version = "1.8", features = ["zeroize_derive"] }
+
+# Concurrency primitives
+dashmap      = "6"
+parking_lot  = "0.12"
+
+# File watching
+notify        = "6"
+notify-debouncer-mini = "0.4"
+
+# Metrics
+metrics                    = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
+
+# Misc
+humantime-serde = "1"
+humantime       = "2"
+hdrhistogram    = "7"
+tempfile        = "3"
+criterion       = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Internal crates
+yggdrasil-proto = { path = "crates/yggdrasil-proto" }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+[profile.bench]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1

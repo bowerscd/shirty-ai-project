@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+
+# Python bytecode caches (bench/ scripts use python3)
+__pycache__/
+*.pyc
+*.pyo
+
+# Local secrets / identities used during dev
+identity.key
+*.identity
+*.token

@@ -1,0 +1,124 @@
+# End-to-end network-stack test for the yggdrasil + ratatoskr pair.
+#
+# Topology:
+#
+#   ┌────────────┐      wan (172.30.0.0/24)       ┌─────────────────────┐
+#   │  client    │ ────────────────────────────►  │  vps (yggdrasil)    │
+#   │  (tester)  │                                │   :7000/tcp         │
+#   └────────────┘                                │   :7001/udp         │
+#                                                 │   :51820/udp        │
+#                                                 │   :9090/tcp metrics │
+#                                                 └──────────┬──────────┘
+#                                                            │ proxied
+#                                                            ▼
+#                                                 ┌─────────────────────┐
+#                                                 │  home (ratatoskr +  │
+#                                                 │  echo backends on   │
+#                                                 │  :7100/tcp, :7101/udp)│
+#                                                 └─────────────────────┘
+#
+# Notes on the topology:
+# - In real deployment the home box runs *both* ratatoskr and the upstream
+#   service in the same network namespace, because yggdrasil dials
+#   peer_ip:upstream_port — `peer_ip` is the source of the most recent
+#   heartbeat (i.e. ratatoskr's IP) and `upstream_port` is whatever the
+#   rule says. Same arrangement here: the `home` container runs both.
+# - The `init` service performs one-shot key generation and config writes
+#   into the shared volumes; daemons wait for it to complete cleanly.
+# - The `client` container is a vanilla python:slim that runs the test
+#   harness via a bind-mounted scripts directory.
+
+x-yggdrasil-image: &yggdrasil-image
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+
+networks:
+  wan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  yggdrasil_etc:
+  yggdrasil_run:
+  yggdrasil_state:
+  ratatoskr_etc:
+
+services:
+  init:
+    <<: *yggdrasil-image
+    container_name: e2e-init
+    entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/bootstrap.sh"]
+    volumes:
+      - yggdrasil_etc:/etc/yggdrasil
+      - ratatoskr_etc:/etc/ratatoskr
+    restart: "no"
+    networks:
+      - wan
+
+  vps:
+    <<: *yggdrasil-image
+    container_name: e2e-vps
+    # NOTE: the `init` service must be run to completion *before* vps/home,
+    # but podman-compose 1.5 doesn't reliably honour
+    # `depends_on.condition: service_completed_successfully` — it races and
+    # tries to start dependents while init is mid-run. tests/e2e/run.sh
+    # orchestrates init explicitly with `run --rm init` before `up -d`.
+    command:
+      - yggdrasil
+      - run
+      - --config
+      - /etc/yggdrasil/config.toml
+    environment:
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
+    volumes:
+      - yggdrasil_etc:/etc/yggdrasil
+      - yggdrasil_run:/run/yggdrasil
+      - yggdrasil_state:/var/lib/yggdrasil
+    networks:
+      wan:
+        ipv4_address: 172.30.0.10
+    expose:
+      - "7000/tcp"
+      - "7001/udp"
+      - "51820/udp"
+      - "9090/tcp"
+
+  home:
+    <<: *yggdrasil-image
+    container_name: e2e-home
+    depends_on:
+      vps:
+        condition: service_started
+    command:
+      - /usr/local/bin/home-entrypoint.sh
+    environment:
+      RATATOSKR_LOG: info
+      RATATOSKR_LOG_FORMAT: pretty
+      ECHO_TCP_PORT: "7100"
+      ECHO_UDP_PORT: "7101"
+    volumes:
+      - ratatoskr_etc:/etc/ratatoskr
+    networks:
+      wan:
+        ipv4_address: 172.30.0.20
+
+  client:
+    image: python:3.12-slim
+    container_name: e2e-client
+    depends_on:
+      vps:
+        condition: service_started
+      home:
+        condition: service_started
+    working_dir: /tests
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ../tests/e2e:/tests:ro
+      - yggdrasil_run:/run/yggdrasil:ro
+    networks:
+      wan:
+        ipv4_address: 172.30.0.30

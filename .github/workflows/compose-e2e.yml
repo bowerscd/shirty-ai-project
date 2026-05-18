@@ -1,0 +1,93 @@
+name: e2e
+
+# End-to-end test: brings up the full network stack via podman-compose,
+# drives real TCP/UDP traffic through yggdrasil, verifies hot reload and
+# the control plane. Runs against a clean repo checkout — no host state.
+#
+# Decoupled from the unit/integration test workflow because the container
+# build is comparatively slow (cold ~3 min on GitHub-hosted runners,
+# warm ~1 min with cargo cache). Runs on PRs that touch the workspace
+# crates or the compose definitions, plus nightly for drift detection.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "docker/**"
+      - "tests/e2e/**"
+      - ".github/workflows/compose-e2e.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "docker/**"
+      - "tests/e2e/**"
+      - ".github/workflows/compose-e2e.yml"
+  schedule:
+    # 04:17 UTC daily — off-peak, doesn't collide with the bench workflow.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: podman-compose stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install podman + podman-compose
+        # ubuntu-latest ships podman in apt; podman-compose comes from PyPI
+        # (the apt package lags upstream by several releases). Use a pinned
+        # podman-compose so the build is reproducible.
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman python3-pip
+          sudo pip3 install --break-system-packages 'podman-compose==1.5.0'
+          podman --version
+          podman-compose --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-e2e-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-cargo-
+
+      - name: Build images
+        run: podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e build
+
+      - name: Run end-to-end tests
+        run: bash tests/e2e/run.sh
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          echo '--- vps ---'
+          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 200 vps  || true
+          echo '--- home ---'
+          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 200 home || true
+          echo '--- init ---'
+          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 100 init || true
+
+      - name: Tear down
+        if: always()
+        run: podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e down -v --remove-orphans || true

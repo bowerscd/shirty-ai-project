@@ -1,0 +1,54 @@
+[package]
+name        = "yggdrasil"
+description = "High-performance TCP/UDP reverse proxy for residential upstreams"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "yggdrasil"
+path = "src/main.rs"
+
+[dependencies]
+yggdrasil-proto = { workspace = true }
+
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+futures     = { workspace = true }
+
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
+hex         = { workspace = true }
+base64      = { workspace = true }
+humantime-serde = { workspace = true }
+
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+snow        = { workspace = true }
+rand        = { workspace = true }
+blake2      = { workspace = true }
+
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+
+notify                = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+
+metrics                     = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+[dev-dependencies]
+tempfile  = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "flow_table"
+harness = false

@@ -1,0 +1,84 @@
+name: bench (e2e)
+
+# Runs the full bench/ harness against yggdrasil + nginx + direct baseline.
+# Intended to run nightly on a self-hosted runner with `performance` CPU
+# governor and tuned sysctls (see bench/README.md).
+#
+# Manual trigger: workflow_dispatch lets you run on-demand with a baseline SHA
+# to compare against (defaults to the previous nightly).
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: 'short SHA of the baseline run to diff against (results must exist as an artifact)'
+        required: false
+        type: string
+
+jobs:
+  e2e-bench:
+    # Requires a self-hosted runner pinned for benchmarking. Tag the runner
+    # with these labels in the repo settings so CI can target it.
+    runs-on: [self-hosted, linux, bench]
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: verify host is bench-ready
+        run: |
+          set -euo pipefail
+          gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+          if [[ "$gov" != "performance" ]]; then
+            echo "::error::CPU governor is '$gov', must be 'performance'"
+            exit 1
+          fi
+          command -v nginx >/dev/null || { echo "::error::nginx not installed"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build release artifacts
+        run: cargo build --release -p yggdrasil -p ratatoskr -p loadgen
+
+      - name: run full bench matrix
+        run: bench/run-all.sh
+        env:
+          BENCH_SHA: ${{ github.sha }}
+
+      - name: upload result tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: bench/results/${{ github.sha }}/
+          retention-days: 90
+
+      - name: download baseline (if provided)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline_sha != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-results-${{ inputs.baseline_sha }}
+          path: bench/results/${{ inputs.baseline_sha }}
+
+      - name: compare against baseline
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline_sha != '' }}
+        run: |
+          bench/compare.py --check-nginx \
+            bench/results/${{ inputs.baseline_sha }} \
+            bench/results/${{ github.sha }}
+
+      - name: enforce nginx delta budget (always)
+        # Even without a baseline, we always check that yggdrasil is within
+        # budget of nginx in the same run.
+        run: |
+          # Compare the run against itself just to trigger --check-nginx logic.
+          bench/compare.py --check-nginx \
+            bench/results/${{ github.sha }} \
+            bench/results/${{ github.sha }}
