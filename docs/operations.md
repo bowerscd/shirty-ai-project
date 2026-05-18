@@ -147,6 +147,7 @@ Exported on `[metrics] listen` (default `127.0.0.1:9090`, path `/metrics`).
 | `yggdrasil_peer_ip_changes_total`                   | counter | —                  | Times the peer's source IP changed between consecutive heartbeats. Each change drains the affected UDP flow table. |
 | `yggdrasil_rules_loaded`                         | gauge   | —                  | Number of rules currently active.                                                          |
 | `yggdrasil_udp_flows_drained_on_ip_change_total`    | counter | —                  | UDP flows dropped because the peer IP moved while the flow was in-flight.                  |
+| `yggdrasil_udp_flows_rejected_total`                | counter | `rule`, `reason=cap` | New UDP flows rejected because the per-rule flow table was at capacity. A non-zero rate signals scaling pressure or a churn attack. |
 | `yggdrasil_last_heartbeat_timestamp_seconds`        | gauge   | —                  | Wall-clock seconds since `UNIX_EPOCH` of the last accepted heartbeat. Absent until the first heartbeat (relay) or always (terminal). |
 
 Suggested alerts:

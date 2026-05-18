@@ -17,6 +17,9 @@
 //! - `yggdrasil_udp_flows_drained_on_ip_change_total{rule}` — flows aborted
 //!   when the residential IP changed. **Asserted == 0 by
 //!   `heartbeat_invariance.rs`** when no IP change occurs.
+//! - `yggdrasil_udp_flows_rejected_total{rule,reason}` — new flows that
+//!   could not be admitted. `reason=cap` is the only variant today (flow
+//!   table at [`crate::proxy::udp::MAX_FLOWS_PER_RULE_DEFAULT`]).
 //! - `yggdrasil_tcp_connections_accepted_total{rule}` — incoming TCP connects.
 //! - `yggdrasil_udp_packets_inbound_total{rule}` — client→upstream datagrams.
 //! - `yggdrasil_udp_packets_outbound_total{rule}` — upstream→client datagrams.

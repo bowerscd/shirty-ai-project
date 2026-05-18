@@ -31,8 +31,8 @@
 //!
 //! Per-rule flow cap defaults to [`MAX_FLOWS_PER_RULE_DEFAULT`] = 65 536.
 //! When full, new client addresses are dropped and counted under
-//! `udp_flows_rejected_total{reason=cap}` (metric wiring deferred to
-//! Phase 9). The single-datagram receive buffer is 65 535 B (full IP MTU).
+//! `yggdrasil_udp_flows_rejected_total{rule,reason="cap"}`. The
+//! single-datagram receive buffer is 65 535 B (full IP MTU).
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -278,6 +278,12 @@ impl UdpProxyInner {
                 cap = self.max_flows,
                 "drop UDP datagram: flow table at cap"
             );
+            metrics::counter!(
+                "yggdrasil_udp_flows_rejected_total",
+                "rule" => self.rule.name.clone(),
+                "reason" => "cap",
+            )
+            .increment(1);
             return;
         }
 
