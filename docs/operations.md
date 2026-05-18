@@ -147,13 +147,13 @@ Exported on `[metrics] listen` (default `127.0.0.1:9090`, path `/metrics`).
 | `yggdrasil_peer_ip_changes_total`                   | counter | —                  | Times the peer's source IP changed between consecutive heartbeats. Each change drains the affected UDP flow table. |
 | `yggdrasil_rules_loaded`                         | gauge   | —                  | Number of rules currently active.                                                          |
 | `yggdrasil_udp_flows_drained_on_ip_change_total`    | counter | —                  | UDP flows dropped because the peer IP moved while the flow was in-flight.                  |
+| `yggdrasil_last_heartbeat_timestamp_seconds`        | gauge   | —                  | Wall-clock seconds since `UNIX_EPOCH` of the last accepted heartbeat. Absent until the first heartbeat (relay) or always (terminal). |
 
 Suggested alerts:
 
-- **Stale peer**: `time() - yggdrasil_last_heartbeat_timestamp` is not yet
-  exported; until then derive staleness from `yggdrasilctl status --json`
-  and Prometheus `node_exporter`-based timestamping, or use
-  `increase(yggdrasil_heartbeats_received_total{result="accepted"}[2m]) == 0`.
+- **Stale peer**: `time() - yggdrasil_last_heartbeat_timestamp_seconds > 90`
+  fires when no authenticated heartbeat has landed in the last 90s
+  (huginn's default cadence is once per 10s).
 - **Handshake storm**: `rate(yggdrasil_handshakes_completed_total[5m]) > 0.1`.
   A healthy link rehandshakes about once an hour.
 

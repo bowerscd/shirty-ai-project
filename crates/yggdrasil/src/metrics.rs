@@ -29,6 +29,11 @@
 //! - `yggdrasil_mode{mode}` — always `1`, the `mode` label is one of
 //!   `"relay"` / `"terminal"`. Cardinality 1 per daemon. Lets dashboards
 //!   filter and color by mode without joining against external metadata.
+//! - `yggdrasil_last_heartbeat_timestamp_seconds` — wall-clock seconds since
+//!   `UNIX_EPOCH` of the last *accepted* heartbeat. Absent in terminal mode
+//!   (no heartbeat path) and until the first heartbeat lands in relay mode.
+//!   Alert primitive: `time() - yggdrasil_last_heartbeat_timestamp_seconds
+//!   > N`.
 
 use std::net::SocketAddr;
 

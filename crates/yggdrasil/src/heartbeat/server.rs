@@ -252,6 +252,15 @@ impl HeartbeatServer {
         state.last_peer_addr = src;
         metrics::counter!("yggdrasil_heartbeats_received_total", "result" => "accepted")
             .increment(1);
+        // Wall-clock seconds since UNIX_EPOCH. Standard Prometheus
+        // convention is `_timestamp_seconds` for an epoch gauge; alert via
+        // `time() - yggdrasil_last_heartbeat_timestamp_seconds > N`. The
+        // value mirrors what `peer_state.last_heartbeat_ms()` just stored,
+        // converted to seconds.
+        if let Some(ms) = self.peer_state.last_heartbeat_ms() {
+            metrics::gauge!("yggdrasil_last_heartbeat_timestamp_seconds")
+                .set(ms as f64 / 1000.0);
+        }
 
         match effect {
             HeartbeatEffect::SameIp(_) => {
