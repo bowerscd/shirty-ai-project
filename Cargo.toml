@@ -65,6 +65,7 @@ hdrhistogram    = "7"
 tempfile        = "3"
 url             = { version = "2", features = ["serde"] }
 criterion       = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+sd-notify       = "0.4"
 
 # L7 HTTP frontend (Phase 6)
 hyper           = { version = "1", features = ["server", "client", "http1", "http2"] }

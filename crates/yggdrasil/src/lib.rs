@@ -24,6 +24,7 @@ pub mod log;
 pub mod metrics;
 pub mod pending_peers;
 pub mod proxy;
+pub mod systemd;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,6 +201,10 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         "yggdrasil running"
     );
 
+    // 7b. All subsystems are up; notify systemd we are ready. No-op when
+    //     NOTIFY_SOCKET is unset (local dev, docker without --systemd).
+    systemd::notify_ready();
+
     // 8. Wait for shutdown signal, then bring everything down cleanly.
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");
@@ -285,6 +290,10 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
         control_socket = %control.socket_path().display(),
         "yggdrasil running"
     );
+
+    // 5b. All subsystems are up; notify systemd we are ready. No-op when
+    //     NOTIFY_SOCKET is unset (local dev, docker without --systemd).
+    systemd::notify_ready();
 
     // 6. Wait for shutdown signal, then bring everything down cleanly.
     wait_for_shutdown().await;

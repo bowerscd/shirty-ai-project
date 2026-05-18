@@ -45,6 +45,9 @@ notify-debouncer-mini = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
+# systemd readiness notification (no-op when NOTIFY_SOCKET unset).
+sd-notify   = { workspace = true }
+
 # L7 HTTP(S) frontend (Phase 6).
 hyper           = { workspace = true }
 hyper-util      = { workspace = true }

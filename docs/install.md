@@ -87,7 +87,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# `notify` (paired with sd_notify(READY=1) in yggdrasil) means `is-active`
+# reports `active` only after the metrics exporter, heartbeat socket, proxy
+# supervisor, and control socket have all bound — not just after the
+# process forked. Dependent units therefore order correctly.
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/local/bin/yggdrasil run
 Restart=on-failure
 RestartSec=2s
