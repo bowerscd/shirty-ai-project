@@ -54,7 +54,7 @@ fi
 echo "==> bringing daemons up"
 # podman-compose has no `--wait`; the wait_for loops below poll the actual
 # readiness condition (control socket + first authenticated heartbeat).
-"${DC[@]}" "${COMPOSE_ARGS[@]}" up -d vps home client
+"${DC[@]}" "${COMPOSE_ARGS[@]}" up -d vps home terminal client
 
 # -------- helpers -----------------------------------------------------------
 
@@ -276,6 +276,37 @@ if (( age < 0 || age > 30 )); then
     fail "yggdrasil_last_heartbeat_timestamp_seconds=$heartbeat_ts is stale (age ${age}s)"
 fi
 echo "    [ok] yggdrasil_last_heartbeat_timestamp_seconds fresh (age ${age}s)"
+
+# -------- test 8: DNS-resolved upstream_host (terminal mode) ----------------
+
+echo "==> [dns-upstream] terminal-mode rule with upstream_host"
+
+# The terminal container at 172.30.0.40 hosts a TCP rule on :7200 whose
+# upstream is `home-echo-dns:7100`. `home-echo-dns` is pinned to
+# 172.30.0.20 via `extra_hosts:` in compose.e2e.yml. The DNS resolver
+# converges within ~ms of the supervisor binding the rule, but on a cold
+# container start the listener may accept before the first resolution
+# lands — `wait_for` polls until at least one connection round-trips.
+
+run_dns_echo() {
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T client python3 - <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(("172.30.0.40", 7200))
+payload = b"dns-resolved-" + b"z" * 200
+s.sendall(payload)
+got = b""
+while len(got) < len(payload):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    got += chunk
+s.close()
+sys.exit(0 if got == payload else 1)
+PY
+}
+WAIT_TIMEOUT=15 wait_for "DNS-resolved upstream echo via terminal:7200" run_dns_echo
 
 # -------- done --------------------------------------------------------------
 

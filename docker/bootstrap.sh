@@ -14,9 +14,16 @@ RAT_CFG=/etc/huginn/config.toml
 RAT_KEY=/etc/huginn/identity.key
 TOKEN_PATH=/tmp/huginn.token
 
+# Second yggdrasil instance: terminal-mode, exercises DNS upstream_host.
+# Mounted at /etc/yggdrasil-terminal in init; the terminal service sees
+# this same volume at /etc/yggdrasil.
+YGT_CFG=/etc/yggdrasil-terminal/config.toml
+YGT_KEY=/etc/yggdrasil-terminal/identity.key
+
 # Re-running the init service should be idempotent so `podman compose up`
 # after a partial failure works without manual cleanup.
-if [[ -f "$YGG_KEY" && -f "$RAT_KEY" && -f "$YGG_CFG" && -f "$RAT_CFG" ]]; then
+if [[ -f "$YGG_KEY" && -f "$RAT_KEY" && -f "$YGG_CFG" && -f "$RAT_CFG" \
+      && -f "$YGT_KEY" && -f "$YGT_CFG" ]]; then
     echo "[init] already bootstrapped; skipping"
     exit 0
 fi
@@ -88,5 +95,38 @@ EOF
 echo "[init] applying enrolment token on huginn side"
 huginn enroll "$TOKEN_PATH" --config "$RAT_CFG" >/dev/null
 rm -f "$TOKEN_PATH"
+
+# -- terminal-mode yggdrasil ------------------------------------------------
+#
+# Separate identity + config + rules dir for the `terminal` container. The
+# rule listens on :7200 and forwards to `home-echo-dns:7100`. That hostname
+# is pinned to the home box's IP via the terminal container's `extra_hosts:`
+# entry, so the DNS resolver path exercises both the resolution loop and
+# the dial-after-resolve hot path in tcp.rs.
+
+echo "[init] generating terminal yggdrasil identity"
+mkdir -p /etc/yggdrasil-terminal/rules
+yggdrasil keygen --identity-file "$YGT_KEY" --force >/dev/null
+
+echo "[init] writing terminal yggdrasil server config"
+cat >"$YGT_CFG" <<'EOF'
+[server]
+mode             = "terminal"
+rules_dir        = "/etc/yggdrasil/rules"
+state_dir        = "/var/lib/yggdrasil"
+identity_file    = "/etc/yggdrasil/identity.key"
+
+[control]
+socket = "/run/yggdrasil/control.sock"
+EOF
+
+echo "[init] writing terminal DNS-upstream rule"
+cat >/etc/yggdrasil-terminal/rules/dns-echo.toml <<'EOF'
+[[rule]]
+name          = "dns-echo"
+listen        = "0.0.0.0:7200"
+protocol      = "tcp"
+upstream_host = "home-echo-dns:7100"
+EOF
 
 echo "[init] done"
