@@ -89,8 +89,13 @@ async fn spawn_terminator(
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path())
-        .expect("load acceptor");
+    let acceptor = ChainAcceptor::load(
+        supervisor.handle(),
+        derive_cfg,
+        state_dir.path(),
+        ratatoskr::pubkey::PubKey::x25519(*server_keys.public_key()),
+    )
+    .expect("load acceptor");
     std::mem::forget(state_dir);
 
     let (hb, outbound) = HeartbeatServer::bind(

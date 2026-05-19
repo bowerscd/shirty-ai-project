@@ -446,18 +446,6 @@ async fn run_chain_tunnel_bridge(
 
     let stream = match initiator.open(target_pubkey, dest).await {
         Ok(s) => s,
-        Err(OpenError::TargetNotUpstream { requested, upstream }) => {
-            let err = Response::Error {
-                code: error_codes::TUNNEL_OPEN_REJECTED.into(),
-                message: format!(
-                    "target_pubkey {requested} does not match this \
-                     node's chain upstream {upstream}; multi-hop \
-                     forwarding is not implemented in v1"
-                ),
-            };
-            write_response(&mut writer, &err).await?;
-            return Ok(());
-        }
         Err(OpenError::Rejected(reason)) => {
             let err = Response::Error {
                 code: error_codes::TUNNEL_OPEN_REJECTED.into(),

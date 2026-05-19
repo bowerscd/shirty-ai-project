@@ -94,8 +94,13 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path())
-        .expect("load acceptor");
+    let acceptor = ChainAcceptor::load(
+        supervisor.handle(),
+        derive_cfg,
+        state_dir.path(),
+        ratatoskr::pubkey::PubKey::x25519(*server_keys.public_key()),
+    )
+    .expect("load acceptor");
 
     // 4. HeartbeatServer bound to a random loopback port with the acceptor.
     let hb_cancel = cancel.clone();
@@ -234,8 +239,13 @@ async fn unknown_body_type_acks_unknown_over_wire() {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor =
-        ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path()).unwrap();
+    let acceptor = ChainAcceptor::load(
+        supervisor.handle(),
+        derive_cfg,
+        state_dir.path(),
+        ratatoskr::pubkey::PubKey::x25519(*server_keys.public_key()),
+    )
+    .unwrap();
     let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         clone_kp(&server_keys),

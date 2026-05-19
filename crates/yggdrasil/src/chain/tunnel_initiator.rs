@@ -123,17 +123,6 @@ pub struct InitiatorStream {
 /// Error returned by [`TunnelInitiator::open`].
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
-    /// In v1, `target_pubkey` must equal this initiator's chain upstream
-    /// pubkey: multi-hop forwarding is a Phase 5 concern, so the
-    /// originator can only open tunnels at its direct upstream. The
-    /// embedded pubkeys are returned for operator diagnostic display.
-    #[error(
-        "target pubkey {requested} does not match this node's upstream {upstream}"
-    )]
-    TargetNotUpstream {
-        requested: PubKey,
-        upstream: PubKey,
-    },
     /// The chain client task has exited; no envelopes can be sent.
     #[error("chain client is shut down")]
     ChainClientShutDown,
@@ -201,11 +190,22 @@ impl From<ChainClientShutDown> for SendDataError {
 #[derive(Debug)]
 pub struct TunnelInitiator {
     chain: ChainClientHandle,
-    /// Pubkey of this node's chain upstream. The initiator always sets
-    /// `TunnelOpen.target_pubkey = upstream_pubkey` in v1; multi-hop
-    /// forwarding is upstream-side concern (Phase 5).
+    /// Pubkey of this node's chain upstream. Initiators record this so
+    /// they can populate diagnostics; the protocol layer no longer
+    /// constrains `TunnelOpen.target_pubkey` to equal it — Phase 5
+    /// multi-hop forwarding lets the originator target any pubkey on
+    /// the chain.
+    #[allow(dead_code)]
     upstream_pubkey: PubKey,
-    next_stream_id: AtomicU32,
+    /// Monotone allocator for upstream-side stream IDs. Held by `Arc` so
+    /// a [`TunnelForwarder`] running alongside this initiator (on a
+    /// relay that both originates and forwards tunnels through the
+    /// same upstream chain) can share the same ID space — preventing
+    /// any chance of a forwarded stream colliding with a
+    /// locally-originated one.
+    ///
+    /// [`TunnelForwarder`]: crate::chain::tunnel_forwarder::TunnelForwarder
+    next_stream_id: Arc<AtomicU32>,
     streams: Mutex<HashMap<u32, StreamEntry>>,
 }
 
@@ -221,9 +221,20 @@ impl TunnelInitiator {
             // 0`, which keeps the wire-trace easy to read (test vectors
             // and the terminator both pick low non-zero ids by
             // convention).
-            next_stream_id: AtomicU32::new(1),
+            next_stream_id: Arc::new(AtomicU32::new(1)),
             streams: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Hand out a clone of the upstream-side stream-id allocator. The
+    /// chain-side [`TunnelForwarder`] uses this to mint upstream stream
+    /// IDs for forwarded tunnels that share the same upstream chain as
+    /// this initiator, ensuring no two subsystems ever emit the same
+    /// id on the same outbound chain client.
+    ///
+    /// [`TunnelForwarder`]: crate::chain::tunnel_forwarder::TunnelForwarder
+    pub fn stream_id_allocator(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.next_stream_id)
     }
 
     /// Open a fresh stream toward `dest` on `target_pubkey`. Sends a
@@ -233,21 +244,17 @@ impl TunnelInitiator {
     /// either [`TunnelInitiator::close`] or an inbound `TunnelClose`
     /// removes it; on `Err` the registry is unmodified.
     ///
-    /// In v1 `target_pubkey` must equal this initiator's upstream
-    /// pubkey (see [`OpenError::TargetNotUpstream`]). Multi-hop
-    /// forwarding is a Phase 5 concern.
+    /// `target_pubkey` is the pubkey of the chain node that should
+    /// terminate the tunnel. When it equals this initiator's direct
+    /// upstream, the upstream terminates locally. When it points
+    /// further into the chain, the upstream's
+    /// [`TunnelForwarder`](crate::chain::tunnel_forwarder::TunnelForwarder)
+    /// rewrites the stream id and relays the envelope onward.
     pub async fn open(
         self: &Arc<Self>,
         target_pubkey: PubKey,
         dest: SocketAddr,
     ) -> Result<InitiatorStream, OpenError> {
-        if target_pubkey != self.upstream_pubkey {
-            metric_outcome("open_target_not_upstream");
-            return Err(OpenError::TargetNotUpstream {
-                requested: target_pubkey,
-                upstream: self.upstream_pubkey,
-            });
-        }
         let stream_id = self.alloc_stream_id();
         let body = TunnelOpen {
             stream_id,
@@ -451,7 +458,13 @@ impl TunnelInitiator {
     /// `run` loop, so it must not `.await`; we use `try_lock` on the
     /// mutex and treat contention as `STREAM_NOT_FOUND` rather than
     /// blocking the heartbeat loop.
-    fn dispatch_inbound(&self, body_type: u8, body: &[u8]) -> AckStatus {
+    ///
+    /// Visible to `pub(crate)` so the chain-tunnel router can chain
+    /// this dispatch with a fall-through to a [`TunnelForwarder`] for
+    /// stream ids that don't belong to this initiator.
+    ///
+    /// [`TunnelForwarder`]: crate::chain::tunnel_forwarder::TunnelForwarder
+    pub(crate) fn dispatch_inbound(&self, body_type: u8, body: &[u8]) -> AckStatus {
         let kind = match ControlBodyType::from_byte(body_type) {
             Some(k) => k,
             None => return AckStatus::Unknown,
@@ -657,25 +670,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_target_pubkey_mismatch_before_touching_the_wire() {
-        let (handle, _join) = fake_chain_client(|_, _| {
-            panic!("target mismatch must short-circuit before the wire")
+    async fn open_emits_target_pubkey_verbatim_for_multi_hop() {
+        // Phase 5: the initiator no longer constrains `target_pubkey`
+        // to equal `upstream_pubkey`; it puts whatever the caller
+        // passed onto the wire so an upstream forwarder can route it
+        // onward. This test pins that contract.
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<TunnelOpen>>> = Arc::new(Mutex::new(None));
+        let captured_cl = Arc::clone(&captured);
+        let (handle, _join) = fake_chain_client(move |body_type, body| {
+            assert_eq!(body_type, ControlBodyType::TunnelOpen.as_byte());
+            let open: TunnelOpen = postcard::from_bytes(body).unwrap();
+            *captured_cl.lock().unwrap() = Some(open);
+            Ok(())
         });
         let upstream = fake_pubkey(0x11);
+        let downstream_terminator = fake_pubkey(0xEE);
         let initiator = TunnelInitiator::new(handle, upstream);
-        let other = fake_pubkey(0xEE);
-        let err = initiator
-            .open(other, "127.0.0.1:1".parse().unwrap())
+        let stream = initiator
+            .open(downstream_terminator, "127.0.0.1:1".parse().unwrap())
             .await
-            .expect_err("expected target-mismatch error");
-        match err {
-            OpenError::TargetNotUpstream { requested, upstream: u } => {
-                assert_eq!(requested, other);
-                assert_eq!(u, upstream);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        assert!(initiator.open_stream_ids().await.is_empty());
+            .expect("multi-hop open should succeed");
+        let got = captured.lock().unwrap().clone().expect("open went to wire");
+        assert_eq!(
+            got.target_pubkey, downstream_terminator,
+            "initiator must put the caller-provided target on the wire verbatim"
+        );
+        assert_eq!(got.stream_id, stream.stream_id);
     }
 
     #[tokio::test]
