@@ -127,6 +127,18 @@ impl HeartbeatServer {
                     "received Rekey signal; peer must send a fresh Handshake1"
                 );
             }
+            PacketType::Control | PacketType::ControlAck => {
+                // Control-channel dispatch lands in a follow-up commit in
+                // this phase; for now, drop these so the parser does not
+                // produce non-exhaustive warnings. Phase 2 tests run an
+                // in-process loopback that exercises the reliability layer
+                // directly without touching this server.
+                tracing::debug!(
+                    src = %src,
+                    packet_type = ?view.packet_type,
+                    "drop control packet: dispatch not yet wired into this server"
+                );
+            }
             PacketType::Handshake2 | PacketType::HeartbeatAck => {
                 tracing::debug!(
                     src = %src,

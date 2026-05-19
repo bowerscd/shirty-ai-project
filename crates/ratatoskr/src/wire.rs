@@ -1,4 +1,5 @@
-//! Wire format for the control-plane channel between huginn and yggdrasil.
+//! Wire format for the chain control plane between a downstream node and its
+//! upstream.
 //!
 //! Every packet starts with a 5-byte preamble:
 //!
@@ -12,8 +13,9 @@
 //! Handshake packets (`Handshake1`, `Handshake2`) follow the preamble immediately
 //! with the raw Noise message bytes.
 //!
-//! Post-handshake packets (`Heartbeat`, `HeartbeatAck`, `Rekey`) carry an 8-byte
-//! big-endian counter (the Noise AEAD nonce, in cleartext) before the ciphertext:
+//! Post-handshake packets (`Heartbeat`, `HeartbeatAck`, `Rekey`, `Control`,
+//! `ControlAck`) carry an 8-byte big-endian counter (the Noise AEAD nonce, in
+//! cleartext) before the ciphertext:
 //!
 //! ```text
 //! +------+-------------+----------+------------------+
@@ -27,6 +29,8 @@
 //! * `Heartbeat`     — `timestamp_ms` (u64 BE) ++ `flags` (u8) — total 9 bytes
 //! * `HeartbeatAck`  — `echoed_counter` (u64 BE) ++ `server_ts_ms` (u64 BE) — 16 bytes
 //! * `Rekey`         — empty
+//! * `Control`       — postcard-encoded [`crate::control_frame::ControlEnvelope`]
+//! * `ControlAck`    — postcard-encoded [`crate::control_frame::ControlAck`]
 //!
 //! The counter is in cleartext so the receiver can call
 //! [`snow::TransportState::set_receiving_nonce`] before attempting to decrypt
@@ -44,6 +48,8 @@ pub const TAG_HANDSHAKE_2: u8 = 0x02;
 pub const TAG_HEARTBEAT: u8 = 0x03;
 pub const TAG_HEARTBEAT_ACK: u8 = 0x04;
 pub const TAG_REKEY: u8 = 0x05;
+pub const TAG_CONTROL: u8 = 0x06;
+pub const TAG_CONTROL_ACK: u8 = 0x07;
 
 // ---- Constants ----
 
@@ -92,6 +98,8 @@ pub enum PacketType {
     Heartbeat    = TAG_HEARTBEAT,
     HeartbeatAck = TAG_HEARTBEAT_ACK,
     Rekey        = TAG_REKEY,
+    Control      = TAG_CONTROL,
+    ControlAck   = TAG_CONTROL_ACK,
 }
 
 impl PacketType {
@@ -102,14 +110,23 @@ impl PacketType {
             TAG_HEARTBEAT      => Self::Heartbeat,
             TAG_HEARTBEAT_ACK  => Self::HeartbeatAck,
             TAG_REKEY          => Self::Rekey,
+            TAG_CONTROL        => Self::Control,
+            TAG_CONTROL_ACK    => Self::ControlAck,
             other              => return Err(Error::UnknownPacketType(other)),
         })
     }
 
-    /// `true` for `Heartbeat`, `HeartbeatAck`, `Rekey` — the cleartext counter
+    /// `true` for every post-handshake packet — the cleartext counter
     /// field follows the preamble for these.
     pub fn has_counter(self) -> bool {
-        matches!(self, Self::Heartbeat | Self::HeartbeatAck | Self::Rekey)
+        matches!(
+            self,
+            Self::Heartbeat
+                | Self::HeartbeatAck
+                | Self::Rekey
+                | Self::Control
+                | Self::ControlAck,
+        )
     }
 }
 
@@ -261,6 +278,39 @@ mod tests {
         write_preamble(&mut buf, PacketType::Heartbeat, SessionId([0; 4]));
         buf.extend_from_slice(&[0, 0, 0, 0]);
         assert!(matches!(parse(&buf), Err(Error::MalformedPacket(_))));
+    }
+
+    #[test]
+    fn parse_control_carries_counter_and_body() {
+        let sid = SessionId([9, 9, 9, 9]);
+        let mut buf = Vec::new();
+        write_preamble(&mut buf, PacketType::Control, sid);
+        write_counter(&mut buf, 0xAA);
+        buf.extend_from_slice(b"CT");
+        let view = parse(&buf).unwrap();
+        assert_eq!(view.packet_type, PacketType::Control);
+        assert_eq!(view.session_id, sid);
+        assert_eq!(view.counter, Some(0xAA));
+        assert_eq!(view.body, b"CT");
+    }
+
+    #[test]
+    fn parse_control_ack_carries_counter_and_body() {
+        let sid = SessionId([8, 8, 8, 8]);
+        let mut buf = Vec::new();
+        write_preamble(&mut buf, PacketType::ControlAck, sid);
+        write_counter(&mut buf, 0xBB);
+        buf.extend_from_slice(b"ACK");
+        let view = parse(&buf).unwrap();
+        assert_eq!(view.packet_type, PacketType::ControlAck);
+        assert_eq!(view.counter, Some(0xBB));
+        assert_eq!(view.body, b"ACK");
+    }
+
+    #[test]
+    fn control_tags_have_counter() {
+        assert!(PacketType::Control.has_counter());
+        assert!(PacketType::ControlAck.has_counter());
     }
 
     #[test]

@@ -357,6 +357,7 @@ fn spawn_chain_client(
         local_keys: local_keys.clone(),
         heartbeat_interval: up.heartbeat_interval,
         rekey_interval: up.rekey_interval,
+        body_handler: None,
     };
     let upstream_fp = ratatoskr::auth::public_key_fingerprint(&upstream_pubkey);
     tracing::info!(

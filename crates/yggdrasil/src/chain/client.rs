@@ -11,19 +11,33 @@
 //! ## Concurrency
 //!
 //! The whole client runs on one task: `tokio::select!` between the cancel
-//! token, the heartbeat ticker, the rekey deadline, and the UDP recv arm.
-//! No locking, no shared mutable state, no rendezvous — the heartbeat
-//! [`Session`] is exclusively owned by the loop.
+//! token, the heartbeat ticker, the control-channel retransmit timer, the
+//! caller-side control-send queue, and the UDP recv arm. No locking, no
+//! shared mutable state, no rendezvous — the heartbeat [`Session`] and
+//! [`ControlChannel`] are exclusively owned by the loop.
+//!
+//! ## Control channel
+//!
+//! Phase 2 plumbing: the loop owns a per-session [`ControlChannel`] that
+//! sequences, retransmits, and dedups `Control` / `ControlAck` packets. The
+//! client task pulls outbound sends from an `mpsc` fed by callers holding a
+//! [`ChainClientHandle`], and dispatches inbound envelopes through an
+//! optional [`BodyHandler`] (production default: ack everything `Unknown`).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::{Initiator, Session, StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::control_frame::{AckStatus, ControlAck};
 use ratatoskr::wire::{self, PacketType, SessionId};
+
+use super::reliability::{ControlChannel, InboundDisposition, SendError};
 
 /// Build-time defaults that callers can override.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +46,16 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// If we go this many heartbeat intervals without seeing an ACK, give up
 /// on the current session and re-handshake.
 const ACK_DEADLINE_MULTIPLIER: u32 = 6;
+
+/// Body-type dispatcher invoked when an inbound control envelope is
+/// classified as `Deliver` by the [`ControlChannel`]. The handler returns
+/// the [`AckStatus`] to send back to the peer.
+///
+/// In production builds the default is `None`, which acks every inbound
+/// envelope as [`AckStatus::Unknown`] — Phase 2 ships no real body types
+/// yet, so any non-`Reserved` body must come from a peer running a newer
+/// version of the protocol that this node has not yet been upgraded to.
+pub type BodyHandler = Arc<dyn Fn(u8, &[u8]) -> AckStatus + Send + Sync>;
 
 /// Static configuration of the chain client.
 pub struct ChainClientConfig {
@@ -43,24 +67,100 @@ pub struct ChainClientConfig {
     pub local_keys:         StaticKeyPair,
     pub heartbeat_interval: Duration,
     pub rekey_interval:     Duration,
+    /// Optional dispatcher for delivered control envelopes. `None` →
+    /// every inbound envelope acks [`AckStatus::Unknown`].
+    pub body_handler:       Option<BodyHandler>,
 }
 
-/// Driver: owns the config and the cancel token; consumed by
-/// [`ChainClient::run`].
+impl std::fmt::Debug for ChainClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainClientConfig")
+            .field("endpoint", &self.endpoint)
+            .field("upstream_pubkey", &hex::encode(self.upstream_pubkey))
+            .field("local_keys", &"<redacted>")
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("rekey_interval", &self.rekey_interval)
+            .field("body_handler", &self.body_handler.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+/// Request issued by a [`ChainClientHandle`] consumer; consumed by the
+/// chain client task and folded into the per-session [`ControlChannel`].
+#[derive(Debug)]
+pub struct ControlOp {
+    pub body_type:  u8,
+    pub body:       Vec<u8>,
+    pub completion: oneshot::Sender<Result<(), SendError>>,
+}
+
+/// Clone-able handle that lets external code enqueue control envelopes on
+/// the chain client. Sending on a handle whose client task has exited
+/// fails with [`ChainClientShutDown`].
+#[derive(Debug, Clone)]
+pub struct ChainClientHandle {
+    tx: mpsc::UnboundedSender<ControlOp>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("chain client is shut down")]
+pub struct ChainClientShutDown;
+
+impl ChainClientHandle {
+    /// Enqueue a control envelope for the upstream. Returns the per-send
+    /// `Receiver`; its value is `Ok(())` on `AckStatus::Ok`, or a
+    /// [`SendError`] for any other outcome. The receiver itself may resolve
+    /// with `Err(oneshot::error::RecvError)` if the client task drops the
+    /// completion sender before producing a result (e.g. session ended
+    /// during shutdown without a clean ack).
+    pub fn send_control(
+        &self,
+        body_type: u8,
+        body: Vec<u8>,
+    ) -> Result<oneshot::Receiver<Result<(), SendError>>, ChainClientShutDown> {
+        let (completion, rx) = oneshot::channel();
+        self.tx
+            .send(ControlOp { body_type, body, completion })
+            .map_err(|_| ChainClientShutDown)?;
+        Ok(rx)
+    }
+}
+
+/// Driver: owns the config, the cancel token, and the control-send queue;
+/// consumed by [`ChainClient::run`].
 pub struct ChainClient {
-    config: ChainClientConfig,
-    cancel: CancellationToken,
+    config:     ChainClientConfig,
+    cancel:     CancellationToken,
+    control_tx: mpsc::UnboundedSender<ControlOp>,
+    control_rx: mpsc::UnboundedReceiver<ControlOp>,
+}
+
+impl std::fmt::Debug for ChainClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainClient")
+            .field("config", &self.config)
+            .field("cancel", &"<token>")
+            .finish()
+    }
 }
 
 impl ChainClient {
     pub fn new(config: ChainClientConfig, cancel: CancellationToken) -> Self {
-        Self { config, cancel }
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        Self { config, cancel, control_tx, control_rx }
+    }
+
+    /// Clone the control-send handle. Multiple callers may hold handles
+    /// concurrently; each enqueued op is processed in FIFO order by the
+    /// client task.
+    pub fn handle(&self) -> ChainClientHandle {
+        ChainClientHandle { tx: self.control_tx.clone() }
     }
 
     /// Run forever until the cancel token fires. Returns `Ok(())` on clean
     /// shutdown. Inner session errors are logged and trigger backoff +
     /// reconnect, so this only returns when explicitly cancelled.
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         let mut backoff = BACKOFF_MIN;
         loop {
             if self.cancel.is_cancelled() {
@@ -86,7 +186,7 @@ impl ChainClient {
         }
     }
 
-    async fn run_session_once(&self) -> Result<SessionExit> {
+    async fn run_session_once(&mut self) -> Result<SessionExit> {
         let upstream_addr = resolve_endpoint(&self.config.endpoint).await?;
         let bind_addr: SocketAddr = match upstream_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
@@ -148,7 +248,7 @@ impl ChainClient {
     }
 
     async fn heartbeat_loop(
-        &self,
+        &mut self,
         socket: UdpSocket,
         mut session: Session,
     ) -> Result<SessionExit> {
@@ -162,6 +262,12 @@ impl ChainClient {
         let mut buf = [0u8; 2048];
 
         let ack_deadline = self.config.heartbeat_interval * ACK_DEADLINE_MULTIPLIER;
+
+        // Per-session control reliability state. Drop-aborts every pending
+        // send with `SendError::ChannelClosed` when this function returns
+        // (rekey, cancel, or fatal session error), so callers awaiting on a
+        // completion receiver always make progress.
+        let mut channel = ControlChannel::new();
 
         loop {
             if session_started.elapsed() >= self.config.rekey_interval {
@@ -189,18 +295,23 @@ impl ChainClient {
                 );
             }
 
+            // Compute the next control-channel retransmit deadline. If the
+            // outbound queue is empty, sleep for a long interval (we'll be
+            // woken by any of the other select arms first).
+            let retx_at = channel
+                .next_tick_at()
+                .map(tokio::time::Instant::from_std)
+                .unwrap_or_else(|| {
+                    tokio::time::Instant::now() + Duration::from_secs(3600)
+                });
+
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(SessionExit::Cancelled),
-                _ = ticker.tick() => {
-                    let ts = current_unix_millis();
-                    let (counter, packet) = session
-                        .encode_heartbeat(ts, 0)
-                        .context("encode heartbeat")?;
-                    socket.send(&packet).await.context("send heartbeat")?;
-                    heartbeats_sent += 1;
-                    tracing::trace!(counter, ts, "heartbeat sent");
-                }
+                // Drain inbound before anything else: heartbeat acks must
+                // arrive promptly, and an unbounded outbound `control_rx`
+                // burst would otherwise starve this arm and bail the
+                // session on the no-ack deadline.
                 res = socket.recv(&mut buf) => {
                     let n = res.context("recv from upstream")?;
                     let view = match wire::parse(&buf[..n]) {
@@ -227,6 +338,53 @@ impl ChainClient {
                                 }
                             }
                         }
+                        PacketType::Control => {
+                            match session.decode_control(&view) {
+                                Ok(env) => {
+                                    let seq = env.seq;
+                                    let status = match channel.on_inbound(env) {
+                                        InboundDisposition::Deliver(env) => {
+                                            dispatch_body(
+                                                self.config.body_handler.as_ref(),
+                                                env.body_type,
+                                                &env.body,
+                                            )
+                                        }
+                                        InboundDisposition::Duplicate => AckStatus::Ok,
+                                    };
+                                    let ack = ControlAck { seq, status };
+                                    match session.encode_control_ack(&ack) {
+                                        Ok((_, packet)) => {
+                                            if let Err(e) = socket.send(&packet).await {
+                                                tracing::warn!(seq, error = %e, "send ControlAck failed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(seq, error = %e, "encode ControlAck failed");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "ignoring malformed Control");
+                                }
+                            }
+                        }
+                        PacketType::ControlAck => {
+                            match session.decode_control_ack(&view) {
+                                Ok(ack) => {
+                                    let seq = ack.seq;
+                                    let resolved = channel.on_ack(&ack);
+                                    if resolved {
+                                        tracing::trace!(seq, "control ack resolved waiter");
+                                    } else {
+                                        tracing::debug!(seq, "control ack for unknown seq");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "ignoring malformed ControlAck");
+                                }
+                            }
+                        }
                         PacketType::Handshake2 => {
                             tracing::debug!("ignoring late Handshake2");
                         }
@@ -235,8 +393,67 @@ impl ChainClient {
                         }
                     }
                 }
+                _ = ticker.tick() => {
+                    let ts = current_unix_millis();
+                    let (counter, packet) = session
+                        .encode_heartbeat(ts, 0)
+                        .context("encode heartbeat")?;
+                    socket.send(&packet).await.context("send heartbeat")?;
+                    heartbeats_sent += 1;
+                    tracing::trace!(counter, ts, "heartbeat sent");
+                }
+                Some(op) = self.control_rx.recv() => {
+                    let env = channel.enqueue(
+                        op.body_type,
+                        op.body,
+                        op.completion,
+                        Instant::now(),
+                    );
+                    let seq = env.seq;
+                    match session.encode_control(&env) {
+                        Ok((counter, packet)) => {
+                            if let Err(e) = socket.send(&packet).await {
+                                tracing::warn!(seq, counter, error = %e, "send control failed");
+                            } else {
+                                tracing::trace!(seq, counter, "control envelope sent");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(seq, error = %e, "encode control failed");
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(retx_at) => {
+                    let due = channel.next_due(Instant::now());
+                    for env in due {
+                        let seq = env.seq;
+                        match session.encode_control(&env) {
+                            Ok((counter, packet)) => {
+                                if let Err(e) = socket.send(&packet).await {
+                                    tracing::warn!(seq, counter, error = %e, "retransmit control failed");
+                                } else {
+                                    tracing::trace!(seq, counter, "control envelope retransmitted");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(seq, error = %e, "encode control retransmit failed");
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+fn dispatch_body(
+    handler: Option<&BodyHandler>,
+    body_type: u8,
+    body: &[u8],
+) -> AckStatus {
+    match handler {
+        Some(h) => h(body_type, body),
+        None => AckStatus::Unknown,
     }
 }
 
@@ -352,6 +569,7 @@ mod tests {
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
+            body_handler: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -425,6 +643,7 @@ mod tests {
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(20),
             rekey_interval: Duration::from_millis(200),
+            body_handler: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -459,6 +678,7 @@ mod tests {
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
+            body_handler: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -488,6 +708,7 @@ mod tests {
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
+            body_handler: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -501,5 +722,271 @@ mod tests {
         cancel.cancel();
         let res = tokio::time::timeout(Duration::from_secs(8), client_handle).await;
         assert!(res.is_ok(), "client did not stop within 8s of cancel");
+    }
+
+    /// Echo-style server that completes the chain handshake, acks every
+    /// heartbeat, decodes inbound `Control` envelopes, dispatches them
+    /// through a [`ControlChannel`] for dedup, and replies with a
+    /// `ControlAck` whose status reflects the body type. Lossy variants
+    /// drop a configurable fraction of inbound and outbound packets to
+    /// exercise the retransmit + dedup paths.
+    struct ControlTestServer {
+        addr:   SocketAddr,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl ControlTestServer {
+        async fn start_with_loss(server_keys: StaticKeyPair, loss_pct: u32) -> Self {
+            use ratatoskr::control_frame::{ControlBodyType, ControlEnvelope};
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let mut session: Option<Session> = None;
+                let mut channel = crate::chain::reliability::ControlChannel::new();
+                loop {
+                    let (n, from) = match sock.recv_from(&mut buf).await {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    // Inbound loss injection.
+                    if loss_pct > 0 && rand::random::<u32>() % 100 < loss_pct {
+                        continue;
+                    }
+                    let view = match wire::parse(&buf[..n]) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match view.packet_type {
+                        PacketType::Handshake1 => {
+                            let half = match Responder::process_handshake_1(
+                                &server_keys,
+                                &view,
+                            ) {
+                                Ok(h) => h,
+                                Err(_) => continue,
+                            };
+                            if let Ok((s, reply)) = half.complete() {
+                                let _ = sock.send_to(&reply, from).await;
+                                session = Some(s);
+                            }
+                        }
+                        PacketType::Heartbeat => {
+                            if let Some(s) = session.as_mut() {
+                                if let Ok(hb) = s.decode_heartbeat(&view) {
+                                    if let Ok((_, ack)) =
+                                        s.encode_heartbeat_ack(hb.counter, 0)
+                                    {
+                                        // Outbound loss injection.
+                                        if loss_pct > 0
+                                            && rand::random::<u32>() % 100 < loss_pct
+                                        {
+                                            continue;
+                                        }
+                                        let _ = sock.send_to(&ack, from).await;
+                                    }
+                                }
+                            }
+                        }
+                        PacketType::Control => {
+                            let Some(s) = session.as_mut() else { continue };
+                            let env: ControlEnvelope = match s.decode_control(&view) {
+                                Ok(e) => e,
+                                Err(_) => continue,
+                            };
+                            let seq = env.seq;
+                            let status = match channel.on_inbound(env) {
+                                InboundDisposition::Deliver(env) => {
+                                    match ControlBodyType::from_byte(env.body_type) {
+                                        Some(ControlBodyType::Noop) => AckStatus::Ok,
+                                        _ => AckStatus::Unknown,
+                                    }
+                                }
+                                InboundDisposition::Duplicate => AckStatus::Ok,
+                            };
+                            let ack = ControlAck { seq, status };
+                            if let Ok((_, packet)) = s.encode_control_ack(&ack) {
+                                if loss_pct > 0
+                                    && rand::random::<u32>() % 100 < loss_pct
+                                {
+                                    continue;
+                                }
+                                let _ = sock.send_to(&packet, from).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            Self { addr, handle }
+        }
+
+        async fn stop(self) {
+            self.handle.abort();
+            let _ = self.handle.await;
+        }
+    }
+
+    /// End-to-end happy path: enqueue 1000 `Noop` control envelopes via the
+    /// chain client handle, await all completion receivers, assert every
+    /// one resolved `Ok`. Exercises the full Noise + UDP + reliability path
+    /// with no loss injected.
+    ///
+    /// Uses a 200ms heartbeat (→ 1.2s no-ack deadline) rather than the 50ms
+    /// of other tests, so concurrent test execution can't starve the
+    /// heartbeat-ack path long enough to bail the session mid-burst.
+    #[tokio::test]
+    async fn control_send_handle_resolves_one_thousand_noop_envelopes() {
+        use ratatoskr::control_frame::ControlBodyType;
+        let server_keys = StaticKeyPair::generate().unwrap();
+        let client_keys = StaticKeyPair::generate().unwrap();
+        let server_pub = *server_keys.public_key();
+        let server = ControlTestServer::start_with_loss(server_keys, 0).await;
+
+        let cancel = CancellationToken::new();
+        let cfg = ChainClientConfig {
+            endpoint: server.addr.to_string(),
+            upstream_pubkey: server_pub,
+            local_keys: client_keys,
+            heartbeat_interval: Duration::from_millis(200),
+            rekey_interval: Duration::from_secs(120),
+            body_handler: None,
+        };
+        let client = ChainClient::new(cfg, cancel.clone());
+        let handle = client.handle();
+        let client_handle = tokio::spawn(async move { client.run().await });
+
+        // Wait for the handshake to complete: the very first send would
+        // race the handshake otherwise. A brief sleep is sufficient
+        // because `start_with_loss(_, 0)` never drops anything.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut receivers = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            let rx = handle
+                .send_control(ControlBodyType::Noop.as_byte(), vec![])
+                .expect("client task alive");
+            receivers.push(rx);
+        }
+
+        let deadline = Duration::from_secs(15);
+        let mut ok_count = 0usize;
+        let join_all = tokio::time::timeout(deadline, async {
+            for rx in receivers {
+                let r = rx.await.expect("oneshot delivered");
+                assert!(r.is_ok(), "send resolved with {r:?}");
+                ok_count += 1;
+            }
+            ok_count
+        })
+        .await
+        .expect("all 1000 sends should resolve within deadline");
+        assert_eq!(join_all, 1000);
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_handle).await;
+        server.stop().await;
+    }
+
+    /// Lossy variant: 10% packet drop in both directions. Retransmit +
+    /// dedup must converge to "all 1000 sends report `Ok`" within the
+    /// deadline. The retransmit budget is 5 attempts at 200ms→2s; under
+    /// 10% loss, the per-direction probability that all 5 attempts and
+    /// all 5 acks drop is `(0.1)^10 = 1e-10`, so the test is overwhelmingly
+    /// reliable even though `rand::random` is non-deterministic.
+    #[tokio::test]
+    async fn control_send_converges_under_10_percent_packet_loss() {
+        use ratatoskr::control_frame::ControlBodyType;
+        let server_keys = StaticKeyPair::generate().unwrap();
+        let client_keys = StaticKeyPair::generate().unwrap();
+        let server_pub = *server_keys.public_key();
+        // 10% loss in each direction.
+        let server = ControlTestServer::start_with_loss(server_keys, 10).await;
+
+        let cancel = CancellationToken::new();
+        let cfg = ChainClientConfig {
+            endpoint: server.addr.to_string(),
+            upstream_pubkey: server_pub,
+            local_keys: client_keys,
+            // Longer heartbeat interval so the ack-deadline (6× hb) outlasts
+            // multi-packet drop bursts.
+            heartbeat_interval: Duration::from_millis(200),
+            rekey_interval: Duration::from_secs(120),
+            body_handler: None,
+        };
+        let client = ChainClient::new(cfg, cancel.clone());
+        let handle = client.handle();
+        let client_handle = tokio::spawn(async move { client.run().await });
+
+        // Wait for handshake (which may itself need a retry on loss).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        const N: usize = 1000;
+        let mut receivers = Vec::with_capacity(N);
+        for _ in 0..N {
+            let rx = handle
+                .send_control(ControlBodyType::Noop.as_byte(), vec![])
+                .expect("client task alive");
+            receivers.push(rx);
+        }
+
+        let deadline = Duration::from_secs(30);
+        let outcomes = tokio::time::timeout(deadline, async {
+            let mut results = Vec::with_capacity(N);
+            for rx in receivers {
+                let r = rx.await.expect("oneshot delivered");
+                results.push(r);
+            }
+            results
+        })
+        .await
+        .expect("all 1000 sends should resolve within 30s under 10% loss");
+        let ok = outcomes.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(ok, N, "every send should converge to Ok under bounded loss");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_handle).await;
+        server.stop().await;
+    }
+
+    /// `ControlClientHandle::send_control` resolves with `ChannelClosed`
+    /// when the client task exits (cancellation) before processing the op.
+    /// This is the production "graceful shutdown" path.
+    #[tokio::test]
+    async fn pending_sends_resolve_when_session_ends() {
+        use ratatoskr::control_frame::ControlBodyType;
+        let server_keys = StaticKeyPair::generate().unwrap();
+        let client_keys = StaticKeyPair::generate().unwrap();
+        let server_pub = *server_keys.public_key();
+        let server = ControlTestServer::start_with_loss(server_keys, 0).await;
+
+        let cancel = CancellationToken::new();
+        let cfg = ChainClientConfig {
+            endpoint: server.addr.to_string(),
+            upstream_pubkey: server_pub,
+            local_keys: client_keys,
+            heartbeat_interval: Duration::from_millis(50),
+            rekey_interval: Duration::from_secs(60),
+            body_handler: None,
+        };
+        let client = ChainClient::new(cfg, cancel.clone());
+        let handle = client.handle();
+        let client_handle = tokio::spawn(async move { client.run().await });
+
+        // Wait for handshake.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Enqueue a send, then immediately cancel. The send's completion
+        // either arrives Ok (race won) or ChannelClosed (race lost). Both
+        // are acceptable; the contract is "never hangs".
+        let rx = handle
+            .send_control(ControlBodyType::Noop.as_byte(), vec![])
+            .expect("client task alive");
+        cancel.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(3), rx).await;
+        assert!(res.is_ok(), "rx must resolve within 3s of cancel");
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_handle).await;
+        server.stop().await;
     }
 }

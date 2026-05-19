@@ -7,17 +7,23 @@
 //! an upstream; mid-chain relays have both; the root relay has only a
 //! downstream.
 //!
-//! In Phase 1 the chain protocol on the wire is identical to the
-//! pre-existing Noise_IK heartbeat protocol. Future phases extend the
-//! tag space (TAG_CONTROL, TAG_CONTROL_ACK) for branch announcements,
-//! TLS material distribution, and other control-plane traffic.
-//!
 //! Module layout:
-//! * [`client`] — outbound side: dial upstream, run Noise_IK, send heartbeats.
-//! * The inbound side (server) currently lives under [`crate::heartbeat`]
-//!   and will be wrapped/moved here in a later phase. The migration is
-//!   gated on the new tag space landing.
+//! * [`client`] — outbound side: dial upstream, run Noise_IK, send heartbeats
+//!   and control frames.
+//! * [`reliability`] — per-session retransmit + dedup state machine that sits
+//!   between the Noise transport and the body-type dispatcher.
+//!
+//! The inbound (server) side of chain traffic currently lives under
+//! [`crate::heartbeat`] and will be wrapped/moved here in a later phase;
+//! that move was deliberately deferred so this phase only adds the new
+//! `TAG_CONTROL` / `TAG_CONTROL_ACK` dispatch arms without restructuring
+//! the existing single-downstream session machinery.
 
 pub mod client;
+pub mod reliability;
 
-pub use client::{ChainClient, ChainClientConfig};
+pub use client::{
+    BodyHandler, ChainClient, ChainClientConfig, ChainClientHandle, ChainClientShutDown,
+    ControlOp,
+};
+pub use reliability::{ControlChannel, InboundDisposition, SendError};

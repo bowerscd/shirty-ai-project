@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::wire::{self, PacketType, PacketView, SessionId};
+use crate::control_frame::{ControlAck, ControlEnvelope};
 
 /// Standard Noise pattern string used by all yggdrasil/huginn peers.
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -421,6 +422,37 @@ impl Session {
         Ok(view.counter.expect("verified by decode_packet"))
     }
 
+    /// Encode an outbound `Control` packet carrying a postcard-encoded
+    /// [`ControlEnvelope`] inside Noise AEAD.
+    pub fn encode_control(&mut self, envelope: &ControlEnvelope) -> Result<(u64, Vec<u8>)> {
+        let counter = self.transport.sending_nonce();
+        let plaintext = postcard::to_allocvec(envelope)?;
+        self.encode_packet(PacketType::Control, counter, &plaintext)
+            .map(|p| (counter, p))
+    }
+
+    /// Encode an outbound `ControlAck` packet carrying a postcard-encoded
+    /// [`ControlAck`] inside Noise AEAD.
+    pub fn encode_control_ack(&mut self, ack: &ControlAck) -> Result<(u64, Vec<u8>)> {
+        let counter = self.transport.sending_nonce();
+        let plaintext = postcard::to_allocvec(ack)?;
+        self.encode_packet(PacketType::ControlAck, counter, &plaintext)
+            .map(|p| (counter, p))
+    }
+
+    /// Decode an inbound `Control` packet into its envelope. Replay-rejects
+    /// like every post-handshake packet.
+    pub fn decode_control(&mut self, view: &PacketView<'_>) -> Result<ControlEnvelope> {
+        let plaintext = self.decode_packet(PacketType::Control, view)?;
+        postcard::from_bytes::<ControlEnvelope>(&plaintext).map_err(Error::from)
+    }
+
+    /// Decode an inbound `ControlAck` packet into its envelope.
+    pub fn decode_control_ack(&mut self, view: &PacketView<'_>) -> Result<ControlAck> {
+        let plaintext = self.decode_packet(PacketType::ControlAck, view)?;
+        postcard::from_bytes::<ControlAck>(&plaintext).map_err(Error::from)
+    }
+
     // ---- internals ----
 
     fn encode_packet(
@@ -613,5 +645,47 @@ mod tests {
             assert_eq!(hb.counter, counter);
         }
         assert!(prev.unwrap() >= 999);
+    }
+
+    #[test]
+    fn control_envelope_roundtrips_through_session() {
+        use crate::control_frame::{ControlBodyType, ControlEnvelope};
+        let (mut init, mut resp, _, _) = establish();
+        let env = ControlEnvelope {
+            seq: 1,
+            body_type: ControlBodyType::Noop.as_byte(),
+            body: b"hello chain".to_vec(),
+        };
+        let (counter, packet) = init.encode_control(&env).unwrap();
+        let view = wire::parse(&packet).unwrap();
+        assert_eq!(view.packet_type, PacketType::Control);
+        assert_eq!(view.counter, Some(counter));
+        let back = resp.decode_control(&view).unwrap();
+        assert_eq!(back, env);
+    }
+
+    #[test]
+    fn control_ack_roundtrips_through_session() {
+        use crate::control_frame::{AckStatus, ControlAck};
+        let (mut init, mut resp, _, _) = establish();
+        let ack = ControlAck { seq: 99, status: AckStatus::Reject(0xBEEF) };
+        let (counter, packet) = resp.encode_control_ack(&ack).unwrap();
+        let view = wire::parse(&packet).unwrap();
+        assert_eq!(view.packet_type, PacketType::ControlAck);
+        assert_eq!(view.counter, Some(counter));
+        let back = init.decode_control_ack(&view).unwrap();
+        assert_eq!(back, ack);
+    }
+
+    #[test]
+    fn control_decode_rejects_wrong_packet_type() {
+        use crate::control_frame::{AckStatus, ControlAck};
+        let (mut init, mut resp, _, _) = establish();
+        let ack = ControlAck { seq: 1, status: AckStatus::Ok };
+        let (_, packet) = init.encode_control_ack(&ack).unwrap();
+        let view = wire::parse(&packet).unwrap();
+        // Trying to decode a ControlAck as a Control should fail.
+        let err = resp.decode_control(&view).err();
+        assert!(matches!(err, Some(Error::Auth(_))));
     }
 }
