@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::chain::derive::{derive, DeriveConfig};
+use crate::chain::introspection::IntrospectionState;
 use crate::chain::tunnel_forwarder::TunnelForwarder;
 use crate::chain::tunnel_terminator::TunnelManager;
 use crate::proxy::supervisor::SupervisorHandle;
@@ -130,6 +131,14 @@ pub struct ChainAcceptor {
     ///
     /// See [`set_tunnel_forwarder`](ChainAcceptor::set_tunnel_forwarder).
     tunnel_forwarder: OnceLock<Arc<TunnelForwarder>>,
+    /// Late-bound chain-introspection sink. Phase 5B's
+    /// `/internal/derived-rules` HTTP endpoint reads from this. When
+    /// unset (e.g. tests, or relays where the introspection endpoint
+    /// is intentionally disabled), `handle_predicate_set_update`
+    /// silently skips the `record_apply` notification.
+    ///
+    /// See [`set_introspection`](ChainAcceptor::set_introspection).
+    introspection: OnceLock<Arc<IntrospectionState>>,
 }
 
 impl ChainAcceptor {
@@ -161,6 +170,7 @@ impl ChainAcceptor {
             local_pubkey,
             tunnel: OnceLock::new(),
             tunnel_forwarder: OnceLock::new(),
+            introspection: OnceLock::new(),
         }))
     }
 
@@ -183,6 +193,20 @@ impl ChainAcceptor {
         fwd: Arc<TunnelForwarder>,
     ) -> std::result::Result<(), Arc<TunnelForwarder>> {
         self.tunnel_forwarder.set(fwd)
+    }
+
+    /// Attach the chain-introspection sink. Must be called at most
+    /// once; further calls return the state back to the caller.
+    ///
+    /// Wiring is opt-in: relays that disable the introspection HTTP
+    /// endpoint simply never call this and the `record_apply` notify
+    /// in [`handle_predicate_set_update`](Self::handle_predicate_set_update)
+    /// degenerates to a no-op.
+    pub fn set_introspection(
+        &self,
+        ix: Arc<IntrospectionState>,
+    ) -> std::result::Result<(), Arc<IntrospectionState>> {
+        self.introspection.set(ix)
     }
 
     /// Decode + dispatch one [`ControlEnvelope`] body and return the
@@ -483,6 +507,15 @@ impl ChainAcceptor {
             "origin" => set.origin.to_string(),
         )
         .set(set.version as f64);
+
+        // Phase 5B: notify the introspection sink, if one is attached.
+        // This populates the `/internal/derived-rules` snapshot with the
+        // predicate set we just applied. Skipped silently when no sink
+        // is wired (tests, future opt-out).
+        if let Some(ix) = self.introspection.get() {
+            ix.record_apply(&set);
+        }
+
         AckStatus::Ok
     }
 

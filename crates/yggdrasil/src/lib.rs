@@ -140,7 +140,17 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
 
     // 4. Metrics exporter. Set up before anything emits metrics so the
     //    global recorder is the prometheus one and not the no-op fallback.
-    if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Relay).await {
+    //    The [`IntrospectionSlot`] is created up front and populated in
+    //    step 5b once the supervisor exists — see [`crate::chain::introspection`]
+    //    for the ordering rationale.
+    let introspection_slot = metrics::new_introspection_slot();
+    if let Err(e) = metrics::init(
+        config.metrics.listen,
+        ratatoskr::control::Mode::Relay,
+        Some(introspection_slot.clone()),
+    )
+    .await
+    {
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
@@ -161,6 +171,28 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     )
     .await
     .context("spawning proxy supervisor")?;
+
+    // 5a. Phase 5B introspection state. Constructed now that the
+    //     supervisor exists. The `/internal/derived-rules` endpoint
+    //     reads this lazily through `introspection_slot`.
+    //
+    //     `record_apply` writers:
+    //     * the chain acceptor (on a relay) — attached below.
+    //     * the predicate publisher (on a terminal) — does not apply
+    //       in `run_relay`; terminals install their own state in
+    //       [`crate::run_terminal`].
+    let introspection_state = crate::chain::IntrospectionState::new(
+        ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
+        config.chain.upstream.as_ref().map(|u| u.pubkey),
+        config.chain.downstream.as_ref().map(|d| d.pubkey),
+        supervisor.handle(),
+    );
+    if introspection_slot.set(introspection_state.clone()).is_err() {
+        // Slot was constructed fresh above; nobody else can have set
+        // it. If this ever fires, the orchestration layer has been
+        // reordered incorrectly.
+        anyhow::bail!("introspection slot set twice; orchestration ordering bug");
+    }
 
     // 5b. Chain acceptor — receive-side dispatcher for inbound
     //     `PredicateSetUpdate` envelopes. Built only when a listener is
@@ -192,6 +224,17 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     } else {
         None
     };
+
+    // 5c. Attach the introspection sink to the chain acceptor so the
+    //     `/internal/derived-rules` snapshot updates on every inbound
+    //     `PredicateSetUpdate` the relay accepts. Relays without a
+    //     chain listener never accept pushes, so they skip this wiring
+    //     — the snapshot's `predicates` array stays empty for the
+    //     daemon's lifetime, which is the correct semantic.
+    if let Some(acc) = chain_acceptor.as_ref() {
+        acc.set_introspection(introspection_state.clone())
+            .map_err(|_| anyhow::anyhow!("introspection set twice on acceptor"))?;
+    }
 
     // 6. Heartbeat (chain) listener — only when [chain.listener] is set.
     //    A pure-proxy relay (no downstream/listener, only an upstream) is
@@ -380,8 +423,16 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     //    the control server.
     let shutdown = CancellationToken::new();
 
-    // 3. Metrics exporter.
-    if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Terminal).await {
+    // 3. Metrics exporter. The [`IntrospectionSlot`] is created up
+    //    front and populated in step 4a once the supervisor exists.
+    let introspection_slot = metrics::new_introspection_slot();
+    if let Err(e) = metrics::init(
+        config.metrics.listen,
+        ratatoskr::control::Mode::Terminal,
+        Some(introspection_slot.clone()),
+    )
+    .await
+    {
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
@@ -434,6 +485,21 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     .await
     .context("spawning proxy supervisor")?;
 
+    // 4a. Phase 5B introspection state. Terminals have no inbound
+    //     chain listener, so `record_apply` is exclusively driven by
+    //     the predicate publisher's success branch. `downstream` is
+    //     always `None` here (terminals don't accept downstream
+    //     connections).
+    let introspection_state = crate::chain::IntrospectionState::new(
+        ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
+        config.chain.upstream.as_ref().map(|u| u.pubkey),
+        None,
+        supervisor.handle(),
+    );
+    if introspection_slot.set(introspection_state.clone()).is_err() {
+        anyhow::bail!("introspection slot set twice; orchestration ordering bug");
+    }
+
     // 5. UDS control surface. Terminal mode has no downstream identity, so
     //    peer-related endpoints return `not_supported_in_terminal_mode`.
     let control = ControlServer::bind(
@@ -454,6 +520,10 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     //     applied [`RuleSet`] upstream as a `PredicateSetUpdate` envelope.
     //     Pure-local terminals (no upstream) have no one to push to and
     //     this publisher is skipped.
+    //
+    //     The publisher carries the introspection state through so it
+    //     can update the `/internal/derived-rules` snapshot on each
+    //     successful upstream ack (Phase 5B).
     let predicate_publisher_join = chain_client_handle.as_ref().map(|handle| {
         let origin = ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key());
         let supervisor_handle = supervisor.handle();
@@ -462,6 +532,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
             handle.clone(),
             origin,
             config.server.state_dir.clone(),
+            Some(introspection_state.clone()),
             shutdown.clone(),
         )
     });

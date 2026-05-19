@@ -44,9 +44,13 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_listener_serves_health_and_metrics() {
     // 127.0.0.1:0 -> kernel picks a free port. init() returns the bound addr.
-    let addr = yggdrasil::metrics::init("127.0.0.1:0".parse().unwrap(), Mode::Terminal)
-        .await
-        .expect("metrics init");
+    let addr = yggdrasil::metrics::init(
+        "127.0.0.1:0".parse().unwrap(),
+        Mode::Terminal,
+        None,
+    )
+    .await
+    .expect("metrics init");
 
     // /healthz is unconditional — process is responding, so 200 ok.
     let resp = http_get(addr, "/healthz").await;

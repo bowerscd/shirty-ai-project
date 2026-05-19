@@ -22,6 +22,7 @@
 //! [`ControlBodyType::PredicateSetUpdate`]: ratatoskr::control_frame::ControlBodyType::PredicateSetUpdate
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::chain::client::{ChainClientHandle, ChainClientShutDown};
+use crate::chain::introspection::IntrospectionState;
 use crate::chain::predicate_extractor;
 use crate::chain::reliability::SendError;
 
@@ -67,14 +69,28 @@ const PUBLISH_ACK_DEADLINE: Duration = Duration::from_secs(30);
 /// [`VERSION_FILE`]). Loading errors are non-fatal: a corrupt or absent
 /// file resets the counter to `0` and emits a warn-level log so the
 /// operator notices.
+///
+/// `introspection` is the Phase 5B `/internal/derived-rules` sink: on
+/// every successful upstream-acked push the publisher calls
+/// [`IntrospectionState::record_apply`] with the predicate set we just
+/// shipped. Pass `None` when the terminal disables the introspection
+/// endpoint (the publisher then degenerates to its pre-5B behaviour).
 pub fn spawn(
     rules_rx: watch::Receiver<RuleSet>,
     chain_handle: ChainClientHandle,
     origin: PubKey,
     state_dir: PathBuf,
+    introspection: Option<Arc<IntrospectionState>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(rules_rx, chain_handle, origin, state_dir, cancel))
+    tokio::spawn(run(
+        rules_rx,
+        chain_handle,
+        origin,
+        state_dir,
+        introspection,
+        cancel,
+    ))
 }
 
 async fn run(
@@ -82,6 +98,7 @@ async fn run(
     chain_handle: ChainClientHandle,
     origin: PubKey,
     state_dir: PathBuf,
+    introspection: Option<Arc<IntrospectionState>>,
     cancel: CancellationToken,
 ) {
     let version_path = state_dir.join(VERSION_FILE);
@@ -126,6 +143,7 @@ async fn run(
                     next_version,
                     last_sent_predicates.as_deref(),
                     &chain_handle,
+                    introspection.as_deref(),
                     &cancel,
                 ).await {
                     version = applied.version;
@@ -173,6 +191,7 @@ async fn publish_one(
     next_version: u64,
     last_sent: Option<&[Predicate]>,
     chain_handle: &ChainClientHandle,
+    introspection: Option<&IntrospectionState>,
     cancel: &CancellationToken,
 ) -> Option<AppliedPush> {
     let outcome = predicate_extractor::extract(set, origin, next_version);
@@ -282,6 +301,13 @@ async fn publish_one(
             .increment(1);
             metrics::gauge!("yggdrasil_chain_predicate_version")
                 .set(predicate_set.version as f64);
+            // Phase 5B: notify the introspection sink with the set we
+            // just successfully pushed. `predicate_set` is moved into
+            // `AppliedPush` below, so we record_apply BEFORE the
+            // destructure.
+            if let Some(ix) = introspection {
+                ix.record_apply(&predicate_set);
+            }
             Some(AppliedPush {
                 version: predicate_set.version,
                 predicates: predicate_set.predicates,
@@ -479,6 +505,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            None,
             cancel.clone(),
         );
 
@@ -536,6 +563,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            None,
             cancel.clone(),
         );
 
@@ -577,6 +605,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            None,
             cancel.clone(),
         );
 
@@ -607,6 +636,7 @@ mod tests {
                 handle,
                 origin(),
                 state_dir.path().to_path_buf(),
+                None,
                 cancel.clone(),
             );
             tx.send(RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap())
@@ -632,6 +662,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            None,
             cancel.clone(),
         );
         tx.send(RuleSet::from_rules(vec![tcp_rule("beta", 9090)]).unwrap())

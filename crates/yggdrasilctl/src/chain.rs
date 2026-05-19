@@ -1,12 +1,15 @@
 //! `chain` scope — chain-control plane operations.
 //!
-//! Phase 4C adds `chain tunnel open`: a one-shot bidirectional stdio
+//! Phase 4C added `chain tunnel open`: a one-shot bidirectional stdio
 //! splice through the daemon's UDS. Internally it asks the daemon to
-//! open a tunnel toward `dest` at `pubkey` (which in v1 must equal
-//! the daemon's chain upstream), then hands the socket halves to two
-//! `tokio::io::copy` tasks against stdin / stdout. Suitable for
-//! scripting `(echo PAYLOAD; cat) | yggdrasilctl chain tunnel open`
-//! pipelines and for ssh ProxyCommand wiring.
+//! open a tunnel toward `dest` at `pubkey`, then hands the socket
+//! halves to two `tokio::io::copy` tasks against stdin / stdout.
+//! Suitable for scripting `(echo PAYLOAD; cat) | yggdrasilctl chain
+//! tunnel open` pipelines and for ssh ProxyCommand wiring.
+//!
+//! Phase 5 added multi-hop forwarding: `pubkey` may be any node on
+//! the chain (direct upstream, two hops up, etc.). The local daemon's
+//! upstream relay forwards to the next hop on `pubkey` mismatch.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -40,13 +43,12 @@ pub enum TunnelAction {
 
 #[derive(Debug, Args)]
 pub struct OpenArgs {
-    /// Tagged target pubkey, e.g. `x25519:0123…ef`. In v1 this must
-    /// equal the daemon's chain upstream (multi-hop forwarding is a
-    /// later phase); the daemon will return `tunnel_open_rejected`
-    /// otherwise.
+    /// Tagged target pubkey, e.g. `x25519:0123…ef`. May be any node on
+    /// this chain — the local daemon's upstream relay forwards the
+    /// open envelope onward until it reaches the target (Phase 5).
     #[arg(long)]
     pub pubkey: String,
-    /// Destination `host:port` the upstream relay should dial. Both
+    /// Destination `host:port` the target relay should dial. Both
     /// IPv4 and IPv6 (`[::1]:443`) are accepted.
     #[arg(long)]
     pub dest: SocketAddr,

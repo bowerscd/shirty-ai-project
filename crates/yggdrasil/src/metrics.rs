@@ -8,21 +8,25 @@
 //!
 //! ## HTTP endpoints
 //!
-//! The listener serves four routes — Prometheus exposition plus standard
-//! liveness / readiness probes — over a single port:
+//! The listener serves five routes — Prometheus exposition, standard
+//! liveness / readiness probes, and a loopback-only chain-introspection
+//! endpoint — over a single port:
 //!
-//! | Path       | Status               | Body                            |
-//! |------------|----------------------|---------------------------------|
-//! | `/metrics` | 200                  | Prometheus text exposition      |
-//! | `/healthz` | 200                  | `ok\n` — liveness (process up)  |
-//! | `/readyz`  | 200 or 503           | `ready\n` once [`crate::health::mark_ready`] has been called; `not ready\n` otherwise |
-//! | `/`        | 200                  | Plain-text index of the above   |
-//! | (other)    | 404                  | `not found\n`                   |
+//! | Path                       | Status               | Body                            |
+//! |----------------------------|----------------------|---------------------------------|
+//! | `/metrics`                 | 200                  | Prometheus text exposition      |
+//! | `/healthz`                 | 200                  | `ok\n` — liveness (process up)  |
+//! | `/readyz`                  | 200 or 503           | `ready\n` once [`crate::health::mark_ready`] has been called; `not ready\n` otherwise |
+//! | `/`                        | 200                  | Plain-text index of the above   |
+//! | `/internal/derived-rules`  | 200 / 403 / 404      | JSON snapshot of the local node's chain-applied predicates + derived rules + chain identity. Loopback-only; non-loopback peers get 403. Returns 404 when [`init`] was called without an [`IntrospectionState`]. See [`crate::chain::introspection`]. |
+//! | (other)                    | 404                  | `not found\n`                   |
 //!
-//! Bundling all four behind one listener keeps the operator-facing surface
-//! to a single port. Kubernetes `readinessProbe.httpGet.path: /readyz`,
-//! load-balancer pool members, `docker run --health-cmd="curl -fs
-//! .../readyz"`, etc. all work without any extra wiring.
+//! Bundling all routes behind one listener keeps the operator-facing
+//! surface to a single port. Kubernetes `readinessProbe.httpGet.path:
+//! /readyz`, load-balancer pool members, `docker run --health-cmd="curl
+//! -fs .../readyz"`, etc. all work without any extra wiring. The
+//! `/internal/*` prefix is reserved for operator-facing introspection
+//! that must never be reachable from outside the host.
 //!
 //! ## Metric catalogue
 //!
@@ -58,6 +62,7 @@
 //!   > N`.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -72,15 +77,43 @@ use tokio::net::TcpListener;
 
 use ratatoskr::control::Mode;
 
+use crate::chain::introspection::IntrospectionState;
 use crate::health;
 
+/// Late-bound holder for the chain-introspection state. The metrics
+/// listener has to come up *before* the proxy supervisor so the
+/// supervisor's startup-time gauges hit the real recorder; the
+/// [`IntrospectionState`], by contrast, needs the supervisor's handle
+/// to read `derived_rules`. We resolve the ordering tension by passing
+/// this empty slot into [`init`] and filling it in the orchestration
+/// layer ([`crate::run_relay`] / [`crate::run_terminal`]) once the
+/// supervisor exists.
+///
+/// HTTP requests to `/internal/derived-rules` that race the fill
+/// observe `None` and receive `503 Service Unavailable` until the slot
+/// is populated. In practice this window is a few milliseconds at
+/// startup.
+pub type IntrospectionSlot = Arc<OnceLock<Arc<IntrospectionState>>>;
+
+/// Construct a fresh [`IntrospectionSlot`]. The caller passes the slot
+/// to [`init`] *and* fills it later with [`OnceLock::set`].
+pub fn new_introspection_slot() -> IntrospectionSlot {
+    Arc::new(OnceLock::new())
+}
+
 /// Install the prometheus recorder, emit the startup gauges, and spawn the
-/// HTTP listener that serves `/metrics`, `/healthz`, `/readyz`, and `/`.
+/// HTTP listener that serves `/metrics`, `/healthz`, `/readyz`, `/`, and
+/// — when `introspection` resolves — the loopback-gated
+/// `/internal/derived-rules` chain-introspection endpoint.
 ///
 /// Must be called exactly once per process before any metric is emitted
 /// (otherwise that metric goes to the no-op recorder). Returns the actual
 /// bound address — primarily useful for tests that pass `127.0.0.1:0`.
-pub async fn init(listen: SocketAddr, mode: Mode) -> Result<SocketAddr> {
+pub async fn init(
+    listen: SocketAddr,
+    mode: Mode,
+    introspection: Option<IntrospectionSlot>,
+) -> Result<SocketAddr> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
         .with_context(|| "installing prometheus recorder")?;
@@ -113,7 +146,7 @@ pub async fn init(listen: SocketAddr, mode: Mode) -> Result<SocketAddr> {
     let listener = TcpListener::from_std(std_listener)
         .context("converting metrics listener to tokio")?;
 
-    tokio::spawn(accept_loop(listener, handle));
+    tokio::spawn(accept_loop(listener, handle, introspection));
 
     tracing::info!(
         listen = %bound,
@@ -123,7 +156,11 @@ pub async fn init(listen: SocketAddr, mode: Mode) -> Result<SocketAddr> {
     Ok(bound)
 }
 
-async fn accept_loop(listener: TcpListener, handle: PrometheusHandle) {
+async fn accept_loop(
+    listener: TcpListener,
+    handle: PrometheusHandle,
+    introspection: Option<IntrospectionSlot>,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(p) => p,
@@ -133,11 +170,20 @@ async fn accept_loop(listener: TcpListener, handle: PrometheusHandle) {
             }
         };
         let handle = handle.clone();
+        let introspection = introspection.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req: Request<Incoming>| {
                 let handle = handle.clone();
-                async move { Ok::<_, std::convert::Infallible>(route(req, &handle)) }
+                let introspection = introspection.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(route(
+                        req,
+                        &handle,
+                        introspection.as_ref(),
+                        peer,
+                    ))
+                }
             });
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 tracing::debug!(peer = %peer, error = %e, "metrics connection error");
@@ -146,7 +192,12 @@ async fn accept_loop(listener: TcpListener, handle: PrometheusHandle) {
     }
 }
 
-fn route(req: Request<Incoming>, handle: &PrometheusHandle) -> Response<Full<Bytes>> {
+fn route(
+    req: Request<Incoming>,
+    handle: &PrometheusHandle,
+    introspection: Option<&IntrospectionSlot>,
+    peer: SocketAddr,
+) -> Response<Full<Bytes>> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/metrics") => text_response(StatusCode::OK, handle.render()),
         (&Method::GET, "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
@@ -161,7 +212,60 @@ fn route(req: Request<Incoming>, handle: &PrometheusHandle) -> Response<Full<Byt
             StatusCode::OK,
             INDEX_BODY.to_string(),
         ),
+        (&Method::GET, "/internal/derived-rules") => {
+            internal_derived_rules(introspection, peer)
+        }
         _ => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
+    }
+}
+
+/// `/internal/derived-rules` handler. Gated to loopback peers — the
+/// endpoint exposes the operator's effective rule set (hostnames + ports)
+/// and must not leak across the trust boundary. Non-loopback peers see
+/// `403 Forbidden`. A 404 is returned when [`init`] was called without an
+/// introspection slot (e.g. an operator path that disables the
+/// endpoint). `503` is returned when the slot was passed but the
+/// orchestration layer has not yet filled it (brief startup window
+/// between `metrics::init` and supervisor construction).
+fn internal_derived_rules(
+    introspection: Option<&IntrospectionSlot>,
+    peer: SocketAddr,
+) -> Response<Full<Bytes>> {
+    if !peer.ip().is_loopback() {
+        tracing::warn!(
+            peer = %peer,
+            "non-loopback peer requested /internal/derived-rules; refusing"
+        );
+        return text_response(
+            StatusCode::FORBIDDEN,
+            "forbidden: /internal/* is loopback-only\n".to_string(),
+        );
+    }
+    let Some(slot) = introspection else {
+        return text_response(
+            StatusCode::NOT_FOUND,
+            "not found\n".to_string(),
+        );
+    };
+    let Some(ix) = slot.get() else {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "introspection state not yet initialised\n".to_string(),
+        );
+    };
+    match ix.render_json() {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .expect("static response build never fails"),
+        Err(e) => {
+            tracing::error!(error = %e, "render_json failed");
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error\n".to_string(),
+            )
+        }
     }
 }
 
@@ -176,8 +280,9 @@ fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
 const INDEX_BODY: &str = "\
 yggdrasil
 
-/metrics  Prometheus text exposition
-/healthz  Liveness probe — 200 while the process is responding
-/readyz   Readiness probe — 200 once all subsystems are bound, else 503
+/metrics                  Prometheus text exposition
+/healthz                  Liveness probe — 200 while the process is responding
+/readyz                   Readiness probe — 200 once all subsystems are bound, else 503
+/internal/derived-rules   Chain introspection JSON (loopback only)
 ";
 

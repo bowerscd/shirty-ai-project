@@ -176,6 +176,28 @@ impl SupervisorHandle {
     pub fn current_set_rx(&self) -> watch::Receiver<RuleSet> {
         self.current_set_rx.clone()
     }
+
+    /// Test-only constructor for unit tests that need a
+    /// [`SupervisorHandle`] without spinning up a full supervisor task.
+    /// The returned handle has a live `current_set_rx` (seeded with
+    /// `initial`) but a dead `apply_tx` — `apply_ruleset` will fail
+    /// with [`SupervisorShutDown`] on the first call.
+    #[cfg(test)]
+    pub(crate) fn __test_new(initial: RuleSet) -> (Self, watch::Sender<RuleSet>) {
+        let (apply_tx, _apply_rx) = mpsc::channel::<RuleSet>(1);
+        let (current_set_tx, current_set_rx) = watch::channel::<RuleSet>(initial);
+        // The receiver is intentionally dropped: tests that use this
+        // path do not call `apply_ruleset`. Holding the sender alive
+        // keeps the watch open until the test ends.
+        drop(_apply_rx);
+        (
+            Self {
+                apply_tx,
+                current_set_rx,
+            },
+            current_set_tx,
+        )
+    }
 }
 
 impl ProxySupervisor {

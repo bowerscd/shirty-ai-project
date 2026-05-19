@@ -32,6 +32,7 @@
 pub mod acceptor;
 pub mod client;
 pub mod derive;
+pub mod introspection;
 pub mod predicate_extractor;
 pub mod predicate_publisher;
 pub mod reliability;
@@ -45,6 +46,7 @@ pub use client::{
     ControlOp,
 };
 pub use derive::{derive, DeriveConfig, DeriveError};
+pub use introspection::{ChainSnapshot, IntrospectionSnapshot, IntrospectionState};
 pub use predicate_extractor::{extract, ExtractOutcome};
 pub use reliability::{ControlChannel, InboundDisposition, SendError};
 pub use tunnel_forwarder::{combined_tunnel_body_handler, TunnelForwarder};
