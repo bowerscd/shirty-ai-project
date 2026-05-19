@@ -2825,6 +2825,7 @@ dependencies = [
  "notify-debouncer-mini",
  "parking_lot",
  "pin-project-lite",
+ "postcard",
  "rand",
  "ratatoskr",
  "rcgen",

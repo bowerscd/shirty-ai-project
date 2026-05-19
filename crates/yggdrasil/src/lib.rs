@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
 
-use crate::chain::{ChainClient, ChainClientConfig};
+use crate::chain::{ChainClient, ChainClientConfig, ChainClientHandle};
 use crate::control::ControlServer;
 use crate::heartbeat::{HeartbeatServer, PeerState, UNENROLLED_PEER_KEY};
 use crate::pending_peers::PendingPeerStore;
@@ -167,7 +167,12 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     };
 
     // 5b. Outbound chain client — only when [chain.upstream] is set.
-    let chain_client_handle = spawn_chain_client(&config, &local_keys, shutdown.clone());
+    //     Phase 3B does not push predicates from relays; the handle is
+    //     therefore unused on this path. We still keep the chain client
+    //     spawned so mid-chain relays maintain their upstream session.
+    let chain_client = spawn_chain_client(&config, &local_keys, shutdown.clone());
+    let _chain_client_handle = chain_client.as_ref().map(|c| c.handle.clone());
+    let chain_client_join = chain_client.map(|c| c.join);
 
     // 6. Rule-driven proxy supervisor.
     let resolver_factory = ResolverFactory::new_relay(peer_state.clone());
@@ -215,7 +220,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     if let Some(handle) = hb_handle {
         let _ = handle.await;
     }
-    if let Some(handle) = chain_client_handle {
+    if let Some(handle) = chain_client_join {
         let _ = handle.await;
     }
     Ok(())
@@ -252,7 +257,9 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     // 3b. Outbound chain client — only when [chain.upstream] is set.
     //     A terminal node without an upstream is still useful (pure local
     //     proxy), so absence is not an error.
-    let chain_client_handle = spawn_chain_client(&config, &local_keys, shutdown.clone());
+    let chain_client = spawn_chain_client(&config, &local_keys, shutdown.clone());
+    let chain_client_handle = chain_client.as_ref().map(|c| c.handle.clone());
+    let chain_client_join = chain_client.map(|c| c.join);
 
     // 4. Rule-driven proxy supervisor with a terminal-mode factory: every
     //    rule must carry `upstream_addr`; `upstream_port` rules are
@@ -287,6 +294,22 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     .await
     .context("binding control socket")?;
 
+    // 5b. Predicate publisher — only when the chain client is present.
+    //     Watches the supervisor's `current_set` channel and pushes each
+    //     applied [`RuleSet`] upstream as a `PredicateSetUpdate` envelope.
+    //     Pure-local terminals (no upstream) have no one to push to and
+    //     this publisher is skipped.
+    let predicate_publisher_join = chain_client_handle.as_ref().map(|handle| {
+        let origin = ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key());
+        let supervisor_handle = supervisor.handle();
+        chain::predicate_publisher::spawn(
+            supervisor_handle.current_set_rx(),
+            handle.clone(),
+            origin,
+            shutdown.clone(),
+        )
+    });
+
     tracing::info!(
         control_socket = %control.socket_path().display(),
         "yggdrasil running"
@@ -300,7 +323,10 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
-    if let Some(handle) = chain_client_handle {
+    if let Some(handle) = predicate_publisher_join {
+        let _ = handle.await;
+    }
+    if let Some(handle) = chain_client_join {
         let _ = handle.await;
     }
     Ok(())
@@ -338,6 +364,14 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<StaticKeyPair> {
     }
 }
 
+/// Spawned chain client — the join handle plus a cloneable
+/// [`ChainClientHandle`] for callers that want to enqueue control
+/// envelopes (e.g. the predicate publisher on terminals).
+struct SpawnedChainClient {
+    join: tokio::task::JoinHandle<()>,
+    handle: ChainClientHandle,
+}
+
 /// Spawn the outbound chain client when `[chain.upstream]` is configured.
 /// Returns `None` when no upstream is set (a legitimate configuration for
 /// pure-proxy nodes and root relays).
@@ -345,7 +379,7 @@ fn spawn_chain_client(
     config: &config::ServerConfig,
     local_keys: &StaticKeyPair,
     shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<SpawnedChainClient> {
     let up = config.chain.upstream.as_ref()?;
     let upstream_pubkey = *up
         .pubkey
@@ -368,11 +402,13 @@ fn spawn_chain_client(
         "spawning chain client"
     );
     let client = ChainClient::new(cfg, shutdown);
-    Some(tokio::spawn(async move {
+    let handle = client.handle();
+    let join = tokio::spawn(async move {
         if let Err(e) = client.run().await {
             tracing::error!(error = %e, "chain client exited with error");
         }
-    }))
+    });
+    Some(SpawnedChainClient { join, handle })
 }
 
 async fn wait_for_shutdown() {

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -128,6 +129,53 @@ pub struct ProxySupervisor {
     /// Kept alive for the lifetime of the supervisor — drop tears down
     /// the underlying inotify watch.
     _cert_watcher: Arc<CertWatcher>,
+    /// Cloneable side of the external rule-set apply channel. Held here
+    /// so [`ProxySupervisor::handle`] can clone it for callers.
+    apply_tx: mpsc::Sender<RuleSet>,
+    /// Latest [`RuleSet`] applied by the supervisor (file-watch *or*
+    /// external push, whichever ran most recently). Subscribers receive a
+    /// new value after every successful apply; the supervisor itself owns
+    /// the sender, so receivers' `borrow()` always reflects the freshest
+    /// applied set.
+    current_set_rx: watch::Receiver<RuleSet>,
+}
+
+/// Cloneable cross-task handle for external callers that need to push
+/// new rule sets into a running supervisor (notably the chain control
+/// plane's predicate-receive path on relays, and the predicate-publisher
+/// task on terminals which only observes `current_set` rather than
+/// authoring pushes).
+#[derive(Debug, Clone)]
+pub struct SupervisorHandle {
+    apply_tx: mpsc::Sender<RuleSet>,
+    current_set_rx: watch::Receiver<RuleSet>,
+}
+
+/// Returned by [`SupervisorHandle::apply_ruleset`] when the supervisor
+/// task has exited (shutdown or panic).
+#[derive(Debug, thiserror::Error)]
+#[error("proxy supervisor is shut down")]
+pub struct SupervisorShutDown;
+
+impl SupervisorHandle {
+    /// Enqueue a new [`RuleSet`] for application. The supervisor computes
+    /// the diff against its current state internally and applies it on
+    /// its own task, identical to a file-watch reload. Returns once the
+    /// push is enqueued (not once it has been applied).
+    ///
+    /// Use [`SupervisorHandle::current_set_rx`] to observe when the
+    /// pushed set has been applied: the watch fires after each successful
+    /// apply.
+    pub async fn apply_ruleset(&self, set: RuleSet) -> Result<(), SupervisorShutDown> {
+        self.apply_tx.send(set).await.map_err(|_| SupervisorShutDown)
+    }
+
+    /// Subscribe to the supervisor's `current_set` watch. The receiver's
+    /// initial value is the empty default set; subsequent values are the
+    /// applied set after each successful reload (from any source).
+    pub fn current_set_rx(&self) -> watch::Receiver<RuleSet> {
+        self.current_set_rx.clone()
+    }
 }
 
 impl ProxySupervisor {
@@ -154,6 +202,14 @@ impl ProxySupervisor {
         let cancel = shutdown.child_token();
         let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Vec::<ProxySnapshot>::new());
 
+        // External-push channel. Capacity 8 lets the chain dispatcher
+        // burst a few coalesced sets back-to-back without blocking, while
+        // still applying backpressure if the supervisor falls catastrophically
+        // behind (which would be a bug worth surfacing).
+        let (apply_tx, apply_rx) = mpsc::channel::<RuleSet>(8);
+        let (current_set_tx, current_set_rx) =
+            watch::channel::<RuleSet>(RuleSet::default());
+
         let cert_store = Arc::new(CertStore::new());
         // Share the rule watcher's debounce window with the cert
         // watcher — operators expect both to coalesce on the same
@@ -169,6 +225,8 @@ impl ProxySupervisor {
         let main_cancel = cancel.clone();
         let main_handle = tokio::spawn(supervisor_loop(
             watcher,
+            apply_rx,
+            current_set_tx,
             resolver_factory,
             default_bind,
             cert_config,
@@ -186,6 +244,8 @@ impl ProxySupervisor {
             reload_trigger,
             cert_store,
             _cert_watcher: cert_watcher,
+            apply_tx,
+            current_set_rx,
         })
     }
 
@@ -244,11 +304,24 @@ impl ProxySupervisor {
     pub fn cert_store(&self) -> Arc<CertStore> {
         Arc::clone(&self.cert_store)
     }
+
+    /// Cloneable handle for external callers that need to push rule sets
+    /// into the supervisor or observe the most-recently-applied set.
+    /// Used by the chain control plane's predicate-receive path on relays
+    /// and the predicate-publisher task on terminals.
+    pub fn handle(&self) -> SupervisorHandle {
+        SupervisorHandle {
+            apply_tx: self.apply_tx.clone(),
+            current_set_rx: self.current_set_rx.clone(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn supervisor_loop(
     mut watcher: RuleWatcher,
+    mut apply_rx: mpsc::Receiver<RuleSet>,
+    current_set_tx: watch::Sender<RuleSet>,
     resolver_factory: ResolverFactory,
     default_bind: Option<IpAddr>,
     cert_config: CertConfig,
@@ -259,6 +332,11 @@ async fn supervisor_loop(
 ) {
     let mut active: HashMap<String, ActiveProxy> = HashMap::new();
     let mut redirect_listeners: HashMap<IpAddr, RedirectListener> = HashMap::new();
+    // Supervisor-owned source of truth. Both the file watcher and the
+    // external apply channel feed RuleSets in; we always compute the diff
+    // against this field so the two sources can coexist without their
+    // notions of "previous" diverging.
+    let mut current_set: RuleSet = RuleSet::default();
 
     loop {
         tokio::select! {
@@ -270,10 +348,16 @@ async fn supervisor_loop(
             update = watcher.recv() => {
                 match update {
                     Some(u) => {
-                        apply_update(
+                        // Watcher emits {set, diff}, but we ignore the diff
+                        // and recompute against `current_set` so external
+                        // pushes between file events are honoured.
+                        let RuleUpdate { set, diff: _ } = u;
+                        apply_set(
                             &mut active,
                             &mut redirect_listeners,
-                            u,
+                            &mut current_set,
+                            set,
+                            "file_watcher",
                             &resolver_factory,
                             default_bind,
                             &cert_config,
@@ -282,11 +366,40 @@ async fn supervisor_loop(
                             &cancel,
                         )
                         .await;
+                        let _ = current_set_tx.send(current_set.clone());
                         publish_snapshot(&active, &snapshot_tx, &cert_store);
                     }
                     None => {
                         tracing::warn!("rule watcher channel closed; supervisor exiting");
                         break;
+                    }
+                }
+            }
+            ext = apply_rx.recv() => {
+                match ext {
+                    Some(set) => {
+                        apply_set(
+                            &mut active,
+                            &mut redirect_listeners,
+                            &mut current_set,
+                            set,
+                            "external_push",
+                            &resolver_factory,
+                            default_bind,
+                            &cert_config,
+                            &cert_store,
+                            &cert_watcher,
+                            &cancel,
+                        )
+                        .await;
+                        let _ = current_set_tx.send(current_set.clone());
+                        publish_snapshot(&active, &snapshot_tx, &cert_store);
+                    }
+                    None => {
+                        // All SupervisorHandle clones dropped. Not an exit
+                        // condition by itself — we keep serving the file
+                        // watcher — but we won't get any further external
+                        // pushes. Continue without `ext` ever firing again.
                     }
                 }
             }
@@ -313,6 +426,48 @@ async fn supervisor_loop(
 struct ActiveProxy {
     handle: ProxyHandle,
     upstream_description: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_set(
+    active: &mut HashMap<String, ActiveProxy>,
+    redirect_listeners: &mut HashMap<IpAddr, RedirectListener>,
+    current_set: &mut RuleSet,
+    new_set: RuleSet,
+    source: &'static str,
+    resolver_factory: &ResolverFactory,
+    default_bind: Option<IpAddr>,
+    cert_config: &CertConfig,
+    cert_store: &Arc<CertStore>,
+    cert_watcher: &Arc<CertWatcher>,
+    parent_cancel: &CancellationToken,
+) {
+    // Compute the diff against the supervisor-owned current state, not
+    // whatever the input source thinks the previous state was. This is
+    // what lets file-watch and chain-push coexist on a single supervisor.
+    let diff = current_set.diff(&new_set);
+    tracing::debug!(
+        source = source,
+        added = diff.added.len(),
+        changed = diff.changed.len(),
+        removed = diff.removed.len(),
+        unchanged = diff.unchanged.len(),
+        "supervisor applying rule set"
+    );
+    let set = new_set.clone();
+    apply_update(
+        active,
+        redirect_listeners,
+        RuleUpdate { set, diff },
+        resolver_factory,
+        default_bind,
+        cert_config,
+        cert_store,
+        cert_watcher,
+        parent_cancel,
+    )
+    .await;
+    *current_set = new_set;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1061,5 +1216,73 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "expected duplicate-rule-name error");
+    }
+
+    /// External `SupervisorHandle::apply_ruleset` pushes a fresh
+    /// [`RuleSet`] into a running supervisor; the supervisor recomputes
+    /// the diff against its own `current_set` and applies it identically
+    /// to a file-watcher event.
+    #[tokio::test]
+    async fn external_apply_ruleset_swaps_active_proxies() {
+        let dir = tempfile::tempdir().unwrap();
+        // File-watcher sees no rule files; current_set starts empty.
+        let (factory, _peer) = relay_factory();
+        let shutdown = CancellationToken::new();
+        let sup = ProxySupervisor::spawn(
+            dir.path().to_path_buf(),
+            Duration::from_millis(50),
+            factory,
+            None,
+            CertConfig::default(),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Wait for the initial empty-file-set sync to land.
+        await_snapshot_len(&sup, 0).await;
+
+        // External push: one TCP rule.
+        let handle = sup.handle();
+        let port = free_port().await;
+        let rule = Rule {
+            name: "ext-alpha".to_string(),
+            listen: format!("127.0.0.1:{port}").parse().unwrap(),
+            protocol: Protocol::Tcp,
+            upstream_port: Some(9001),
+            upstream_addr: None,
+            upstream_host: None,
+            idle_timeout: None,
+            proxy_protocol: None,
+            routes: None,
+            cert_dir: None,
+        };
+        let set = RuleSet::from_rules(vec![rule]).unwrap();
+        handle.apply_ruleset(set.clone()).await.unwrap();
+
+        await_snapshot_len(&sup, 1).await;
+        let snaps = sup.snapshot();
+        assert_eq!(snaps[0].name, "ext-alpha");
+
+        // The current_set watch should also reflect the applied set.
+        let mut rx = handle.current_set_rx();
+        // Spin briefly: the watch send happens after the snapshot send.
+        for _ in 0..50 {
+            if rx.borrow_and_update().rules().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(rx.borrow().rules().len(), 1);
+        assert_eq!(rx.borrow().rules()[0].name, "ext-alpha");
+
+        // External push of an empty set tears down the proxy.
+        handle
+            .apply_ruleset(RuleSet::default())
+            .await
+            .unwrap();
+        await_snapshot_len(&sup, 0).await;
+
+        sup.stop().await;
     }
 }

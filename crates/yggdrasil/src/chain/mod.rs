@@ -14,6 +14,9 @@
 //!   between the Noise transport and the body-type dispatcher.
 //! * [`predicate_extractor`] — pure projection from a local [`RuleSet`] to a
 //!   [`PredicateSet`] suitable for pushing upstream.
+//! * [`predicate_publisher`] — terminal-side task: watches the supervisor's
+//!   `current_set` channel and pushes successive [`PredicateSet`]s to the
+//!   upstream via the chain client.
 //! * [`derive`] — pure projection from a received [`PredicateSet`] back to a
 //!   local [`RuleSet`] the relay can apply to its proxy supervisor.
 //!
@@ -29,6 +32,7 @@
 pub mod client;
 pub mod derive;
 pub mod predicate_extractor;
+pub mod predicate_publisher;
 pub mod reliability;
 
 pub use client::{

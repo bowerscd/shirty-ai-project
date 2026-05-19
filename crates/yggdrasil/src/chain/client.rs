@@ -124,6 +124,15 @@ impl ChainClientHandle {
             .map_err(|_| ChainClientShutDown)?;
         Ok(rx)
     }
+
+    /// Test-only constructor: wrap a pre-built sender so unit tests can
+    /// observe enqueued ops without running a full chain session. Not
+    /// part of the public API.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn __test_new(tx: mpsc::UnboundedSender<ControlOp>) -> Self {
+        Self { tx }
+    }
 }
 
 /// Driver: owns the config, the cancel token, and the control-send queue;
