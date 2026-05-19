@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -28,11 +29,13 @@ use ratatoskr::control::{
     PendingResponse, Request, Response, StatusResponse,
 };
 use ratatoskr::pubkey::PubKey;
+use ratatoskr::tunnel::TUNNEL_DATA_MAX_PAYLOAD;
 
-use crate::rules::ReloadTrigger;
+use crate::chain::tunnel_initiator::{OpenError, TunnelInitiator};
 use crate::heartbeat::PeerState;
 use crate::pending_peers::PendingPeerStore;
 use crate::proxy::supervisor::ProxySupervisor;
+use crate::rules::ReloadTrigger;
 
 /// Handle to a running control server.
 pub struct ControlServer {
@@ -63,6 +66,12 @@ struct ControlState {
     /// `[chain.downstream].pubkey` atomically (tmp + rename). Held even in
     /// terminal mode (unused; cheap to carry).
     config_path: PathBuf,
+    /// Initiator-side of the chain tunnel. `Some` only when this node
+    /// has a chain upstream configured (`[chain.upstream]`); without an
+    /// upstream we have nowhere to forward `TunnelOpen` envelopes, so
+    /// the `OpenChainTunnel` UDS request returns
+    /// [`error_codes::NO_CHAIN_UPSTREAM`].
+    tunnel_initiator: Option<Arc<TunnelInitiator>>,
 }
 
 impl ControlServer {
@@ -75,6 +84,13 @@ impl ControlServer {
     ///
     /// `peer_state` and `pending_store` are `None` in terminal mode. All
     /// `downstream ...` requests then return `not_supported_in_terminal_mode`.
+    ///
+    /// `tunnel_initiator` is `Some` only when the daemon has a chain
+    /// upstream configured (predicate publisher / chain tunnel both
+    /// depend on it). Pure-local terminals leave it `None`; the
+    /// `OpenChainTunnel` UDS request then returns
+    /// [`error_codes::NO_CHAIN_UPSTREAM`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         socket_path: impl Into<PathBuf>,
         mode: Mode,
@@ -82,6 +98,7 @@ impl ControlServer {
         supervisor: &ProxySupervisor,
         pending_store: Option<Arc<PendingPeerStore>>,
         config_path: PathBuf,
+        tunnel_initiator: Option<Arc<TunnelInitiator>>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -128,6 +145,7 @@ impl ControlServer {
             cert_store: supervisor.cert_store(),
             pending_store,
             config_path,
+            tunnel_initiator,
         });
 
         let main_cancel = cancel.clone();
@@ -191,37 +209,73 @@ async fn handle_connection(
     cancel: CancellationToken,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
 
     loop {
+        line.clear();
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
-            line = lines.next_line() => {
-                let line = match line.context("read control request")? {
-                    Some(s) => s,
-                    None => return Ok(()), // peer closed
-                };
-                let response = handle_request_text(&line, &state);
-                let mut buf = serde_json::to_vec(&response).context("encode response")?;
-                buf.push(b'\n');
-                writer.write_all(&buf).await.context("write response")?;
+            res = reader.read_line(&mut line) => {
+                let n = res.context("read control request")?;
+                if n == 0 {
+                    return Ok(()); // peer closed
+                }
+                let parsed: std::result::Result<Request, _> =
+                    serde_json::from_str(line.trim());
+                match parsed {
+                    Ok(Request::OpenChainTunnel { target_pubkey, dest }) => {
+                        // Hand the connection off to the tunnel bridge:
+                        // after this call returns the UDS half is dead
+                        // either way (success → splice consumed it;
+                        // failure → an `Error` response was written and
+                        // we close).
+                        return run_chain_tunnel_bridge(
+                            target_pubkey,
+                            dest,
+                            reader,
+                            writer,
+                            state,
+                            cancel,
+                        )
+                        .await;
+                    }
+                    Ok(req) => {
+                        let response = dispatch(req, &state);
+                        let mut buf =
+                            serde_json::to_vec(&response).context("encode response")?;
+                        buf.push(b'\n');
+                        writer.write_all(&buf).await.context("write response")?;
+                    }
+                    Err(e) => {
+                        let response = Response::Error {
+                            code: error_codes::INVALID_REQUEST.into(),
+                            message: format!("could not parse request as JSON: {e}"),
+                        };
+                        let mut buf =
+                            serde_json::to_vec(&response).context("encode response")?;
+                        buf.push(b'\n');
+                        writer.write_all(&buf).await.context("write response")?;
+                    }
+                }
             }
         }
     }
 }
 
-fn handle_request_text(line: &str, state: &ControlState) -> Response {
-    let req: Request = match serde_json::from_str(line.trim()) {
-        Ok(r) => r,
-        Err(e) => {
-            return Response::Error {
-                code: error_codes::INVALID_REQUEST.into(),
-                message: format!("could not parse request as JSON: {e}"),
-            }
-        }
-    };
-    dispatch(req, state)
+/// Single-line response writer used by the connection-hijack path. The
+/// non-hijack path inlines the equivalent two lines because keeping the
+/// error-flow ergonomics close to the surrounding loop matters more
+/// than the line count.
+async fn write_response(
+    writer: &mut OwnedWriteHalf,
+    response: &Response,
+) -> Result<()> {
+    let mut buf = serde_json::to_vec(response).context("encode response")?;
+    buf.push(b'\n');
+    writer.write_all(&buf).await.context("write response")?;
+    Ok(())
 }
 
 fn dispatch(req: Request, state: &ControlState) -> Response {
@@ -323,6 +377,18 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                 .collect();
             Response::Certs(CertsListResponse { certs })
         }
+        // `OpenChainTunnel` is handled by [`run_chain_tunnel_bridge`] in
+        // [`handle_connection`] before reaching this synchronous
+        // dispatch table: the bridge owns the socket halves and pumps
+        // raw bytes between the operator and the chain. If we ever
+        // reach this arm it means the connection-loop routing slipped.
+        Request::OpenChainTunnel { .. } => Response::Error {
+            code: error_codes::INTERNAL_ERROR.into(),
+            message: "internal routing error: OpenChainTunnel reached \
+                      the synchronous dispatcher (should have been \
+                      hijacked by handle_connection)"
+                .to_string(),
+        },
     }
 }
 
@@ -335,6 +401,184 @@ fn terminal_mode_unsupported(verb: &str) -> Response {
              (terminal daemons have no downstream identity)"
         ),
     }
+}
+
+/// Hijack the UDS connection for a chain tunnel.
+///
+/// Wire shape:
+/// 1. Caller has already written `Request::OpenChainTunnel { ... }\n` to
+///    the socket and is awaiting a single response line.
+/// 2. On success we write `Response::ChainTunnelOpened { stream_id }\n`
+///    once, then enter raw-bytes mode: bytes from the UDS reader are
+///    chunked and fed to [`TunnelInitiator::send_data`]; bytes coming
+///    back through the [`crate::chain::tunnel_initiator::InitiatorStream::inbound_rx`]
+///    are written directly to the UDS writer.
+/// 3. The connection closes when the operator closes their write half
+///    (EOF on the UDS reader) or when the upstream sends `TunnelClose`
+///    (the `close_rx` oneshot fires and the inbox drains).
+///
+/// On failure (no upstream / target mismatch / open rejected / open
+/// failed) we write a single `Response::Error { code, message }\n` and
+/// return; the connection then drops. No partial response is ever
+/// emitted: callers can rely on "exactly one JSON response line then
+/// either raw bytes or EOF".
+async fn run_chain_tunnel_bridge(
+    target_pubkey: PubKey,
+    dest: std::net::SocketAddr,
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    state: Arc<ControlState>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let initiator = match &state.tunnel_initiator {
+        Some(i) => i.clone(),
+        None => {
+            let err = Response::Error {
+                code: error_codes::NO_CHAIN_UPSTREAM.into(),
+                message: "this node has no chain upstream configured; \
+                          OpenChainTunnel is unavailable"
+                    .to_string(),
+            };
+            write_response(&mut writer, &err).await?;
+            return Ok(());
+        }
+    };
+
+    let stream = match initiator.open(target_pubkey, dest).await {
+        Ok(s) => s,
+        Err(OpenError::TargetNotUpstream { requested, upstream }) => {
+            let err = Response::Error {
+                code: error_codes::TUNNEL_OPEN_REJECTED.into(),
+                message: format!(
+                    "target_pubkey {requested} does not match this \
+                     node's chain upstream {upstream}; multi-hop \
+                     forwarding is not implemented in v1"
+                ),
+            };
+            write_response(&mut writer, &err).await?;
+            return Ok(());
+        }
+        Err(OpenError::Rejected(reason)) => {
+            let err = Response::Error {
+                code: error_codes::TUNNEL_OPEN_REJECTED.into(),
+                message: format!(
+                    "upstream rejected the tunnel open with reason \
+                     code 0x{reason:04x}"
+                ),
+            };
+            write_response(&mut writer, &err).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            let err = Response::Error {
+                code: error_codes::TUNNEL_OPEN_FAILED.into(),
+                message: format!("failed to open chain tunnel: {e}"),
+            };
+            write_response(&mut writer, &err).await?;
+            return Ok(());
+        }
+    };
+
+    let stream_id = stream.stream_id;
+    let ok = Response::ChainTunnelOpened { stream_id };
+    write_response(&mut writer, &ok).await?;
+    tracing::debug!(stream_id, target = %target_pubkey, dest = %dest, "chain tunnel opened; entering splice");
+
+    let crate::chain::tunnel_initiator::InitiatorStream {
+        mut inbound_rx,
+        close_rx,
+        ..
+    } = stream;
+
+    // Spawn the upload pump (operator stdin / UDS reader → tunnel).
+    // We hold the reader in the task because it's owned and we need
+    // raw `read()` semantics; the BufReader will drain its internal
+    // buffer first (any bytes the operator pipelined after the
+    // request line) before pulling from the underlying socket.
+    let upload_initiator = initiator.clone();
+    let upload_done = CancellationToken::new();
+    let upload_done_for_task = upload_done.clone();
+    let upload_join = tokio::spawn(async move {
+        let mut buf = vec![0u8; TUNNEL_DATA_MAX_PAYLOAD];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    tracing::debug!(stream_id, "upload: UDS read EOF");
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = upload_initiator
+                        .send_data(stream_id, buf[..n].to_vec())
+                        .await
+                    {
+                        tracing::warn!(
+                            stream_id,
+                            error = %e,
+                            "upload: send_data failed; aborting splice"
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(stream_id, error = %e, "upload: UDS read error");
+                    break;
+                }
+            }
+        }
+        upload_done_for_task.cancel();
+    });
+
+    // Main task: pump inbox → UDS writer, watching for the upload
+    // pump exiting (operator closed write half), an explicit
+    // `close_rx` from the peer, or daemon shutdown.
+    tokio::pin!(close_rx);
+    let mut peer_initiated_close = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = upload_done.cancelled() => break,
+            res = &mut close_rx => {
+                // Peer sent TunnelClose (or its registry slot was
+                // dropped). Drain whatever is still queued in the
+                // inbox so the operator sees the last bytes before
+                // the EOF.
+                peer_initiated_close = res.is_ok();
+                while let Ok(payload) = inbound_rx.try_recv() {
+                    if writer.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                break;
+            }
+            res = inbound_rx.recv() => match res {
+                Some(payload) => {
+                    if let Err(e) = writer.write_all(&payload).await {
+                        tracing::debug!(stream_id, error = %e, "download: UDS write error");
+                        break;
+                    }
+                }
+                None => {
+                    // Inbox closed without close_rx firing: should
+                    // only happen if the registry entry was removed
+                    // out from under us. Treat as a peer-initiated
+                    // close.
+                    peer_initiated_close = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Only emit our own TunnelClose if the peer didn't already.
+    if !peer_initiated_close {
+        initiator.close(stream_id, 0).await;
+    }
+    let _ = writer.shutdown().await;
+    upload_join.abort();
+    let _ = upload_join.await;
+    tracing::debug!(stream_id, "chain tunnel bridge exited");
+    Ok(())
 }
 
 fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
@@ -502,6 +746,7 @@ mod tests {
             supervisor,
             Some(pending),
             cfg,
+            None,
             shutdown,
         )
         .await

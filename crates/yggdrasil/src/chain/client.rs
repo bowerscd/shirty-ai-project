@@ -166,6 +166,19 @@ impl ChainClient {
         ChainClientHandle { tx: self.control_tx.clone() }
     }
 
+    /// Install (or replace) the per-envelope body handler.
+    ///
+    /// `ChainClientConfig::body_handler` is normally set at construction
+    /// time, but the chain-tunnel initiator needs the [`ChainClientHandle`]
+    /// (only available *after* `ChainClient::new`) in order to build its
+    /// dispatcher closure. This setter lets the caller construct the
+    /// initiator with the live handle and then register its body handler
+    /// before [`ChainClient::run`] is called. Idempotent; callers must
+    /// finish wiring before `run()` begins consuming the chain socket.
+    pub fn set_body_handler(&mut self, handler: BodyHandler) {
+        self.config.body_handler = Some(handler);
+    }
+
     /// Run forever until the cancel token fires. Returns `Ok(())` on clean
     /// shutdown. Inner session errors are logged and trigger backoff +
     /// reconnect, so this only returns when explicitly cancelled.

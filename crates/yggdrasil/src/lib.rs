@@ -252,6 +252,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     //     spawned so mid-chain relays maintain their upstream session.
     let chain_client = spawn_chain_client(&config, &local_keys, shutdown.clone());
     let _chain_client_handle = chain_client.as_ref().map(|c| c.handle.clone());
+    let chain_initiator = chain_client.as_ref().map(|c| c.initiator.clone());
     let chain_client_join = chain_client.map(|c| c.join);
 
     // 7. UDS control surface for `yggdrasilctl`.
@@ -262,6 +263,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         &supervisor,
         Some(pending_store.clone()),
         args.config.clone(),
+        chain_initiator,
         shutdown.clone(),
     )
     .await
@@ -322,6 +324,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     //     proxy), so absence is not an error.
     let chain_client = spawn_chain_client(&config, &local_keys, shutdown.clone());
     let chain_client_handle = chain_client.as_ref().map(|c| c.handle.clone());
+    let chain_initiator = chain_client.as_ref().map(|c| c.initiator.clone());
     let chain_client_join = chain_client.map(|c| c.join);
 
     // 4. Rule-driven proxy supervisor with a terminal-mode factory: every
@@ -352,6 +355,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
         &supervisor,
         None,
         args.config.clone(),
+        chain_initiator,
         shutdown.clone(),
     )
     .await
@@ -430,10 +434,16 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<StaticKeyPair> {
 
 /// Spawned chain client — the join handle plus a cloneable
 /// [`ChainClientHandle`] for callers that want to enqueue control
-/// envelopes (e.g. the predicate publisher on terminals).
+/// envelopes (e.g. the predicate publisher on terminals) and the
+/// [`TunnelInitiator`] wired as the client's body handler.
+///
+/// The initiator is `Some` whenever the chain client is spawned; it is
+/// passed into [`ControlServer::bind`] so the `OpenChainTunnel` UDS
+/// hijack can find a place to forward operator bytes.
 struct SpawnedChainClient {
     join: tokio::task::JoinHandle<()>,
     handle: ChainClientHandle,
+    initiator: Arc<crate::chain::TunnelInitiator>,
 }
 
 /// Spawn the outbound chain client when `[chain.upstream]` is configured.
@@ -465,14 +475,23 @@ fn spawn_chain_client(
         rekey_interval = ?up.rekey_interval,
         "spawning chain client"
     );
-    let client = ChainClient::new(cfg, shutdown);
+    let mut client = ChainClient::new(cfg, shutdown);
     let handle = client.handle();
+    // Build the tunnel initiator using the live handle, then install its
+    // body handler before `client.run()` begins draining the chain
+    // socket. The handler is a synchronous `Arc<dyn Fn>` so installing
+    // it after construction is just a pointer swap.
+    let initiator = crate::chain::TunnelInitiator::new(
+        handle.clone(),
+        ratatoskr::pubkey::PubKey::x25519(upstream_pubkey),
+    );
+    client.set_body_handler(initiator.body_handler());
     let join = tokio::spawn(async move {
         if let Err(e) = client.run().await {
             tracing::error!(error = %e, "chain client exited with error");
         }
     });
-    Some(SpawnedChainClient { join, handle })
+    Some(SpawnedChainClient { join, handle, initiator })
 }
 
 async fn wait_for_shutdown() {

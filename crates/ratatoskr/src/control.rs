@@ -18,10 +18,12 @@
 //! encounter a variant they don't recognise. Reusing a kind string with a
 //! different schema is forbidden.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::pubkey::PubKey;
 
 /// Runtime mode the daemon is operating in, surfaced in status responses.
 ///
@@ -72,6 +74,26 @@ pub enum Request {
     /// entry per `(rule, route)`. Each entry includes the resolved
     /// hostname, where the cert came from, and parsed metadata.
     CertsList,
+    /// Open a chain tunnel from this node toward `target_pubkey`, which
+    /// must terminate the tunnel at `dest` (a TCP `host:port`). This
+    /// request **hijacks the UDS connection**: once the server responds
+    /// with [`Response::ChainTunnelOpened`], no further newline-delimited
+    /// JSON is exchanged on the socket. Both sides switch to bidirectional
+    /// raw byte streaming, which the daemon bridges to
+    /// [`tunnel::TunnelData`](crate::tunnel::TunnelData) envelopes on the
+    /// chain control channel. Closing either half of the UDS triggers a
+    /// [`tunnel::TunnelClose`](crate::tunnel::TunnelClose) emission and
+    /// shutdown of the other half. There is no second JSON response.
+    ///
+    /// `target_pubkey` is the node where the tunnel terminates. Today the
+    /// only supported topology is `target_pubkey == this node's upstream`;
+    /// multi-hop forwarding is deferred.
+    OpenChainTunnel {
+        /// Pubkey of the node that should terminate the tunnel.
+        target_pubkey: PubKey,
+        /// Destination socket address on the terminating node.
+        dest: SocketAddr,
+    },
 }
 
 /// All possible server → client messages.
@@ -90,6 +112,15 @@ pub enum Response {
         fingerprint: String,
     },
     Certs(CertsListResponse),
+    /// Successful response to [`Request::OpenChainTunnel`]. The originator-
+    /// chosen `stream_id` is echoed so the operator can correlate logs.
+    /// After this object is sent, the daemon stops parsing newline-JSON on
+    /// the UDS connection and begins streaming tunnel bytes in both
+    /// directions; the client must do the same.
+    ChainTunnelOpened {
+        /// Stream id allocated by the daemon's initiator-side registry.
+        stream_id: u32,
+    },
     /// Generic failure. Always preserves the request kind for diagnostics.
     Error {
         /// e.g. "no_such_fingerprint", "config_write_failed", "unknown_request".
@@ -198,6 +229,19 @@ pub mod error_codes {
     /// identity. Peer-related commands (`peer show`, `peer pending`,
     /// `peer approve`) are not meaningful and return this code.
     pub const NOT_SUPPORTED_IN_TERMINAL_MODE: &str = "not_supported_in_terminal_mode";
+    /// The daemon has no chain upstream configured (no `[chain.upstream]`
+    /// section in its config), so it has no way to forward tunnel control
+    /// frames. `chain tunnel open` requests return this code.
+    pub const NO_CHAIN_UPSTREAM: &str = "no_chain_upstream";
+    /// The chain control channel rejected the tunnel-open envelope with a
+    /// reject reason from [`crate::tunnel::tunnel_reject`]. The reason
+    /// code is appended to the message text for the operator.
+    pub const TUNNEL_OPEN_REJECTED: &str = "tunnel_open_rejected";
+    /// The chain control channel failed to deliver the tunnel-open frame
+    /// (transport failure, retransmit budget exhausted, or upstream client
+    /// task gone). `chain tunnel open` returns this code; the operator can
+    /// retry.
+    pub const TUNNEL_OPEN_FAILED: &str = "tunnel_open_failed";
 }
 
 /// Default UDS path the server binds and the CLI connects to.
@@ -222,12 +266,40 @@ mod tests {
                 fingerprint: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
             },
             Request::CertsList,
+            Request::OpenChainTunnel {
+                target_pubkey: PubKey::x25519([0x42; 32]),
+                dest: "127.0.0.1:9100".parse().unwrap(),
+            },
         ];
         for r in cases {
             let s = serde_json::to_string(&r).unwrap();
             let back: Request = serde_json::from_str(&s).unwrap();
             assert_eq!(r, back);
         }
+    }
+
+    #[test]
+    fn open_chain_tunnel_request_uses_tagged_pubkey() {
+        let r = Request::OpenChainTunnel {
+            target_pubkey: PubKey::x25519([0x11; 32]),
+            dest: "10.0.0.1:443".parse().unwrap(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"kind\":\"open_chain_tunnel\""), "got: {s}");
+        assert!(s.contains("\"x25519:"), "expected tagged pubkey form, got: {s}");
+        assert!(s.contains("\"10.0.0.1:443\""), "expected dest in payload, got: {s}");
+    }
+
+    #[test]
+    fn chain_tunnel_opened_response_round_trip() {
+        let resp = Response::ChainTunnelOpened { stream_id: 0xC0DE_C0DE };
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(
+            s.contains("\"kind\":\"chain_tunnel_opened\""),
+            "got: {s}"
+        );
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(resp, back);
     }
 
     #[test]
