@@ -66,13 +66,15 @@ pub enum AckStatus {
 /// Body-type registry. The repr is the on-the-wire `ControlEnvelope.body_type`
 /// byte. New variants append; existing values never shift.
 ///
-/// Phase 2 deliberately ships only the [`Reserved`] sentinel and the
-/// [`Noop`] body, which is reserved for the internal reliability-layer
-/// round-trip tests (see `yggdrasil::chain` integration tests). Production
-/// code paths never enqueue [`Noop`].
+/// Phase 3 introduces [`PredicateSetUpdate`] for terminal→upstream rule
+/// pushes. The wire body for that variant is a postcard-encoded
+/// [`PredicateSet`]; reject reason codes live in
+/// [`predicate_reject`](crate::predicate::predicate_reject).
 ///
 /// [`Reserved`]: ControlBodyType::Reserved
 /// [`Noop`]: ControlBodyType::Noop
+/// [`PredicateSetUpdate`]: ControlBodyType::PredicateSetUpdate
+/// [`PredicateSet`]: crate::predicate::PredicateSet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ControlBodyType {
@@ -84,6 +86,15 @@ pub enum ControlBodyType {
     /// as zero bytes; receivers ack `Ok`. Production code paths never
     /// enqueue this body.
     Noop = 0x01,
+    /// Downstream → upstream push of the downstream's current
+    /// [`PredicateSet`]. Body is the postcard-encoded set. Receivers ack
+    /// `Ok` on accept, `Reject(code)` with a
+    /// [`predicate_reject`](crate::predicate::predicate_reject) code on
+    /// validation/version/policy failure, or `Unknown` if they don't yet
+    /// support predicate pushes.
+    ///
+    /// [`PredicateSet`]: crate::predicate::PredicateSet
+    PredicateSetUpdate = 0x02,
 }
 
 impl ControlBodyType {
@@ -93,6 +104,7 @@ impl ControlBodyType {
         Some(match byte {
             0x00 => Self::Reserved,
             0x01 => Self::Noop,
+            0x02 => Self::PredicateSetUpdate,
             _ => return None,
         })
     }
@@ -165,6 +177,11 @@ mod tests {
         assert_eq!(
             ControlBodyType::from_byte(0x01),
             Some(ControlBodyType::Noop),
+        );
+        assert_eq!(ControlBodyType::PredicateSetUpdate.as_byte(), 0x02);
+        assert_eq!(
+            ControlBodyType::from_byte(0x02),
+            Some(ControlBodyType::PredicateSetUpdate),
         );
         assert!(ControlBodyType::from_byte(0xFF).is_none());
     }

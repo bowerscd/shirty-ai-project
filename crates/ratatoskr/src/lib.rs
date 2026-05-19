@@ -17,6 +17,7 @@ pub mod control;
 pub mod control_frame;
 pub mod error;
 pub mod intro;
+pub mod predicate;
 pub mod pubkey;
 pub mod rule;
 pub mod wire;

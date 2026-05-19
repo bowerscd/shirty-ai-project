@@ -940,7 +940,24 @@ impl RuleSet {
             f.validate_each()?;
             rules.extend(f.rule);
         }
+        Self::from_rules_unchecked_individuals(rules)
+    }
 
+    /// Build a [`RuleSet`] from an already-constructed list of rules.
+    /// Each rule is individually validated, then cross-rule duplicate
+    /// detection runs. Used by the chain-control derive path, which
+    /// synthesises rules from received predicates rather than reading
+    /// them from `.toml` files.
+    pub fn from_rules(rules: Vec<Rule>) -> Result<Self> {
+        for r in &rules {
+            r.validate()?;
+        }
+        Self::from_rules_unchecked_individuals(rules)
+    }
+
+    // Cross-rule duplicate detection only — assumes each rule has already
+    // been individually validated.
+    fn from_rules_unchecked_individuals(rules: Vec<Rule>) -> Result<Self> {
         // Duplicate name check.
         {
             let mut seen = std::collections::HashSet::<&str>::new();

@@ -12,18 +12,29 @@
 //!   and control frames.
 //! * [`reliability`] — per-session retransmit + dedup state machine that sits
 //!   between the Noise transport and the body-type dispatcher.
+//! * [`predicate_extractor`] — pure projection from a local [`RuleSet`] to a
+//!   [`PredicateSet`] suitable for pushing upstream.
+//! * [`derive`] — pure projection from a received [`PredicateSet`] back to a
+//!   local [`RuleSet`] the relay can apply to its proxy supervisor.
 //!
 //! The inbound (server) side of chain traffic currently lives under
 //! [`crate::heartbeat`] and will be wrapped/moved here in a later phase;
 //! that move was deliberately deferred so this phase only adds the new
 //! `TAG_CONTROL` / `TAG_CONTROL_ACK` dispatch arms without restructuring
 //! the existing single-downstream session machinery.
+//!
+//! [`RuleSet`]: ratatoskr::rule::RuleSet
+//! [`PredicateSet`]: ratatoskr::predicate::PredicateSet
 
 pub mod client;
+pub mod derive;
+pub mod predicate_extractor;
 pub mod reliability;
 
 pub use client::{
     BodyHandler, ChainClient, ChainClientConfig, ChainClientHandle, ChainClientShutDown,
     ControlOp,
 };
+pub use derive::{derive, DeriveConfig, DeriveError};
+pub use predicate_extractor::{extract, ExtractOutcome};
 pub use reliability::{ControlChannel, InboundDisposition, SendError};
