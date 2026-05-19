@@ -1,125 +1,176 @@
 # yggdrasil
 
-A residential reverse proxy. Run **yggdrasil** on a VPS with a stable public IP; run **huginn** on your home server behind a dynamic IP and CGNAT. Inbound TCP and UDP from the internet are forwarded to your home box without you ever exposing it directly.
+A residential reverse proxy with a chain control plane. One binary, two modes:
 
-It is **not** a tunnel. There is no overlay network, no kernel module, no userspace TUN. Yggdrasil is a plain L4 reverse proxy that learns where to send traffic from authenticated heartbeats: huginn signs a heartbeat with its long-term key, yggdrasil verifies it and remembers the source IP, and any rules pointing at that peer route to whatever IP the heartbeat came from. When your residential IP changes, the next heartbeat updates the mapping.
+* **relay** — runs on a VPS with a stable public IP. Accepts inbound TCP and
+  UDP from the internet, forwards each rule to whatever current address its
+  downstream peer most recently authenticated from.
+* **terminal** — runs on a home box behind a dynamic IP / CGNAT. Dials a
+  relay upstream over UDP, sends authenticated heartbeats, publishes the
+  local rule set as a predicate set the relay derives its own listeners from.
+
+Both modes are the same `yggdrasil` binary; the difference is `[server].mode`
+plus whether `[chain.downstream]` or `[chain.upstream]` is configured. A
+deployment is a chain of one or more relays terminating in exactly one
+terminal — `home -> midbox -> vps` works the same way `home -> vps` does.
+
+It is **not** a tunnel. There is no overlay network, no kernel module, no
+userspace TUN. The L4 data plane learns where to send traffic from
+authenticated heartbeats; when the home box's residential IP changes, the
+next heartbeat updates the mapping and traffic keeps flowing.
 
 ## Get up and running
 
-These commands assume you have a VPS reachable from the public internet and a separate "home" machine where the upstream service runs.
+Two-host topology (relay on VPS, terminal at home). Walkthrough in
+[docs/quickstart.md](docs/quickstart.md); the shape is:
 
 ```bash
 # Build everything (one-time, on each host).
 cargo build --release --workspace
+
+# Install (on each host).
+sudo install -m 0755 target/release/{yggdrasil,yggdrasilctl} /usr/local/bin/
+sudo mkdir -p /etc/yggdrasil/conf.d /var/lib/yggdrasil /run/yggdrasil
 ```
 
-**On the VPS** (where `yggdrasil` will run):
+### Relay side (VPS)
 
 ```bash
-sudo install -m 0755 target/release/yggdrasil    /usr/local/bin/
-sudo install -m 0755 target/release/yggdrasilctl /usr/local/bin/
-sudo mkdir -p /etc/yggdrasil/conf.d /var/lib/yggdrasil /run/yggdrasil
-sudo yggdrasil keygen --identity-file /etc/yggdrasil/identity.key
+# Generate this node's long-term identity.
+sudo yggdrasilctl identity rotate
 
-# Minimal /etc/yggdrasil/config.toml
+# Minimal /etc/yggdrasil/config.toml — listener for inbound chain traffic.
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-heartbeat_listen = "0.0.0.0:51820"     # UDP, the only port huginn talks to
-rules_dir     = "/etc/yggdrasil/conf.d"
+mode = "relay"
 
-[control]
-socket = "/run/yggdrasil/control.sock"
+[chain.listener]
+listen = "0.0.0.0:51820"
 EOF
 ```
 
-**On the home box** (where `huginn` will run):
+### Terminal side (home)
 
 ```bash
-sudo install -m 0755 target/release/huginn /usr/local/bin/
-sudo mkdir -p /etc/huginn
-sudo huginn keygen --identity-file /etc/huginn/identity.key
+# Generate this node's long-term identity.
+sudo yggdrasilctl identity rotate
 
-# Seed a config so `huginn enroll` has something to update.
-sudo tee /etc/huginn/config.toml >/dev/null <<'EOF'
-[client]
-yggdrasil_endpoint   = "placeholder:1"
-yggdrasil_pubkey_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-identity_file        = "/etc/huginn/identity.key"
+# Minimal /etc/yggdrasil/config.toml — terminal mode, no listener.
+sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
+[server]
+mode = "terminal"
 EOF
-
-# Copy the huginn pubkey it printed and run, ON THE VPS:
-#     yggdrasil enroll-token --peer-pubkey <hex> \
-#         --endpoint <VPS_IP>:51820 -o huginn.token
-# Then scp huginn.token back to the home box and:
-sudo huginn enroll /tmp/huginn.token --config /etc/huginn/config.toml
 ```
 
-Add a forwarding rule on the VPS:
+### Enrol the terminal at the relay
+
+The enrolment handshake is two files exchanged out-of-band: an **intro** file
+the terminal emits (advertising its pubkey to the relay) and an **invite**
+file the relay emits in reply (committing both pubkeys plus the relay's
+reachable endpoint). The terminal applies the invite to populate
+`[chain.upstream]`; the relay's `identity add-downstream` step has already
+written `[chain.downstream]` locally.
 
 ```bash
-# /etc/yggdrasil/conf.d/ssh.toml — listens on :2222, forwards to home :22
+# Terminal: export an intro file.
+sudo yggdrasilctl identity export-intro --out /tmp/home.intro
+
+# Relay: accept the intro, mint an invite.
+sudo yggdrasilctl identity add-downstream \
+    --from /tmp/home.intro \
+    --my-endpoint vps.example.net:51820 \
+    --out /tmp/home.invite
+
+# Terminal: apply the invite (writes [chain.upstream]).
+sudo yggdrasilctl identity add-upstream --from /tmp/home.invite
+```
+
+Verify the printed fingerprints match what `identity show` reports on the
+opposite host before continuing — that's the security boundary.
+
+### Add a forwarding rule (terminal side)
+
+Rules live in `conf.d/*.toml` on the **terminal** node. The terminal's
+predicate publisher pushes them upstream; the relay derives matching
+listeners on its end.
+
+```bash
+# /etc/yggdrasil/conf.d/ssh.toml — terminal rule pointing at the local sshd.
 sudo tee /etc/yggdrasil/conf.d/ssh.toml >/dev/null <<'EOF'
 [[rule]]
 name          = "ssh"
 listen        = "0.0.0.0:2222"
 protocol      = "tcp"
-upstream_port = 22
+upstream_addr = "127.0.0.1:22"
 EOF
 ```
 
-Start both daemons (systemd unit files in [docs/install.md](docs/install.md), or just run in a screen for a smoke test):
+Start both daemons (`yggdrasil run`, or via the systemd unit in
+[docs/install.md](docs/install.md)). The relay derives a matching
+`0.0.0.0:2222` TCP listener from the published predicate; the terminal
+treats inbound chain TCP as connections destined for `127.0.0.1:22`.
+
+### Verify
 
 ```bash
-# VPS:
-sudo yggdrasil run
+# Relay:
+sudo yggdrasilctl local status
+# mode:                 relay
+# downstream_ip:        203.0.113.42        (the home box's public IP)
+# last_heartbeat:       423 ms ago
+# rule_count:           1                   (derived from terminal's predicate)
+# downstream_enrolled:  true
 
-# Home:
-sudo huginn run
+# Walk the chain and surface drift between published vs accepted predicates.
+sudo yggdrasilctl chain diff
+
+# From any host on the internet:
+ssh -p 2222 user@vps.example.net
 ```
-
-Verify it's working:
-
-```bash
-# VPS:
-sudo yggdrasilctl status
-# peer_ip:        203.0.113.42        (your home box's public IP)
-# last_heartbeat: 1234 ms ago
-
-# From any client on the internet:
-ssh -p 2222 user@<VPS_IP>
-```
-
-That's the whole thing. Drop more `*.toml` files into `conf.d/` for more rules; they're picked up live.
 
 ## Documentation
 
-- [docs/install.md](docs/install.md) — building, systemd units, file layout, upgrades
-- [docs/quickstart.md](docs/quickstart.md) — the walkthrough above in more depth
-- [docs/configuration.md](docs/configuration.md) — full schema reference for every config file
-- [docs/cli-reference.md](docs/cli-reference.md) — every subcommand and flag for `yggdrasil`, `huginn`, `yggdrasilctl`
-- [docs/operations.md](docs/operations.md) — day-to-day runbook (peer rotation, hot reload, metrics, troubleshooting)
-- [docs/architecture.md](docs/architecture.md) — why the design looks the way it does
-- [docs/security.md](docs/security.md) — threat model, crypto, enrollment-token format
-- [tests/e2e/run.sh](tests/e2e/run.sh) — full podman-compose stack exercising a real two-host topology (see [docker/compose.e2e.yml](docker/compose.e2e.yml))
+* [docs/install.md](docs/install.md) — building, filesystem layout, systemd
+* [docs/quickstart.md](docs/quickstart.md) — the walkthrough above in depth
+* [docs/configuration.md](docs/configuration.md) — every config field
+* [docs/cli-reference.md](docs/cli-reference.md) — every subcommand of
+  `yggdrasil` and `yggdrasilctl`
+* [docs/operations.md](docs/operations.md) — runbook (key rotation, hot
+  reload, metrics, `chain diff`, troubleshooting)
+* [docs/architecture.md](docs/architecture.md) — why the design looks the
+  way it does (chain plane, predicate projection, half-close)
+* [docs/security.md](docs/security.md) — threat model, crypto, intro/invite
+* [tests/e2e/run.sh](tests/e2e/run.sh) — 2-node podman-compose smoke
+* [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain smoke
 
 ## What's in the box
 
-| Binary          | Where it runs   | What it does                                                                 |
-| --------------- | --------------- | ---------------------------------------------------------------------------- |
-| `yggdrasil`     | VPS             | Listens for heartbeats, runs the proxy listeners defined in `conf.d/*.toml`. |
-| `huginn`     | Home box        | Sends authenticated heartbeats to yggdrasil at a fixed interval.               |
-| `yggdrasilctl`  | VPS (admin CLI) | Inspects status, manages peers, forces rule reloads. Talks to yggdrasil over a Unix socket. |
+| Crate           | Output                              | Role                                                     |
+| --------------- | ----------------------------------- | -------------------------------------------------------- |
+| `yggdrasil`     | bin `yggdrasil` (daemon)            | The proxy / chain node. Same binary in relay or terminal. |
+| `yggdrasilctl`  | bin `yggdrasilctl`                  | Admin CLI. Three scopes: `local`, `chain`, `identity`.    |
+| `ratatoskr`     | (lib only)                          | Shared protocol types, wire format, Noise_IK auth.        |
+| `loadgen`       | bin `loadgen` (workspace-internal)  | UDP/TCP load generator used by [bench/](bench/README.md). |
 
-The `ratatoskr` crate contains the shared wire formats and the `loadgen` crate is a benchmark tool used by [bench/](bench/README.md).
+There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 
 ## Threat model in one paragraph
 
-The VPS is untrusted with the home box's private contents but trusted with its IP address (the same trust property as DNS). Heartbeats are end-to-end encrypted under Noise_IK with mutual long-term key authentication, so a VPS operator cannot impersonate the home box, and a network attacker cannot redirect traffic to a different home box — but the VPS operator *can* observe and tamper with the proxied bytes (just like any reverse proxy operator). Run TLS or QUIC on top if you need confidentiality from the proxy itself. Full details in [docs/security.md](docs/security.md).
+The relay is untrusted with the terminal's private contents but trusted with
+its IP address (the same trust property as DNS). Chain traffic is end-to-end
+encrypted under Noise_IK with mutual long-term key authentication, so a relay
+operator cannot impersonate the terminal, and a network attacker cannot
+redirect traffic to a different terminal — but the relay operator *can*
+observe and tamper with the proxied bytes (just like any reverse proxy
+operator). Run TLS or QUIC on top if you need confidentiality from the relay
+itself. Full details in [docs/security.md](docs/security.md).
 
 ## Status
 
-The protocol, configuration formats, and CLI surface are stable enough to deploy in low-stakes self-hosted setups. Phase 11 added end-to-end benchmarks against nginx as a comparison baseline; see [bench/README.md](bench/README.md).
+The control protocol, configuration formats, and CLI surface are stable
+enough to deploy in low-stakes self-hosted setups.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.

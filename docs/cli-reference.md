@@ -1,22 +1,24 @@
 # CLI reference
 
-Every subcommand exposed by the three binaries, with its real flags and
+Every subcommand exposed by the two binaries, with its real flags and
 defaults. Where a flag also reads from an environment variable, that's
 called out.
 
 Conventions:
 
-- All three binaries accept `--help` / `-h` and `--version`.
-- Log format selectors are **global** flags (`--log-format json|pretty`)
-  available on every subcommand; the daemons default to `json`.
-- Paths default to the `/etc/...` layout from [install.md](install.md). Override
-  with `--config` or `--identity-file` for non-standard layouts.
+* Both binaries accept `--help` / `-h` and `--version`.
+* Log-format selectors are global flags (`--log-format json|pretty`); the
+  daemon defaults to `json`.
+* Paths default to the `/etc/...` layout from [install.md](install.md).
+  Override with `--config` or `--identity-file` for non-standard layouts.
 
 ---
 
 ## `yggdrasil`
 
-The reverse-proxy daemon. Runs on the VPS.
+The chain daemon. Same binary in relay and terminal modes; the mode is
+selected by `[server].mode` in the config file (or overridden with
+`--mode`).
 
 ### `yggdrasil run`
 
@@ -25,40 +27,13 @@ Start the daemon. The foreground process you'll wire into systemd.
 | Flag                | Env var                  | Default                              | Notes                                                                  |
 | ------------------- | ------------------------ | ------------------------------------ | ---------------------------------------------------------------------- |
 | `--config`          | `YGGDRASIL_CONFIG`       | `/etc/yggdrasil/config.toml`         | Path to the server config file.                                        |
-| `--rules-dir`       | `YGGDRASIL_RULES_DIR`    | (value from `config.toml`)           | Override `server.rules_dir` without editing the config — useful for tests. |
-| `--mode`            | —                        | (value from `config.toml`)           | Override `server.mode`. `relay` or `terminal`. No aliases.             |
-| `--bind`            | —                        | (value from `config.toml`)           | Override `server.default_bind`. Rewrites wildcard rule listens to this IP. |
+| `--rules-dir`       | `YGGDRASIL_RULES_DIR`    | (value from config)                  | Override `[server].rules_dir` without editing the config — useful for tests. |
+| `--mode`            | —                        | (value from config)                  | Override `[server].mode`. `relay` or `terminal`. No aliases.           |
+| `--bind`            | —                        | (value from config)                  | Override `[server].default_bind`. Hard-rewrites every rule's `listen` IP to this address. |
 
-Exits 0 on SIGTERM/SIGINT, non-zero on startup error (bad config, key not
-loadable, port already in use).
-
-### `yggdrasil keygen`
-
-Generate the server's long-term X25519 identity.
-
-| Flag              | Default                          | Notes                                                                |
-| ----------------- | -------------------------------- | -------------------------------------------------------------------- |
-| `--identity-file` | `/etc/yggdrasil/identity.key`    | Output path. Written with mode 0600.                                 |
-| `--force`         | (off)                            | Overwrite an existing file. Default refuses to clobber.              |
-
-Prints the pubkey (hex) and short fingerprint to stdout. The secret never
-leaves the file.
-
-### `yggdrasil enroll-token`
-
-Mint an out-of-band enrollment token for a huginn peer. Also stamps
-`peer.public_key_hex` into the yggdrasil config so the peer is "official"
-right away.
-
-| Flag              | Default                          | Notes                                                                                                  |
-| ----------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `--peer-pubkey`   | **required**                     | Hex-encoded X25519 pubkey of the huginn peer (64 chars).                                            |
-| `--endpoint`      | **required**                     | `host:port` huginn should heartbeat to. Embedded in the token.                                      |
-| `-o, --output`    | `huginn-enrollment.token`     | Where to write the binary token.                                                                       |
-| `--config`        | `/etc/yggdrasil/config.toml`     | Server config; used to look up the local identity and to write back `peer.public_key_hex`.             |
-| `--force`         | (off)                            | Overwrite `peer.public_key_hex` even if a different peer is already enrolled.                          |
-
-The token is **not** a secret — see [security.md](security.md#enrollment-token-format).
+The daemon exits 0 on SIGTERM/SIGINT, non-zero on startup error (bad
+config, identity not loadable, port already in use). Identity files at
+`[server].identity_file` are auto-generated on first start if missing.
 
 ### `yggdrasil version`
 
@@ -66,133 +41,199 @@ Print the build version. Identical to `yggdrasil --version`.
 
 ---
 
-## `huginn`
-
-The heartbeat client daemon. Runs on the home box.
-
-### `huginn run`
-
-Start the daemon. Connects to the configured `yggdrasil_endpoint`, performs
-the Noise_IK handshake, then sends a heartbeat every `heartbeat_interval`.
-
-| Flag        | Env var               | Default                          | Notes                       |
-| ----------- | --------------------- | -------------------------------- | --------------------------- |
-| `--config`  | `HUGINN_CONFIG`    | `/etc/huginn/config.toml`     | Client config path.         |
-
-Exits on SIGTERM/SIGINT; restarts handshake transparently if the server
-moves or rejects the session.
-
-### `huginn keygen`
-
-Generate the client's long-term X25519 identity.
-
-| Flag              | Default                          | Notes                                                                |
-| ----------------- | -------------------------------- | -------------------------------------------------------------------- |
-| `--identity-file` | `/etc/huginn/identity.key`    | Output path, mode 0600.                                              |
-| `--force`         | (off)                            | Overwrite an existing file.                                          |
-
-Prints the pubkey and short fingerprint. You'll paste the pubkey into the
-VPS operator's `yggdrasil enroll-token --peer-pubkey` invocation.
-
-### `huginn pubkey`
-
-Print the local pubkey (hex). Reads `--identity-file` if you haven't enrolled yet.
-
-| Flag              | Default                          | Notes                            |
-| ----------------- | -------------------------------- | -------------------------------- |
-| `--identity-file` | `/etc/huginn/identity.key`    |                                  |
-
-### `huginn fingerprint`
-
-Print the local short fingerprint (BLAKE2s-128 of the pubkey). Useful for
-out-of-band verification.
-
-| Flag              | Default                          |
-| ----------------- | -------------------------------- |
-| `--identity-file` | `/etc/huginn/identity.key`    |
-
-### `huginn enroll <token>`
-
-Apply an enrollment token. Reads the token, cross-checks the embedded
-`peer_public` against the local identity (catches "wrong token file"
-mistakes), and writes `client.yggdrasil_pubkey_hex` + `client.yggdrasil_endpoint`
-into the config.
-
-| Positional / flag    | Default                          | Notes                                                                                              |
-| -------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `<token>` (positional) | **required**                   | Path to the token file produced by `yggdrasil enroll-token`.                                       |
-| `--config`           | `/etc/huginn/config.toml`     | Config file to update in place.                                                                    |
-
-The config file must already exist with at least `[client]` and an `identity_file`
-key. `enroll` updates only two fields; placeholders in the other fields are
-preserved.
-
-### `huginn version`
-
-Print the build version.
-
----
-
 ## `yggdrasilctl`
 
-Admin CLI. Talks to a running `yggdrasil` over its Unix control socket. All
-subcommands are read-only by default — the only mutating one is `peer approve`.
+Admin CLI. Three scopes — `local`, `chain`, `identity` — selected as the
+first positional argument.
 
 ### Global flags
 
-| Flag       | Env var                   | Default                          | Notes                                                              |
-| ---------- | ------------------------- | -------------------------------- | ------------------------------------------------------------------ |
-| `--socket` | `YGGDRASIL_CONTROL_SOCKET`| `/run/yggdrasil/control.sock`    | Path to the daemon's control socket.                               |
-| `--json`   | —                         | (off)                            | Emit raw JSON responses. Otherwise human-readable text.            |
-
-### `yggdrasilctl status`
-
-High-level server status. Shows the current peer IP (from the most recent
-authenticated heartbeat), milliseconds since that heartbeat, rule count,
-uptime, and whether a peer is enrolled. In terminal mode the heartbeat-
-and peer-related fields are suppressed.
-
-### `yggdrasilctl rules list`
-
-Print loaded rules with their listen sockets and upstream targets.
-
-### `yggdrasilctl rules reload`
-
-Force a re-scan of `rules_dir`. The inotify watcher already handles most
-cases — use this when the filesystem stack doesn't deliver events
-(NFS, some FUSE filesystems, container bind mounts on macOS).
-
-### `yggdrasilctl certs list`
-
-List currently-loaded HTTPS certificates with their source (path,
-ephemeral, convention, or default) and load timestamp. HTTPS rules only.
-
-### `yggdrasilctl peer show`
-
-Print the currently-enrolled peer's pubkey and fingerprint.
-
-### `yggdrasilctl peer pending`
-
-List staged TOFU candidates — peers that have attempted a handshake but
-aren't yet enrolled in `config.toml`. See
-[operations.md → TOFU peer enrolment](operations.md#tofu-peer-enrolment).
-
-### `yggdrasilctl peer approve <fingerprint>`
-
-Approve a staged TOFU candidate. After approval the candidate is written
-into `config.toml` and the next heartbeat from that key will be accepted.
-
-| Positional        | Notes                                                                                |
-| ----------------- | ------------------------------------------------------------------------------------ |
-| `<fingerprint>`   | Short BLAKE2s-128 fingerprint (32 hex chars) shown by `peer pending`.                |
+| Flag       | Env var                   | Default                          | Notes                                                                                                |
+| ---------- | ------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--socket` | `YGGDRASIL_CONTROL_SOCKET`| `/run/yggdrasil/control.sock`    | Path to the daemon's control socket. Used by `local` and `chain` scopes.                              |
+| `--config` | `YGGDRASIL_CONFIG`        | `/etc/yggdrasil/config.toml`     | Path to the daemon's config file. Used by `identity` scope to mutate `[chain.*]` and resolve `identity_file`. |
+| `--json`   | —                         | (off)                            | Emit raw JSON responses where possible. Otherwise human-readable text.                                |
 
 ### Exit codes
 
 | Exit | Meaning                                                                            |
 | ---- | ---------------------------------------------------------------------------------- |
 | 0    | Success.                                                                           |
-| 1    | Local error — couldn't connect to the socket, timeout, malformed response.          |
+| 1    | Local error — couldn't connect to the socket, timeout, malformed response. For `chain diff`, this is also the "drift detected" exit code. |
 | 2    | Server returned a `Response::Error { code, message }`. Both are printed to stderr. |
+
+---
+
+## `yggdrasilctl local <cmd>` — daemon-local UDS commands
+
+### `local status`
+
+High-level server status. Shows the daemon's mode, currently-known
+downstream IP (relay mode only), milliseconds since the last accepted
+heartbeat, rule count, uptime, and downstream-enrolment flag. In terminal
+mode the heartbeat- and downstream-related fields are suppressed.
+
+### `local rules list`
+
+Print loaded rules with their listen sockets and resolved upstream
+targets.
+
+### `local rules reload`
+
+Force a re-scan of `[server].rules_dir`. The inotify watcher already
+handles most cases — use this when the filesystem stack doesn't deliver
+events (NFS, some FUSE filesystems, container bind mounts on macOS).
+
+### `local certs list`
+
+List currently-loaded HTTPS certificates with their hostname, source
+(path / ephemeral / convention / default), and load timestamp.
+
+### `local downstream show`
+
+Print the currently-enrolled downstream's tagged pubkey and fingerprint.
+
+### `local downstream pending`
+
+List staged TOFU candidates — peers that have attempted a handshake but
+aren't yet enrolled in `[chain.downstream]`.
+
+### `local downstream approve <fingerprint>`
+
+Approve a staged TOFU candidate. After approval the candidate is written
+into `[chain.downstream].pubkey` and the next heartbeat from that key is
+accepted.
+
+| Positional        | Notes                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| `<fingerprint>`   | Short BLAKE2s-128 fingerprint (32 hex chars) shown by `downstream pending`.          |
+
+---
+
+## `yggdrasilctl chain <cmd>` — chain-control plane commands
+
+### `chain tunnel open --pubkey <PK> --dest <HOST:PORT>`
+
+Open a one-shot bidirectional chain tunnel to `dest` at `pubkey`, then
+splice it against this process's stdin/stdout. Exits when either stdin
+closes or the peer closes the tunnel.
+
+| Flag        | Type           | Notes                                                                                                       |
+| ----------- | -------------- | ----------------------------------------------------------------------------------------------------------- |
+| `--pubkey`  | tagged pubkey  | Target node where the tunnel terminates. May be any node along the chain — the daemon's tunnel forwarder routes onward until the pubkey matches. |
+| `--dest`    | `host:port`    | Destination socket the terminator should dial after the tunnel arrives. Subject to the terminator's `[chain.tunnel]` allow-list. |
+
+Useful for `ssh -o ProxyCommand='yggdrasilctl chain tunnel open --pubkey
+… --dest …'` style wiring, or for one-shot pipelines like `echo PAYLOAD
+| yggdrasilctl chain tunnel open …`.
+
+### `chain apply --file <PATH>`
+
+Push a candidate `rules.toml` file into the running **terminal** daemon
+without writing to `[server].rules_dir` on disk. The CLI parses the file
+locally for early error messages with line context; the daemon
+re-validates server-side (per-rule + cross-rule uniqueness, listen /
+protocol conflicts) and rejects the apply as a unit on any conflict.
+
+Terminal mode only. Relay-mode daemons return
+`not_supported_in_relay_mode`.
+
+| Flag       | Type | Notes                                                                                              |
+| ---------- | ---- | -------------------------------------------------------------------------------------------------- |
+| `--file`   | path | Candidate rule file. Parsed via `ratatoskr::rule::RuleFile::from_toml` before shipping.            |
+
+On success, the predicate publisher emits a fresh `PredicateSetUpdate`
+on its next tick (if `[chain.upstream]` is set).
+
+### `chain diff`
+
+Walk the chain upward from the local node and surface drift between
+each terminal's published predicate set and what each upstream hop
+actually accepted. Each hop is reached over a chain tunnel to its
+loopback `/internal/derived-rules` HTTP endpoint.
+
+| Flag                | Type        | Default | Notes                                                                                                                   |
+| ------------------- | ----------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `--metrics-port`    | u16         | `9090`  | Port on each node's loopback where the metrics listener is bound. Assumed identical on every hop.                       |
+| `--max-hops`        | usize       | `8`     | Walk depth cap. A chain deeper than 8 is unusual; tune up only if you've explicitly designed one.                       |
+| `--per-hop-timeout` | `humantime` | `5s`    | Per-fetch deadline. Overall walk time is bounded by `max_hops * per_hop_timeout`.                                       |
+
+Exit codes: `0` if every hop is in sync (or all `Predicates::None` /
+origin-mismatch sentinels are documented expected drift), `1` if drift
+is detected on at least one hop, `2` for protocol-level errors.
+
+Human-readable output:
+
+```
+hop 0 (local x25519:abc…): predicates=2 v=12 origin=x25519:abc…
+  derived_rules: 2 active
+hop 1 (upstream x25519:def…): predicates=2 v=12 origin=x25519:abc…
+  in sync with hop 0
+hop 2 (upstream x25519:fff…): predicates=0
+  no predicates on this hop (under v1 only the immediate upstream of a
+  terminal carries the pushed set; deeper hops are reported for chain
+  identity only)
+
+in sync across 3 hop(s).
+```
+
+With `--json`, the same data is emitted as a structured `DiffReport`
+suitable for piping into `jq`.
+
+---
+
+## `yggdrasilctl identity <cmd>` — offline identity & enrollment
+
+All `identity` commands are file-based and run without contacting the
+daemon. Changes to `[chain.*]` take effect on the next daemon restart
+(chain endpoints are wired at startup; there is no hot-reload path for
+them).
+
+Identity-file resolution order:
+
+1. Explicit `--identity-file <PATH>` flag.
+2. `[server].identity_file` in `--config`, if the config file exists.
+3. Fallback `/etc/yggdrasil/identity.key`.
+
+### `identity show [--identity-file <PATH>]`
+
+Print this node's tagged pubkey and fingerprint.
+
+### `identity rotate [--identity-file <PATH>] [--force]`
+
+Generate a fresh X25519 keypair and write it to the identity file with
+mode 0600. Refuses to clobber an existing file unless `--force` is given.
+
+### `identity export-intro [--identity-file <PATH>] [--out PATH] [--note STR]`
+
+Emit an intro file (this node advertising itself as a downstream
+candidate). Defaults to `./intro.txt`. The intro contains the local
+pubkey + fingerprint + operator note. Not a secret.
+
+### `identity add-downstream --from <INTRO> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
+
+Apply an intro file received from a prospective downstream. Writes
+`[chain.downstream].pubkey = <downstream-pubkey>` into the daemon
+config and emits an invite file (default `./invite.txt`) containing
+both pubkeys plus `my_endpoint`. Hand-deliver the invite back to the
+downstream.
+
+### `identity add-upstream --from <INVITE> [--identity-file <PATH>]`
+
+Apply an invite file received from an upstream. Verifies the invite's
+`downstream_pubkey` matches the local identity (catches "wrong invite
+file" mistakes), then writes `[chain.upstream]` into the daemon config:
+the upstream's pubkey + endpoint.
+
+### `identity remove-upstream`
+
+Remove `[chain.upstream]` from the daemon config. Useful for re-enrolling
+against a new upstream.
+
+### `identity remove-downstream`
+
+Remove `[chain.downstream]` from the daemon config. The next downstream
+that handshakes lands in the pending-peer TOFU store.
 
 ---
 
@@ -204,14 +245,14 @@ for end-to-end usage; the per-subcommand surface is documented inline via
 
 Subcommands:
 
-- `udp` — steady-rate UDP RTT measurement (`--target`, `--flows`, `--pps`,
+* `udp` — steady-rate UDP RTT measurement (`--target`, `--flows`, `--pps`,
   `--packet-size`, `--duration`, `--warmup`).
-- `udp-churn` — sustained new-flow rate (`--target`, `--rate`, `--duration`).
-- `tcp` — TCP ping-pong RTT (`--target`, `--connections`, `--message-size`,
+* `udp-churn` — sustained new-flow rate (`--target`, `--rate`, `--duration`).
+* `tcp` — TCP ping-pong RTT (`--target`, `--connections`, `--message-size`,
   `--duration`, `--warmup`).
-- `tcp-throughput` — bulk TCP MB/s (`--target`, `--streams`, `--buffer-size`,
+* `tcp-throughput` — bulk TCP MB/s (`--target`, `--streams`, `--buffer-size`,
   `--duration`).
-- `tcp-connrate` — TCP connect/close rate (`--target`, `--concurrency`,
+* `tcp-connrate` — TCP connect/close rate (`--target`, `--concurrency`,
   `--duration`).
 
 All modes emit a stable JSON report to stdout, or to `--report-json <path>`.

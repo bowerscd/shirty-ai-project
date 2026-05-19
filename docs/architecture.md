@@ -6,77 +6,126 @@ or evaluating yggdrasil before deploying it. For day-to-day operations, see
 
 ## The problem in one paragraph
 
-You have a server with a public, static IP (the **VPS**). You have a box at
+You have a server with a public, static IP (the **relay**). You have a box at
 home with the application you want to expose, but its IP changes every time
-the ISP renews its DHCP lease. You want internet traffic to reach
-`vps.example.net:443` and end up at your home box's port 443 — without
-running TLS-MITM, without a custom client, without paying for a static
-residential IP. yggdrasil is a Linux daemon for the VPS side; huginn is
-its companion daemon for the home side.
-
-## High-level shape
-
-```
-                      authenticated UDP (Noise_IK)
-                  +------------------ heartbeats ------------------+
-                  |          source IP = current home IP           |
-                  v                                                |
-        +-----------------+                              +-----------------+
-clients |    yggdrasil    |   forwarded TCP / UDP        |   huginn     | home services
-------> | (VPS, public)   | ---------------------------> | (home, NAT'd)   | --------------> 22, 25565, ...
-        +-----------------+                              +-----------------+
-            ^      ^
-            |      |
-            |      +-- Prometheus /metrics
-            +-- yggdrasilctl over UDS
-```
-
-yggdrasil binds three things:
-
-1. **Heartbeat UDP socket** (`server.heartbeat_listen`). One per host.
-   Carries Noise_IK control traffic only — no application data.
-2. **Per-rule data-plane sockets**. Each `[[rule]]` in `conf.d/*.toml`
-   creates exactly one TCP listener or one UDP listener.
-3. **Unix control socket** (`control.socket`). Talks to `yggdrasilctl`.
-
-huginn binds nothing. It only opens an outbound UDP connection to
-`yggdrasil_endpoint`, performs the handshake, and sends heartbeats.
+the ISP renews its DHCP lease (the **terminal**). You want internet traffic
+to reach `vps.example.net:443` and end up at your home box's port 443 —
+without running TLS-MITM, without a custom client, without paying for a
+static residential IP. yggdrasil is a Linux daemon that runs at both ends
+(and at any number of intermediate hops) of a chain of authenticated UDP
+control sessions.
 
 ## Cast of characters
 
-The four binaries are named after pieces of the Norse world-tree myth.
-The metaphor is a navigation aid, not a load-bearing detail:
+There is exactly one daemon binary, `yggdrasil`, running in one of two modes
+selected by `[server].mode` and the `[chain.*]` sub-tables:
 
-- **yggdrasil** — the world-tree itself. The VPS-side daemon that
-  terminates listeners, forwards traffic, and roots the deployment in a
-  stable public address.
-- **huginn** — one of Odin's two ravens; a scout. The home-side daemon
-  that flies out to the world-tree at regular intervals (the heartbeat)
-  so yggdrasil always knows where home is.
-- **ratatoskr** — the squirrel that runs messages up and down the
-  world-tree. The shared library crate carrying the wire format,
-  authenticated session layer, control-plane messages, and rule schema
-  — the protocol everyone speaks.
-- **yggdrasilctl** — the operator's hand on the trunk. A local admin
-  CLI that talks to a running yggdrasil over its Unix socket.
+| Mode       | Accepts inbound chain traffic | Dials upstream | Typical role                               |
+| ---------- | ----------------------------- | -------------- | ------------------------------------------ |
+| `relay`    | Yes (when `[chain.listener]` set) | Optional   | Root VPS, or mid-chain forwarder.          |
+| `terminal` | No                            | Yes (required) | Home box / chain leaf.                     |
+
+The auxiliary binaries are:
+
+* **yggdrasilctl** — admin CLI. Three scopes: `local` (UDS, daemon-local
+  operations), `chain` (introspection across the chain), `identity`
+  (file-based identity + intro/invite handshake).
+* **ratatoskr** — shared library. Wire format, Noise_IK auth, control-plane
+  message types, rule schema, predicate schema, tunnel envelopes.
+* **loadgen** — benchmark generator under [bench/](../bench/).
+
+The metaphor is a navigation aid, not load-bearing: yggdrasil is the tree,
+ratatoskr is the squirrel who runs messages up and down it.
+
+## High-level shape — single-hop deployment
+
+```
+                      Noise_IK over UDP, heartbeats + control frames
+                +------------------------------------------------------+
+                |               source IP = terminal's current IP      |
+                v                                                      |
+        +-----------------+                                   +-----------------+
+clients |   yggdrasil     |   forwarded TCP / UDP             |   yggdrasil     | home services
+------> | (VPS, "relay")  | --------------------------------> | ("terminal")    | --------------> 22, 25565, ...
+        +-----------------+                                   +-----------------+
+            ^      ^
+            |      |
+            |      +-- Prometheus /metrics + /readyz + /healthz +
+            |          loopback-only /internal/derived-rules
+            +-- yggdrasilctl over UDS
+```
+
+Both nodes bind:
+
+1. **Chain listener** (relay only, when `[chain.listener]` is set). UDP.
+   Carries Noise_IK-protected control frames — heartbeats, predicate pushes,
+   tunnel envelopes. No application bytes.
+2. **Per-rule data-plane sockets**. Each rule (on the terminal: from
+   `conf.d/*.toml`; on the relay: derived from the terminal's published
+   predicate set) creates exactly one TCP listener or one UDP listener.
+3. **Unix control socket** (`[control].socket`). Talks to `yggdrasilctl`.
+4. **Metrics HTTP listener** (`[metrics].listen`). Prometheus + health +
+   `/internal/derived-rules`.
+
+The terminal additionally maintains an outbound UDP connection (the **chain
+client**) to its `[chain.upstream]` endpoint, performs the Noise_IK
+handshake, and runs the heartbeat / predicate-push tasks against it.
+
+## High-level shape — multi-hop chain
+
+```
+        clients                   +---------------+   forwarded TCP/UDP   +---------------+   forwarded TCP/UDP   +---------------+   loopback dial
+        ---------+--------------> |    vps        | --------------------> |    midbox     | --------------------> |    home       | ----------------> 127.0.0.1:22 etc.
+                                  | relay (root)  |                       | relay (mid)   |                       | terminal      |
+                                  +---------------+                       +---------------+                       +---------------+
+                                       ^                                       ^      ^                              |
+                                       |                                       |      |                              |
+                                       | predicates flow upward                |      | predicates flow upward      |
+                                       |  (terminal publishes its rule set;    |      |  ("home-tcp-echo" derived   |
+                                       |   v1 mid-relays do NOT re-project)    |      |   into a TCP listener on     |
+                                       |                                       |      |   midbox)                    |
+                                       |                                       |      |                              |
+                                       |          Noise_IK chain control       v      v                              |
+                                       +------------------ heartbeats ----------------------------------------------+
+```
+
+Chain orientation rule: for any node X, `upstream(X)` is the node X dials
+(and sends heartbeats to); `downstream(X)` is the node that dials X. The
+terminal has only an upstream; the root relay has only a downstream;
+mid-chain relays have both. v1 supports exactly one upstream and one
+downstream per node.
+
+`v1 relays do NOT re-project predicates upward.` A predicate set
+originating at a terminal lands on its immediate upstream and is derived
+into a `RuleSet` there. It is **not** aggregated and re-published on the
+next hop. This means `vps` in the three-hop diagram above runs zero rules
+(it sees no published predicates from `midbox`), and `chain diff` will
+legitimately report drift at the top hop. Predicate aggregation across
+intermediate hops is a deliberate v2 deferral.
 
 ## Crypto: Noise_IK
 
-The control channel uses **Noise_IK_25519_ChaChaPoly_BLAKE2s** via the
-`snow` crate. Same suite as WireGuard. Why this and not TLS:
+The chain control channel uses **Noise_IK_25519_ChaChaPoly_BLAKE2s** via
+the `snow` crate. Same suite as WireGuard. Why this and not TLS:
 
-- We don't need certificates or PKI. Both sides have a single long-term
-  X25519 keypair pinned in their config; the trust model is identical to
-  SSH `authorized_keys`. PKI buys us nothing and adds attack surface.
-- Noise_IK gives mutual authentication in one round-trip (two messages):
-  the responder learns the initiator's static key as part of message 1.
-- The transcript is short enough to fit in a single UDP datagram on either
-  side, so we don't have to invent a fragmentation/reassembly story.
+* No certificates or PKI. Both ends pin a single 32-byte X25519 public key
+  in their config. Same trust model as SSH `authorized_keys`.
+* Noise_IK gives mutual authentication in one round-trip (two messages):
+  the responder learns the initiator's static key in message 1.
+* The transcript fits in a single UDP datagram on either side, so we don't
+  need a fragmentation/reassembly story for the handshake.
 
 After the handshake completes both sides hold a `snow::TransportState`
-which we wrap as `Session` in `ratatoskr/src/auth.rs`. Every
-heartbeat is `Session::encode_heartbeat(now_ms, flags)` → a single AEAD-
-sealed UDP datagram; every ack is `Session::encode_heartbeat_ack`.
+which we wrap as `Session` in [`crates/ratatoskr/src/auth.rs`](../crates/ratatoskr/src/auth.rs).
+Every wire frame is `Session::encode_*` → a single AEAD-sealed UDP
+datagram; every ack is decoded with the matching `Session::decode_*`.
+
+Plaintext frame budget per datagram is
+`ratatoskr::wire::MAX_CONTROL_PLAINTEXT_LEN` (17 KiB), which accommodates
+the largest TunnelData payload (16 KiB) plus envelope overhead. The total
+UDP packet size, including preamble, counter, ciphertext, and AEAD tag,
+is `ratatoskr::wire::MAX_PACKET_LEN`. Buffers on production receive paths
+(heartbeat server, chain client) are sized to that constant.
 
 ### Replay protection
 
@@ -90,51 +139,90 @@ cleartext, prefixed to the AEAD ciphertext. The receiver:
    replaying a real packet plus a fake counter cannot ratchet us past
    genuine traffic.
 
-Strict-monotonic replay (rather than a window) is fine here because UDP
-delivery between the two endpoints is over a single path with one
-sender per session.
+Strict-monotonic replay (rather than a window) is fine here: UDP delivery
+between the two endpoints is over a single path with one sender per
+session, and the in-process retransmit layer (see "Reliability" below)
+handles loss above the crypto layer.
 
 ## Identity & enrollment
 
-Each side has one X25519 keypair, stored on disk as a 64-byte file (32
-secret + 32 public) with mode 0600. The pubkey is publishable; the secret
-is zeroized on drop.
+Each node has one X25519 keypair, stored on disk as a 64-byte file (32
+secret + 32 public) with mode 0600. Default path
+`/etc/yggdrasil/identity.key`, overridable via `[server].identity_file`.
+Auto-generated on first daemon start if missing. The pubkey is publishable;
+the secret is wrapped in `zeroize::Zeroizing` so it's wiped on drop.
 
-`fingerprint = BLAKE2s-128(pubkey)` rendered as 32 hex chars. Used for
-out-of-band display in TOFU flows.
+Tagged pubkey form `x25519:<hex>` is used everywhere on the operator surface
+and on the wire's TOML/JSON projections. Bare hex is rejected. The
+`postcard`-encoded wire form uses an enum-with-discriminator so future
+algorithms (`ed25519:…`, `pq:…`) can be added without breaking parsing.
 
-Two enrollment paths, both documented in detail in
-[quickstart.md](quickstart.md) and [security.md](security.md#enrollment-token-format):
+`fingerprint = BLAKE2s-128(pubkey)` rendered as 32 hex chars (no `x25519:`
+tag). Used for downstream TOFU approval and out-of-band confirmation.
 
-- **Out-of-band token** — operator runs `yggdrasil enroll-token` against
-  huginn's pubkey, transfers the resulting `*.token` file, huginn
-  applies it. The token contains both pubkeys and the endpoint hint;
-  it's not a secret.
-- **TOFU** — start yggdrasil with `peer.public_key_hex = ""`, let
-  huginn try to handshake, then `yggdrasilctl peer pending` /
-  `yggdrasilctl peer approve <fingerprint>` to admit the candidate after
-  out-of-band fingerprint verification.
+### Intro / invite handshake
+
+Enrolment is a two-file out-of-band ceremony driven by the `identity`
+scope of `yggdrasilctl`:
+
+1. **Downstream emits an intro.** On the would-be downstream:
+   `yggdrasilctl identity export-intro --out intro.txt`
+   writes the local pubkey + fingerprint + optional operator note.
+
+2. **Upstream issues an invite.** On the would-be upstream:
+   `yggdrasilctl identity add-downstream --from intro.txt
+   --my-endpoint vps.example.net:51820 --out invite.txt`
+   writes `[chain.downstream]` into the upstream's config (pinning the
+   downstream's pubkey) and emits an invite file containing both pubkeys
+   plus the upstream's reachable endpoint.
+
+3. **Downstream applies the invite.** Back on the downstream:
+   `yggdrasilctl identity add-upstream --from invite.txt`
+   verifies that the invite's `downstream_pubkey` matches the local
+   identity (catches "wrong invite file" mistakes) and writes
+   `[chain.upstream]` into the downstream's config (pinning the upstream's
+   pubkey + endpoint).
+
+The intro and invite files are not secrets. Both contain only public
+material; leaking them lets an attacker learn pubkeys and the upstream
+endpoint, neither of which lets them impersonate either side. The
+out-of-band fingerprint check after applying the invite is the security
+boundary; if you skip it, you trust whoever transported the files.
+
+### TOFU fallback
+
+If a downstream attempts a handshake whose pubkey isn't pinned in
+`[chain.downstream]`, the upstream stages it in the **pending peer
+store** and refuses traffic. The operator inspects candidates with
+`yggdrasilctl local downstream pending`, verifies the fingerprint
+out-of-band, and approves with `yggdrasilctl local downstream approve
+<fingerprint>`. Approval writes `[chain.downstream].pubkey` into the
+upstream's config.
+
+TOFU staging never accepts data on its own — it only collects candidates
+for human review.
 
 ## Heartbeats and the peer-IP source of truth
 
 `PeerState` (`crates/yggdrasil/src/heartbeat/peer_state.rs`) owns:
 
-- The configured peer static pubkey (live-swappable via
+* The pinned downstream static pubkey (live-swappable via
   `set_peer_static_key` so TOFU approval doesn't require a restart).
-- An `AtomicU64` for `last_heartbeat_ms` since process start.
-- A `tokio::sync::watch::Sender<Option<IpAddr>>` for the current peer IP.
+* An `AtomicU64` for `last_heartbeat_ms` since process start.
+* A `tokio::sync::watch::Sender<Option<IpAddr>>` for the downstream's
+  currently-observed IP.
 
 When `HeartbeatServer` processes a valid heartbeat, it calls
 `peer_state.record_heartbeat(src_addr)`. That call returns one of:
 
-- `SameIp(ip)` — most common. The watch channel **does not fire** because
-  we use `send_if_modified` which skips updates when the new value
-  equals the old one.
-- `FirstHeartbeat(ip)` — initial `None → Some(_)` transition. Watch fires.
-- `IpChanged { old, new }` — the home side rotated. Watch fires.
+* `SameIp(ip)` — most common. The watch channel **does not fire** because
+  we use `send_if_modified` which skips updates when the new value equals
+  the old one.
+* `FirstHeartbeat(ip)` — initial `None → Some(_)` transition. Watch fires.
+* `IpChanged { old, new }` — the downstream rotated. Watch fires.
 
-The data-plane code subscribes to the watch and reacts only when it
-fires. **This is the structural guarantee behind the heartbeat invariance
+The data-plane code subscribes to the watch and reacts only when it fires.
+**This is the structural guarantee behind the heartbeat invariance
 principle** — same-IP heartbeats can't even reach the drain path, so they
 can't possibly disturb in-flight UDP flows or TCP connections.
 
@@ -142,13 +230,15 @@ can't possibly disturb in-flight UDP flows or TCP connections.
 
 The single most important property in this codebase:
 
-> **Heartbeats with an unchanged peer IP MUST NOT disturb the data plane.**
+> **Heartbeats with an unchanged downstream IP MUST NOT disturb the data
+> plane.**
 
 If you're holding a stateful UDP session — a Factorio game, a Source-engine
-session, Mumble, WireGuard tunnelled through the proxy — and yggdrasil
+session, Mumble, WireGuard tunnelled through the proxy — and the relay
 gets a heartbeat with the same IP it saw last time, **nothing changes on
 the data plane**. No socket close, no flow rebind, no rekey of the proxy↔
-upstream pair. The heartbeat just refreshes `last_heartbeat_ms` and ACKs.
+upstream pair. The heartbeat just refreshes `last_heartbeat_ms` and
+acks.
 
 That invariance is tested by
 [`heartbeat_invariance_udp.rs`](../crates/yggdrasil/tests/heartbeat_invariance_udp.rs)
@@ -158,19 +248,22 @@ after.
 
 ## Data-plane: per-rule proxies
 
-Every `[[rule]]` becomes one `ProxyHandle` owned by `ProxySupervisor`
-(`src/proxy/supervisor.rs`). Two variants:
+Every `[[rule]]` (in `conf.d/*.toml` on the terminal, or derived from the
+predicate set on the relay) becomes one `ProxyHandle` owned by
+`ProxySupervisor` (`src/proxy/supervisor.rs`). Variants:
 
 ### TCP (`proxy/tcp.rs`)
 
 Plain async accept loop. On each new client connection:
 
-1. Snapshot `peer_state.current_ip()`. If `None`, drop the socket
-   immediately — listener stays up.
-2. Dial `(peer_ip, rule.upstream_port)`. Connection failures close the
-   client without sending bytes (no leaked half-open).
+1. Resolve the dial target. Relay mode: snapshot
+   `peer_state.current_ip()` (drop the socket immediately if `None`),
+   combine with `rule.upstream_port`. Terminal mode: read the rule's
+   `upstream_addr` or DNS-resolved `upstream_host` directly.
+2. Dial the target. Connection failures close the client without sending
+   bytes (no leaked half-open).
 3. Optionally write a PROXY-protocol v1/v2 header so the upstream service
-   sees the real client IP.
+   sees the real client IP. TCP-only; rejected on terminal-mode rules.
 4. `copy_bidirectional` between the two halves until either closes.
 
 `TCP_NODELAY` is on by default; game protocols (low-RTT pings) noticeably
@@ -180,35 +273,42 @@ benefit and bulk-byte workloads are unaffected.
 
 The interesting one — UDP has no inherent connection, so we build one.
 
-- One `Arc<UdpSocket>` per rule, bound to `rule.listen`. We deliberately
+* One `Arc<UdpSocket>` per rule, bound to `rule.listen`. We deliberately
   reuse the same kernel socket for outbound responses so the client sees
   the same source IP:port pair across the whole flow.
-- A `DashMap<SocketAddr, Arc<FlowEntry>>` keyed by client address. Each
-  `FlowEntry` owns a freshly-bound ephemeral UDP socket connected to
-  `(peer_ip, rule.upstream_port)`, plus an `AbortHandle` for the
-  `upstream_to_client_loop` task.
-- Inbound packets from a known client: update `last_seen_ms`, forward.
-  Unknown client: read `peer_state.current_ip()` (drop if `None`), bind
-  ephemeral socket, spawn the return-path task, insert atomically via
-  `DashMap::entry`, forward.
-- A reaper task wakes periodically and evicts flows older than the rule's
+* A `DashMap<SocketAddr, Arc<FlowEntry>>` keyed by client address. Each
+  `FlowEntry` owns a freshly-bound ephemeral UDP socket connected to the
+  resolved upstream, plus an `AbortHandle` for the `upstream_to_client_loop`
+  task.
+* Inbound packets from a known client: update `last_seen_ms`, forward.
+  Unknown client: resolve dial target (drop if `None` in relay mode),
+  bind ephemeral socket, spawn the return-path task, insert atomically
+  via `DashMap::entry`, forward.
+* A reaper task wakes periodically and evicts flows older than the rule's
   `idle_timeout` (default 60s, configurable per rule).
-- A separate **`ipchange_loop`** task subscribes to `peer_state.watch()`.
+* A separate **`ipchange_loop`** task subscribes to `peer_state.watch()`.
   When the channel fires (real IP change), it drains every flow:
   `flows.retain(|_, e| { e.upstream_task.abort(); false })`. Subsequent
-  client packets bind fresh sockets pointed at the new IP.
+  client packets bind fresh sockets pointed at the new IP. (Relay only;
+  terminal-mode rules dial fixed addresses and have no `ipchange_loop`.)
 
 The structural reason same-IP heartbeats are cheap is that the watch
 channel never fires for them — `ipchange_loop` is parked, the reaper is
 unaffected, and the frontend recv loop never even reads `peer_state` for
 known clients (it just hashes into `DashMap`).
 
-## Rules: hot reload
+### HTTPS (`proxy/http_frontend.rs`)
 
-`rules_dir` is watched via `notify-debouncer-mini` with a 250 ms
-debounce. The worker task:
+L7 frontend, relay-only. Terminates TLS, performs SNI-based virtual-host
+routing, and forwards each request as cleartext HTTP to a per-route
+backend URL. See [configuration.md → HTTPS rules](configuration.md#https-rules).
 
-1. On filesystem event → `load_dir(rules_dir)` → returns a fresh
+## Rules: hot reload (terminal-side)
+
+On the terminal, `[server].rules_dir` is watched via `notify-debouncer-mini`
+with a 250 ms debounce. The worker task:
+
+1. On filesystem event → `RuleSet::from_dir(rules_dir)` → returns a fresh
    `RuleSet` (validated, cross-file uniqueness checked).
 2. `previous.diff(&new) → RuleDiff { added, removed, changed, unchanged }`.
 3. **Unchanged rules are strictly untouched.** The supervisor doesn't
@@ -217,67 +317,190 @@ debounce. The worker task:
    heartbeat invariance.
 4. Validation failures keep the previous `RuleSet` live. There is no
    "partial apply" mode — half-good reloads are worse than no reload.
+5. The new `RuleSet` is fed to the **predicate publisher** (if
+   `[chain.upstream]` is set), which projects it through
+   `predicate_extractor::extract` and pushes the resulting `PredicateSet`
+   to the upstream chain client on its next tick.
 
-Force a re-scan with `yggdrasilctl rules reload` (for filesystems where
-inotify is unreliable).
+Force a re-scan with `yggdrasilctl local rules reload` (for filesystems
+where inotify is unreliable — NFS, FUSE, some container bind mounts).
+
+A pre-validated rule set can also be pushed directly without writing to
+disk via `yggdrasilctl chain apply --file rules.toml`. The daemon
+re-validates and feeds the result into the same supervisor pipeline. This
+is mostly useful for tests and ephemeral configurations; persistent rules
+should still live in `rules_dir`.
+
+## Chain control plane
+
+The chain plane is a Noise_IK-protected UDP control channel between
+adjacent nodes. It carries five frame body types defined as
+`ratatoskr::control_frame::ControlBodyType`:
+
+| Code | Body                | Direction          | Purpose                                                 |
+| ---- | ------------------- | ------------------ | ------------------------------------------------------- |
+| 0    | `Reserved`          | —                  | Wire reservation; never sent.                            |
+| 1    | `Noop`              | bi-directional     | Keep-alive / handshake test frame.                      |
+| 2    | `PredicateSetUpdate`| downstream → upstream | Terminal pushes a new `PredicateSet` to its upstream. |
+| 3    | `TunnelOpen`        | originator → terminator | Open a chain tunnel to `dest` at `target_pubkey`.   |
+| 4    | `TunnelData`        | bi-directional     | Forward bytes within an open tunnel stream.             |
+| 5    | `TunnelClose`       | bi-directional     | Half-close one direction of a tunnel stream.            |
+
+Each frame is acknowledged by the receiver. The reliability layer
+(`crates/yggdrasil/src/chain/reliability.rs`) sits between the Noise
+transport and the body-type dispatcher and provides:
+
+* Per-session monotonic sequence numbers (frames are encoded with a
+  body-side seq independent of the AEAD counter).
+* In-flight retransmit with exponential backoff until the matching ack
+  arrives.
+* Receiver-side dedup using a small sliding window.
+
+The retransmit + dedup machinery lets us treat the chain as a reliable
+ordered byte-channel above the per-datagram Noise layer.
+
+### Components
+
+```
+                            (terminal)                                       (relay)
+    rules_dir watcher
+            |
+            v
+    +-----------------+    PredicateSetUpdate frames    +-----------------+
+    | predicate_      | ------------------------------> | acceptor        |
+    | publisher       |                                 | (apply derived  |
+    +-----------------+                                 |  RuleSet)       |
+                                                        +-----------------+
+
+    +-----------------+    TunnelOpen / Data / Close    +-----------------+
+    | tunnel_         | -----------------------------> | tunnel_         |
+    | initiator       |                                 | forwarder       | (mid-chain)
+    | (originating    |                                 |   ||            |
+    |  yggdrasilctl)  |                                 |   v             |
+    +-----------------+                                 | tunnel_         |
+                                                        | terminator      | (target node)
+                                                        +-----------------+
+```
+
+* **`acceptor`** — relay-side dispatcher. Receives `PredicateSetUpdate`,
+  validates the version-monotonicity, runs `derive::derive` to project
+  it back into a local `RuleSet`, hands the result to the proxy
+  supervisor. Exposes the resulting derived rules through
+  `/internal/derived-rules` for `chain diff`.
+* **`predicate_publisher`** — terminal-side task. Subscribes to the
+  supervisor's `current_set` channel and emits `PredicateSetUpdate` on
+  the next tick after a real change.
+* **`tunnel_initiator`** — originator-side stream registry. Allocates a
+  `stream_id`, sends `TunnelOpen`, splices the UDS half against the
+  in-flight tunnel.
+* **`tunnel_forwarder`** — mid-chain. For tunnel frames whose
+  `target_pubkey` is not us, look up the (downstream, upstream) stream
+  binding and forward the body on the other side. Used at every hop
+  along a multi-hop tunnel.
+* **`tunnel_terminator`** — destination-side. For tunnel frames whose
+  `target_pubkey` is us, splice against a freshly-dialled TCP socket to
+  the `dest` address (subject to the `[chain.tunnel]` allow-list).
+* **`client`** — chain-client state machine. Owns the Noise handshake,
+  the heartbeat tick, and the dispatch of inbound body types to the
+  combined handler stack.
+
+### TCP-style half-close
+
+Tunnel streams behave like TCP: each direction is independently
+closeable; entries persist in the registry until **both** sides have
+closed. This shows up at every layer:
+
+* `tunnel_initiator::signal_close` only marks the local half closed; it
+  does not remove the registry entry. The entry is removed when the
+  reciprocal `TunnelClose` from the peer arrives.
+* `tunnel_forwarder::handle_close_from_downstream` is lookup-only — the
+  upstream-side `TunnelClose` still has to land before both halves of
+  the binding are released.
+* `tunnel_terminator::run_stream` joins reader + writer with
+  `tokio::join!` (not `select! + abort`) so a one-shot
+  request/response pattern doesn't get its response truncated when one
+  half completes ahead of the other.
+* On unknown stream ids, both the terminator and the initiator return
+  `Reject(STREAM_NOT_FOUND)` from `handle_close`. This is load-bearing:
+  the acceptor's combined dispatch and the
+  `combined_tunnel_body_handler` chain use `STREAM_NOT_FOUND` as the
+  fall-through signal between the terminator/initiator leg and the
+  forwarder leg. Returning an idempotent `Ok` here would silently
+  swallow upstream-initiated closes for forwarded streams.
+
+The half-close semantics are exercised end-to-end by
+[`tests/e2e/run-chain.sh`](../tests/e2e/run-chain.sh) milestone 5 (chain
+tunnel echo across 3 hops) and milestones 6/7 (`chain diff` walking
+upstream through forwarded tunnels).
+
+### Multi-hop tunnels
+
+`yggdrasilctl chain tunnel open --pubkey x25519:… --dest host:port` may
+target any node along the chain — direct upstream, two hops up, etc.
+The local daemon's `tunnel_initiator` sends the `TunnelOpen` envelope
+upstream; each intermediate `tunnel_forwarder` rewrites stream ids and
+forwards to the next hop until a node whose own pubkey matches
+`target_pubkey` terminates the tunnel via `tunnel_terminator`. Inbound
+data and closes flow back along the same path in reverse.
+
+Forwarders maintain a (downstream\_stream\_id, upstream\_stream\_id) map
+keyed by the local stream's allocation; the binding is removed only
+after both sides have observed a close. Stream-id allocation is local
+to each hop — there is no end-to-end stream namespace.
+
+### `/internal/derived-rules`
+
+A loopback-only HTTP endpoint exposed on the metrics listener. Returns a
+JSON snapshot of the node's chain-applied predicate set + derived rules
++ chain identity. Non-loopback peers receive 403. `chain diff` opens a
+chain tunnel to each upstream hop's loopback metrics port and queries
+this endpoint to surface drift between the local terminal's published
+predicates and what each upstream actually accepted.
 
 ## Control plane: yggdrasilctl over UDS
 
-`/run/yggdrasil/control.sock` is a Unix domain socket carrying newline-
-delimited JSON. We chose NDJSON specifically because it makes
+`/run/yggdrasil/control.sock` carries newline-delimited JSON. We chose
+NDJSON specifically because it makes
 `socat - UNIX-CONNECT:/run/yggdrasil/control.sock` and `jq` viable for
 debugging — no length-prefixed framing.
 
-Request/response definitions live in `crates/ratatoskr/src/control.rs`
-so `yggdrasilctl` and the server share the type surface verbatim.
+Request/response definitions live in
+[`crates/ratatoskr/src/control.rs`](../crates/ratatoskr/src/control.rs) so
+both sides of the wire share the type surface verbatim.
+
+`OpenChainTunnel` is special: after the daemon responds with
+`ChainTunnelOpened { stream_id }`, the UDS connection switches from
+newline-JSON mode into bidirectional raw-bytes mode. The CLI splices
+stdin/stdout against the socket; closing either half emits `TunnelClose`
+on the chain side.
 
 Filesystem permissions are the access boundary. Run yggdrasil as a
-dedicated user (e.g. `yggdrasil`), drop the socket directory's group
-permissions to `yggdrasil-admin` (or whatever group you use for
-administrators), and don't put untrusted users in that group.
+dedicated user, drop the socket directory's group to your admin group,
+and don't put untrusted users in that group.
 
 ## Process model
 
-Both daemons are single-process, multi-task tokio applications. There is
-no fork, no privileged child, no helper subprocess. Capabilities-wise:
+The daemon is single-process, multi-task tokio. There is no fork, no
+privileged child, no helper subprocess. Capabilities-wise:
 
-- yggdrasil needs `CAP_NET_BIND_SERVICE` if any rule listens on a port
-  < 1024 (e.g. `0.0.0.0:443`). The systemd unit in
+* yggdrasil needs `CAP_NET_BIND_SERVICE` if any derived rule listens on a
+  port < 1024 (e.g. `0.0.0.0:443`). The systemd unit in
   [install.md](install.md#systemd-units) grants this and nothing else.
-- huginn needs only the ability to open one outbound UDP socket.
-  Standard unprivileged user, no caps.
-
-Identity files are mode 0600 and owned by the daemon user. The
-in-process `StaticKeyPair` is `zeroize::Zeroizing` so the secret is wiped
-on drop even if a panic unwinds the stack.
-
-## Why one peer
-
-yggdrasil supports exactly **one** huginn peer per instance.
-Multi-peer is intentionally out of scope:
-
-- It would force per-rule peer selection ("rule X goes to peer A"), which
-  is a different product — a multi-tenant residential proxy.
-- A single PeerState lets us keep `current_ip` as one cheap atomic, and
-  lets the UDP proxy's `ipchange_loop` be a single global task rather
-  than per-rule.
-- Most home-lab users want one VPS pointing at one home box. The 80%
-  case is also the simple case.
-
-If you really need two upstream homes, run two yggdrasil instances on
-the same VPS bound to different `heartbeat_listen` ports.
+* Identity files are mode 0600 and owned by the daemon user. The
+  in-process `StaticKeyPair` uses `zeroize::Zeroizing` so the secret is
+  wiped on drop even if a panic unwinds the stack.
 
 ## Observability inventory
 
-Logs (both daemons): `tracing` JSON to stdout. Configure verbosity per
-`tracing-subscriber` env-filter via `YGGDRASIL_LOG` / `HUGINN_LOG`.
+Logs: `tracing` JSON to stdout. Configure verbosity per `tracing-subscriber`
+env-filter via `YGGDRASIL_LOG`.
 
-Metrics (yggdrasil only): Prometheus on `metrics.listen`, default
-`127.0.0.1:9090/metrics`. Full list in
-[operations.md → Prometheus metrics](operations.md#prometheus-metrics).
+Metrics: Prometheus on `[metrics].listen`, default `127.0.0.1:9090/metrics`.
+Full list in [operations.md → Prometheus metrics](operations.md#prometheus-metrics).
 
-Admin: `yggdrasilctl status / rules / peer`. Reference in
-[cli-reference.md](cli-reference.md#yggdrasilctl).
+Admin: `yggdrasilctl local {status,rules,downstream,certs}` plus
+`yggdrasilctl chain {tunnel open,apply,diff}`. Reference in
+[cli-reference.md](cli-reference.md).
 
 ## Build artefacts
 
@@ -286,7 +509,6 @@ Admin: `yggdrasilctl status / rules / peer`. Reference in
 | `ratatoskr`     | (lib only)                          | shared types + crypto  |
 | `yggdrasil`     | bin `yggdrasil` + lib               | depends on `ratatoskr` |
 | `yggdrasilctl`  | bin `yggdrasilctl`                  | depends on `ratatoskr` |
-| `huginn`        | bin `huginn`                        | depends on `ratatoskr` |
 | `loadgen`       | bin `loadgen` (workspace-internal)  | depends on nothing     |
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency. The
@@ -295,9 +517,10 @@ implementations.
 
 ## Where to look next
 
-- Wire format: `crates/ratatoskr/src/wire.rs`.
-- Authenticated session: `crates/ratatoskr/src/auth.rs`.
-- Heartbeat invariance test: `crates/yggdrasil/tests/heartbeat_invariance_udp.rs`.
-- UDP flow table: `crates/yggdrasil/src/proxy/udp.rs`.
-- Rule watcher: `crates/yggdrasil/src/rules/watcher.rs`.
-- Control-plane request/response: `crates/ratatoskr/src/control.rs`.
+* Wire format: [`crates/ratatoskr/src/wire.rs`](../crates/ratatoskr/src/wire.rs).
+* Authenticated session: [`crates/ratatoskr/src/auth.rs`](../crates/ratatoskr/src/auth.rs).
+* Chain plane components: [`crates/yggdrasil/src/chain/`](../crates/yggdrasil/src/chain/).
+* Heartbeat invariance test: [`crates/yggdrasil/tests/heartbeat_invariance_udp.rs`](../crates/yggdrasil/tests/heartbeat_invariance_udp.rs).
+* UDP flow table: [`crates/yggdrasil/src/proxy/udp.rs`](../crates/yggdrasil/src/proxy/udp.rs).
+* Multi-hop chain smoke: [`tests/e2e/run-chain.sh`](../tests/e2e/run-chain.sh).
+* Control-plane request/response: [`crates/ratatoskr/src/control.rs`](../crates/ratatoskr/src/control.rs).

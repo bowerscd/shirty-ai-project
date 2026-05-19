@@ -1,38 +1,44 @@
 # Configuration reference
 
-There are three config artefacts. All are TOML with `#[serde(deny_unknown_fields)]`,
-so a typo is a hard parse error — there are no silently-ignored keys.
+There are two config artefacts. Both are TOML with
+`#[serde(deny_unknown_fields)]`, so a typo is a hard parse error — there
+are no silently-ignored keys.
 
-| File                                  | Owner   | Purpose                                |
-| ------------------------------------- | ------- | -------------------------------------- |
-| `/etc/yggdrasil/config.toml`          | VPS     | Top-level yggdrasil daemon config.     |
-| `/etc/yggdrasil/conf.d/*.toml`      | VPS     | One or more files defining proxy rules.|
-| `/etc/huginn/config.toml`          | Home    | huginn heartbeat client config.     |
+| File                                  | Owner                | Purpose                                  |
+| ------------------------------------- | -------------------- | ---------------------------------------- |
+| `/etc/yggdrasil/config.toml`          | every node           | Top-level yggdrasil daemon config.       |
+| `/etc/yggdrasil/conf.d/*.toml`        | terminal nodes       | One or more files defining proxy rules.  |
 
-The defaults below are what you get when a field is omitted entirely.
-`humantime` values accept the usual `1h`, `30s`, `250ms`, etc.
+Relay nodes derive their rule set from a downstream terminal's published
+predicate set; they do not normally hold `conf.d/*.toml` files. (The
+relay's `[server].rules_dir` still has to be a valid path — pointing at
+an empty directory is fine.)
+
+Defaults below are what you get when a field is omitted. `humantime`
+values accept the usual `1h`, `30s`, `250ms`, etc. Public keys use the
+tagged textual form `<algo>:<hex>` everywhere (`x25519:6c5a…0ff1`); bare
+hex is rejected on parse.
 
 ## `/etc/yggdrasil/config.toml`
 
 ### `[server]` — required
 
-| Key                | Type                | Default                          | Notes                                                                                          |
-| ------------------ | ------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `mode`             | `"relay"`/`"terminal"` | `relay`                      | `relay` runs heartbeats + forwards traffic to a huginn peer. `terminal` skips heartbeats and forwards to literal `upstream_addr` targets (useful for the home-side leg of a two-hop chain). |
-| `heartbeat_listen` | `host:port`         | **required for relay**           | UDP only. The single socket huginn talks to. Public-facing. Must be omitted in terminal mode. |
-| `rules_dir`        | path                | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
-| `default_bind`     | IP                  | unset                            | If set, rewrites a rule’s wildcard `0.0.0.0`/`[::]` listen to this address. Explicit rule listens are untouched. |
-| `state_dir`        | path                | `/var/lib/yggdrasil`             | Persistent per-host state — TOFU candidates, last-known peer IP cache.                         |
-| `identity_file`    | path                | `/etc/yggdrasil/identity.key`    | Long-term X25519 secret. Mode 0600.                                                            |
-| `cert_dir`         | path                | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the “convention” cert-source rung (`<cert_dir>/<hostname>.{crt,key}`). |
-| `default_cert`     | path                | unset                            | HTTPS only. Wildcard / fallback certificate PEM. Must be set together with `default_key`.       |
-| `default_key`      | path                | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
+| Key                | Type                   | Default                          | Notes                                                                                          |
+| ------------------ | ---------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `mode`             | `"relay"`/`"terminal"` | `"relay"`                        | `relay` accepts inbound chain traffic (when `[chain.listener]` is set) and uses dynamic peer-IP rule resolution. `terminal` only dials upstream and uses fixed-address rule resolution; never accepts inbound chain traffic. |
+| `rules_dir`        | path                   | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
+| `default_bind`     | IP                     | unset                            | If set, hard-rewrites every rule's `listen` IP to this address (the port is preserved). Used to share one config across hosts with different network interfaces. |
+| `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
+| `identity_file`    | path                   | `/etc/yggdrasil/identity.key`    | Long-term X25519 identity (64 bytes: 32 secret ++ 32 public). Mode 0600. Auto-generated on first start if missing. |
+| `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the convention cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). |
+| `default_cert`     | path                   | unset                            | HTTPS only. Wildcard / fallback certificate PEM. Must be set together with `default_key`.       |
+| `default_key`      | path                   | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
 
 ### `[metrics]` — optional
 
-| Key      | Type        | Default            | Notes                                                                                |
-| -------- | ----------- | ------------------ | ------------------------------------------------------------------------------------ |
-| `listen` | `host:port` | `127.0.0.1:9090`   | Prometheus `/metrics` endpoint. Bind to loopback and front with whatever scraper you trust. |
+| Key      | Type        | Default            | Notes                                                                                              |
+| -------- | ----------- | ------------------ | -------------------------------------------------------------------------------------------------- |
+| `listen` | `host:port` | `127.0.0.1:9090`   | Prometheus `/metrics` + `/healthz` + `/readyz` + (loopback-only) `/internal/derived-rules`.        |
 
 ### `[control]` — optional
 
@@ -40,26 +46,60 @@ The defaults below are what you get when a field is omitted entirely.
 | -------- | ---- | ------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `socket` | path | `/run/yggdrasil/control.sock`   | Unix domain socket for `yggdrasilctl`. Restrict to an admin group via filesystem permissions.    |
 
-### `[peer]` — optional, but you'll have one once enrolled
+### `[chain.upstream]` — optional
 
-| Key                | Type             | Default | Notes                                                                                              |
-| ------------------ | ---------------- | ------- | -------------------------------------------------------------------------------------------------- |
-| `public_key_hex`   | 64-char hex      | `""`    | X25519 pubkey of the enrolled huginn. Empty until you run `yggdrasil enroll-token`. **TOFU** approval (via `yggdrasilctl peer approve`) can populate this instead. |
-| `rekey_interval`   | `humantime`      | `1h`    | Force a fresh Noise handshake at most this often, regardless of traffic.                           |
+Configures this node as a chain client (terminal- and mid-chain-relay
+nodes). When set, the daemon dials `endpoint`, performs Noise_IK against
+`pubkey`, and sends heartbeats + control frames. Terminal nodes require
+this section; pure root relays omit it.
 
-Complete example:
+| Key                  | Type           | Default | Notes                                                                                          |
+| -------------------- | -------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `pubkey`             | tagged pubkey  | **required** | `x25519:<hex>` of the upstream node. Pinned; the handshake fails if the responder's static key doesn't match. |
+| `endpoint`           | `host:port`    | **required** | DNS hostname **or** literal IP. Re-resolved on every reconnection attempt — dynamic DNS for the upstream's address works. |
+| `heartbeat_interval` | `humantime`    | `5s`    | How often to emit a heartbeat. Lower = faster IP-change reaction; higher = fewer wakeups.       |
+| `rekey_interval`     | `humantime`    | `1h`    | Force a fresh Noise handshake at most this often, regardless of traffic.                       |
+
+### `[chain.downstream]` — optional
+
+Pins the single enrolled downstream identity. When set, this node accepts
+inbound chain traffic only from `pubkey`. `[chain.listener]` must also be
+set; an enrolled downstream without a listener is rejected at load.
+Forbidden in `mode = "terminal"`.
+
+| Key                  | Type           | Default | Notes                                                                  |
+| -------------------- | -------------- | ------- | ---------------------------------------------------------------------- |
+| `pubkey`             | tagged pubkey  | **required** | `x25519:<hex>` of the downstream node. Written by `yggdrasilctl identity add-downstream` or `local downstream approve`. |
+| `rekey_interval`     | `humantime`    | `1h`    | Force a fresh Noise handshake at most this often.                      |
+
+### `[chain.listener]` — optional
+
+Required when `[chain.downstream]` is set; forbidden when it isn't. UDP
+listener parameters for inbound chain traffic.
+
+| Key      | Type        | Default        | Notes                                                              |
+| -------- | ----------- | -------------- | ------------------------------------------------------------------ |
+| `listen` | `host:port` | **required**   | UDP socket to bind. Public-facing on the root relay.                |
+
+### `[chain.tunnel]` — optional
+
+Allow-list governing what the **tunnel terminator** is allowed to dial.
+A `TunnelOpen` whose `target_pubkey` matches this node's identity is
+permitted only if its `dest` address falls in the allow-list. Defaults
+permit only loopback destinations, so `yggdrasilctl chain` can reach the
+daemon's own `/internal/derived-rules` / health endpoints without
+exposing anything to other downstreams.
+
+| Key                | Type                  | Default                              | Notes                                                                                                          |
+| ------------------ | --------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `allow_loopback`   | bool                  | `true`                               | Permit any port on `127.0.0.0/8` or `::1`. The v1 introspection use case is loopback-only.                     |
+| `allowed_targets`  | `Vec<SocketAddr>`     | `[]`                                 | Explicit `host:port` destinations the terminator may dial. Exact-match (IP + port) against `TunnelOpen.dest`.  |
+
+### Complete example (root relay)
 
 ```toml
 [server]
-mode             = "relay"
-heartbeat_listen = "0.0.0.0:51820"
-rules_dir        = "/etc/yggdrasil/conf.d"
-state_dir        = "/var/lib/yggdrasil"
-identity_file    = "/etc/yggdrasil/identity.key"
-# Optional HTTPS knobs (omit if you don’t run https rules):
-# cert_dir       = "/etc/yggdrasil/certs"
-# default_cert   = "/etc/yggdrasil/certs/wildcard.pem"
-# default_key    = "/etc/yggdrasil/certs/wildcard.key"
+mode = "relay"
 
 [metrics]
 listen = "127.0.0.1:9090"
@@ -67,124 +107,126 @@ listen = "127.0.0.1:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[peer]
-public_key_hex = "9d2f...4b7c"
-rekey_interval = "1h"
+[chain.listener]
+listen = "0.0.0.0:51820"
+
+[chain.downstream]
+pubkey = "x25519:9d2f04a3...4b7c"
 ```
 
-## `/etc/huginn/config.toml`
-
-### `[client]` — required
-
-| Key                    | Type             | Default                          | Notes                                                                                          |
-| ---------------------- | ---------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `yggdrasil_endpoint`   | `host:port`      | **required**                     | DNS hostname **or** literal IP. Re-resolved on each handshake attempt, so dynamic DNS for the VPS works too. |
-| `yggdrasil_pubkey_hex` | 64-char hex      | **required**                     | Server's pubkey. Filled in by `huginn enroll`.                                              |
-| `identity_file`        | path             | `/etc/huginn/identity.key`    | Long-term X25519 secret. Mode 0600.                                                            |
-| `heartbeat_interval`   | `humantime`      | `5s`                             | How often to emit a heartbeat. Lower = faster IP-change reaction; higher = less wakeups.       |
-| `rekey_interval`       | `humantime`      | `1h`                             | Force re-handshake at most this often.                                                         |
-
-Complete example:
+### Complete example (terminal home box)
 
 ```toml
-[client]
-yggdrasil_endpoint   = "vps.example.net:51820"
-yggdrasil_pubkey_hex = "6c5a...0ff1"
-identity_file        = "/etc/huginn/identity.key"
-heartbeat_interval   = "5s"
-rekey_interval       = "1h"
+[server]
+mode = "terminal"
+
+[metrics]
+listen = "127.0.0.1:9090"
+
+[control]
+socket = "/run/yggdrasil/control.sock"
+
+[chain.upstream]
+pubkey   = "x25519:6c5a30bb...0ff1"
+endpoint = "vps.example.net:51820"
+```
+
+### Complete example (mid-chain relay)
+
+Same as a root relay, plus `[chain.upstream]` pointing at the next-hop
+relay. Mode is `"relay"` because the node still accepts inbound chain
+traffic from its downstream.
+
+```toml
+[server]
+mode = "relay"
+
+[chain.upstream]
+pubkey   = "x25519:0123abcd...ef"
+endpoint = "next-hop.example.net:51820"
+
+[chain.listener]
+listen = "0.0.0.0:51820"
+
+[chain.downstream]
+pubkey = "x25519:9d2f04a3...4b7c"
 ```
 
 ## Rule files
 
 Rule files describe proxy rules. They live as `*.toml` files in the
-yggdrasil server’s `rules_dir`. Files are loaded sorted by filename,
+daemon's `[server].rules_dir`. Files are loaded sorted by filename,
 non-recursive. A `*.toml` extension is required; anything else is ignored.
 
+Rules normally live on the **terminal** node. On a relay running in
+single-hop mode, the proxy supervisor is fed exclusively from the
+predicate-derived rule set; manual `conf.d` files there would be
+overwritten on the next downstream push. (Pushing a candidate rule set
+directly without writing to disk is `yggdrasilctl chain apply --file
+rules.toml`.)
+
 Each file contains zero or more `[[rule]]` tables. Splitting rules into
-multiple files is purely cosmetic — yggdrasil aggregates them all into one
-unified rule set with global uniqueness checks.
+multiple files is purely cosmetic — yggdrasil aggregates them all into
+one unified rule set with global uniqueness checks.
 
 ### `[[rule]]` — repeatable
 
-| Key              | Type                       | TCP | UDP | HTTPS | Default       | Notes                                                                                                  |
-| ---------------- | -------------------------- | --- | --- | ----- | ------------- | ------------------------------------------------------------------------------------------------------ |
-| `name`           | string                     | ✓   | ✓   | ✓     | **required**  | Globally unique across all rule files. No whitespace or control characters.                            |
-| `listen`         | `host:port`                | ✓   | ✓   | ✓     | **required**  | Listen socket on the VPS. `port` must be non-zero. Globally unique by `(ip, port, protocol)`.          |
-| `protocol`       | `"tcp"`/`"udp"`/`"https"` | ✓   | ✓   | ✓     | **required**  | Determines whether this is a TCP listener, a UDP receiver, or the HTTPS frontend.                      |
-| `upstream_port`  | u16                        | ✓   | ✓   | —     | one of these  | Port on the home box. The IP comes from the heartbeat. Mutually exclusive with `upstream_addr` and `upstream_host`. |
-| `upstream_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Literal upstream socket address — used by terminal-mode rules and tests. Mutually exclusive with `upstream_port` and `upstream_host`. |
-| `upstream_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | DNS-resolved upstream — terminal-mode only. Re-resolves every 30s; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `upstream_port` and `upstream_addr`. |
-| `idle_timeout`   | `humantime`                | —   | ✓   | —     | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP / HTTPS rules. |
-| `proxy_protocol` | `"v1"`/`"v2"`             | ✓   | —   | —     | absent        | TCP only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and when `upstream_addr` or `upstream_host` is set. |
-| `cert_dir`       | path                       | —   | —   | ✓     | inherits from `[server]` | HTTPS only. Per-rule override of the convention cert directory.                                       |
-| `[[rule.route]]` | table                      | —   | —   | ✓     | **required**  | HTTPS only. One entry per virtual host — see the HTTPS section below.                                  |
+| Key              | Type                       | TCP | UDP | HTTPS | Default       | Notes                                                                                                              |
+| ---------------- | -------------------------- | --- | --- | ----- | ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `name`           | string                     | ✓   | ✓   | ✓     | **required**  | Globally unique across all rule files. No whitespace or control characters.                                        |
+| `listen`         | `host:port`                | ✓   | ✓   | ✓     | **required**  | Listen socket. `port` must be non-zero. Globally unique by `(ip, port, protocol)`.                                 |
+| `protocol`       | `"tcp"`/`"udp"`/`"https"`  | ✓   | ✓   | ✓     | **required**  | Determines whether this is a TCP listener, a UDP receiver, or the HTTPS L7 frontend.                                |
+| `upstream_port`  | u16                        | ✓   | ✓   | —     | one of these  | Relay mode. Port on the residential host. The IP comes from the heartbeat. Mutually exclusive with `upstream_addr` and `upstream_host`. |
+| `upstream_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. Literal upstream socket address. Mutually exclusive with `upstream_port` and `upstream_host`.       |
+| `upstream_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. DNS-resolved upstream. Re-resolves periodically; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `upstream_port` and `upstream_addr`. |
+| `idle_timeout`   | `humantime`                | —   | ✓   | —     | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP / HTTPS rules.            |
+| `proxy_protocol` | `"v1"`/`"v2"`              | ✓   | —   | —     | absent        | TCP relay rules only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and on terminal-mode rules (`upstream_addr` / `upstream_host`). |
+| `cert_dir`       | path                       | —   | —   | ✓     | inherits from `[server]` | HTTPS only. Per-rule override of the convention cert directory.                                          |
+| `[[rule.route]]` | table                      | —   | —   | ✓     | **required**  | HTTPS only. One entry per virtual host — see the HTTPS section below.                                              |
 
 Validation runs at load time. A malformed rule file fails the **whole**
 reload — yggdrasil keeps serving the previous rule set rather than half-
 applying a broken update.
 
-### Examples
+### Examples (terminal mode)
 
 ```toml
-# /etc/yggdrasil/conf.d/ssh.toml — a single TCP rule
+# /etc/yggdrasil/conf.d/ssh.toml — TCP rule pointing at the local sshd.
 [[rule]]
 name          = "ssh"
 listen        = "0.0.0.0:2222"
 protocol      = "tcp"
-upstream_port = 22
+upstream_addr = "127.0.0.1:22"
 ```
 
 ```toml
-# /etc/yggdrasil/conf.d/games.toml — multiple rules, mixed protocols
+# /etc/yggdrasil/conf.d/games.toml — mixed TCP + UDP, DNS-resolved upstream.
 [[rule]]
 name          = "minecraft-java"
 listen        = "0.0.0.0:25565"
 protocol      = "tcp"
-upstream_port = 25565
+upstream_host = "minecraft.lan:25565"
 
 [[rule]]
 name          = "minecraft-bedrock"
 listen        = "0.0.0.0:19132"
 protocol      = "udp"
-upstream_port = 19132
+upstream_addr = "192.168.1.20:19132"
 idle_timeout  = "120s"
 
 [[rule]]
 name          = "wireguard"
 listen        = "0.0.0.0:51821"
 protocol      = "udp"
-upstream_port = 51820
+upstream_addr = "127.0.0.1:51820"
 idle_timeout  = "300s"
 ```
 
 ```toml
-# A TCP rule with PROXY protocol so the home-side service sees the real client IP.
-[[rule]]
-name           = "nginx-public"
-listen         = "0.0.0.0:443"
-protocol       = "tcp"
-upstream_port  = 443
-proxy_protocol = "v2"
-```
-
-```toml
-# A terminal-mode rule that forwards to a literal upstream socket. No huginn
-# heartbeat is involved; this shape is normally used on the home-side leg of a
-# two-hop chain.
-[[rule]]
-name          = "ssh-local"
-listen        = "127.0.0.1:2222"
-protocol      = "tcp"
-upstream_addr = "192.168.1.10:22"
-```
-
-```toml
-# A terminal-mode rule that forwards to a DNS hostname. The resolver
-# re-queries the system DNS every 30s; on lookup failure it retains the
-# last-good address. Rebinds apply to *new* flows only — long-lived TCP
-# sessions and UDP flows are not torn down when the address changes
-# (matching nginx / haproxy semantics).
+# /etc/yggdrasil/conf.d/printer.toml — DNS hostname, periodically re-resolved.
+# Rebinds apply to *new* flows only — long-lived TCP sessions and UDP flows
+# are not torn down when the address changes (matching nginx / haproxy
+# semantics).
 [[rule]]
 name          = "printer"
 listen        = "0.0.0.0:9100"
@@ -192,23 +234,41 @@ protocol      = "tcp"
 upstream_host = "printer.lan:9100"
 ```
 
+### Relay-mode rules
+
+Relay-mode rules are normally produced by the predicate publisher on the
+downstream terminal and applied to the relay's supervisor via the chain
+plane — operators do not hand-author them. They look the same in
+TOML, with `upstream_port` (no host; the IP is filled in at runtime from
+the heartbeat):
+
+```toml
+# What a derived rule on a single-hop relay would look like if you dumped it.
+[[rule]]
+name          = "ssh"
+listen        = "0.0.0.0:2222"
+protocol      = "tcp"
+upstream_port = 22
+```
+
 ### HTTPS rules
 
-An `https` rule terminates TLS on the VPS, performs SNI-based virtual-host
+An `https` rule terminates TLS on the relay, performs SNI-based virtual-host
 routing, and forwards each request as cleartext HTTP to a per-route
 backend URL. Each `[[rule.route]]` table is one virtual host.
 
 | Key              | Type        | Default              | Notes                                                                                                       |
 | ---------------- | ----------- | -------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `hostname`       | DNS name    | **required**         | SNI / `Host:` value. Case-insensitive. Globally unique across all https routes.                             |
-| `upstream`       | `http://…`  | **required**         | Backend URL. Cleartext HTTP only — the encrypted leg ends at the VPS.                                       |
+| `upstream`       | `http://…`  | **required**         | Backend URL. Cleartext HTTP only — the encrypted leg ends at the relay.                                     |
 | `cert`           | path or `"ephemeral"` | unset      | Per-route certificate. A path PEM pairs with `key`. The literal string `"ephemeral"` generates a self-signed cert in memory — only valid for localhost-shaped hostnames (testing). |
 | `key`            | path        | unset                | Per-route private key PEM. Must accompany a path-style `cert`; forbidden with `cert = "ephemeral"`.         |
 | `hsts`           | bool/table  | `false`              | `true` ⇒ default `Strict-Transport-Security` header. Table form (`max_age`, `include_subdomains`, `preload`) gives fine control. |
 
 Cert source precedence (per route): explicit `cert` + `key` paths →
-`cert = "ephemeral"` → `<cert_dir>/<hostname>.{crt,key}` convention →
-`server.default_cert` + `server.default_key` → hard error at load time.
+`cert = "ephemeral"` → `<cert_dir>/<hostname>/{fullchain,privkey}.pem`
+convention → `server.default_cert` + `server.default_key` → hard error at
+load time.
 
 ```toml
 # /etc/yggdrasil/conf.d/web.toml
@@ -232,25 +292,33 @@ protocol = "https"
 
 ## Environment variables
 
-Most CLI flags also bind to environment variables, listed here for completeness:
+Most CLI flags also bind to environment variables, listed here for
+completeness:
 
 | Variable                    | Equivalent flag                             | Used by         |
 | --------------------------- | ------------------------------------------- | --------------- |
 | `YGGDRASIL_LOG_FORMAT`      | `--log-format`                              | `yggdrasil`     |
-| `YGGDRASIL_CONFIG`          | `--config` (default for `yggdrasil run`)    | `yggdrasil`     |
-| `YGGDRASIL_RULES_DIR`    | `--rules-dir` (overrides `server.rules_dir`) | `yggdrasil`     |
+| `YGGDRASIL_LOG`             | (`tracing-subscriber` env-filter)           | `yggdrasil`     |
+| `YGGDRASIL_CONFIG`          | `--config` (default for `yggdrasil run`, and `yggdrasilctl identity`) | `yggdrasil`, `yggdrasilctl` |
+| `YGGDRASIL_RULES_DIR`       | `--rules-dir` (overrides `[server].rules_dir`) | `yggdrasil`    |
 | `YGGDRASIL_CONTROL_SOCKET`  | `--socket`                                  | `yggdrasilctl`  |
-| `HUGINN_LOG_FORMAT`      | `--log-format`                              | `huginn`     |
-| `HUGINN_CONFIG`          | `--config` (default for `huginn run`)    | `huginn`     |
 
 ## Hot reload semantics
 
-- The rules watcher uses `inotify` with a 250 ms debounce. Drop a new file,
+* The rules watcher uses `inotify` with a 250 ms debounce. Drop a new file,
   rename it into place, or `vim` it — within ~250 ms the diff is applied.
-- A reload that fails validation is **rejected as a unit**. The previous
+* A reload that fails validation is **rejected as a unit**. The previous
   rule set keeps serving traffic; the error is logged.
-- Changes to **`/etc/yggdrasil/config.toml`** itself are not hot-reloaded;
+* Changes to **`/etc/yggdrasil/config.toml`** itself are not hot-reloaded;
   restart the daemon (`systemctl restart yggdrasil`). Only `conf.d/*.toml`
-  are picked up live.
-- `yggdrasilctl rules reload` forces a re-scan in case you suspect the
-  inotify event was missed (e.g. NFS, container bind mounts with cached metadata).
+  files are picked up live. In particular, the `[chain.*]` sub-tables are
+  read once at startup — `yggdrasilctl identity add-upstream` /
+  `add-downstream` / `remove-*` mutations require a restart to take
+  effect.
+* `yggdrasilctl local rules reload` forces a re-scan in case you suspect
+  the inotify event was missed (NFS, container bind mounts with cached
+  metadata, etc.).
+* `yggdrasilctl chain apply --file rules.toml` pushes a pre-validated
+  rule vector into the running terminal daemon's supervisor without
+  touching `rules_dir`. The daemon re-validates server-side and rejects
+  the apply as a unit on any cross-rule conflict.
