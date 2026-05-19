@@ -4,7 +4,6 @@ members = [
     "crates/ratatoskr",
     "crates/yggdrasil",
     "crates/yggdrasilctl",
-    "crates/huginn",
     "crates/loadgen",
 ]
 

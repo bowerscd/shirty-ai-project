@@ -40,6 +40,9 @@ pub enum Error {
     #[error("invalid enrollment token: {0}")]
     InvalidEnrollmentToken(String),
 
+    #[error("invalid pubkey: {0}")]
+    InvalidPubKey(String),
+
     // ---- Crypto ----
     #[error("noise protocol error: {0}")]
     Noise(#[from] snow::Error),

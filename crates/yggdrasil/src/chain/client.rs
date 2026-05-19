@@ -1,17 +1,19 @@
-//! Huginn heartbeat client.
+//! Outbound chain control client.
 //!
-//! Maintains a single Noise_IK session against yggdrasil and emits an
-//! authenticated heartbeat every `heartbeat_interval`. Re-handshakes
-//! every `rekey_interval`. On any transport / decode error the client
-//! sleeps with exponential backoff and re-resolves the endpoint, so a
-//! yggdrasil restart (or a yggdrasil IP change) recovers automatically.
+//! Every node — relay or terminal — that declares `[chain.upstream]` in its
+//! config dials that upstream over UDP and maintains a single Noise_IK
+//! session, emitting an authenticated heartbeat every `heartbeat_interval`.
+//! Re-handshakes every `rekey_interval`. On any transport / decode error
+//! the client sleeps with exponential backoff and re-resolves the
+//! endpoint, so an upstream restart (or upstream IP change) recovers
+//! automatically.
 //!
 //! ## Concurrency
 //!
 //! The whole client runs on one task: `tokio::select!` between the cancel
 //! token, the heartbeat ticker, the rekey deadline, and the UDP recv arm.
 //! No locking, no shared mutable state, no rendezvous — the heartbeat
-//! `Session` is exclusively owned by the loop.
+//! [`Session`] is exclusively owned by the loop.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,27 +29,31 @@ use ratatoskr::wire::{self, PacketType, SessionId};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// If we go this many heartbeat intervals without seeing an ACK, give up on
-/// the current session and re-handshake.
+/// If we go this many heartbeat intervals without seeing an ACK, give up
+/// on the current session and re-handshake.
 const ACK_DEADLINE_MULTIPLIER: u32 = 6;
 
-/// Static configuration of the heartbeat client.
-pub struct HeartbeatClientConfig {
+/// Static configuration of the chain client.
+pub struct ChainClientConfig {
+    /// `host:port` (or `[ipv6]:port`) of the upstream node.
     pub endpoint:           String,
-    pub server_pubkey:      [u8; PUBLIC_KEY_LEN],
+    /// X25519 pubkey of the upstream — what Noise_IK pins.
+    pub upstream_pubkey:    [u8; PUBLIC_KEY_LEN],
+    /// This node's static identity.
     pub local_keys:         StaticKeyPair,
     pub heartbeat_interval: Duration,
     pub rekey_interval:     Duration,
 }
 
-/// Driver: owns the config and the cancel token; consumed by [`HeartbeatClient::run`].
-pub struct HeartbeatClient {
-    config: HeartbeatClientConfig,
+/// Driver: owns the config and the cancel token; consumed by
+/// [`ChainClient::run`].
+pub struct ChainClient {
+    config: ChainClientConfig,
     cancel: CancellationToken,
 }
 
-impl HeartbeatClient {
-    pub fn new(config: HeartbeatClientConfig, cancel: CancellationToken) -> Self {
+impl ChainClient {
+    pub fn new(config: ChainClientConfig, cancel: CancellationToken) -> Self {
         Self { config, cancel }
     }
 
@@ -66,11 +72,11 @@ impl HeartbeatClient {
                     backoff = BACKOFF_MIN;
                 }
                 Ok(SessionExit::Cancelled) => {
-                    tracing::info!("heartbeat client cancelled");
+                    tracing::info!("chain client cancelled");
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, backoff = ?backoff, "heartbeat session ended");
+                    tracing::warn!(error = %e, backoff = ?backoff, "chain session ended");
                     if sleep_or_cancel(&self.cancel, backoff).await {
                         return Ok(());
                     }
@@ -81,21 +87,21 @@ impl HeartbeatClient {
     }
 
     async fn run_session_once(&self) -> Result<SessionExit> {
-        let server_addr = resolve_endpoint(&self.config.endpoint).await?;
-        let bind_addr: SocketAddr = match server_addr {
+        let upstream_addr = resolve_endpoint(&self.config.endpoint).await?;
+        let bind_addr: SocketAddr = match upstream_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
         let socket = UdpSocket::bind(bind_addr)
             .await
-            .with_context(|| format!("bind UDP socket toward {server_addr}"))?;
+            .with_context(|| format!("bind UDP socket toward {upstream_addr}"))?;
         socket
-            .connect(server_addr)
+            .connect(upstream_addr)
             .await
-            .with_context(|| format!("connect UDP socket to {server_addr}"))?;
+            .with_context(|| format!("connect UDP socket to {upstream_addr}"))?;
         tracing::info!(
-            server = %server_addr,
-            local  = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            upstream = %upstream_addr,
+            local    = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             "udp socket ready"
         );
 
@@ -107,7 +113,7 @@ impl HeartbeatClient {
         let session_id = SessionId::random();
         let (initiator, hs1) = Initiator::start(
             &self.config.local_keys,
-            &self.config.server_pubkey,
+            &self.config.upstream_pubkey,
             session_id,
         )
         .context("build handshake1")?;
@@ -148,8 +154,6 @@ impl HeartbeatClient {
     ) -> Result<SessionExit> {
         let session_started = Instant::now();
         let mut ticker = tokio::time::interval(self.config.heartbeat_interval);
-        // First tick fires immediately so we send a heartbeat right after the
-        // handshake. (`Interval`'s default behaviour.)
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut last_ack_at: Option<Instant> = None;
@@ -160,7 +164,6 @@ impl HeartbeatClient {
         let ack_deadline = self.config.heartbeat_interval * ACK_DEADLINE_MULTIPLIER;
 
         loop {
-            // Check session lifetime + ACK liveness before awaiting again.
             if session_started.elapsed() >= self.config.rekey_interval {
                 tracing::info!(
                     heartbeats_sent,
@@ -178,9 +181,7 @@ impl HeartbeatClient {
                         acks_received
                     );
                 }
-            } else if heartbeats_sent > 0
-                && session_started.elapsed() > ack_deadline
-            {
+            } else if heartbeats_sent > 0 && session_started.elapsed() > ack_deadline {
                 bail!(
                     "no ACK ever received (sent={}, deadline={:?})",
                     heartbeats_sent,
@@ -201,7 +202,7 @@ impl HeartbeatClient {
                     tracing::trace!(counter, ts, "heartbeat sent");
                 }
                 res = socket.recv(&mut buf) => {
-                    let n = res.context("recv from server")?;
+                    let n = res.context("recv from upstream")?;
                     let view = match wire::parse(&buf[..n]) {
                         Ok(v) => v,
                         Err(e) => {
@@ -227,11 +228,10 @@ impl HeartbeatClient {
                             }
                         }
                         PacketType::Handshake2 => {
-                            // Stale handshake reply (post-rekey collision).
                             tracing::debug!("ignoring late Handshake2");
                         }
                         other => {
-                            tracing::debug!(?other, "ignoring unexpected packet from server");
+                            tracing::debug!(?other, "ignoring unexpected packet from upstream");
                         }
                     }
                 }
@@ -271,16 +271,11 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Minimal echo-style yggdrasil heartbeat responder for testing. Accepts
-    /// any caller, answers Handshake1 with Handshake2 (verifying remote
-    /// static key), then ACKs every heartbeat.
-    ///
-    /// We can't pull in the real `yggdrasil` crate (binary crate; reaching
-    /// across creates a cycle), so we re-implement the responder side with
-    /// only `ratatoskr` primitives.
     use ratatoskr::auth::Responder;
 
+    /// Minimal echo-style upstream responder for testing. Accepts any
+    /// caller, answers Handshake1 with Handshake2 (verifying remote static
+    /// key), then ACKs every heartbeat.
     struct TestServer {
         addr: SocketAddr,
         handle: tokio::task::JoinHandle<()>,
@@ -351,17 +346,16 @@ mod tests {
         let endpoint = server.addr.to_string();
 
         let cancel = CancellationToken::new();
-        let cfg = HeartbeatClientConfig {
+        let cfg = ChainClientConfig {
             endpoint,
-            server_pubkey: server_pub,
+            upstream_pubkey: server_pub,
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
         };
-        let client = HeartbeatClient::new(cfg, cancel.clone());
+        let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
 
-        // Wait for at least 3 heartbeats round-tripped.
         let deadline = Instant::now() + Duration::from_secs(3);
         while server.heartbeats_seen.load(std::sync::atomic::Ordering::Relaxed) < 3 {
             if Instant::now() > deadline {
@@ -384,8 +378,6 @@ mod tests {
         let client_keys = StaticKeyPair::generate().unwrap();
         let server_pub = *server_keys.public_key();
 
-        // Count handshakes by hand: we wrap the responder so we observe
-        // each Handshake1 reception.
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         let handshakes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -427,17 +419,16 @@ mod tests {
         });
 
         let cancel = CancellationToken::new();
-        let cfg = HeartbeatClientConfig {
+        let cfg = ChainClientConfig {
             endpoint: addr.to_string(),
-            server_pubkey: server_pub,
+            upstream_pubkey: server_pub,
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(20),
             rekey_interval: Duration::from_millis(200),
         };
-        let client = HeartbeatClient::new(cfg, cancel.clone());
+        let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
 
-        // Wait long enough for at least 2 handshakes (one initial + one rekey).
         let deadline = Instant::now() + Duration::from_secs(3);
         while handshakes.load(std::sync::atomic::Ordering::Relaxed) < 2 {
             if Instant::now() > deadline {
@@ -462,17 +453,16 @@ mod tests {
         let server = TestServer::start(server_keys).await;
 
         let cancel = CancellationToken::new();
-        let cfg = HeartbeatClientConfig {
+        let cfg = ChainClientConfig {
             endpoint: server.addr.to_string(),
-            server_pubkey: server_pub,
+            upstream_pubkey: server_pub,
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
         };
-        let client = HeartbeatClient::new(cfg, cancel.clone());
+        let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
 
-        // Let a heartbeat or two go through.
         tokio::time::sleep(Duration::from_millis(150)).await;
         cancel.cancel();
 
@@ -488,27 +478,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backoff_and_reconnect_when_endpoint_unresolvable() {
-        // Pointing at port 1 on localhost: bind succeeds, but Handshake2
-        // never arrives → handshake timeout → session error → backoff → retry.
+    async fn backoff_and_reconnect_when_endpoint_unresponsive() {
         let client_keys = StaticKeyPair::generate().unwrap();
 
         let cancel = CancellationToken::new();
-        let cfg = HeartbeatClientConfig {
+        let cfg = ChainClientConfig {
             endpoint: "127.0.0.1:1".to_string(),
-            server_pubkey: [0u8; PUBLIC_KEY_LEN],
+            upstream_pubkey: [0u8; PUBLIC_KEY_LEN],
             local_keys: client_keys,
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
         };
-        let client = HeartbeatClient::new(cfg, cancel.clone());
+        let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
 
-        // Let the client try and fail a couple of times (handshake timeout is
-        // 5s in the constant, but it'll fail much faster on
-        // "connection refused" because UDP doesn't refuse — so we cheat a
-        // bit and just verify the client is *still running* / has not
-        // panicked after a short observation window).
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !client_handle.is_finished(),

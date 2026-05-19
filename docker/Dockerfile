@@ -1,6 +1,6 @@
 # Multi-stage build that produces a single small runtime image containing
-# yggdrasil, yggdrasilctl, and huginn. compose.e2e.yml picks the right
-# binary per service via `command:` overrides.
+# yggdrasil and yggdrasilctl. compose.e2e.yml picks the right binary per
+# service via `command:` overrides.
 #
 # Plain Dockerfile (OCI) syntax — no BuildKit-only directives — so the build
 # runs cleanly under `podman build` (and `docker build` if you ever need it).
@@ -20,10 +20,9 @@ WORKDIR /src
 # enumerated explicitly so a single-crate edit doesn't bust the whole
 # dependency cache.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/ratatoskr/Cargo.toml crates/ratatoskr/Cargo.toml
+COPY crates/ratatoskr/Cargo.toml       crates/ratatoskr/Cargo.toml
 COPY crates/yggdrasil/Cargo.toml       crates/yggdrasil/Cargo.toml
 COPY crates/yggdrasilctl/Cargo.toml    crates/yggdrasilctl/Cargo.toml
-COPY crates/huginn/Cargo.toml       crates/huginn/Cargo.toml
 COPY crates/loadgen/Cargo.toml         crates/loadgen/Cargo.toml
 
 # Stub sources for the dep-cache layer. cargo builds and caches all deps
@@ -37,7 +36,7 @@ RUN set -eux; \
         mkdir -p crates/$crate/src; \
         echo "pub fn _stub() {}" > crates/$crate/src/lib.rs; \
     done; \
-    for bin in yggdrasil yggdrasilctl huginn; do \
+    for bin in yggdrasil yggdrasilctl; do \
         mkdir -p crates/$bin/src; \
         echo "fn main() {}" > crates/$bin/src/main.rs; \
     done; \
@@ -50,7 +49,7 @@ RUN set -eux; \
     echo "fn main() {}" > crates/yggdrasil/benches/flow_table.rs
 
 RUN cargo build --release --workspace \
-        --bin yggdrasil --bin yggdrasilctl --bin huginn
+        --bin yggdrasil --bin yggdrasilctl
 
 # Now real sources.
 COPY crates/ crates/
@@ -60,11 +59,10 @@ RUN find crates -name '*.rs' -exec touch {} +
 
 RUN set -eux; \
     cargo build --release --workspace \
-        --bin yggdrasil --bin yggdrasilctl --bin huginn; \
+        --bin yggdrasil --bin yggdrasilctl; \
     mkdir -p /out; \
     cp target/release/yggdrasil    /out/yggdrasil; \
-    cp target/release/yggdrasilctl /out/yggdrasilctl; \
-    cp target/release/huginn    /out/huginn
+    cp target/release/yggdrasilctl /out/yggdrasilctl
 
 # ---------------------------------------------------------------- runtime
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
@@ -79,7 +77,6 @@ RUN apt-get update \
 
 COPY --from=builder /out/yggdrasil    /usr/local/bin/yggdrasil
 COPY --from=builder /out/yggdrasilctl /usr/local/bin/yggdrasilctl
-COPY --from=builder /out/huginn    /usr/local/bin/huginn
 
 # Helper scripts for the compose e2e topology.
 COPY docker/bootstrap.sh       /usr/local/bin/bootstrap.sh
@@ -89,12 +86,10 @@ RUN chmod 0755 /usr/local/bin/bootstrap.sh \
                /usr/local/bin/home-entrypoint.sh \
                /usr/local/bin/echo-server.py
 
-# Create runtime directories for both daemons. The compose file mounts
-# volumes over the *contents* of these so concurrent yggdrasil + huginn
-# in the same image don't share state.
+# Create runtime directories. The compose file mounts volumes over the
+# *contents* of these so each container has its own isolated state.
 RUN mkdir -p /etc/yggdrasil/rules /etc/yggdrasil/certs \
              /var/lib/yggdrasil /run/yggdrasil \
-             /etc/huginn \
  && chmod 0750 /run/yggdrasil /etc/yggdrasil/certs
 
 # tini reaps zombies cleanly when sidecar processes (e.g. the python echo

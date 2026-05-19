@@ -60,11 +60,12 @@ echo "==> bringing daemons up"
 
 ctl() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps \
-        yggdrasilctl --socket /run/yggdrasil/control.sock "$@"
+        yggdrasilctl --socket /run/yggdrasil/control.sock local "$@"
 }
 
 ctl_json() {
-    ctl --json "$@"
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps \
+        yggdrasilctl --socket /run/yggdrasil/control.sock --json local "$@"
 }
 
 wait_for() {
@@ -91,13 +92,13 @@ fail() {
 
 # -------- gating: wait for first authenticated heartbeat --------------------
 
-echo "==> waiting for huginn to enrol and heartbeat"
-peer_enrolled() {
+echo "==> waiting for home to enrol and heartbeat"
+downstream_enrolled() {
     local out; out=$(ctl_json status 2>/dev/null || true)
-    echo "$out" | grep -q '"peer_enrolled": true' && \
-        echo "$out" | grep -q '"peer_ip": "172.30.0.20"'
+    echo "$out" | grep -q '"downstream_enrolled": true' && \
+        echo "$out" | grep -q '"downstream_ip": "172.30.0.20"'
 }
-WAIT_TIMEOUT=60 wait_for "peer enrolled + heartbeat seen from 172.30.0.20" peer_enrolled
+WAIT_TIMEOUT=60 wait_for "downstream enrolled + heartbeat seen from 172.30.0.20" downstream_enrolled
 
 # -------- test 1: TCP echo --------------------------------------------------
 
@@ -198,9 +199,9 @@ echo "    [ok] original rule still works post-reload"
 
 echo "==> [status] yggdrasilctl status returns sensible data"
 status_json=$(ctl_json status)
-echo "$status_json" | grep -q '"peer_enrolled": true'      || fail "status: peer_enrolled not true"
-echo "$status_json" | grep -q '"rule_count": 2'          || fail "status: expected 2 rules (tcp-echo + udp-echo)"
-echo "$status_json" | grep -q '"peer_ip": "172.30.0.20"'   || fail "status: peer_ip wrong"
+echo "$status_json" | grep -q '"downstream_enrolled": true'   || fail "status: downstream_enrolled not true"
+echo "$status_json" | grep -q '"rule_count": 2'              || fail "status: expected 2 rules (tcp-echo + udp-echo)"
+echo "$status_json" | grep -q '"downstream_ip": "172.30.0.20"' || fail "status: downstream_ip wrong"
 echo "    [ok] status JSON consistent"
 
 # -------- test 6: health + metrics HTTP listener ----------------------------
@@ -263,7 +264,7 @@ metrics_body=$(echo "$metrics" | tail -n +2)
 echo "$metrics_body" | grep -q 'yggdrasil_build_info' \
     || fail "/metrics missing yggdrasil_build_info"
 
-# The heartbeat gauge is set on every accepted heartbeat. Huginn beats once
+# The heartbeat gauge is set on every accepted heartbeat. home beats once
 # a second in this stack, so it must be present and within ~30s of now.
 heartbeat_line=$(echo "$metrics_body" | grep -E '^yggdrasil_last_heartbeat_timestamp_seconds ' || true)
 [[ -n "$heartbeat_line" ]] || fail "/metrics missing yggdrasil_last_heartbeat_timestamp_seconds"

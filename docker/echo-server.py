@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal TCP + UDP echo server used as the upstream behind huginn.
+"""Minimal TCP + UDP echo server used as the upstream on the downstream box.
 
 Listens on two configurable ports (defaults: TCP 7100, UDP 7101) bound to
 0.0.0.0. Per connection, echoes back whatever bytes arrive until the peer

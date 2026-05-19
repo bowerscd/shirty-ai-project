@@ -14,6 +14,8 @@ pub mod auth;
 pub mod control;
 pub mod enrollment;
 pub mod error;
+pub mod intro;
+pub mod pubkey;
 pub mod rule;
 pub mod wire;
 

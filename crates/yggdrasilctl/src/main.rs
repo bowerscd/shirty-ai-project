@@ -1,80 +1,77 @@
-//! yggdrasilctl — admin CLI for yggdrasil over a Unix domain socket.
+//! yggdrasilctl — admin CLI for yggdrasil.
+//!
+//! The CLI is organised into three scopes:
+//!
+//! * `local` — talks to the running daemon over its Unix domain socket
+//!   (`/run/yggdrasil/control.sock` by default). Used for status, rule
+//!   inspection, and downstream TOFU management.
+//! * `chain` — inspects/manages the chain-control plane. Stubs in Phase 1;
+//!   filled in in Phase 4-5 once the chain wire protocol lands.
+//! * `identity` — offline operations on this node's identity file and the
+//!   daemon's config TOML. Mints intro/invite files and edits
+//!   `[chain.upstream]` / `[chain.downstream]` sections. No daemon required.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 
-use ratatoskr::control::{Mode, Request, Response};
+mod chain;
+mod identity;
+mod local;
+
+/// Default path to the daemon's main config file.
+const DEFAULT_CONFIG_PATH: &str = "/etc/yggdrasil/config.toml";
+
+/// Default path to the daemon's control socket.
+const DEFAULT_SOCKET_PATH: &str = "/run/yggdrasil/control.sock";
 
 #[derive(Debug, Parser)]
 #[command(name = "yggdrasilctl", version, about, propagate_version = true)]
 struct Cli {
-    /// Path to the yggdrasil control socket.
-    #[arg(long, default_value = "/run/yggdrasil/control.sock",
-          env = "YGGDRASIL_CONTROL_SOCKET", global = true)]
+    /// Path to the yggdrasil control socket (used by `local` and `chain` scopes).
+    #[arg(
+        long,
+        default_value = DEFAULT_SOCKET_PATH,
+        env = "YGGDRASIL_CONTROL_SOCKET",
+        global = true
+    )]
     socket: PathBuf,
 
-    /// Emit responses as raw JSON instead of human-readable.
+    /// Path to the yggdrasil config file (used by `identity` scope).
+    #[arg(
+        long,
+        default_value = DEFAULT_CONFIG_PATH,
+        env = "YGGDRASIL_CONFIG",
+        global = true
+    )]
+    config: PathBuf,
+
+    /// Emit responses as raw JSON instead of human-readable text.
     #[arg(long, global = true)]
     json: bool,
 
     #[command(subcommand)]
-    command: Command,
+    scope: Scope,
 }
 
 #[derive(Debug, Subcommand)]
-enum Command {
-    /// Show the high-level server status (peer IP, last heartbeat, rule count).
-    Status,
-    /// Inspect or manage loaded rules.
-    Rules {
+enum Scope {
+    /// Daemon-local operations over the control socket.
+    Local {
         #[command(subcommand)]
-        action: RuleAction,
+        cmd: local::Cmd,
     },
-    /// Inspect or manage the enrolled peer.
-    Peer {
+    /// Chain-control plane operations (Phase 4+ — stubs only).
+    Chain {
         #[command(subcommand)]
-        action: PeerAction,
+        cmd: chain::Cmd,
     },
-    /// Inspect loaded TLS certificates (HTTPS L7 frontend).
-    Certs {
+    /// Identity and enrollment (offline; mutates config file).
+    Identity {
         #[command(subcommand)]
-        action: CertAction,
+        cmd: identity::Cmd,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum RuleAction {
-    /// List loaded rules.
-    List,
-    /// Force a reload of the rules directory (in addition to inotify).
-    Reload,
-}
-
-#[derive(Debug, Subcommand)]
-enum PeerAction {
-    /// Show the currently enrolled peer's pubkey and fingerprint.
-    Show,
-    /// List staged TOFU candidates awaiting approval.
-    Pending,
-    /// Approve a staged peer by its short fingerprint.
-    Approve(ApproveArgs),
-}
-
-#[derive(Debug, Args)]
-struct ApproveArgs {
-    /// Short BLAKE2s-128 fingerprint (hex) of the peer to approve.
-    fingerprint: String,
-}
-
-#[derive(Debug, Subcommand)]
-enum CertAction {
-    /// List loaded certificates (one entry per hostname).
-    List,
 }
 
 fn main() -> Result<()> {
@@ -86,166 +83,10 @@ fn main() -> Result<()> {
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
-        let request = build_request(&cli.command);
-        let response = send(&cli.socket, &request, Duration::from_secs(5)).await?;
-        if cli.json {
-            print_json(&response)
-        } else {
-            print_human(&request, &response)
+        match cli.scope {
+            Scope::Local { cmd } => local::run(cmd, &cli.socket, cli.json).await,
+            Scope::Chain { cmd } => chain::run(cmd, &cli.socket, cli.json).await,
+            Scope::Identity { cmd } => identity::run(cmd, &cli.config, cli.json).await,
         }
     })
-}
-
-fn build_request(cmd: &Command) -> Request {
-    match cmd {
-        Command::Status => Request::Status,
-        Command::Rules { action } => match action {
-            RuleAction::List => Request::RulesList,
-            RuleAction::Reload => Request::RulesReload,
-        },
-        Command::Peer { action } => match action {
-            PeerAction::Show => Request::PeerShow,
-            PeerAction::Pending => Request::PeerPending,
-            PeerAction::Approve(a) => Request::PeerApprove {
-                fingerprint: a.fingerprint.clone(),
-            },
-        },
-        Command::Certs { action } => match action {
-            CertAction::List => Request::CertsList,
-        },
-    }
-}
-
-async fn send(socket: &PathBuf, request: &Request, timeout: Duration) -> Result<Response> {
-    let mut stream = tokio::time::timeout(timeout, UnixStream::connect(socket))
-        .await
-        .with_context(|| format!("connect timeout after {timeout:?}"))?
-        .with_context(|| format!("connecting to {}", socket.display()))?;
-
-    let mut buf = serde_json::to_vec(request).context("encode request")?;
-    buf.push(b'\n');
-    tokio::time::timeout(timeout, stream.write_all(&buf))
-        .await
-        .context("write timeout")?
-        .context("writing request")?;
-
-    let (reader, _w) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    let line = tokio::time::timeout(timeout, lines.next_line())
-        .await
-        .context("read timeout")?
-        .context("reading response")?
-        .ok_or_else(|| anyhow!("server closed connection before responding"))?;
-    let resp: Response = serde_json::from_str(&line).context("decode response")?;
-    Ok(resp)
-}
-
-fn print_json(response: &Response) -> Result<()> {
-    let s = serde_json::to_string_pretty(response)?;
-    println!("{s}");
-    if matches!(response, Response::Error { .. }) {
-        std::process::exit(2);
-    }
-    Ok(())
-}
-
-fn print_human(request: &Request, response: &Response) -> Result<()> {
-    match response {
-        Response::Status(s) => {
-            // `mode` controls which fields are meaningful: terminal-mode
-            // daemons have no peer concept, so we omit the heartbeat /
-            // enrollment lines.
-            let mode_str = match s.mode {
-                Mode::Relay => "relay",
-                Mode::Terminal => "terminal",
-            };
-            println!("version:        {}", s.version);
-            println!("mode:           {mode_str}");
-            if matches!(s.mode, Mode::Relay) {
-                println!(
-                    "peer_ip:        {}",
-                    s.peer_ip
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "(none)".to_string())
-                );
-                println!(
-                    "last_heartbeat: {}",
-                    match s.last_heartbeat_age_ms {
-                        Some(ms) => format!("{ms} ms ago"),
-                        None => "(none)".to_string(),
-                    }
-                );
-            }
-            println!("rules:          {}", s.rule_count);
-            println!("uptime:         {} s", s.uptime_secs);
-            if matches!(s.mode, Mode::Relay) {
-                println!("peer_enrolled:  {}", s.peer_enrolled);
-            }
-        }
-        Response::Rules(b) => {
-            if b.rules.is_empty() {
-                println!("(no rules loaded)");
-            } else {
-                println!("{:<24}  {:<5}  {:<24}  upstream", "name", "proto", "listen");
-                for br in &b.rules {
-                    println!(
-                        "{:<24}  {:<5}  {:<24}  {}",
-                        br.name, br.protocol, br.listen, br.upstream
-                    );
-                }
-            }
-        }
-        Response::RulesReloaded {
-            reloaded_rule_count,
-        } => {
-            println!(
-                "reload requested ({reloaded_rule_count} rules currently loaded; \
-                 new state visible on next `rules list`)"
-            );
-        }
-        Response::Peer(p) => {
-            if !p.enrolled {
-                println!("(no peer enrolled)");
-            } else {
-                println!("pubkey:      {}", p.public_key_hex);
-                println!("fingerprint: {}", p.fingerprint);
-            }
-        }
-        Response::PeerPending(p) => {
-            if p.candidates.is_empty() {
-                println!("(no pending candidates)");
-            } else {
-                println!("{:<34} attempts  first_seen", "fingerprint");
-                for c in &p.candidates {
-                    println!(
-                        "{:<34} {:<8}  {}",
-                        c.fingerprint, c.attempt_count, c.first_seen_unix_ms
-                    );
-                }
-            }
-        }
-        Response::PeerApproved { fingerprint } => {
-            println!("approved {fingerprint}");
-        }
-        Response::Certs(c) => {
-            if c.certs.is_empty() {
-                println!("(no certificates loaded)");
-            } else {
-                println!("{:<32}  {:<48}  loaded_unix_ms", "hostname", "source");
-                for entry in &c.certs {
-                    println!(
-                        "{:<32}  {:<48}  {}",
-                        entry.hostname, entry.cert_source, entry.loaded_at_unix_ms,
-                    );
-                }
-            }
-        }
-        Response::Error { code, message } => {
-            // Annotate which command triggered it so error output is greppable.
-            eprintln!("error from server: {code}: {message}");
-            eprintln!("(request was {request:?})");
-            bail!("server returned error");
-        }
-    }
-    Ok(())
 }

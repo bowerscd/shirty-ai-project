@@ -24,9 +24,10 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
-    error_codes, RuleInfo, RulesResponse, CertInfo, CertsListResponse, Mode, PeerResponse,
+    error_codes, RuleInfo, RulesResponse, CertInfo, CertsListResponse, Mode, DownstreamResponse,
     PendingResponse, Request, Response, StatusResponse,
 };
+use ratatoskr::pubkey::PubKey;
 
 use crate::rules::ReloadTrigger;
 use crate::heartbeat::PeerState;
@@ -43,14 +44,14 @@ pub struct ControlServer {
 /// Shared state every connection task sees.
 ///
 /// `peer_state` and `pending_store` are `Option` so the same control surface
-/// can serve both relay-mode daemons (peer enrolled, heartbeat live) and
-/// terminal-mode daemons (no peer concept). When `None`, any `peer ...`
-/// request returns [`error_codes::NOT_SUPPORTED_IN_TERMINAL_MODE`].
+/// can serve both relay-mode daemons (downstream enrolled, heartbeat live)
+/// and terminal-mode daemons (no downstream concept). When `None`, any
+/// `downstream ...` request returns [`error_codes::NOT_SUPPORTED_IN_TERMINAL_MODE`].
 struct ControlState {
     started_at: Instant,
     /// The mode the daemon was started in. Surfaced verbatim in
     /// [`StatusResponse::mode`] and used as the gate for the
-    /// `peer ...` request family.
+    /// `downstream ...` request family.
     mode: Mode,
     peer_state: Option<Arc<PeerState>>,
     snapshot_rx: tokio::sync::watch::Receiver<Vec<crate::proxy::supervisor::ProxySnapshot>>,
@@ -59,7 +60,7 @@ struct ControlState {
     cert_store: Arc<crate::proxy::certs::CertStore>,
     pending_store: Option<Arc<PendingPeerStore>>,
     /// Path to the main server config; the approve flow rewrites
-    /// `[peer].public_key_hex` atomically (tmp + rename). Held even in
+    /// `[chain.downstream].pubkey` atomically (tmp + rename). Held even in
     /// terminal mode (unused; cheap to carry).
     config_path: PathBuf,
 }
@@ -73,7 +74,7 @@ impl ControlServer {
     /// the common "previous run crashed, EADDRINUSE" footgun.
     ///
     /// `peer_state` and `pending_store` are `None` in terminal mode. All
-    /// `peer ...` requests then return `not_supported_in_terminal_mode`.
+    /// `downstream ...` requests then return `not_supported_in_terminal_mode`.
     pub async fn bind(
         socket_path: impl Into<PathBuf>,
         mode: Mode,
@@ -226,11 +227,11 @@ fn handle_request_text(line: &str, state: &ControlState) -> Response {
 fn dispatch(req: Request, state: &ControlState) -> Response {
     match req {
         Request::Status => {
-            // Relay mode: report `peer_ip`, `last_heartbeat_age_ms`, and
-            // `peer_enrolled` from the live peer state. Terminal mode has no
-            // peer concept; emit `None` for the heartbeat fields and
-            // `peer_enrolled = false`.
-            let (peer_ip, last_heartbeat_age_ms, peer_enrolled) = match &state.peer_state {
+            // Relay mode: report `downstream_ip`, `last_heartbeat_age_ms`, and
+            // `downstream_enrolled` from the live peer state. Terminal mode
+            // has no downstream concept; emit `None` for the heartbeat
+            // fields and `downstream_enrolled = false`.
+            let (downstream_ip, last_heartbeat_age_ms, downstream_enrolled) = match &state.peer_state {
                 Some(ps) => {
                     let age = ps.last_heartbeat_ms().and_then(|ts| {
                         SystemTime::now()
@@ -247,11 +248,11 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
             Response::Status(StatusResponse {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 mode: state.mode,
-                peer_ip,
+                downstream_ip,
                 last_heartbeat_age_ms,
                 rule_count,
                 uptime_secs: state.started_at.elapsed().as_secs(),
-                peer_enrolled,
+                downstream_enrolled,
             })
         }
         Request::RulesList => {
@@ -276,35 +277,39 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                 reloaded_rule_count,
             }
         }
-        Request::PeerShow => {
+        Request::DownstreamShow => {
             let peer_state = match &state.peer_state {
                 Some(ps) => ps,
-                None => return terminal_mode_unsupported("peer show"),
+                None => return terminal_mode_unsupported("downstream show"),
             };
             let enrolled = peer_state.is_peer_enrolled();
-            let pubkey = peer_state.peer_static_key();
-            let public_key_hex = if enrolled { hex::encode(pubkey) } else { String::new() };
-            let fingerprint = if enrolled {
-                public_key_fingerprint(&pubkey)
+            let raw = peer_state.peer_static_key();
+            let pubkey = if enrolled {
+                PubKey::X25519(raw).to_string()
             } else {
                 String::new()
             };
-            Response::Peer(PeerResponse {
+            let fingerprint = if enrolled {
+                public_key_fingerprint(&raw)
+            } else {
+                String::new()
+            };
+            Response::Downstream(DownstreamResponse {
                 enrolled,
-                public_key_hex,
+                pubkey,
                 fingerprint,
             })
         }
-        Request::PeerPending => {
+        Request::DownstreamPending => {
             let pending_store = match &state.pending_store {
                 Some(ps) => ps,
-                None => return terminal_mode_unsupported("peer pending"),
+                None => return terminal_mode_unsupported("downstream pending"),
             };
-            Response::PeerPending(PendingResponse {
+            Response::DownstreamPending(PendingResponse {
                 candidates: pending_store.list(),
             })
         }
-        Request::PeerApprove { fingerprint } => approve_peer(state, &fingerprint),
+        Request::DownstreamApprove { fingerprint } => approve_downstream(state, &fingerprint),
         Request::CertsList => {
             let certs = state
                 .cert_store
@@ -327,15 +332,15 @@ fn terminal_mode_unsupported(verb: &str) -> Response {
         code: error_codes::NOT_SUPPORTED_IN_TERMINAL_MODE.into(),
         message: format!(
             "`{verb}` is not supported on a terminal-mode daemon \
-             (terminal daemons have no peer identity)"
+             (terminal daemons have no downstream identity)"
         ),
     }
 }
 
-fn approve_peer(state: &ControlState, fingerprint: &str) -> Response {
+fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
     let (peer_state, pending_store) = match (&state.peer_state, &state.pending_store) {
         (Some(ps), Some(store)) => (ps, store),
-        _ => return terminal_mode_unsupported("peer approve"),
+        _ => return terminal_mode_unsupported("downstream approve"),
     };
     let key = match pending_store.approve(fingerprint) {
         Ok(Some(k)) => k,
@@ -352,14 +357,14 @@ fn approve_peer(state: &ControlState, fingerprint: &str) -> Response {
             };
         }
     };
-    let key_hex = hex::encode(key);
-    if let Err(e) = update_server_peer_config(&state.config_path, &key_hex) {
+    let tagged = PubKey::X25519(key).to_string();
+    if let Err(e) = update_downstream_pubkey(&state.config_path, &tagged) {
         return Response::Error {
             code: error_codes::CONFIG_WRITE_FAILED.into(),
             message: format!(
                 "approve: failed to write {} ({e:#}). \
                  Candidate has been removed from the pending queue; \
-                 set `peer.public_key_hex = \"{key_hex}\"` manually.",
+                 set `chain.downstream.pubkey = \"{tagged}\"` manually.",
                 state.config_path.display()
             ),
         };
@@ -367,17 +372,18 @@ fn approve_peer(state: &ControlState, fingerprint: &str) -> Response {
     peer_state.set_peer_static_key(key);
     tracing::info!(
         fingerprint = fingerprint,
-        "peer approved via control surface; key is now live"
+        "downstream approved via control surface; key is now live"
     );
-    Response::PeerApproved {
+    Response::DownstreamApproved {
         fingerprint: fingerprint.to_string(),
     }
 }
 
-/// Atomic rewrite of `[peer].public_key_hex` in `config_path`. Round-trips
+/// Atomic rewrite of `[chain.downstream].pubkey` in `config_path`. Round-trips
 /// the file through `toml::Value` so other keys are preserved (formatting
-/// and comments are lost — acceptable trade-off documented in commands.rs).
-fn update_server_peer_config(config_path: &Path, peer_pubkey_hex: &str) -> Result<()> {
+/// and comments are lost — acceptable trade-off; explicit `*.tmp` + rename
+/// keeps the change crash-safe).
+fn update_downstream_pubkey(config_path: &Path, tagged_pubkey: &str) -> Result<()> {
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
     let mut doc: toml::Value = text.parse()
@@ -385,15 +391,24 @@ fn update_server_peer_config(config_path: &Path, peer_pubkey_hex: &str) -> Resul
     let table = doc
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a TOML table", config_path.display()))?;
-    let peer_entry = table
-        .entry("peer".to_string())
+    let chain_entry = table
+        .entry("chain".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let peer_table = peer_entry
+    let chain_table = chain_entry
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("`peer` in {} is not a table", config_path.display()))?;
-    peer_table.insert(
-        "public_key_hex".to_string(),
-        toml::Value::String(peer_pubkey_hex.to_string()),
+        .ok_or_else(|| anyhow::anyhow!("`chain` in {} is not a table", config_path.display()))?;
+    let downstream_entry = chain_table
+        .entry("downstream".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+    let downstream_table = downstream_entry
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!(
+            "`chain.downstream` in {} is not a table",
+            config_path.display()
+        ))?;
+    downstream_table.insert(
+        "pubkey".to_string(),
+        toml::Value::String(tagged_pubkey.to_string()),
     );
     let serialised = toml::to_string_pretty(&doc).context("serialise updated config")?;
     let tmp = config_path.with_extension("toml.tmp");
@@ -447,11 +462,11 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
         let store = Arc::new(PendingPeerStore::load(&state_dir).unwrap());
         let config_path = dir.join("yggdrasil.toml");
-        // Minimal valid-looking config so `update_server_peer_config` has
-        // something to round-trip if a test ends up approving.
+        // Minimal valid TOML so `update_downstream_pubkey` has something
+        // to round-trip if a test ends up approving.
         std::fs::write(
             &config_path,
-            "[server]\nheartbeat_listen = \"127.0.0.1:0\"\n[peer]\npublic_key_hex = \"\"\n",
+            "[server]\nidentity_file = \"/tmp/id.key\"\n",
         )
         .unwrap();
         (store, config_path)
@@ -514,9 +529,9 @@ mod tests {
         let resp = send_request(&socket, &Request::Status).await;
         match resp {
             Response::Status(s) => {
-                assert_eq!(s.peer_ip, None);
+                assert_eq!(s.downstream_ip, None);
                 assert_eq!(s.rule_count, 0);
-                assert!(!s.peer_enrolled);
+                assert!(!s.downstream_enrolled);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -549,8 +564,8 @@ mod tests {
         let resp = send_request(&socket, &Request::Status).await;
         match resp {
             Response::Status(s) => {
-                assert_eq!(s.peer_ip, Some(ip));
-                assert!(s.peer_enrolled);
+                assert_eq!(s.downstream_ip, Some(ip));
+                assert!(s.downstream_enrolled);
                 assert!(s.last_heartbeat_age_ms.is_some());
             }
             other => panic!("unexpected response: {other:?}"),
@@ -561,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_show_returns_pubkey_when_enrolled() {
+    async fn downstream_show_returns_pubkey_when_enrolled() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) =
@@ -578,11 +593,13 @@ mod tests {
         )
         .await;
 
-        let resp = send_request(&socket, &Request::PeerShow).await;
+        let resp = send_request(&socket, &Request::DownstreamShow).await;
         match resp {
-            Response::Peer(p) => {
+            Response::Downstream(p) => {
                 assert!(p.enrolled);
-                assert_eq!(p.public_key_hex.len(), 64);
+                // tagged form: "x25519:" + 64 hex chars = 71 chars
+                assert_eq!(p.pubkey.len(), 71);
+                assert!(p.pubkey.starts_with("x25519:"));
                 assert_eq!(p.fingerprint.len(), 32);
             }
             other => panic!("unexpected response: {other:?}"),
@@ -593,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_show_returns_empty_when_not_enrolled() {
+    async fn downstream_show_returns_empty_when_not_enrolled() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
@@ -609,11 +626,11 @@ mod tests {
         )
         .await;
 
-        let resp = send_request(&socket, &Request::PeerShow).await;
+        let resp = send_request(&socket, &Request::DownstreamShow).await;
         match resp {
-            Response::Peer(p) => {
+            Response::Downstream(p) => {
                 assert!(!p.enrolled);
-                assert!(p.public_key_hex.is_empty());
+                assert!(p.pubkey.is_empty());
                 assert!(p.fingerprint.is_empty());
             }
             other => panic!("unexpected response: {other:?}"),
@@ -705,9 +722,9 @@ mod tests {
         )
         .await;
 
-        let resp = send_request(&socket, &Request::PeerPending).await;
+        let resp = send_request(&socket, &Request::DownstreamPending).await;
         match resp {
-            Response::PeerPending(p) => {
+            Response::DownstreamPending(p) => {
                 assert_eq!(p.candidates.len(), 2);
             }
             other => panic!("unexpected response: {other:?}"),
@@ -718,7 +735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_approve_writes_config_and_swaps_live_key() {
+    async fn downstream_approve_writes_config_and_swaps_live_key() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
@@ -743,23 +760,28 @@ mod tests {
 
         let resp = send_request(
             &socket,
-            &Request::PeerApprove {
+            &Request::DownstreamApprove {
                 fingerprint: fp.clone(),
             },
         )
         .await;
         match resp {
-            Response::PeerApproved { fingerprint } => assert_eq!(fingerprint, fp),
+            Response::DownstreamApproved { fingerprint } => assert_eq!(fingerprint, fp),
             other => panic!("unexpected response: {other:?}"),
         }
         // Live key was swapped in.
         assert!(peer_state.is_peer_enrolled());
         assert_eq!(peer_state.peer_static_key(), candidate);
-        // Config file was rewritten with the approved key.
+        // Config file was rewritten with the approved key in tagged form.
         let rewritten = std::fs::read_to_string(&cfg).unwrap();
+        let tagged = format!("x25519:{}", hex::encode(candidate));
         assert!(
-            rewritten.contains(&hex::encode(candidate)),
-            "config not rewritten: {rewritten}"
+            rewritten.contains(&tagged),
+            "config not rewritten with tagged pubkey: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("[chain.downstream]"),
+            "config missing [chain.downstream]: {rewritten}"
         );
 
         shutdown.cancel();
@@ -768,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_approve_unknown_fingerprint_returns_error() {
+    async fn downstream_approve_unknown_fingerprint_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
@@ -786,7 +808,7 @@ mod tests {
 
         let resp = send_request(
             &socket,
-            &Request::PeerApprove {
+            &Request::DownstreamApprove {
                 fingerprint: "not-a-real-fingerprint".to_string(),
             },
         )

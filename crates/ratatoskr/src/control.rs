@@ -59,12 +59,12 @@ pub enum Request {
     RulesList,
     /// Force a reload of the rules directory.
     RulesReload,
-    /// Currently enrolled peer pubkey + fingerprint.
-    PeerShow,
-    /// Staged (TOFU) peer candidates awaiting approval.
-    PeerPending,
+    /// Currently enrolled downstream pubkey + fingerprint.
+    DownstreamShow,
+    /// Staged (TOFU) downstream candidates awaiting approval.
+    DownstreamPending,
     /// Approve a staged candidate by its short fingerprint.
-    PeerApprove {
+    DownstreamApprove {
         /// Short BLAKE2s-128 fingerprint (32 hex chars).
         fingerprint: String,
     },
@@ -84,9 +84,9 @@ pub enum Response {
     Status(StatusResponse),
     Rules(RulesResponse),
     RulesReloaded { reloaded_rule_count: usize },
-    Peer(PeerResponse),
-    PeerPending(PendingResponse),
-    PeerApproved {
+    Downstream(DownstreamResponse),
+    DownstreamPending(PendingResponse),
+    DownstreamApproved {
         fingerprint: String,
     },
     Certs(CertsListResponse),
@@ -109,9 +109,9 @@ pub struct StatusResponse {
     /// mode that used to exist).
     #[serde(default)]
     pub mode: Mode,
-    /// Currently known peer IP (`None` until first heartbeat). Always
+    /// Currently known downstream IP (`None` until first heartbeat). Always
     /// `None` in terminal mode.
-    pub peer_ip: Option<IpAddr>,
+    pub downstream_ip: Option<IpAddr>,
     /// Milliseconds since the last accepted heartbeat (`None` if no heartbeats yet).
     /// Always `None` in terminal mode.
     pub last_heartbeat_age_ms: Option<u64>,
@@ -119,9 +119,9 @@ pub struct StatusResponse {
     pub rule_count: usize,
     /// Server uptime in seconds.
     pub uptime_secs: u64,
-    /// Whether a peer has been enrolled (`peer.public_key_hex` non-empty in config).
-    /// Always `false` in terminal mode.
-    pub peer_enrolled: bool,
+    /// Whether a downstream has been enrolled (`[chain.downstream]` present
+    /// in config). Always `false` in terminal mode.
+    pub downstream_enrolled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,11 +143,11 @@ pub struct RuleInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerResponse {
-    /// Whether the server has a peer enrolled yet.
+pub struct DownstreamResponse {
+    /// Whether the server has a downstream enrolled yet.
     pub enrolled: bool,
-    /// Hex-encoded pubkey (empty if `!enrolled`).
-    pub public_key_hex: String,
+    /// Tagged pubkey form (`x25519:<hex>`); empty if `!enrolled`.
+    pub pubkey: String,
     /// Short fingerprint (empty if `!enrolled`).
     pub fingerprint: String,
 }
@@ -191,7 +191,7 @@ pub mod error_codes {
     pub const NO_SUCH_FINGERPRINT: &str = "no_such_fingerprint";
     pub const CONFIG_WRITE_FAILED: &str = "config_write_failed";
     pub const RELOAD_FAILED:       &str = "reload_failed";
-    pub const PEER_ALREADY_ENROLLED: &str = "peer_already_enrolled";
+    pub const DOWNSTREAM_ALREADY_ENROLLED: &str = "downstream_already_enrolled";
     pub const INVALID_REQUEST:     &str = "invalid_request";
     pub const INTERNAL_ERROR:      &str = "internal_error";
     /// The daemon is running in `mode = "terminal"`, which has no peer
@@ -216,9 +216,9 @@ mod tests {
             Request::Status,
             Request::RulesList,
             Request::RulesReload,
-            Request::PeerShow,
-            Request::PeerPending,
-            Request::PeerApprove {
+            Request::DownstreamShow,
+            Request::DownstreamPending,
+            Request::DownstreamApprove {
                 fingerprint: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
             },
             Request::CertsList,
@@ -235,11 +235,11 @@ mod tests {
         let resp = Response::Status(StatusResponse {
             version: "0.1.0".into(),
             mode: Mode::Relay,
-            peer_ip: Some("192.0.2.1".parse().unwrap()),
+            downstream_ip: Some("192.0.2.1".parse().unwrap()),
             last_heartbeat_age_ms: Some(123),
             rule_count: 3,
             uptime_secs: 60,
-            peer_enrolled: true,
+            downstream_enrolled: true,
         });
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
@@ -264,11 +264,11 @@ mod tests {
         let s = serde_json::json!({
             "kind": "status",
             "version": "0.1.0",
-            "peer_ip": null,
+            "downstream_ip": null,
             "last_heartbeat_age_ms": null,
             "rule_count": 0,
             "uptime_secs": 0,
-            "peer_enrolled": false,
+            "downstream_enrolled": false,
         })
         .to_string();
         let parsed: Response = serde_json::from_str(&s).unwrap();
@@ -283,11 +283,11 @@ mod tests {
         let resp = Response::Status(StatusResponse {
             version: "0.1.0".into(),
             mode: Mode::Terminal,
-            peer_ip: None,
+            downstream_ip: None,
             last_heartbeat_age_ms: None,
             rule_count: 2,
             uptime_secs: 30,
-            peer_enrolled: false,
+            downstream_enrolled: false,
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"mode\":\"terminal\""), "got: {s}");

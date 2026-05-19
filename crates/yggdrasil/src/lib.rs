@@ -15,8 +15,8 @@
 //! integration test / bench suite living inside this crate.
 
 pub mod rules;
+pub mod chain;
 pub mod cli;
-pub mod commands;
 pub mod config;
 pub mod control;
 pub mod health;
@@ -30,11 +30,12 @@ pub mod systemd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
-use ratatoskr::auth::{StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::auth::StaticKeyPair;
 
+use crate::chain::{ChainClient, ChainClientConfig};
 use crate::control::ControlServer;
 use crate::heartbeat::{HeartbeatServer, PeerState, UNENROLLED_PEER_KEY};
 use crate::pending_peers::PendingPeerStore;
@@ -83,55 +84,48 @@ pub async fn run(args: cli::RunArgs) -> Result<()> {
     }
 }
 
-/// Run the relay-mode daemon: heartbeat server, peer state, pending-peer
-/// store, dynamic-IP-resolved proxies.
+/// Run the relay-mode daemon: optional inbound chain listener, peer
+/// state, pending-peer store, dynamic-IP-resolved proxies. May also dial
+/// an upstream chain client when `[chain.upstream]` is configured.
 pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Result<()> {
-    // Validation in `ServerConfig::validate` guarantees `heartbeat_listen` is
-    // `Some` in relay mode.
-    let heartbeat_listen = config
-        .server
-        .heartbeat_listen
-        .expect("relay mode requires heartbeat_listen (validated)");
-
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
         mode = config.server.mode.as_str(),
-        heartbeat_listen = %heartbeat_listen,
+        chain_listener = ?config.chain.listener.as_ref().map(|l| l.listen),
+        chain_upstream = ?config.chain.upstream.as_ref().map(|u| &u.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
     );
 
-    // 1. Load our long-term X25519 identity.
-    let local_keys = StaticKeyPair::load_from_file(&config.server.identity_file)
-        .with_context(|| {
-            format!(
-                "loading server identity from {}",
-                config.server.identity_file.display()
-            )
-        })?;
+    // 1. Load (or auto-generate) our long-term X25519 identity.
+    let local_keys = load_or_generate_identity(&config.server.identity_file)?;
 
-    // 2. Resolve the configured peer. An empty `peer.public_key_hex` is
-    //    legitimate: the daemon comes up in TOFU staging mode, accepts no
-    //    handshakes, but records each unknown candidate to
-    //    `state_dir/pending_peers.toml` for the operator to approve via
-    //    `yggdrasilctl peer approve <fingerprint>`.
-    let peer_pubkey = if config.peer.public_key_hex.is_empty() {
-        tracing::warn!(
-            "no peer enrolled (peer.public_key_hex empty). \
-             Daemon will accept no traffic until you approve a candidate via \
-             `yggdrasilctl peer approve <fingerprint>`."
-        );
-        UNENROLLED_PEER_KEY
-    } else {
-        decode_pubkey_hex(&config.peer.public_key_hex)
-            .context("decoding peer.public_key_hex")?
+    // 2. Resolve the configured downstream. No `[chain.downstream]` means
+    //    the daemon comes up in TOFU staging mode (when a listener is also
+    //    configured); a candidate may then be approved via
+    //    `yggdrasilctl identity add-downstream`.
+    let downstream_pubkey = match config.chain.downstream.as_ref() {
+        Some(dn) => *dn
+            .pubkey
+            .as_x25519()
+            .expect("PubKey::X25519 only variant in v1"),
+        None => {
+            if config.chain.listener.is_some() {
+                tracing::warn!(
+                    "no downstream enrolled ([chain.downstream] absent). \
+                     Daemon will accept no traffic until you approve a candidate via \
+                     `yggdrasilctl identity add-downstream`."
+                );
+            }
+            UNENROLLED_PEER_KEY
+        }
     };
-    let peer_state = PeerState::new(peer_pubkey);
+    let peer_state = PeerState::new(downstream_pubkey);
     if peer_state.is_peer_enrolled() {
         tracing::info!(
-            peer = %peer_state.fingerprint(),
-            "peer identity loaded"
+            downstream = %peer_state.fingerprint(),
+            "downstream identity loaded"
         );
     }
 
@@ -141,31 +135,39 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
             .context("loading pending peer store")?,
     );
 
-    // 3. One shutdown token rules them all. SIGTERM/SIGINT cancels it; both
-    //    the heartbeat server and the proxy supervisor observe it.
+    // 3. One shutdown token rules them all.
     let shutdown = CancellationToken::new();
 
-    // 4. Metrics exporter. Set up before anything emits metrics so the global
-    //    recorder is the prometheus one and not the no-op fallback.
+    // 4. Metrics exporter. Set up before anything emits metrics so the
+    //    global recorder is the prometheus one and not the no-op fallback.
     if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Relay).await {
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
-    // 5. Heartbeat control plane.
-    let hb = HeartbeatServer::bind(
-        heartbeat_listen,
-        local_keys,
-        peer_state.clone(),
-        pending_store.clone(),
-        shutdown.clone(),
-    )
-    .await
-    .context("binding heartbeat server")?;
-    let hb_handle = tokio::spawn(async move {
-        if let Err(e) = hb.run().await {
-            tracing::error!(error = %e, "heartbeat server exited with error");
-        }
-    });
+    // 5. Heartbeat (chain) listener — only when [chain.listener] is set.
+    //    A pure-proxy relay (no downstream/listener, only an upstream) is
+    //    a legitimate mid-chain configuration that does no inbound work.
+    let hb_handle = if let Some(listener) = config.chain.listener.as_ref() {
+        let hb = HeartbeatServer::bind(
+            listener.listen,
+            local_keys.clone(),
+            peer_state.clone(),
+            pending_store.clone(),
+            shutdown.clone(),
+        )
+        .await
+        .context("binding chain listener")?;
+        Some(tokio::spawn(async move {
+            if let Err(e) = hb.run().await {
+                tracing::error!(error = %e, "chain listener exited with error");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // 5b. Outbound chain client — only when [chain.upstream] is set.
+    let chain_client_handle = spawn_chain_client(&config, &local_keys, shutdown.clone());
 
     // 6. Rule-driven proxy supervisor.
     let resolver_factory = ResolverFactory::new_relay(peer_state.clone());
@@ -202,63 +204,59 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         "yggdrasil running"
     );
 
-    // 7b. All subsystems are up; notify systemd we are ready. No-op when
-    //     NOTIFY_SOCKET is unset (local dev, docker without --systemd).
-    //     Mirror the same fact into the process-local readiness flag so
-    //     /readyz on the metrics listener flips to 200.
     health::mark_ready();
     systemd::notify_ready();
 
-    // 8. Wait for shutdown signal, then bring everything down cleanly.
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
-    let _ = hb_handle.await;
+    if let Some(handle) = hb_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = chain_client_handle {
+        let _ = handle.await;
+    }
     Ok(())
 }
 
-/// Run the terminal-mode daemon: no heartbeat, no peer state, no pending
-/// peers. Just the proxy supervisor (with a static resolver factory),
-/// metrics exporter, and the control socket.
-///
-/// The identity file is loaded and the public-key fingerprint logged for
-/// future cross-daemon authentication features; it is not used on the wire
-/// today.
+/// Run the terminal-mode daemon: no inbound chain listener, no peer
+/// state, no pending peers. Just the proxy supervisor (with a static
+/// resolver factory), metrics exporter, the control socket, and an
+/// optional outbound chain client.
 pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
         mode = config.server.mode.as_str(),
+        chain_upstream = ?config.chain.upstream.as_ref().map(|u| &u.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
     );
 
-    // 1. Load our long-term X25519 identity. Even in terminal mode the daemon
-    //    keeps a stable identity for future cross-daemon authentication
-    //    features; today it does not appear on the wire.
-    let _local_keys = StaticKeyPair::load_from_file(&config.server.identity_file)
-        .with_context(|| {
-            format!(
-                "loading server identity from {}",
-                config.server.identity_file.display()
-            )
-        })?;
-    tracing::info!("identity loaded; not used on the wire in terminal mode");
+    // 1. Load (or auto-generate) our long-term X25519 identity. The
+    //    terminal daemon uses this on the wire whenever it dials an
+    //    upstream via the chain client.
+    let local_keys = load_or_generate_identity(&config.server.identity_file)?;
 
-    // 2. Shutdown token observed by the supervisor and control server.
+    // 2. Shutdown token observed by the supervisor, the chain client, and
+    //    the control server.
     let shutdown = CancellationToken::new();
 
-    // 3. Metrics exporter. Set up before anything emits metrics so the global
-    //    recorder is the prometheus one and not the no-op fallback.
+    // 3. Metrics exporter.
     if let Err(e) = metrics::init(config.metrics.listen, ratatoskr::control::Mode::Terminal).await {
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
+    // 3b. Outbound chain client — only when [chain.upstream] is set.
+    //     A terminal node without an upstream is still useful (pure local
+    //     proxy), so absence is not an error.
+    let chain_client_handle = spawn_chain_client(&config, &local_keys, shutdown.clone());
+
     // 4. Rule-driven proxy supervisor with a terminal-mode factory: every
-    //    rule must carry `upstream_addr`; `upstream_port` rules are rejected
-    //    by `ResolverFactory::build`.
+    //    rule must carry `upstream_addr`; `upstream_port` rules are
+    //    rejected by `ResolverFactory::build`.
     let resolver_factory = ResolverFactory::new_terminal();
     let supervisor = ProxySupervisor::spawn(
         config.server.rules_dir.clone(),
@@ -275,9 +273,8 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     .await
     .context("spawning proxy supervisor")?;
 
-    // 5. UDS control surface for `yggdrasilctl`. Terminal mode has no peer
-    //    identity, so the peer-related endpoints return
-    //    `not_supported_in_terminal_mode`.
+    // 5. UDS control surface. Terminal mode has no downstream identity, so
+    //    peer-related endpoints return `not_supported_in_terminal_mode`.
     let control = ControlServer::bind(
         config.control.socket.clone(),
         ratatoskr::control::Mode::Terminal,
@@ -295,20 +292,86 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
         "yggdrasil running"
     );
 
-    // 5b. All subsystems are up; notify systemd we are ready. No-op when
-    //     NOTIFY_SOCKET is unset (local dev, docker without --systemd).
-    //     Mirror the same fact into the process-local readiness flag so
-    //     /readyz on the metrics listener flips to 200.
     health::mark_ready();
     systemd::notify_ready();
 
-    // 6. Wait for shutdown signal, then bring everything down cleanly.
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
+    if let Some(handle) = chain_client_handle {
+        let _ = handle.await;
+    }
     Ok(())
+}
+
+/// Load the static X25519 identity from `path`, generating + persisting it
+/// (mode 0600) if the file does not exist. Logs the fingerprint either way.
+fn load_or_generate_identity(path: &std::path::Path) -> Result<StaticKeyPair> {
+    if path.exists() {
+        let kp = StaticKeyPair::load_from_file(path)
+            .with_context(|| format!("loading identity from {}", path.display()))?;
+        tracing::info!(
+            identity_file = %path.display(),
+            fingerprint = %kp.fingerprint(),
+            "identity loaded"
+        );
+        Ok(kp)
+    } else {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating identity directory {}", parent.display())
+                })?;
+            }
+        }
+        let kp = StaticKeyPair::generate().context("generating identity")?;
+        kp.save_to_file(path)
+            .with_context(|| format!("writing identity to {}", path.display()))?;
+        tracing::info!(
+            identity_file = %path.display(),
+            fingerprint = %kp.fingerprint(),
+            "identity auto-generated on first start"
+        );
+        Ok(kp)
+    }
+}
+
+/// Spawn the outbound chain client when `[chain.upstream]` is configured.
+/// Returns `None` when no upstream is set (a legitimate configuration for
+/// pure-proxy nodes and root relays).
+fn spawn_chain_client(
+    config: &config::ServerConfig,
+    local_keys: &StaticKeyPair,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let up = config.chain.upstream.as_ref()?;
+    let upstream_pubkey = *up
+        .pubkey
+        .as_x25519()
+        .expect("PubKey::X25519 only variant in v1");
+    let cfg = ChainClientConfig {
+        endpoint: up.endpoint.clone(),
+        upstream_pubkey,
+        local_keys: local_keys.clone(),
+        heartbeat_interval: up.heartbeat_interval,
+        rekey_interval: up.rekey_interval,
+    };
+    let upstream_fp = ratatoskr::auth::public_key_fingerprint(&upstream_pubkey);
+    tracing::info!(
+        upstream_endpoint = %up.endpoint,
+        upstream_fingerprint = %upstream_fp,
+        heartbeat_interval = ?up.heartbeat_interval,
+        rekey_interval = ?up.rekey_interval,
+        "spawning chain client"
+    );
+    let client = ChainClient::new(cfg, shutdown);
+    Some(tokio::spawn(async move {
+        if let Err(e) = client.run().await {
+            tracing::error!(error = %e, "chain client exited with error");
+        }
+    }))
 }
 
 async fn wait_for_shutdown() {
@@ -326,11 +389,3 @@ async fn wait_for_shutdown() {
     }
 }
 
-fn decode_pubkey_hex(hex_str: &str) -> Result<[u8; PUBLIC_KEY_LEN]> {
-    let bytes = hex::decode(hex_str).context("not valid hex")?;
-    let arr: [u8; PUBLIC_KEY_LEN] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("expected exactly {PUBLIC_KEY_LEN} bytes, got {}", bytes.len()))?;
-    Ok(arr)
-}

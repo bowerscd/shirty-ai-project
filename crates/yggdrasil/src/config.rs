@@ -1,4 +1,21 @@
 //! Server configuration schema (`/etc/yggdrasil/config.toml`).
+//!
+//! The config is organised into a small number of named tables:
+//!
+//! * `[server]` — runtime mode, paths, defaults.
+//! * `[metrics]` — Prometheus exporter listen address.
+//! * `[control]` — `yggdrasilctl` Unix-domain socket path.
+//! * `[chain.upstream]` (optional) — this node's outbound chain client:
+//!   who to dial, what to pin, how often to heartbeat. Drives both relay-
+//!   and terminal-mode nodes when set.
+//! * `[chain.downstream]` (optional) — single accepted downstream
+//!   identity (for v1 — one downstream per node). When present and
+//!   `pubkey` is set, the node listens for inbound chain traffic.
+//! * `[chain.listener]` (optional) — listener parameters (UDP socket) for
+//!   inbound chain traffic. Required when `[chain.downstream]` is set.
+//!
+//! All public keys use the tagged textual form `<algo>:<hex>`; bare hex is
+//! rejected.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -6,6 +23,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use ratatoskr::pubkey::PubKey;
 use ratatoskr::Error as ProtoError;
 
 /// Top-level server config file. Validated on load.
@@ -17,16 +35,23 @@ pub struct ServerConfig {
     pub metrics: MetricsSection,
     #[serde(default)]
     pub control: ControlSection,
-    /// The single enrolled huginn peer. Empty `public_key_hex` means
-    /// no peer is enrolled yet — TOFU candidates may then be staged via `yggdrasilctl`.
+    /// Chain-control configuration: who this node dials upstream, who it
+    /// accepts downstream, and where it listens for inbound chain traffic.
+    /// All sub-tables are optional; an absent `[chain]` table is identical
+    /// to one with no subsections set.
     #[serde(default)]
-    pub peer:    PeerSection,
+    pub chain:   ChainSection,
 }
 
 /// Runtime mode selector. English-only operator surface (no serde aliases).
 ///
-/// * `Relay` — cloud-side daemon. Dials the heartbeat-discovered peer IP.
-/// * `Terminal` — home-side daemon. Dials a fixed `upstream_addr` per rule.
+/// * `Relay` — accepts inbound chain traffic AND may dial further upstream.
+/// * `Terminal` — only dials upstream; never accepts inbound chain traffic.
+///
+/// "relay vs terminal" gates proxy resolver behaviour (relay uses dynamic
+/// peer-IP rules; terminal uses static `upstream_addr`), but both modes
+/// can now run an outbound chain client when `[chain.upstream]` is
+/// configured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -50,10 +75,6 @@ pub struct ServerSection {
     /// Runtime mode. Defaults to `relay`.
     #[serde(default)]
     pub mode: Mode,
-    /// UDP socket to receive huginn heartbeats on. Required in `relay` mode;
-    /// must be unset in `terminal` mode (validated on load).
-    #[serde(default)]
-    pub heartbeat_listen: Option<SocketAddr>,
     /// Directory containing `*.toml` rule files. Defaults to `/etc/yggdrasil/conf.d`.
     #[serde(default = "default_rules_dir")]
     pub rules_dir: PathBuf,
@@ -66,13 +87,11 @@ pub struct ServerSection {
     /// Per-host state directory (TOFU staging, runtime markers).
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    /// Path to the server's static X25519 identity (created by `yggdrasil keygen`).
+    /// Path to the node's static X25519 identity. Auto-generated on first
+    /// start if the file does not exist.
     #[serde(default = "default_identity_file")]
     pub identity_file: PathBuf,
     /// Root directory under which per-rule TLS material lives by convention.
-    /// Individual `[[rule.route]]` blocks may still reference cert/key files by
-    /// absolute path; this directory is the recommended root for those paths
-    /// and the location `yggdrasilctl certs list` enumerates.
     #[serde(default = "default_cert_dir")]
     pub cert_dir: PathBuf,
     /// Default TLS certificate (full chain, PEM) used by L7 `https` rules
@@ -80,8 +99,7 @@ pub struct ServerSection {
     /// with `default_key` (XOR-validated on load).
     #[serde(default)]
     pub default_cert: Option<PathBuf>,
-    /// Default TLS private key (PEM) paired with `default_cert`. Must be set
-    /// together with `default_cert`.
+    /// Default TLS private key (PEM) paired with `default_cert`.
     #[serde(default)]
     pub default_key:  Option<PathBuf>,
 }
@@ -89,8 +107,8 @@ pub struct ServerSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsSection {
-    /// Address to expose Prometheus `/metrics` on. Leave at the default `127.0.0.1:9090`
-    /// and front it with whatever scraper you trust.
+    /// Address to expose Prometheus `/metrics` on. Leave at the default
+    /// `127.0.0.1:9090` and front it with whatever scraper you trust.
     pub listen: SocketAddr,
 }
 
@@ -118,16 +136,61 @@ impl Default for ControlSection {
     }
 }
 
+/// Container for all `[chain.*]` sub-tables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PeerSection {
-    /// Hex-encoded X25519 public key of the enrolled huginn peer.
-    /// Empty string means "not yet enrolled".
+pub struct ChainSection {
+    /// Outbound chain client config. When set, this node dials the
+    /// configured upstream and sends heartbeats. Optional — terminal-mode
+    /// nodes with no upstream link omit this entirely.
     #[serde(default)]
-    pub public_key_hex: String,
+    pub upstream:   Option<ChainUpstream>,
+    /// Single enrolled downstream identity. When set, the node accepts
+    /// inbound chain traffic only from this pubkey. v1 supports exactly
+    /// one downstream per node; multi-downstream lands in a later phase.
+    #[serde(default)]
+    pub downstream: Option<ChainDownstream>,
+    /// Inbound listener parameters. Required when `[chain.downstream]` is
+    /// set. Forbidden when `[chain.downstream]` is absent.
+    #[serde(default)]
+    pub listener:   Option<ChainListener>,
+}
+
+/// `[chain.upstream]` — outbound chain client configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainUpstream {
+    /// Tagged pubkey (`x25519:<hex>`) of the upstream node we dial.
+    pub pubkey: PubKey,
+    /// Endpoint to dial: `host:port` or `[ipv6]:port`. Re-resolved on
+    /// every reconnection attempt; DNS rebinds during the lifetime of the
+    /// daemon are honoured.
+    pub endpoint: String,
+    /// How often to send heartbeats. Default 5 s.
+    #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
+    pub heartbeat_interval: Duration,
     /// Re-handshake after at most this much time (default 1h).
     #[serde(default = "default_rekey_interval", with = "humantime_serde")]
     pub rekey_interval: Duration,
+}
+
+/// `[chain.downstream]` — accepted downstream identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainDownstream {
+    /// Tagged pubkey (`x25519:<hex>`) of the enrolled downstream node.
+    pub pubkey: PubKey,
+    /// Re-handshake after at most this much time (default 1h).
+    #[serde(default = "default_rekey_interval", with = "humantime_serde")]
+    pub rekey_interval: Duration,
+}
+
+/// `[chain.listener]` — inbound chain listener parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainListener {
+    /// UDP socket to bind on. Required.
+    pub listen: SocketAddr,
 }
 
 fn default_state_dir() -> PathBuf       { PathBuf::from("/var/lib/yggdrasil") }
@@ -135,6 +198,7 @@ fn default_identity_file() -> PathBuf   { PathBuf::from("/etc/yggdrasil/identity
 fn default_rules_dir() -> PathBuf       { PathBuf::from("/etc/yggdrasil/conf.d") }
 fn default_cert_dir() -> PathBuf        { PathBuf::from("/etc/yggdrasil/certs") }
 fn default_rekey_interval() -> Duration { Duration::from_secs(3600) }
+fn default_heartbeat_interval() -> Duration { Duration::from_secs(5) }
 
 impl ServerConfig {
     /// Load and validate a config file from disk.
@@ -151,40 +215,64 @@ impl ServerConfig {
         Ok(cfg)
     }
 
-    /// Validate the in-memory config. Called automatically by [`Self::load`];
-    /// expose publicly so consumers that mutate config after load (e.g.
-    /// applying CLI overrides) can re-validate before use.
+    /// Validate the in-memory config.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.peer.public_key_hex.is_empty() {
-            let bytes = hex::decode(&self.peer.public_key_hex)
-                .map_err(|_| ConfigError::Invalid("peer.public_key_hex is not valid hex".into()))?;
-            if bytes.len() != ratatoskr::auth::PUBLIC_KEY_LEN {
+        // ---- [chain.listener] ↔ [chain.downstream] coupling ----
+        match (&self.chain.listener, &self.chain.downstream) {
+            (Some(_), None) => {
                 return Err(ConfigError::Invalid(
-                    "peer.public_key_hex must decode to exactly 32 bytes".into(),
+                    "[chain.listener] is set but [chain.downstream] is not; \
+                     a listener with no enrolled downstream would accept no traffic"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "[chain.downstream] is set but [chain.listener] is not; \
+                     an enrolled downstream cannot reach this node without a listener"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+
+        // ---- Terminal-mode constraints ----
+        if matches!(self.server.mode, Mode::Terminal)
+            && (self.chain.downstream.is_some() || self.chain.listener.is_some())
+        {
+            return Err(ConfigError::Invalid(
+                "terminal-mode nodes must not declare [chain.downstream] or \
+                 [chain.listener] — they never accept inbound chain traffic"
+                    .into(),
+            ));
+        }
+
+        // ---- [chain.upstream] sanity ----
+        if let Some(up) = &self.chain.upstream {
+            if up.endpoint.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[chain.upstream].endpoint must not be empty".into(),
+                ));
+            }
+            if !up.endpoint.contains(':') {
+                return Err(ConfigError::Invalid(format!(
+                    "[chain.upstream].endpoint must be host:port (got {:?})",
+                    up.endpoint
+                )));
+            }
+            if up.heartbeat_interval.is_zero() {
+                return Err(ConfigError::Invalid(
+                    "[chain.upstream].heartbeat_interval must be > 0".into(),
+                ));
+            }
+            if up.rekey_interval.is_zero() {
+                return Err(ConfigError::Invalid(
+                    "[chain.upstream].rekey_interval must be > 0".into(),
                 ));
             }
         }
-        match self.server.mode {
-            Mode::Relay => {
-                if self.server.heartbeat_listen.is_none() {
-                    return Err(ConfigError::Invalid(
-                        "server.heartbeat_listen is required in relay mode".into(),
-                    ));
-                }
-            }
-            Mode::Terminal => {
-                if self.server.heartbeat_listen.is_some() {
-                    return Err(ConfigError::Invalid(
-                        "server.heartbeat_listen must not be set in terminal mode".into(),
-                    ));
-                }
-                if !self.peer.public_key_hex.is_empty() {
-                    return Err(ConfigError::Invalid(
-                        "peer.public_key_hex must be empty in terminal mode".into(),
-                    ));
-                }
-            }
-        }
+
+        // ---- TLS default cert/key XOR ----
         match (&self.server.default_cert, &self.server.default_key) {
             (Some(_), None) => {
                 return Err(ConfigError::Invalid(
@@ -232,7 +320,6 @@ mod tests {
     fn relay_minimal_toml() -> &'static str {
         r#"
         [server]
-        heartbeat_listen = "0.0.0.0:51820"
         "#
     }
 
@@ -255,7 +342,6 @@ mod tests {
             r#"
             [server]
             mode = "relay"
-            heartbeat_listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
@@ -266,7 +352,6 @@ mod tests {
     fn parses_explicit_terminal() {
         let cfg = parse(terminal_minimal_toml()).unwrap();
         assert_eq!(cfg.server.mode, Mode::Terminal);
-        assert!(cfg.server.heartbeat_listen.is_none());
     }
 
     #[test]
@@ -275,55 +360,11 @@ mod tests {
             r#"
             [server]
             mode = "verdfolnir"
-            heartbeat_listen = "0.0.0.0:51820"
             "#,
         )
         .err()
         .unwrap();
         assert!(matches!(err, ConfigError::Proto(_)));
-    }
-
-    #[test]
-    fn relay_without_heartbeat_listen_is_rejected() {
-        let err = parse(
-            r#"
-            [server]
-            mode = "relay"
-            "#,
-        )
-        .err()
-        .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("heartbeat_listen is required")));
-    }
-
-    #[test]
-    fn terminal_with_heartbeat_listen_is_rejected() {
-        let err = parse(
-            r#"
-            [server]
-            mode = "terminal"
-            heartbeat_listen = "0.0.0.0:51820"
-            "#,
-        )
-        .err()
-        .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("must not be set in terminal")));
-    }
-
-    #[test]
-    fn terminal_with_peer_pubkey_is_rejected() {
-        let err = parse(
-            r#"
-            [server]
-            mode = "terminal"
-
-            [peer]
-            public_key_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-            "#,
-        )
-        .err()
-        .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("must be empty in terminal")));
     }
 
     #[test]
@@ -337,7 +378,6 @@ mod tests {
         let cfg = parse(
             r#"
             [server]
-            heartbeat_listen = "0.0.0.0:51820"
             rules_dir = "/srv/yggdrasil/rules"
             "#,
         )
@@ -350,7 +390,6 @@ mod tests {
         let cfg = parse(
             r#"
             [server]
-            heartbeat_listen = "0.0.0.0:51820"
             default_bind = "192.168.1.5"
             "#,
         )
@@ -362,23 +401,15 @@ mod tests {
     }
 
     #[test]
-    fn default_bind_absent_is_none() {
-        let cfg = parse(relay_minimal_toml()).unwrap();
-        assert!(cfg.server.default_bind.is_none());
-    }
-
-    #[test]
     fn unknown_field_is_rejected() {
         let err = parse(
             r#"
             [server]
-            heartbeat_listen = "0.0.0.0:51820"
             branches_dir = "/etc/yggdrasil/branches"
             "#,
         )
         .err()
         .unwrap();
-        // Old field name no longer accepted (pre-release; clean break).
         assert!(matches!(err, ConfigError::Proto(_)));
     }
 
@@ -389,37 +420,17 @@ mod tests {
     }
 
     #[test]
-    fn cert_dir_override_parses() {
-        let cfg = parse(
-            r#"
-            [server]
-            heartbeat_listen = "0.0.0.0:51820"
-            cert_dir = "/srv/yggdrasil/tls"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.server.cert_dir, PathBuf::from("/srv/yggdrasil/tls"));
-    }
-
-    #[test]
     fn default_cert_and_key_set_together_parses() {
         let cfg = parse(
             r#"
             [server]
-            heartbeat_listen = "0.0.0.0:51820"
             default_cert = "/etc/yggdrasil/certs/wildcard.pem"
             default_key  = "/etc/yggdrasil/certs/wildcard.key"
             "#,
         )
         .unwrap();
-        assert_eq!(
-            cfg.server.default_cert,
-            Some(PathBuf::from("/etc/yggdrasil/certs/wildcard.pem"))
-        );
-        assert_eq!(
-            cfg.server.default_key,
-            Some(PathBuf::from("/etc/yggdrasil/certs/wildcard.key"))
-        );
+        assert!(cfg.server.default_cert.is_some());
+        assert!(cfg.server.default_key.is_some());
     }
 
     #[test]
@@ -427,7 +438,6 @@ mod tests {
         let err = parse(
             r#"
             [server]
-            heartbeat_listen = "0.0.0.0:51820"
             default_cert = "/etc/yggdrasil/certs/wildcard.pem"
             "#,
         )
@@ -444,7 +454,6 @@ mod tests {
         let err = parse(
             r#"
             [server]
-            heartbeat_listen = "0.0.0.0:51820"
             default_key = "/etc/yggdrasil/certs/wildcard.key"
             "#,
         )
@@ -456,29 +465,219 @@ mod tests {
         );
     }
 
+    // ---- [chain.upstream] ----
+
     #[test]
-    fn default_cert_and_key_absent_is_ok() {
-        let cfg = parse(relay_minimal_toml()).unwrap();
-        assert!(cfg.server.default_cert.is_none());
-        assert!(cfg.server.default_key.is_none());
+    fn parses_chain_upstream() {
+        let cfg = parse(
+            r#"
+            [server]
+
+            [chain.upstream]
+            pubkey   = "x25519:1111111111111111111111111111111111111111111111111111111111111111"
+            endpoint = "u.example.com:7117"
+            "#,
+        )
+        .unwrap();
+        let up = cfg.chain.upstream.expect("upstream parsed");
+        assert_eq!(up.endpoint, "u.example.com:7117");
+        assert_eq!(up.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(up.rekey_interval, Duration::from_secs(3600));
+        assert_eq!(
+            up.pubkey,
+            PubKey::X25519([0x11; ratatoskr::auth::PUBLIC_KEY_LEN])
+        );
     }
 
     #[test]
-    fn terminal_mode_accepts_cert_settings() {
-        // Cert config is mode-agnostic for now (Phase 6b lays the groundwork;
-        // the actual L7 frontend is gated to relay mode in a later phase).
+    fn chain_upstream_rejects_untagged_pubkey() {
+        let err = parse(
+            r#"
+            [server]
+
+            [chain.upstream]
+            pubkey   = "1111111111111111111111111111111111111111111111111111111111111111"
+            endpoint = "host:1"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Proto(_)));
+    }
+
+    #[test]
+    fn chain_upstream_rejects_empty_endpoint() {
+        let err = parse(
+            r#"
+            [server]
+
+            [chain.upstream]
+            pubkey   = "x25519:1111111111111111111111111111111111111111111111111111111111111111"
+            endpoint = ""
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("endpoint must not be empty")));
+    }
+
+    #[test]
+    fn chain_upstream_rejects_endpoint_without_port() {
+        let err = parse(
+            r#"
+            [server]
+
+            [chain.upstream]
+            pubkey   = "x25519:1111111111111111111111111111111111111111111111111111111111111111"
+            endpoint = "host-no-port"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("host:port")));
+    }
+
+    #[test]
+    fn chain_upstream_parses_humantime_intervals() {
+        let cfg = parse(
+            r#"
+            [server]
+
+            [chain.upstream]
+            pubkey             = "x25519:2222222222222222222222222222222222222222222222222222222222222222"
+            endpoint           = "host:1"
+            heartbeat_interval = "2s"
+            rekey_interval     = "30m"
+            "#,
+        )
+        .unwrap();
+        let up = cfg.chain.upstream.unwrap();
+        assert_eq!(up.heartbeat_interval, Duration::from_secs(2));
+        assert_eq!(up.rekey_interval, Duration::from_secs(30 * 60));
+    }
+
+    // ---- [chain.downstream] + [chain.listener] ----
+
+    #[test]
+    fn relay_with_chain_downstream_and_listener_parses() {
+        let cfg = parse(
+            r#"
+            [server]
+
+            [chain.downstream]
+            pubkey = "x25519:3333333333333333333333333333333333333333333333333333333333333333"
+
+            [chain.listener]
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        let dn = cfg.chain.downstream.expect("downstream parsed");
+        let ln = cfg.chain.listener.expect("listener parsed");
+        assert_eq!(
+            dn.pubkey,
+            PubKey::X25519([0x33; ratatoskr::auth::PUBLIC_KEY_LEN])
+        );
+        assert_eq!(ln.listen, "0.0.0.0:51820".parse::<SocketAddr>().unwrap());
+        assert_eq!(dn.rekey_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn chain_downstream_without_listener_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+
+            [chain.downstream]
+            pubkey = "x25519:4444444444444444444444444444444444444444444444444444444444444444"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("[chain.listener] is not")));
+    }
+
+    #[test]
+    fn chain_listener_without_downstream_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+
+            [chain.listener]
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("[chain.downstream] is not")));
+    }
+
+    #[test]
+    fn terminal_mode_rejects_chain_downstream() {
+        let err = parse(
+            r#"
+            [server]
+            mode = "terminal"
+
+            [chain.downstream]
+            pubkey = "x25519:5555555555555555555555555555555555555555555555555555555555555555"
+
+            [chain.listener]
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("terminal-mode nodes must not declare")));
+    }
+
+    #[test]
+    fn terminal_mode_accepts_only_upstream() {
         let cfg = parse(
             r#"
             [server]
             mode = "terminal"
-            cert_dir = "/etc/yggdrasil/tls"
-            default_cert = "/etc/yggdrasil/tls/wc.pem"
-            default_key  = "/etc/yggdrasil/tls/wc.key"
+
+            [chain.upstream]
+            pubkey   = "x25519:6666666666666666666666666666666666666666666666666666666666666666"
+            endpoint = "u.example.com:7117"
             "#,
         )
         .unwrap();
         assert_eq!(cfg.server.mode, Mode::Terminal);
-        assert_eq!(cfg.server.cert_dir, PathBuf::from("/etc/yggdrasil/tls"));
-        assert!(cfg.server.default_cert.is_some());
+        assert!(cfg.chain.upstream.is_some());
+        assert!(cfg.chain.downstream.is_none());
+        assert!(cfg.chain.listener.is_none());
+    }
+
+    #[test]
+    fn relay_with_both_upstream_and_downstream_parses() {
+        let cfg = parse(
+            r#"
+            [server]
+
+            [chain.upstream]
+            pubkey   = "x25519:7777777777777777777777777777777777777777777777777777777777777777"
+            endpoint = "uu.example.com:7117"
+
+            [chain.downstream]
+            pubkey = "x25519:8888888888888888888888888888888888888888888888888888888888888888"
+
+            [chain.listener]
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.chain.upstream.is_some());
+        assert!(cfg.chain.downstream.is_some());
+        assert!(cfg.chain.listener.is_some());
+    }
+
+    #[test]
+    fn empty_chain_section_is_valid() {
+        let cfg = parse(relay_minimal_toml()).unwrap();
+        assert!(cfg.chain.upstream.is_none());
+        assert!(cfg.chain.downstream.is_none());
+        assert!(cfg.chain.listener.is_none());
     }
 }

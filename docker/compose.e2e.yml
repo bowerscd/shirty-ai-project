@@ -1,30 +1,34 @@
-# End-to-end network-stack test for the yggdrasil + huginn pair.
+# End-to-end network-stack test for the chain-control yggdrasil topology.
 #
 # Topology:
 #
 #   ┌────────────┐      wan (172.30.0.0/24)       ┌─────────────────────┐
 #   │  client    │ ────────────────────────────►  │  vps (yggdrasil)    │
-#   │  (tester)  │                                │   :7000/tcp         │
-#   └────────────┘                                │   :7001/udp         │
-#                                                 │   :51820/udp        │
+#   │  (tester)  │                                │   relay-mode        │
+#   └────────────┘                                │   :7000/tcp         │
+#                                                 │   :7001/udp         │
+#                                                 │   :51820/udp chain  │
 #                                                 │   :9090/tcp metrics │
 #                                                 └──────────┬──────────┘
 #                                                            │ proxied
 #                                                            ▼
-#                                                 ┌─────────────────────┐
-#                                                 │  home (huginn +  │
-#                                                 │  echo backends on   │
-#                                                 │  :7100/tcp, :7101/udp)│
-#                                                 └─────────────────────┘
+#                                                 ┌─────────────────────────┐
+#                                                 │  home (yggdrasil        │
+#                                                 │  terminal-mode +        │
+#                                                 │  echo backends on       │
+#                                                 │  :7100/tcp, :7101/udp)  │
+#                                                 └─────────────────────────┘
 #
 # Notes on the topology:
-# - In real deployment the home box runs *both* huginn and the upstream
-#   service in the same network namespace, because yggdrasil dials
-#   peer_ip:upstream_port — `peer_ip` is the source of the most recent
-#   heartbeat (i.e. huginn's IP) and `upstream_port` is whatever the
-#   rule says. Same arrangement here: the `home` container runs both.
-# - The `init` service performs one-shot key generation and config writes
-#   into the shared volumes; daemons wait for it to complete cleanly.
+# - vps runs in relay mode with `[chain.listener]` + `[chain.downstream]`
+#   pinned to home's pubkey. Its rule files forward traffic from
+#   :7000/:7001 to downstream_ip:7100/7101.
+# - home runs in terminal mode with `[chain.upstream]` pointing at
+#   vps:51820. It also runs the python echo backends in the same network
+#   namespace so vps's rule-dial target lands on a real listener.
+# - The `init` service performs one-shot key generation + offline
+#   intro/invite handshake via `yggdrasilctl identity`. vps/home/terminal
+#   wait for it to complete cleanly.
 # - The `client` container is a vanilla python:slim that runs the test
 #   harness via a bind-mounted scripts directory.
 
@@ -44,7 +48,9 @@ volumes:
   yggdrasil_etc:
   yggdrasil_run:
   yggdrasil_state:
-  huginn_etc:
+  home_etc:
+  home_run:
+  home_state:
   terminal_etc:
   terminal_run:
   terminal_state:
@@ -56,10 +62,10 @@ services:
     entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/bootstrap.sh"]
     volumes:
       - yggdrasil_etc:/etc/yggdrasil
-      - huginn_etc:/etc/huginn
-      # Mounted at a distinct path so bootstrap can write the terminal-mode
-      # config + rules without colliding with the relay-mode config above.
-      # The `terminal` service mounts the same volume at /etc/yggdrasil.
+      # Mounted at distinct paths so bootstrap can write each daemon's
+      # config + rules without colliding. Each daemon service mounts
+      # the same volume at its canonical /etc/yggdrasil path.
+      - home_etc:/etc/yggdrasil-home
       - terminal_etc:/etc/yggdrasil-terminal
     restart: "no"
     networks:
@@ -104,12 +110,14 @@ services:
     command:
       - /usr/local/bin/home-entrypoint.sh
     environment:
-      HUGINN_LOG: info
-      HUGINN_LOG_FORMAT: pretty
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
       ECHO_TCP_PORT: "7100"
       ECHO_UDP_PORT: "7101"
     volumes:
-      - huginn_etc:/etc/huginn
+      - home_etc:/etc/yggdrasil
+      - home_run:/run/yggdrasil
+      - home_state:/var/lib/yggdrasil
     networks:
       wan:
         ipv4_address: 172.30.0.20

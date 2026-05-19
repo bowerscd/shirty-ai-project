@@ -414,15 +414,15 @@ async fn terminal_control_status_response_shape() {
     match resp {
         Response::Status(StatusResponse {
             mode,
-            peer_ip,
+            downstream_ip,
             last_heartbeat_age_ms,
-            peer_enrolled,
+            downstream_enrolled,
             ..
         }) => {
             assert_eq!(mode, Mode::Terminal);
-            assert_eq!(peer_ip, None);
+            assert_eq!(downstream_ip, None);
             assert_eq!(last_heartbeat_age_ms, None);
-            assert!(!peer_enrolled);
+            assert!(!downstream_enrolled);
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -432,7 +432,7 @@ async fn terminal_control_status_response_shape() {
     supervisor.stop().await;
 }
 
-/// All three `peer ...` commands return the terminal-mode unsupported error.
+/// All three `downstream ...` commands return the terminal-mode unsupported error.
 #[tokio::test]
 async fn terminal_control_peer_commands_are_rejected() {
     let shutdown = CancellationToken::new();
@@ -451,7 +451,7 @@ async fn terminal_control_peer_commands_are_rejected() {
     let config_path = socket_dir.path().join("yggdrasil.toml");
     std::fs::write(
         &config_path,
-        "[server]\nmode = \"terminal\"\n[peer]\npublic_key_hex = \"\"\n",
+        "[server]\nmode = \"terminal\"\n",
     )
     .unwrap();
 
@@ -468,9 +468,9 @@ async fn terminal_control_peer_commands_are_rejected() {
     .unwrap();
 
     let cases = [
-        Request::PeerShow,
-        Request::PeerPending,
-        Request::PeerApprove {
+        Request::DownstreamShow,
+        Request::DownstreamPending,
+        Request::DownstreamApprove {
             fingerprint: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
         },
     ];
