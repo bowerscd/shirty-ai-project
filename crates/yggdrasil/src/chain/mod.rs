@@ -29,12 +29,14 @@
 //! [`RuleSet`]: ratatoskr::rule::RuleSet
 //! [`PredicateSet`]: ratatoskr::predicate::PredicateSet
 
+pub mod acceptor;
 pub mod client;
 pub mod derive;
 pub mod predicate_extractor;
 pub mod predicate_publisher;
 pub mod reliability;
 
+pub use acceptor::ChainAcceptor;
 pub use client::{
     BodyHandler, ChainClient, ChainClientConfig, ChainClientHandle, ChainClientShutDown,
     ControlOp,

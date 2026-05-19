@@ -203,6 +203,7 @@ impl HeartbeatHarness {
             server_keys,
             peer_state,
             pending_store,
+            None,
             shutdown,
         )
         .await

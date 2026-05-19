@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ratatoskr::control_frame::{AckStatus, ControlAck};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +32,8 @@ use ratatoskr::auth::{Responder, Session, StaticKeyPair};
 use ratatoskr::wire::{self, PacketType, PacketView};
 
 use super::peer_state::{HeartbeatEffect, PeerState};
+use crate::chain::reliability::{ControlChannel, InboundDisposition};
+use crate::chain::ChainAcceptor;
 use crate::pending_peers::PendingPeerStore;
 
 /// Heartbeat UDP server. Construct with [`HeartbeatServer::bind`], then drive
@@ -41,6 +44,11 @@ pub struct HeartbeatServer {
     peer_state: Arc<PeerState>,
     pending_store: Arc<PendingPeerStore>,
     shutdown: CancellationToken,
+    /// Chain-control receive dispatcher. `None` skips control envelope
+    /// dispatch (terminals / Phase 2 tests / drivers without a
+    /// supervisor); when `Some`, inbound `Control` packets are decoded,
+    /// dedup-classified, routed by body type, and acked.
+    acceptor: Option<Arc<ChainAcceptor>>,
     session: Option<SessionState>,
 }
 
@@ -48,16 +56,25 @@ struct SessionState {
     session: Session,
     last_peer_addr: SocketAddr,
     started_at: Instant,
+    /// Per-session inbound reliability layer. Sequence numbers reset
+    /// when the underlying Noise session is replaced, matching the
+    /// control-frame protocol's session-local seq space.
+    control_channel: ControlChannel,
 }
 
 impl HeartbeatServer {
     /// Bind the heartbeat UDP socket. Returns immediately on success;
     /// call [`HeartbeatServer::run`] to actually start serving.
+    ///
+    /// `acceptor` is the chain-control dispatcher. Pass `None` to drop
+    /// inbound control packets (the Phase 2 behaviour, still used by
+    /// tests that do not exercise the relay-side dispatcher).
     pub async fn bind(
         listen: SocketAddr,
         local_keys: StaticKeyPair,
         peer_state: Arc<PeerState>,
         pending_store: Arc<PendingPeerStore>,
+        acceptor: Option<Arc<ChainAcceptor>>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(listen)
@@ -67,6 +84,7 @@ impl HeartbeatServer {
             local = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             peer  = %peer_state.fingerprint(),
             enrolled = peer_state.is_peer_enrolled(),
+            chain_acceptor = acceptor.is_some(),
             "heartbeat server bound"
         );
         Ok(Self {
@@ -75,6 +93,7 @@ impl HeartbeatServer {
             peer_state,
             pending_store,
             shutdown,
+            acceptor,
             session: None,
         })
     }
@@ -127,16 +146,16 @@ impl HeartbeatServer {
                     "received Rekey signal; peer must send a fresh Handshake1"
                 );
             }
-            PacketType::Control | PacketType::ControlAck => {
-                // Control-channel dispatch lands in a follow-up commit in
-                // this phase; for now, drop these so the parser does not
-                // produce non-exhaustive warnings. Phase 2 tests run an
-                // in-process loopback that exercises the reliability layer
-                // directly without touching this server.
+            PacketType::Control => self.handle_control(&view, src).await,
+            PacketType::ControlAck => {
+                // The relay-side server is a Control *receiver*: it never
+                // initiates a Control envelope, so it never expects a
+                // peer-originated ControlAck. Drop quietly; the chain
+                // client running on a terminal handles ControlAck on its
+                // own outbound socket.
                 tracing::debug!(
                     src = %src,
-                    packet_type = ?view.packet_type,
-                    "drop control packet: dispatch not yet wired into this server"
+                    "drop ControlAck: relay-side server is receive-only on the control channel"
                 );
             }
             PacketType::Handshake2 | PacketType::HeartbeatAck => {
@@ -219,6 +238,7 @@ impl HeartbeatServer {
             session,
             last_peer_addr: src,
             started_at: Instant::now(),
+            control_channel: ControlChannel::new(),
         });
     }
 
@@ -318,6 +338,80 @@ impl HeartbeatServer {
             );
         }
     }
+
+    async fn handle_control(&mut self, view: &PacketView<'_>, src: SocketAddr) {
+        let state = match self.session.as_mut() {
+            Some(s) => s,
+            None => {
+                tracing::debug!(src = %src, "drop Control: no active session");
+                return;
+            }
+        };
+
+        // Decrypt + replay-protect. Strict-monotone counter enforcement
+        // lives inside the Session; a duplicate AEAD-level packet is
+        // rejected here before reaching the channel dedup.
+        let env = match state.session.decode_control(view) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    src = %src,
+                    error = %e,
+                    "drop Control: decrypt or replay check failed"
+                );
+                return;
+            }
+        };
+        let seq = env.seq;
+
+        // Channel-level dedup: a retransmitted (seq, body) pair that
+        // already won the race is treated as if it succeeded — we re-ack
+        // Ok so the sender's reliability layer clears its outbound entry.
+        let status = match state.control_channel.on_inbound(env) {
+            InboundDisposition::Deliver(env) => match self.acceptor.as_ref() {
+                Some(acc) => acc.dispatch(env.body_type, &env.body).await,
+                None => {
+                    tracing::debug!(
+                        src = %src,
+                        body_type = env.body_type,
+                        "drop Control body: no chain acceptor configured"
+                    );
+                    AckStatus::Unknown
+                }
+            },
+            InboundDisposition::Duplicate => {
+                tracing::debug!(
+                    src = %src,
+                    seq,
+                    "Control duplicate; re-acking Ok"
+                );
+                AckStatus::Ok
+            }
+        };
+
+        // Build + encrypt the ack on the SAME session.
+        let ack = ControlAck { seq, status };
+        let packet = match state.session.encode_control_ack(&ack) {
+            Ok((_, p)) => p,
+            Err(e) => {
+                tracing::warn!(
+                    src = %src,
+                    seq,
+                    error = %e,
+                    "encode ControlAck failed"
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.socket.send_to(&packet, src).await {
+            tracing::warn!(
+                src = %src,
+                seq,
+                error = %e,
+                "send ControlAck failed"
+            );
+        }
+    }
 }
 
 fn current_unix_millis() -> u64 {
@@ -360,6 +454,7 @@ mod tests {
             server_keys.clone_for_test(),
             peer_state.clone(),
             pending_store,
+            None,
             cancel.clone(),
         )
         .await

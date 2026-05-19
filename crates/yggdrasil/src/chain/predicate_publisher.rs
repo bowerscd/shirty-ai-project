@@ -7,15 +7,11 @@
 //! [`ChainClientHandle::send_control`] as a
 //! [`ControlBodyType::PredicateSetUpdate`] envelope.
 //!
-//! The publisher tracks a monotone `version: u64` counter in memory; it
-//! is bumped on every successful upstream ack. Persistence across restarts
-//! is intentionally deferred — Phase 3 wires the receive side to require
-//! `version` to be strictly greater than the relay's last accepted value
-//! for the same `origin`, and Phase 3C adds a `state_dir` blob so the
-//! counter survives restarts. In Phase 3B the counter resets to `1` on
-//! each terminal boot; relays therefore accept the first push of a fresh
-//! session unconditionally and the receive-side enforcement only kicks
-//! in once Phase 3C is wired.
+//! The publisher tracks a monotone `version: u64` counter that is
+//! persisted to `state_dir/chain-predicate-version.toml` after every
+//! successful upstream ack. On startup the counter is loaded from that
+//! file; the first push therefore uses `last_persisted + 1` rather than
+//! restarting at 1 and tripping the relay's `VERSION_STALE` invariant.
 //!
 //! Run only on terminal nodes (mode = `terminal`). Spawned by
 //! [`crate::run_terminal`] when both a chain upstream *and* a supervisor
@@ -25,14 +21,17 @@
 //! [`PredicateSet`]: ratatoskr::predicate::PredicateSet
 //! [`ControlBodyType::PredicateSetUpdate`]: ratatoskr::control_frame::ControlBodyType::PredicateSetUpdate
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use ratatoskr::control_frame::ControlBodyType;
 use ratatoskr::predicate::{
     predicate_reject, Predicate, PREDICATE_SET_MAX_WIRE_BYTES,
 };
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::RuleSet;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +39,18 @@ use tokio_util::sync::CancellationToken;
 use crate::chain::client::{ChainClientHandle, ChainClientShutDown};
 use crate::chain::predicate_extractor;
 use crate::chain::reliability::SendError;
+
+/// File name used to persist the publisher's monotone version under
+/// `state_dir`.
+const VERSION_FILE: &str = "chain-predicate-version.toml";
+
+/// On-disk shape. Wrapped in a struct so the TOML reads as
+/// `version = N` rather than a bare integer.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedVersion {
+    #[serde(default)]
+    version: u64,
+}
 
 /// How long to wait for an upstream ack before treating the in-flight
 /// push as failed and moving on. The reliability layer's own retransmit
@@ -51,26 +62,45 @@ const PUBLISH_ACK_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Spawn the publisher task. Returns the join handle; the caller awaits
 /// it during shutdown.
+///
+/// `state_dir` holds the persisted version counter (see
+/// [`VERSION_FILE`]). Loading errors are non-fatal: a corrupt or absent
+/// file resets the counter to `0` and emits a warn-level log so the
+/// operator notices.
 pub fn spawn(
     rules_rx: watch::Receiver<RuleSet>,
     chain_handle: ChainClientHandle,
     origin: PubKey,
+    state_dir: PathBuf,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(rules_rx, chain_handle, origin, cancel))
+    tokio::spawn(run(rules_rx, chain_handle, origin, state_dir, cancel))
 }
 
 async fn run(
     mut rules_rx: watch::Receiver<RuleSet>,
     chain_handle: ChainClientHandle,
     origin: PubKey,
+    state_dir: PathBuf,
     cancel: CancellationToken,
 ) {
-    let mut version: u64 = 0;
+    let version_path = state_dir.join(VERSION_FILE);
+    let mut version: u64 = match load_version(&version_path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %version_path.display(),
+                "failed to load persisted predicate version; restarting at 0"
+            );
+            0
+        }
+    };
     let mut last_sent_predicates: Option<Vec<Predicate>> = None;
 
     tracing::info!(
         origin = %origin,
+        version,
         "predicate publisher started"
     );
 
@@ -100,6 +130,25 @@ async fn run(
                 ).await {
                     version = applied.version;
                     last_sent_predicates = Some(applied.predicates);
+                    if let Err(e) = persist_version(&version_path, version) {
+                        // Persist failure does not roll the in-memory
+                        // version back: the upstream has already accepted
+                        // and a future restart that loses this write
+                        // will only ever request a *lower* version, which
+                        // the upstream will reject with VERSION_STALE.
+                        // That is the safe failure mode.
+                        tracing::error!(
+                            error = %e,
+                            path = %version_path.display(),
+                            version,
+                            "failed to persist predicate version"
+                        );
+                        metrics::counter!(
+                            "yggdrasil_chain_predicate_push_total",
+                            "outcome" => "persist_error"
+                        )
+                        .increment(1);
+                    }
                 }
             }
         }
@@ -325,6 +374,33 @@ async fn publish_one(
     }
 }
 
+fn load_version(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let p: PersistedVersion =
+        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(p.version)
+}
+
+fn persist_version(path: &Path, version: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+    }
+    let text = toml::to_string_pretty(&PersistedVersion { version })
+        .context("serialise chain-predicate-version TOML")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +473,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
         let (tx, rx) = watch::channel(RuleSet::default());
-        let publisher = spawn(rx, handle, origin(), cancel.clone());
+        let state_dir = tempfile::tempdir().unwrap();
+        let publisher = spawn(
+            rx,
+            handle,
+            origin(),
+            state_dir.path().to_path_buf(),
+            cancel.clone(),
+        );
 
         // First applied set: one TCP rule.
         let set1 = RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap();
@@ -447,7 +530,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
         let (tx, rx) = watch::channel(RuleSet::default());
-        let publisher = spawn(rx, handle, origin(), cancel.clone());
+        let state_dir = tempfile::tempdir().unwrap();
+        let publisher = spawn(
+            rx,
+            handle,
+            origin(),
+            state_dir.path().to_path_buf(),
+            cancel.clone(),
+        );
 
         let set1 = RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap();
         tx.send(set1.clone()).unwrap();
@@ -481,13 +571,78 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
         let (_tx, rx) = watch::channel(RuleSet::default());
-        let publisher = spawn(rx, handle, origin(), cancel.clone());
+        let state_dir = tempfile::tempdir().unwrap();
+        let publisher = spawn(
+            rx,
+            handle,
+            origin(),
+            state_dir.path().to_path_buf(),
+            cancel.clone(),
+        );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         {
             let g = sink.lock().await;
             assert!(g.is_empty(), "initial RuleSet::default should not push");
         }
+
+        cancel.cancel();
+        let _ = publisher.await;
+    }
+
+    /// A second publisher instance pointed at the same `state_dir`
+    /// resumes counting from the persisted version, so the first push
+    /// after restart is `last + 1` rather than `1`.
+    #[tokio::test]
+    async fn persisted_version_survives_restart() {
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // First publisher: accept 1 push, version becomes 1, persisted to disk.
+        {
+            let cancel = CancellationToken::new();
+            let (handle, sink) = fake_handle();
+            let (tx, rx) = watch::channel(RuleSet::default());
+            let publisher = spawn(
+                rx,
+                handle,
+                origin(),
+                state_dir.path().to_path_buf(),
+                cancel.clone(),
+            );
+            tx.send(RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap())
+                .unwrap();
+            let op = next_op(&sink).await;
+            let decoded: PredicateSet = postcard::from_bytes(&op.body).unwrap();
+            assert_eq!(decoded.version, 1);
+            op.completion.send(Ok(())).unwrap();
+            // Give the publisher a moment to land the persist call after
+            // resolving the ack.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+            let _ = publisher.await;
+        }
+
+        // Second publisher with the same state_dir: next push must be
+        // version 2.
+        let cancel = CancellationToken::new();
+        let (handle, sink) = fake_handle();
+        let (tx, rx) = watch::channel(RuleSet::default());
+        let publisher = spawn(
+            rx,
+            handle,
+            origin(),
+            state_dir.path().to_path_buf(),
+            cancel.clone(),
+        );
+        tx.send(RuleSet::from_rules(vec![tcp_rule("beta", 9090)]).unwrap())
+            .unwrap();
+        let op = next_op(&sink).await;
+        let decoded: PredicateSet = postcard::from_bytes(&op.body).unwrap();
+        assert_eq!(
+            decoded.version, 2,
+            "expected v2 after restart with persisted v1"
+        );
+        op.completion.send(Ok(())).unwrap();
 
         cancel.cancel();
         let _ = publisher.await;

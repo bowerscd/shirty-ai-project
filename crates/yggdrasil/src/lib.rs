@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
 
-use crate::chain::{ChainClient, ChainClientConfig, ChainClientHandle};
+use crate::chain::{ChainAcceptor, ChainClient, ChainClientConfig, ChainClientHandle};
 use crate::control::ControlServer;
 use crate::heartbeat::{HeartbeatServer, PeerState, UNENROLLED_PEER_KEY};
 use crate::pending_peers::PendingPeerStore;
@@ -144,37 +144,8 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
-    // 5. Heartbeat (chain) listener — only when [chain.listener] is set.
-    //    A pure-proxy relay (no downstream/listener, only an upstream) is
-    //    a legitimate mid-chain configuration that does no inbound work.
-    let hb_handle = if let Some(listener) = config.chain.listener.as_ref() {
-        let hb = HeartbeatServer::bind(
-            listener.listen,
-            local_keys.clone(),
-            peer_state.clone(),
-            pending_store.clone(),
-            shutdown.clone(),
-        )
-        .await
-        .context("binding chain listener")?;
-        Some(tokio::spawn(async move {
-            if let Err(e) = hb.run().await {
-                tracing::error!(error = %e, "chain listener exited with error");
-            }
-        }))
-    } else {
-        None
-    };
-
-    // 5b. Outbound chain client — only when [chain.upstream] is set.
-    //     Phase 3B does not push predicates from relays; the handle is
-    //     therefore unused on this path. We still keep the chain client
-    //     spawned so mid-chain relays maintain their upstream session.
-    let chain_client = spawn_chain_client(&config, &local_keys, shutdown.clone());
-    let _chain_client_handle = chain_client.as_ref().map(|c| c.handle.clone());
-    let chain_client_join = chain_client.map(|c| c.join);
-
-    // 6. Rule-driven proxy supervisor.
+    // 5. Rule-driven proxy supervisor. Built *before* the heartbeat
+    //    listener so the chain acceptor can hold a handle to it.
     let resolver_factory = ResolverFactory::new_relay(peer_state.clone());
     let supervisor = ProxySupervisor::spawn(
         config.server.rules_dir.clone(),
@@ -190,6 +161,67 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     )
     .await
     .context("spawning proxy supervisor")?;
+
+    // 5b. Chain acceptor — receive-side dispatcher for inbound
+    //     `PredicateSetUpdate` envelopes. Built only when a listener is
+    //     configured: without a listener we never receive Control
+    //     packets, so the acceptor would be unused. Persists per-origin
+    //     versions under `state_dir/chain-predicates.toml`.
+    let chain_acceptor = if config.chain.listener.is_some() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let bind_addr = config
+            .server
+            .default_bind
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let derive_cfg = crate::chain::DeriveConfig {
+            bind_addr,
+            // Phase 3 does not yet plumb a relay-wide PROXY-protocol
+            // policy; derived TCP rules are emitted without PROXY
+            // headers until a future phase adds the config knob.
+            proxy_protocol: None,
+        };
+        Some(
+            ChainAcceptor::load(
+                supervisor.handle(),
+                derive_cfg,
+                &config.server.state_dir,
+            )
+            .context("loading chain acceptor state")?,
+        )
+    } else {
+        None
+    };
+
+    // 6. Heartbeat (chain) listener — only when [chain.listener] is set.
+    //    A pure-proxy relay (no downstream/listener, only an upstream) is
+    //    a legitimate mid-chain configuration that does no inbound work.
+    let hb_handle = if let Some(listener) = config.chain.listener.as_ref() {
+        let hb = HeartbeatServer::bind(
+            listener.listen,
+            local_keys.clone(),
+            peer_state.clone(),
+            pending_store.clone(),
+            chain_acceptor.clone(),
+            shutdown.clone(),
+        )
+        .await
+        .context("binding chain listener")?;
+        Some(tokio::spawn(async move {
+            if let Err(e) = hb.run().await {
+                tracing::error!(error = %e, "chain listener exited with error");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // 6b. Outbound chain client — only when [chain.upstream] is set.
+    //     Phase 3B does not push predicates from relays; the handle is
+    //     therefore unused on this path. We still keep the chain client
+    //     spawned so mid-chain relays maintain their upstream session.
+    let chain_client = spawn_chain_client(&config, &local_keys, shutdown.clone());
+    let _chain_client_handle = chain_client.as_ref().map(|c| c.handle.clone());
+    let chain_client_join = chain_client.map(|c| c.join);
 
     // 7. UDS control surface for `yggdrasilctl`.
     let control = ControlServer::bind(
@@ -306,6 +338,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
             supervisor_handle.current_set_rx(),
             handle.clone(),
             origin,
+            config.server.state_dir.clone(),
             shutdown.clone(),
         )
     });
