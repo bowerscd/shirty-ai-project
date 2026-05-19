@@ -20,6 +20,7 @@ pub mod intro;
 pub mod predicate;
 pub mod pubkey;
 pub mod rule;
+pub mod tunnel;
 pub mod wire;
 
 pub use error::{Error, Result};

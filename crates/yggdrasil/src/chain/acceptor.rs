@@ -166,6 +166,25 @@ impl ChainAcceptor {
             ControlBodyType::PredicateSetUpdate => {
                 self.handle_predicate_set_update(body).await
             }
+            ControlBodyType::TunnelOpen
+            | ControlBodyType::TunnelData
+            | ControlBodyType::TunnelClose => {
+                // Tunnel state machine lands in Phase 4B. The wire body
+                // types are registered now (Phase 4A) so the registry is
+                // stable; until the terminator is wired in, this acceptor
+                // answers `Unknown` so a forward-rolled peer learns the
+                // feature is not active here.
+                tracing::debug!(
+                    body_type = body_type,
+                    "control envelope: tunnel body received before terminator wired"
+                );
+                metrics::counter!(
+                    "yggdrasil_chain_predicate_recv_total",
+                    "outcome" => "unknown_body",
+                )
+                .increment(1);
+                AckStatus::Unknown
+            }
         }
     }
 
