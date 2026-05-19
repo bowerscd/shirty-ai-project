@@ -234,6 +234,16 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                  to local request {request:?}"
             );
         }
+        Response::ChainApplied(_) => {
+            // `ChainApplied` belongs to the `chain apply` path and is
+            // never produced for any request issued from the `local`
+            // scope. Defensive arm so the Response enum stays
+            // exhaustive at this match site.
+            bail!(
+                "server returned unexpected ChainApplied response \
+                 to local request {request:?}"
+            );
+        }
     }
     Ok(())
 }

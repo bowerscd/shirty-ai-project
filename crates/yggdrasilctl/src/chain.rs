@@ -23,6 +23,7 @@ use tokio::net::UnixStream;
 
 use ratatoskr::control::{Request, Response};
 use ratatoskr::pubkey::PubKey;
+use ratatoskr::rule::{RuleFile, RuleSet};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -31,6 +32,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: TunnelAction,
     },
+    /// Push a candidate rule set from a TOML file into the running
+    /// terminal daemon without touching its rules directory on disk.
+    /// The daemon validates the candidate, projects its predicate set,
+    /// and (if a chain upstream is configured) publishes the projection
+    /// on its next push tick.
+    Apply(ApplyArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -54,11 +61,22 @@ pub struct OpenArgs {
     pub dest: SocketAddr,
 }
 
+#[derive(Debug, Args)]
+pub struct ApplyArgs {
+    /// Path to a candidate `rules.toml` file. Parsed locally for early
+    /// schema errors with line context, then shipped to the daemon as
+    /// a pre-parsed rule vector. The daemon performs defensive
+    /// re-validation (per-rule + cross-rule) before applying.
+    #[arg(long, value_name = "PATH")]
+    pub file: PathBuf,
+}
+
 pub async fn run(cmd: Cmd, socket: &Path, _json: bool) -> Result<()> {
     match cmd {
         Cmd::Tunnel {
             action: TunnelAction::Open(args),
         } => open_tunnel(socket, &args).await,
+        Cmd::Apply(args) => apply(socket, &args).await,
     }
 }
 
@@ -161,4 +179,97 @@ async fn open_tunnel(socket: &Path, args: &OpenArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Push a candidate rule set from `args.file` to the running daemon.
+///
+/// Local parse + validation runs first so the CLI fails fast with line
+/// context on schema errors (the daemon's own error path would only see
+/// a `Vec<Rule>` and couldn't point at TOML line numbers). The daemon
+/// re-validates as defence in depth.
+async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
+    // 1. Read and parse the candidate file. `RuleFile::from_toml`
+    //    attaches the path to any TOML parse error.
+    let contents = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("reading {}", args.file.display()))?;
+    let rule_file = RuleFile::from_toml(args.file.clone(), &contents)
+        .with_context(|| format!("parsing {}", args.file.display()))?;
+    let rules = rule_file.rule;
+    if rules.is_empty() {
+        bail!(
+            "{} contains no `[[rule]]` blocks; nothing to apply",
+            args.file.display()
+        );
+    }
+
+    // 2. Locally pre-validate so schema errors don't even hit the
+    //    wire. The daemon will run the same checks again.
+    if let Err(e) = RuleSet::from_rules(rules.clone()) {
+        bail!(
+            "{} failed local validation: {e}",
+            args.file.display()
+        );
+    }
+
+    // 3. Send the request and await the single response line.
+    let request = Request::ChainApply { rules };
+    let response = send_chain_apply(socket, &request, Duration::from_secs(5)).await?;
+
+    match response {
+        Response::ChainApplied(b) => {
+            println!(
+                "applied {} rule{} ({} projected predicate{}{})",
+                b.applied_rule_count,
+                if b.applied_rule_count == 1 { "" } else { "s" },
+                b.predicate_count,
+                if b.predicate_count == 1 { "" } else { "s" },
+                if b.skipped_https.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; {} HTTPS rule{} skipped from projection: {}",
+                        b.skipped_https.len(),
+                        if b.skipped_https.len() == 1 { "" } else { "s" },
+                        b.skipped_https.join(", ")
+                    )
+                }
+            );
+            Ok(())
+        }
+        Response::Error { code, message } => {
+            bail!("daemon refused apply: code={code} message={message}");
+        }
+        other => bail!("daemon returned unexpected response to ChainApply: {other:?}"),
+    }
+}
+
+/// Connect to the UDS, write a single `Request::ChainApply` line, read
+/// exactly one response line back. Mirrors `local::send` but kept
+/// separate so the `chain` scope doesn't depend on `local` internals.
+async fn send_chain_apply(
+    socket: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response> {
+    let socket: PathBuf = socket.to_path_buf();
+    let mut stream = tokio::time::timeout(timeout, UnixStream::connect(&socket))
+        .await
+        .with_context(|| format!("connect timeout after {timeout:?}"))?
+        .with_context(|| format!("connecting to {}", socket.display()))?;
+
+    let mut buf = serde_json::to_vec(request).context("encode ChainApply request")?;
+    buf.push(b'\n');
+    tokio::time::timeout(timeout, stream.write_all(&buf))
+        .await
+        .context("write timeout")?
+        .context("writing ChainApply request")?;
+
+    let (reader, _w) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let line = tokio::time::timeout(timeout, lines.next_line())
+        .await
+        .context("read timeout")?
+        .context("reading ChainApply response")?
+        .ok_or_else(|| anyhow!("server closed connection before responding to ChainApply"))?;
+    serde_json::from_str(&line).context("decode ChainApply response")
 }

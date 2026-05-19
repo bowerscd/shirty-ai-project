@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::pubkey::PubKey;
+use crate::rule::Rule;
 
 /// Runtime mode the daemon is operating in, surfaced in status responses.
 ///
@@ -94,6 +95,31 @@ pub enum Request {
         /// Destination socket address on the terminating node.
         dest: SocketAddr,
     },
+    /// Push a candidate rule set into the daemon's running supervisor
+    /// without touching the rules directory on disk. Backs
+    /// `yggdrasilctl chain apply --file rules.toml`.
+    ///
+    /// The CLI is the canonical parser: it reads `rules.toml`, parses
+    /// it via [`crate::rule::RuleFile::from_toml`], performs per-rule
+    /// validation, and ships the resulting `Vec<Rule>` over the wire.
+    /// The daemon performs defensive re-validation (cross-rule
+    /// uniqueness, listen/protocol conflicts) and refuses the apply if
+    /// any rule fails. On terminals with `[chain.upstream]` configured,
+    /// the daemon additionally pre-checks the projected predicate set
+    /// against [`crate::predicate::PREDICATE_SET_MAX_WIRE_BYTES`] so an
+    /// oversize push fails synchronously here instead of silently
+    /// failing later in the publisher.
+    ///
+    /// **Terminal mode only.** Relays receive their rule set from
+    /// downstream predicate pushes and cannot accept a manual apply
+    /// without it being immediately overwritten on the next push;
+    /// returns [`error_codes::NOT_SUPPORTED_IN_RELAY_MODE`].
+    ChainApply {
+        /// Pre-parsed rules from the operator's candidate file. Order
+        /// is preserved across the wire; uniqueness + listen-conflict
+        /// checks run on the daemon side.
+        rules: Vec<Rule>,
+    },
 }
 
 /// All possible server → client messages.
@@ -112,6 +138,11 @@ pub enum Response {
         fingerprint: String,
     },
     Certs(CertsListResponse),
+    /// Successful response to [`Request::ChainApply`]. Reports the
+    /// number of rules that were handed to the supervisor and, for
+    /// terminal daemons with a chain upstream, what the projected
+    /// predicate set looks like.
+    ChainApplied(ChainAppliedResponse),
     /// Successful response to [`Request::OpenChainTunnel`]. The originator-
     /// chosen `stream_id` is echoed so the operator can correlate logs.
     /// After this object is sent, the daemon stops parsing newline-JSON on
@@ -216,6 +247,21 @@ pub struct CertInfo {
     pub loaded_at_unix_ms: u64,
 }
 
+/// Response body for a successful [`Request::ChainApply`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainAppliedResponse {
+    /// Total rules handed to the supervisor.
+    pub applied_rule_count: usize,
+    /// Predicates that will be projected upstream from the new rule
+    /// set, if the daemon has a chain upstream. Zero on terminals
+    /// without `[chain.upstream]` and on pure-local nodes.
+    pub predicate_count: usize,
+    /// Names of rules dropped during predicate projection because their
+    /// protocol isn't representable as a predicate (currently HTTPS).
+    /// Empty on nodes without an upstream because no projection is run.
+    pub skipped_https: Vec<String>,
+}
+
 /// Stable error-code strings used in `Response::Error.code`. Kept in one place
 /// so tests on both sides can assert against them without typos.
 pub mod error_codes {
@@ -242,6 +288,26 @@ pub mod error_codes {
     /// task gone). `chain tunnel open` returns this code; the operator can
     /// retry.
     pub const TUNNEL_OPEN_FAILED: &str = "tunnel_open_failed";
+    /// The daemon is running in `mode = "relay"`. The requested
+    /// operation is meaningful only on terminal-mode daemons; relays
+    /// have their rule sets derived from downstream predicate pushes
+    /// and would immediately overwrite anything applied manually.
+    pub const NOT_SUPPORTED_IN_RELAY_MODE: &str = "not_supported_in_relay_mode";
+    /// The candidate rule set sent with [`super::Request::ChainApply`]
+    /// failed validation: a duplicate name, a duplicate listen/protocol
+    /// pair, or a per-rule shape error. The error `message` field
+    /// carries the human-readable detail emitted by
+    /// [`crate::rule::RuleSet::from_rules`].
+    pub const RULES_INVALID: &str = "rules_invalid";
+    /// The candidate rule set projects to a predicate set larger than
+    /// [`crate::predicate::PREDICATE_SET_MAX_WIRE_BYTES`], so the
+    /// publisher would silently drop the push. `chain apply` rejects
+    /// synchronously so the operator can shrink the set.
+    pub const PREDICATE_SET_OVERSIZE: &str = "predicate_set_oversize";
+    /// The supervisor task is no longer running (shutdown or panic) and
+    /// cannot accept the candidate rule set. The daemon is likely on
+    /// its way down; the operator should restart and try again.
+    pub const APPLY_FAILED: &str = "apply_failed";
 }
 
 /// Default UDS path the server binds and the CLI connects to.
@@ -407,5 +473,51 @@ mod tests {
         // kind is serialised at the top level for compatibility with the
         // existing dispatcher.
         assert!(s.contains("\"kind\":\"certs\""), "got: {s}");
+    }
+
+    #[test]
+    fn chain_apply_request_round_trip() {
+        use crate::rule::{Protocol, Rule};
+        let r = Request::ChainApply {
+            rules: vec![Rule {
+                name: "echo-tcp".into(),
+                listen: "127.0.0.1:9100".parse().unwrap(),
+                protocol: Protocol::Tcp,
+                upstream_addr: Some("10.0.0.5:9000".parse().unwrap()),
+                upstream_port: None,
+                upstream_host: None,
+                idle_timeout: None,
+                proxy_protocol: None,
+                routes: None,
+                cert_dir: None,
+            }],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"kind\":\"chain_apply\""), "got: {s}");
+        assert!(s.contains("\"echo-tcp\""), "got: {s}");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn chain_applied_response_round_trip() {
+        let resp = Response::ChainApplied(ChainAppliedResponse {
+            applied_rule_count: 3,
+            predicate_count: 2,
+            skipped_https: vec!["api-l7".into()],
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"kind\":\"chain_applied\""), "got: {s}");
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn chain_apply_error_codes_are_stable_strings() {
+        // Pin the wire-stable strings so daemon + CLI never drift.
+        assert_eq!(error_codes::NOT_SUPPORTED_IN_RELAY_MODE, "not_supported_in_relay_mode");
+        assert_eq!(error_codes::RULES_INVALID, "rules_invalid");
+        assert_eq!(error_codes::PREDICATE_SET_OVERSIZE, "predicate_set_oversize");
+        assert_eq!(error_codes::APPLY_FAILED, "apply_failed");
     }
 }
