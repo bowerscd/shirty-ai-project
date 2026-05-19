@@ -26,4 +26,4 @@ mod server;
 #[allow(unused_imports)]
 pub use peer_state::{HeartbeatEffect, PeerState, UNENROLLED_PEER_KEY};
 #[allow(unused_imports)]
-pub use server::HeartbeatServer;
+pub use server::{HeartbeatServer, OutboundHandle};

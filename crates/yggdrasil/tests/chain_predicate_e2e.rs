@@ -99,7 +99,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
 
     // 4. HeartbeatServer bound to a random loopback port with the acceptor.
     let hb_cancel = cancel.clone();
-    let hb = HeartbeatServer::bind(
+    let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         clone_kp(&server_keys),
         peer_state.clone(),
@@ -236,7 +236,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     };
     let acceptor =
         ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path()).unwrap();
-    let hb = HeartbeatServer::bind(
+    let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         clone_kp(&server_keys),
         peer_state.clone(),

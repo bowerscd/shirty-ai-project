@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
 
-use crate::chain::{ChainAcceptor, ChainClient, ChainClientConfig, ChainClientHandle};
+use crate::chain::{ChainAcceptor, ChainClient, ChainClientConfig, ChainClientHandle, TunnelAllowList, TunnelManager};
 use crate::control::ControlServer;
 use crate::heartbeat::{HeartbeatServer, PeerState, UNENROLLED_PEER_KEY};
 use crate::pending_peers::PendingPeerStore;
@@ -196,7 +196,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     //    A pure-proxy relay (no downstream/listener, only an upstream) is
     //    a legitimate mid-chain configuration that does no inbound work.
     let hb_handle = if let Some(listener) = config.chain.listener.as_ref() {
-        let hb = HeartbeatServer::bind(
+        let (hb, outbound) = HeartbeatServer::bind(
             listener.listen,
             local_keys.clone(),
             peer_state.clone(),
@@ -206,6 +206,37 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         )
         .await
         .context("binding chain listener")?;
+
+        // Phase 4B tunnel terminator. Only meaningful alongside a
+        // chain listener (the inbound side decodes `TunnelOpen`); a
+        // pure-upstream relay has nothing to terminate.
+        if let Some(acc) = chain_acceptor.as_ref() {
+            let allow = TunnelAllowList {
+                allow_loopback: config.chain.tunnel.allow_loopback,
+                allowed_targets: config
+                    .chain
+                    .tunnel
+                    .allowed_targets
+                    .iter()
+                    .copied()
+                    .collect(),
+            };
+            let mgr = TunnelManager::new(
+                allow,
+                ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
+                outbound.sender(),
+            );
+            // First call wins; if some future refactor sets it twice
+            // we surface that as a hard error so the operator notices.
+            acc.set_tunnel_manager(mgr)
+                .map_err(|_| anyhow::anyhow!("tunnel manager set twice"))?;
+        } else {
+            // No acceptor means we'll never decode Tunnel* bodies; drop
+            // the outbound handle so the server's keepalive is the only
+            // sender (channel stays open, nobody writes to it).
+            drop(outbound);
+        }
+
         Some(tokio::spawn(async move {
             if let Err(e) = hb.run().await {
                 tracing::error!(error = %e, "chain listener exited with error");

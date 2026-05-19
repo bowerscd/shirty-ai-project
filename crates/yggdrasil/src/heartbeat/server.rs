@@ -24,8 +24,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ratatoskr::control_frame::{AckStatus, ControlAck};
+use ratatoskr::control_frame::{AckStatus, ControlAck, ControlEnvelope};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::{Responder, Session, StaticKeyPair};
@@ -49,6 +50,14 @@ pub struct HeartbeatServer {
     /// supervisor); when `Some`, inbound `Control` packets are decoded,
     /// dedup-classified, routed by body type, and acked.
     acceptor: Option<Arc<ChainAcceptor>>,
+    /// Relay-initiated `Control` envelopes (Phase 4B `TunnelData` /
+    /// `TunnelClose` produced by the tunnel terminator's splice tasks).
+    /// Drained by the run loop, encoded on the active session, and
+    /// emitted on the socket. The keepalive sender lives as long as the
+    /// server so the receiver never short-circuits with `None` when no
+    /// tunnel manager is configured.
+    outbound_rx: mpsc::UnboundedReceiver<ControlEnvelope>,
+    _outbound_keepalive: mpsc::UnboundedSender<ControlEnvelope>,
     session: Option<SessionState>,
 }
 
@@ -60,6 +69,11 @@ struct SessionState {
     /// when the underlying Noise session is replaced, matching the
     /// control-frame protocol's session-local seq space.
     control_channel: ControlChannel,
+    /// Per-session monotonic outbound `ControlEnvelope.seq` counter.
+    /// Phase 4B uses this for fire-and-forget relay-initiated frames;
+    /// reliability (retransmit / ack-tracking) will layer on top in a
+    /// later phase without changing the wire shape.
+    next_outbound_seq: u32,
 }
 
 impl HeartbeatServer {
@@ -69,6 +83,12 @@ impl HeartbeatServer {
     /// `acceptor` is the chain-control dispatcher. Pass `None` to drop
     /// inbound control packets (the Phase 2 behaviour, still used by
     /// tests that do not exercise the relay-side dispatcher).
+    ///
+    /// The returned [`OutboundHandle`] is the **sender** side of the
+    /// relay-initiated `Control` envelope channel (Phase 4B tunnel
+    /// terminator pushes `TunnelData` / `TunnelClose` here). Drop it if
+    /// the daemon never originates control envelopes — the server holds
+    /// a keepalive sender internally so the channel won't close.
     pub async fn bind(
         listen: SocketAddr,
         local_keys: StaticKeyPair,
@@ -76,7 +96,7 @@ impl HeartbeatServer {
         pending_store: Arc<PendingPeerStore>,
         acceptor: Option<Arc<ChainAcceptor>>,
         shutdown: CancellationToken,
-    ) -> Result<Self> {
+    ) -> Result<(Self, OutboundHandle)> {
         let socket = UdpSocket::bind(listen)
             .await
             .with_context(|| format!("bind heartbeat UDP socket on {listen}"))?;
@@ -87,15 +107,19 @@ impl HeartbeatServer {
             chain_acceptor = acceptor.is_some(),
             "heartbeat server bound"
         );
-        Ok(Self {
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let server = Self {
             socket,
             local_keys,
             peer_state,
             pending_store,
             shutdown,
             acceptor,
+            outbound_rx,
+            _outbound_keepalive: outbound_tx.clone(),
             session: None,
-        })
+        };
+        Ok((server, OutboundHandle(outbound_tx)))
     }
 
     /// The actually-bound local address. Useful when `listen` had port 0.
@@ -115,6 +139,9 @@ impl HeartbeatServer {
                 _ = self.shutdown.cancelled() => {
                     tracing::info!("heartbeat server received shutdown");
                     return Ok(());
+                }
+                Some(env) = self.outbound_rx.recv() => {
+                    self.handle_outbound(env).await;
                 }
                 res = self.socket.recv_from(&mut buf) => {
                     match res {
@@ -239,6 +266,7 @@ impl HeartbeatServer {
             last_peer_addr: src,
             started_at: Instant::now(),
             control_channel: ControlChannel::new(),
+            next_outbound_seq: 0,
         });
     }
 
@@ -412,6 +440,65 @@ impl HeartbeatServer {
             );
         }
     }
+
+    /// Encode + send a relay-initiated [`ControlEnvelope`] on the active
+    /// session. Phase 4B is fire-and-forget: if there is no session
+    /// (handshake hasn't happened yet, or it expired) the envelope is
+    /// dropped with a debug log.
+    async fn handle_outbound(&mut self, mut env: ControlEnvelope) {
+        let state = match self.session.as_mut() {
+            Some(s) => s,
+            None => {
+                tracing::debug!(
+                    body_type = env.body_type,
+                    "drop outbound Control: no active session"
+                );
+                return;
+            }
+        };
+        let seq = state.next_outbound_seq;
+        state.next_outbound_seq = seq.wrapping_add(1);
+        env.seq = seq;
+
+        let packet = match state.session.encode_control(&env) {
+            Ok((_, p)) => p,
+            Err(e) => {
+                tracing::warn!(
+                    seq,
+                    body_type = env.body_type,
+                    error = %e,
+                    "encode outbound Control failed"
+                );
+                return;
+            }
+        };
+        let dest = state.last_peer_addr;
+        if let Err(e) = self.socket.send_to(&packet, dest).await {
+            tracing::warn!(
+                seq,
+                body_type = env.body_type,
+                dest = %dest,
+                error = %e,
+                "send outbound Control failed"
+            );
+        }
+    }
+}
+
+/// Sender side of the relay-initiated `Control` envelope channel. Hand
+/// this to subsystems that need to push frames upstream
+/// (Phase 4B: tunnel terminator splice tasks). Cloneable; the server
+/// holds a keepalive sender internally so droppers don't close the
+/// channel.
+#[derive(Debug, Clone)]
+pub struct OutboundHandle(mpsc::UnboundedSender<ControlEnvelope>);
+
+impl OutboundHandle {
+    /// Underlying sender, suitable for passing into a
+    /// [`crate::chain::TunnelManager`].
+    pub fn sender(&self) -> mpsc::UnboundedSender<ControlEnvelope> {
+        self.0.clone()
+    }
 }
 
 fn current_unix_millis() -> u64 {
@@ -449,7 +536,7 @@ mod tests {
         // on drop order with the spawned server task).
         std::mem::forget(pending_dir);
         let cancel = CancellationToken::new();
-        let server = HeartbeatServer::bind(
+        let (server, _outbound) = HeartbeatServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             server_keys.clone_for_test(),
             peer_state.clone(),

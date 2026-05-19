@@ -154,6 +154,12 @@ pub struct ChainSection {
     /// set. Forbidden when `[chain.downstream]` is absent.
     #[serde(default)]
     pub listener:   Option<ChainListener>,
+    /// Tunnel-over-chain settings (`yggdrasilctl chain` introspection
+    /// commands open chain tunnels to reach upstream `/healthz`,
+    /// `/metrics`, and friends without exposing those endpoints publicly).
+    /// Default policy = allow loopback destinations only.
+    #[serde(default)]
+    pub tunnel:     ChainTunnel,
 }
 
 /// `[chain.upstream]` — outbound chain client configuration.
@@ -192,6 +198,40 @@ pub struct ChainListener {
     /// UDP socket to bind on. Required.
     pub listen: SocketAddr,
 }
+
+/// `[chain.tunnel]` — tunnel-over-chain allow-list.
+///
+/// The tunnel terminator (a relay where `TunnelOpen.target_pubkey ==
+/// self`) enforces these rules before dialling the open's `dest` socket
+/// address. The default policy is **loopback-only**: operator
+/// introspection endpoints listening on `127.0.0.1` or `::1` are
+/// reachable through `yggdrasilctl chain`; everything else returns
+/// `tunnel_reject::TARGET_NOT_ALLOWED`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainTunnel {
+    /// Allow any port on the local loopback address (`127.0.0.0/8` or
+    /// `::1`). Default `true` — reaches the daemon's own metrics /
+    /// health endpoints, which is the v1 use case.
+    #[serde(default = "default_allow_loopback")]
+    pub allow_loopback: bool,
+    /// Additional explicit `host:port` destinations the terminator is
+    /// permitted to dial. Empty by default. Each entry is exact-match
+    /// against the open request's `dest` (both IP and port).
+    #[serde(default)]
+    pub allowed_targets: Vec<SocketAddr>,
+}
+
+impl Default for ChainTunnel {
+    fn default() -> Self {
+        Self {
+            allow_loopback: true,
+            allowed_targets: Vec::new(),
+        }
+    }
+}
+
+fn default_allow_loopback() -> bool { true }
 
 fn default_state_dir() -> PathBuf       { PathBuf::from("/var/lib/yggdrasil") }
 fn default_identity_file() -> PathBuf   { PathBuf::from("/etc/yggdrasil/identity.key") }

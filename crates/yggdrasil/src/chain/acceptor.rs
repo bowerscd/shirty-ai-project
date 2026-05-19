@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use ratatoskr::control_frame::{AckStatus, ControlBodyType};
@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::chain::derive::{derive, DeriveConfig};
+use crate::chain::tunnel_terminator::TunnelManager;
 use crate::proxy::supervisor::SupervisorHandle;
 
 /// State file name under `state_dir`. Single file regardless of how many
@@ -103,6 +104,14 @@ pub struct ChainAcceptor {
     derive_cfg: DeriveConfig,
     state_path: PathBuf,
     state: Mutex<InMemoryState>,
+    /// Late-bound tunnel terminator. Construction order in
+    /// [`crate::run_relay`] is: build acceptor → bind heartbeat server
+    /// (returning the outbound channel handle) → build [`TunnelManager`]
+    /// with that handle → attach via [`set_tunnel_manager`]. When unset,
+    /// inbound `Tunnel*` body types are acked `Unknown`.
+    ///
+    /// [`set_tunnel_manager`]: ChainAcceptor::set_tunnel_manager
+    tunnel: OnceLock<Arc<TunnelManager>>,
 }
 
 impl ChainAcceptor {
@@ -130,7 +139,18 @@ impl ChainAcceptor {
             derive_cfg,
             state_path,
             state: Mutex::new(state),
+            tunnel: OnceLock::new(),
         }))
+    }
+
+    /// Attach a tunnel terminator. Must be called at most once; further
+    /// calls return the manager back to the caller. Idempotent on the
+    /// happy path.
+    pub fn set_tunnel_manager(
+        &self,
+        mgr: Arc<TunnelManager>,
+    ) -> std::result::Result<(), Arc<TunnelManager>> {
+        self.tunnel.set(mgr)
     }
 
     /// Decode + dispatch one [`ControlEnvelope`] body and return the
@@ -168,23 +188,26 @@ impl ChainAcceptor {
             }
             ControlBodyType::TunnelOpen
             | ControlBodyType::TunnelData
-            | ControlBodyType::TunnelClose => {
-                // Tunnel state machine lands in Phase 4B. The wire body
-                // types are registered now (Phase 4A) so the registry is
-                // stable; until the terminator is wired in, this acceptor
-                // answers `Unknown` so a forward-rolled peer learns the
-                // feature is not active here.
-                tracing::debug!(
-                    body_type = body_type,
-                    "control envelope: tunnel body received before terminator wired"
-                );
-                metrics::counter!(
-                    "yggdrasil_chain_predicate_recv_total",
-                    "outcome" => "unknown_body",
-                )
-                .increment(1);
-                AckStatus::Unknown
-            }
+            | ControlBodyType::TunnelClose => match self.tunnel.get() {
+                Some(tm) => match kind {
+                    ControlBodyType::TunnelOpen => tm.handle_open(body).await,
+                    ControlBodyType::TunnelData => tm.handle_data(body).await,
+                    ControlBodyType::TunnelClose => tm.handle_close(body).await,
+                    _ => unreachable!("outer match constrains kind to tunnel variants"),
+                },
+                None => {
+                    tracing::debug!(
+                        body_type = body_type,
+                        "control envelope: tunnel body received but no terminator attached"
+                    );
+                    metrics::counter!(
+                        "yggdrasil_chain_predicate_recv_total",
+                        "outcome" => "unknown_body",
+                    )
+                    .increment(1);
+                    AckStatus::Unknown
+                }
+            },
         }
     }
 

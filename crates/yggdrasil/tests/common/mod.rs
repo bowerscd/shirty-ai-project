@@ -198,7 +198,7 @@ impl HeartbeatHarness {
     ) -> Self {
         let pending_dir = tempfile::tempdir().unwrap();
         let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
-        let hb = HeartbeatServer::bind(
+        let (hb, _outbound) = HeartbeatServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             server_keys,
             peer_state,
