@@ -249,7 +249,7 @@ impl ChainClient {
             .await
             .context("send handshake1")?;
 
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; ratatoskr::wire::MAX_PACKET_LEN];
         let n = match tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv(&mut buf)).await {
             Ok(r) => r.context("recv handshake2")?,
             Err(_) => bail!("handshake2 timeout after {:?}", HANDSHAKE_TIMEOUT),
@@ -281,7 +281,7 @@ impl ChainClient {
         let mut last_ack_at: Option<Instant> = None;
         let mut heartbeats_sent: u64 = 0;
         let mut acks_received: u64 = 0;
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; ratatoskr::wire::MAX_PACKET_LEN];
 
         let ack_deadline = self.config.heartbeat_interval * ACK_DEADLINE_MULTIPLIER;
 
@@ -336,6 +336,7 @@ impl ChainClient {
                 // session on the no-ack deadline.
                 res = socket.recv(&mut buf) => {
                     let n = res.context("recv from upstream")?;
+                    tracing::trace!(n, "chain client: recv UDP packet");
                     let view = match wire::parse(&buf[..n]) {
                         Ok(v) => v,
                         Err(e) => {
@@ -473,10 +474,17 @@ fn dispatch_body(
     body_type: u8,
     body: &[u8],
 ) -> AckStatus {
-    match handler {
+    let res = match handler {
         Some(h) => h(body_type, body),
         None => AckStatus::Unknown,
-    }
+    };
+    tracing::trace!(
+        body_type,
+        body_len = body.len(),
+        ?res,
+        "chain client: dispatch_body"
+    );
+    res
 }
 
 enum SessionExit {

@@ -423,10 +423,23 @@ impl TunnelForwarder {
         }
     }
 
-    /// Handle a `TunnelClose` from the *downstream* peer. Removes the
-    /// registry entries and forwards the close upstream best-effort.
+    /// Handle a `TunnelClose` from the *downstream* peer. Forwards
+    /// the close upstream best-effort but **keeps both registry
+    /// entries alive** so the upstream terminator can still flush
+    /// response bytes back through this forwarder before its own
+    /// `TunnelClose` arrives.
+    ///
+    /// This mirrors the TCP-style half-close semantics that
+    /// [`TunnelInitiator::signal_close`] relies on: a close from
+    /// downstream is "I am done writing" — the upstream may still
+    /// have bytes to send back. Entries are removed when the upstream
+    /// side's reciprocal `TunnelClose` lands in
+    /// [`TunnelForwarder::dispatch_close_from_upstream`].
+    ///
     /// The downstream ack is always `Ok` (a close from the downstream
     /// is authoritative — there is nothing to reject).
+    ///
+    /// [`TunnelInitiator::signal_close`]: crate::chain::tunnel_initiator::TunnelInitiator::signal_close
     pub async fn handle_close_from_downstream(&self, body: &[u8]) -> AckStatus {
         let close: TunnelClose = match postcard::from_bytes(body) {
             Ok(c) => c,
@@ -440,24 +453,21 @@ impl TunnelForwarder {
             }
         };
 
+        // Look up — DO NOT remove. The upstream terminator may still
+        // be flushing response bytes; entries are removed only when
+        // the upstream side closes back. See type-level docs.
         let upstream_id_opt = {
-            let mut by_ds = self.by_downstream.lock().await;
-            let removed = by_ds.remove(&close.stream_id);
-            if let Some(entry) = removed {
-                let mut by_us = self.by_upstream.lock().await;
-                by_us.remove(&entry.upstream_stream_id);
-                Some(entry.upstream_stream_id)
-            } else {
-                None
-            }
+            let by_ds = self.by_downstream.lock().await;
+            by_ds.get(&close.stream_id).map(|e| e.upstream_stream_id)
         };
 
         let upstream_id = match upstream_id_opt {
             Some(id) => id,
             None => {
-                // Already gone — peer-initiated close from upstream
-                // raced ahead of us, or stream never existed. Ack Ok
-                // so the originator stops retrying.
+                // Already gone — upstream-initiated close raced ahead
+                // of us and removed both entries, or this stream id
+                // never existed. Ack Ok so the originator stops
+                // retrying.
                 metric_outcome("close_downstream_already_gone");
                 return AckStatus::Ok;
             }
@@ -465,7 +475,7 @@ impl TunnelForwarder {
 
         // Best-effort upstream propagation; we do not block the
         // downstream ack on the upstream ack landing because the
-        // operator is done with this stream regardless.
+        // operator is done writing regardless.
         let upstream_close = TunnelClose {
             stream_id: upstream_id,
             reason: close.reason,
@@ -897,8 +907,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_removes_both_directions() {
-        let (upstream, _join) = fake_chain_client(|_, _| Ok(()));
+    async fn close_from_downstream_preserves_entries_until_upstream_reciprocal() {
+        // Capture the upstream id so we can simulate the upstream's
+        // reciprocal `TunnelClose`.
+        let captured_upstream_id = Arc::new(std::sync::Mutex::new(0u32));
+        let cap = Arc::clone(&captured_upstream_id);
+        let (upstream, _join) = fake_chain_client(move |body_type, body| {
+            if body_type == ControlBodyType::TunnelOpen.as_byte() {
+                let open: TunnelOpen = postcard::from_bytes(body).unwrap();
+                *cap.lock().unwrap() = open.stream_id;
+            }
+            Ok(())
+        });
         let (ds_tx, _ds_rx) = mpsc::unbounded_channel();
         let fwd = TunnelForwarder::new(
             upstream,
@@ -917,19 +937,45 @@ mod tests {
             AckStatus::Ok
         );
         assert_eq!(fwd.open_stream_ids().await, vec![9]);
+        let upstream_id = *captured_upstream_id.lock().unwrap();
+        assert_ne!(upstream_id, 9);
 
+        // TCP-style half-close: downstream sending `TunnelClose` does
+        // not remove the registry entries. The upstream terminator
+        // may still be flushing response bytes back; entries persist
+        // until the upstream-side `TunnelClose` arrives.
         let close = TunnelClose { stream_id: 9, reason: 0 };
         let close_body = postcard::to_allocvec(&close).unwrap();
         assert_eq!(
             fwd.handle_close_from_downstream(&close_body).await,
             AckStatus::Ok
         );
-        // Allow the spawned best-effort upstream close to drain.
+        // Let the spawned best-effort upstream close ack drain.
         tokio::task::yield_now().await;
+        assert_eq!(
+            fwd.open_stream_ids().await,
+            vec![9],
+            "downstream close must not remove entries"
+        );
+
+        // Upstream's reciprocal `TunnelClose` (re-using the upstream
+        // id) removes both sides.
+        let upstream_close = TunnelClose {
+            stream_id: upstream_id,
+            reason: 0,
+        };
+        let upstream_close_body = postcard::to_allocvec(&upstream_close).unwrap();
+        assert_eq!(
+            fwd.dispatch_inbound_from_upstream(
+                ControlBodyType::TunnelClose.as_byte(),
+                &upstream_close_body,
+            ),
+            AckStatus::Ok
+        );
         assert!(fwd.open_stream_ids().await.is_empty());
 
-        // A subsequent downstream data on the closed id should be
-        // STREAM_NOT_FOUND.
+        // A subsequent downstream data on the now-removed id should
+        // be STREAM_NOT_FOUND.
         let ds_data = TunnelData {
             stream_id: 9,
             payload: vec![1],

@@ -662,47 +662,119 @@ async fn run_chain_tunnel_bridge(
     // Main task: pump inbox → UDS writer, watching for the upload
     // pump exiting (operator closed write half), an explicit
     // `close_rx` from the peer, or daemon shutdown.
+    //
+    // TCP-style half-close: when the operator closes their UDS write
+    // half (`upload_done` fires), we send a wire `TunnelClose` to the
+    // peer via [`TunnelInitiator::signal_close`] but **keep the local
+    // registry entry alive** so any response bytes the peer is still
+    // flushing make it back to the operator. Without this, the
+    // [`TunnelInitiator::close`] path would also `remove_stream` and
+    // any subsequent `TunnelData` would be rejected with
+    // `STREAM_NOT_FOUND`. Matters for request/response patterns like
+    // `yggdrasilctl chain diff` over HTTP/1.1 with `Connection:
+    // close`, where the server emits its response *after* seeing FIN.
     tokio::pin!(close_rx);
     let mut peer_initiated_close = false;
+    let mut we_sent_close = false;
+    let mut upload_done_seen = false;
+    let mut bridge_bytes_written: usize = 0;
+    let mut bridge_chunks_written: usize = 0;
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => break,
-            _ = upload_done.cancelled() => break,
+            _ = cancel.cancelled() => {
+                tracing::debug!(stream_id, "bridge: cancel arm");
+                break;
+            }
+            _ = upload_done.cancelled(), if !upload_done_seen => {
+                upload_done_seen = true;
+                tracing::debug!(
+                    stream_id,
+                    "bridge: upload_done arm; calling signal_close"
+                );
+                initiator.signal_close(stream_id, 0).await;
+                tracing::debug!(stream_id, "bridge: signal_close returned");
+                we_sent_close = true;
+            }
             res = &mut close_rx => {
-                // Peer sent TunnelClose (or its registry slot was
-                // dropped). Drain whatever is still queued in the
-                // inbox so the operator sees the last bytes before
-                // the EOF.
+                tracing::debug!(
+                    stream_id,
+                    close_rx_ok = res.is_ok(),
+                    "bridge: close_rx arm fired; draining inbound_rx"
+                );
                 peer_initiated_close = res.is_ok();
+                let mut drained_chunks: usize = 0;
+                let mut drained_bytes: usize = 0;
                 while let Ok(payload) = inbound_rx.try_recv() {
-                    if writer.write_all(&payload).await.is_err() {
+                    drained_chunks += 1;
+                    drained_bytes += payload.len();
+                    if let Err(e) = writer.write_all(&payload).await {
+                        tracing::warn!(
+                            stream_id,
+                            error = %e,
+                            "bridge: UDS write_all failed during close drain"
+                        );
                         break;
                     }
+                    bridge_bytes_written += payload.len();
+                    bridge_chunks_written += 1;
                 }
+                tracing::debug!(
+                    stream_id,
+                    drained_chunks,
+                    drained_bytes,
+                    "bridge: close_rx drain complete"
+                );
                 break;
             }
             res = inbound_rx.recv() => match res {
                 Some(payload) => {
+                    let len = payload.len();
                     if let Err(e) = writer.write_all(&payload).await {
-                        tracing::debug!(stream_id, error = %e, "download: UDS write error");
+                        tracing::warn!(stream_id, error = %e, "bridge: UDS write_all failed");
                         break;
                     }
+                    bridge_bytes_written += len;
+                    bridge_chunks_written += 1;
+                    tracing::trace!(
+                        stream_id,
+                        chunk_bytes = len,
+                        bridge_bytes_written,
+                        bridge_chunks_written,
+                        "bridge: inbound_rx arm wrote chunk to UDS"
+                    );
                 }
                 None => {
-                    // Inbox closed without close_rx firing: should
-                    // only happen if the registry entry was removed
-                    // out from under us. Treat as a peer-initiated
-                    // close.
+                    tracing::debug!(
+                        stream_id,
+                        "bridge: inbound_rx arm hit None (registry entry removed)"
+                    );
                     peer_initiated_close = true;
                     break;
                 }
             }
         }
     }
+    tracing::debug!(
+        stream_id,
+        bridge_bytes_written,
+        bridge_chunks_written,
+        peer_initiated_close,
+        we_sent_close,
+        upload_done_seen,
+        "bridge: main loop exit"
+    );
 
-    // Only emit our own TunnelClose if the peer didn't already.
-    if !peer_initiated_close {
+    // Cleanup: if neither side has wire-closed yet (cancel path), do
+    // a full close. If we already half-closed, the peer's TunnelClose
+    // back removed the local entry (or will, idempotently); calling
+    // `close` here is a safe no-op via the `remove_stream` returns-
+    // `false` path.
+    if !we_sent_close && !peer_initiated_close {
+        initiator.close(stream_id, 0).await;
+    } else if we_sent_close && !peer_initiated_close {
+        // Peer never wire-closed (e.g. cancel midway through). Make
+        // sure we drop our local entry so the registry doesn't leak.
         initiator.close(stream_id, 0).await;
     }
     let _ = writer.shutdown().await;

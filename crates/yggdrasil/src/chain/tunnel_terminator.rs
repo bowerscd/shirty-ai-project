@@ -24,7 +24,8 @@
 //!   the splice task's inbound queue. Unknown stream id returns
 //!   [`tunnel_reject::STREAM_NOT_FOUND`].
 //! * [`TunnelClose`] — decode, signal the splice task to drain and exit.
-//!   Idempotent: closing an already-closed stream acks `Ok`.
+//!   Unknown stream id returns [`tunnel_reject::STREAM_NOT_FOUND`]
+//!   so the acceptor's dispatch can fall through to the forwarder.
 //!
 //! Outbound side (relay → peer):
 //! The splice task reads from the upstream TCP socket, chunks at
@@ -303,8 +304,10 @@ impl TunnelManager {
         }
     }
 
-    /// Decode + dispatch a `TunnelClose` body. Idempotent: closing an
-    /// already-closed (or never-opened) stream acks `Ok`.
+    /// Decode + dispatch a `TunnelClose` body. Returns
+    /// `Reject(STREAM_NOT_FOUND)` for unknown stream ids so the
+    /// acceptor's dispatch can fall through to the forwarder (which
+    /// owns proxied streams). Mirrors [`handle_data`]'s behaviour.
     pub async fn handle_close(&self, body: &[u8]) -> AckStatus {
         let close: TunnelClose = match postcard::from_bytes(body) {
             Ok(c) => c,
@@ -324,17 +327,30 @@ impl TunnelManager {
                 reason = close.reason,
                 "tunnel close: peer-initiated"
             );
-            handle.task.abort();
+            // Drop the inbound sender so the splice's writer-pump
+            // drains its queue, shuts down the local TCP write half
+            // (sending FIN to the dialled server), and exits. Do NOT
+            // abort the splice task here: the reader-pump may still
+            // be reading the server's response (e.g. HTTP/1.1 with
+            // `Connection: close`, where the server sends the response
+            // *after* seeing FIN). The splice task will exit on its
+            // own when both halves are done, and emit a
+            // `TunnelClose` envelope back to the initiator at that
+            // point. See [`run_stream`] for the half-close mechanics.
             drop(handle.inbound_tx);
+            // We deliberately drop the JoinHandle without aborting;
+            // the task continues running until both pumps complete.
+            drop(handle.task);
             metric_outcome("close_ok");
+            AckStatus::Ok
         } else {
             tracing::debug!(
                 stream_id = close.stream_id,
-                "tunnel close: unknown stream id (idempotent ack ok)"
+                "tunnel close: unknown stream id (falling through to forwarder if attached)"
             );
-            metric_outcome("close_unknown");
+            metric_outcome("stream_not_found");
+            AckStatus::Reject(tunnel_reject::STREAM_NOT_FOUND)
         }
-        AckStatus::Ok
     }
 
     /// Snapshot of currently-open stream ids. Used by tests + diagnostic
@@ -372,14 +388,29 @@ async fn run_stream(
     let outbound_for_reader = outbound.clone();
     let reader_task = tokio::spawn(async move {
         let mut buf = vec![0u8; TUNNEL_DATA_MAX_PAYLOAD];
+        let mut bytes_read_total: usize = 0;
+        let mut chunks_sent: usize = 0;
         loop {
             let n = match read_half.read(&mut buf).await {
-                Ok(0) => break, // clean EOF
-                Ok(n) => n,
-                Err(e) => {
+                Ok(0) => {
                     tracing::debug!(
                         stream_id,
+                        bytes_read_total,
+                        chunks_sent,
+                        "tunnel splice: reader EOF from local TCP"
+                    );
+                    break;
+                }
+                Ok(n) => {
+                    bytes_read_total += n;
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        stream_id,
                         error = %e,
+                        bytes_read_total,
+                        chunks_sent,
                         "tunnel splice: tcp read error"
                     );
                     break;
@@ -406,33 +437,54 @@ async fn run_stream(
                 body,
             };
             if outbound_for_reader.send(env).is_err() {
-                tracing::debug!(
+                tracing::warn!(
                     stream_id,
                     "tunnel splice: outbound channel closed; ending"
                 );
                 break;
             }
+            chunks_sent += 1;
         }
     });
 
     // Pump inbound TunnelData payloads → TCP-write.
     let writer_task = tokio::spawn(async move {
+        let mut bytes_written_total: usize = 0;
+        let mut chunks_received: usize = 0;
         while let Some(payload) = inbound_rx.recv().await {
+            chunks_received += 1;
+            bytes_written_total += payload.len();
             if let Err(e) = write_half.write_all(&payload).await {
-                tracing::debug!(
+                tracing::warn!(
                     stream_id,
                     error = %e,
+                    bytes_written_total,
+                    chunks_received,
                     "tunnel splice: tcp write error"
                 );
                 break;
             }
         }
+        tracing::debug!(
+            stream_id,
+            bytes_written_total,
+            chunks_received,
+            "tunnel splice: writer inbound_rx closed; shutting TCP write half"
+        );
         // Caller (handle_close or reader EOF) drops inbound_tx; signal
         // half-close to the upstream TCP peer so HTTP can flush.
         let _ = write_half.shutdown().await;
     });
 
-    let _ = tokio::join!(reader_task, writer_task);
+    // Wait for *both* pumps to finish. TCP-style half-close means each
+    // direction is independent: writer_task ends when the peer drops
+    // its write half (`handle_close` runs and drops `inbound_tx`),
+    // reader_task ends when the local TCP server closes its write half
+    // (e.g. HTTP/1.1 `Connection: close` after the response is fully
+    // written). Aborting one when the other completes would truncate
+    // the response on request/response patterns like
+    // `yggdrasilctl chain diff`, so we deliberately wait for both.
+    let (_r, _w) = tokio::join!(reader_task, writer_task);
 
     // Best-effort close-notification to the peer. Phase 4B is
     // fire-and-forget: if the channel is closed (session torn down),
@@ -446,7 +498,7 @@ async fn run_stream(
         };
         let _ = outbound.send(env);
     }
-    tracing::info!(stream_id, "tunnel splice task exited");
+    tracing::debug!(stream_id, "tunnel splice task exited");
 }
 
 #[cfg(test)]
@@ -599,10 +651,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_idempotent_on_unknown_stream() {
+    async fn close_unknown_stream_returns_stream_not_found() {
         let (mgr, _rx) = loopback_manager();
         let body = close_envelope(123, 0);
-        assert_eq!(mgr.handle_close(&body).await, AckStatus::Ok);
+        assert_eq!(
+            mgr.handle_close(&body).await,
+            AckStatus::Reject(tunnel_reject::STREAM_NOT_FOUND)
+        );
     }
 
     #[tokio::test]

@@ -64,6 +64,19 @@ pub const HEARTBEAT_ACK_PT_LEN: usize = 8 + 8;
 /// AEAD tag length (ChaCha20-Poly1305).
 pub const AEAD_TAG_LEN: usize = 16;
 
+/// Maximum plaintext length the Noise-AEAD path will accept on a single
+/// packet. Chosen to cover one [`crate::tunnel::TUNNEL_DATA_MAX_PAYLOAD`]
+/// chunk (16 KiB) plus the postcard-encoded envelope overhead with
+/// comfortable margin. Senders should size their encode buffers to at
+/// least [`MAX_PACKET_LEN`]; receivers should size their UDP recv
+/// buffers to the same value so a single datagram never gets truncated.
+pub const MAX_CONTROL_PLAINTEXT_LEN: usize = 17 * 1024;
+/// Maximum on-wire packet length, including preamble, counter, and the
+/// AEAD ciphertext for a [`MAX_CONTROL_PLAINTEXT_LEN`]-sized plaintext.
+/// Used to size encode buffers, decode buffers, and UDP recv buffers.
+pub const MAX_PACKET_LEN: usize =
+    PREAMBLE_LEN + COUNTER_LEN + MAX_CONTROL_PLAINTEXT_LEN + AEAD_TAG_LEN;
+
 /// A 4-byte session identifier, picked by the initiator and echoed by the responder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SessionId(pub [u8; 4]);

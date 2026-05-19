@@ -461,7 +461,7 @@ impl Session {
         counter: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>> {
-        let mut ct_buf = [0u8; 1024];
+        let mut ct_buf = [0u8; wire::MAX_PACKET_LEN];
         let ct_len = self.transport.write_message(plaintext, &mut ct_buf)?;
 
         let mut packet =
@@ -500,7 +500,7 @@ impl Session {
         // On failure, snow leaves the recv nonce unchanged; we additionally leave
         // `last_seen_counter` unchanged so attackers cannot ratchet it forward.
         self.transport.set_receiving_nonce(counter);
-        let mut pt_buf = [0u8; 1024];
+        let mut pt_buf = [0u8; wire::MAX_PACKET_LEN];
         let pt_len = self.transport.read_message(view.body, &mut pt_buf)?;
         self.last_seen_counter = Some(counter);
         Ok(pt_buf[..pt_len].to_vec())

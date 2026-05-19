@@ -79,12 +79,18 @@ COPY --from=builder /out/yggdrasil    /usr/local/bin/yggdrasil
 COPY --from=builder /out/yggdrasilctl /usr/local/bin/yggdrasilctl
 
 # Helper scripts for the compose e2e topology.
-COPY docker/bootstrap.sh       /usr/local/bin/bootstrap.sh
-COPY docker/home-entrypoint.sh /usr/local/bin/home-entrypoint.sh
-COPY docker/echo-server.py     /usr/local/bin/echo-server.py
+COPY docker/bootstrap.sh                       /usr/local/bin/bootstrap.sh
+COPY docker/home-entrypoint.sh                 /usr/local/bin/home-entrypoint.sh
+COPY docker/echo-server.py                     /usr/local/bin/echo-server.py
+# Chain (3-level) e2e helpers — used by compose.e2e.chain.yml. Shipped
+# inside the same image so a single `docker build` covers both stacks.
+COPY docker/bootstrap-chain.sh                 /usr/local/bin/bootstrap-chain.sh
+COPY docker/chain-loopback-echo-entrypoint.sh  /usr/local/bin/chain-loopback-echo-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/bootstrap.sh \
                /usr/local/bin/home-entrypoint.sh \
-               /usr/local/bin/echo-server.py
+               /usr/local/bin/echo-server.py \
+               /usr/local/bin/bootstrap-chain.sh \
+               /usr/local/bin/chain-loopback-echo-entrypoint.sh
 
 # Create runtime directories. The compose file mounts volumes over the
 # *contents* of these so each container has its own isolated state.

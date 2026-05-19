@@ -433,6 +433,55 @@ impl TunnelInitiator {
         }
     }
 
+    /// Send a wire-level [`TunnelClose`] envelope for `stream_id` and
+    /// await the upstream ack, but **keep the local registry entry**
+    /// in place. This is the half-close primitive:
+    ///
+    /// * After calling this, the peer's terminator treats our side as
+    ///   done writing and stops accepting our [`TunnelData`].
+    /// * Our local registry entry is still live, so any
+    ///   [`TunnelData`] the peer flushes *back* (typical for
+    ///   HTTP/1.1 `Connection: close` request/response, where the
+    ///   server emits its response after seeing FIN) continues to
+    ///   route to the bridge's `inbound_rx` rather than being
+    ///   rejected with `STREAM_NOT_FOUND`.
+    /// * When the peer's splice finishes, it emits a
+    ///   `TunnelClose`-back envelope. The body handler then removes
+    ///   our local entry and fires `close_rx`, at which point the
+    ///   bridge drains and exits cleanly.
+    ///
+    /// Idempotent against a peer-initiated close: if the local entry
+    /// has already been removed (by the peer's `TunnelClose`), this
+    /// is a no-op.
+    pub async fn signal_close(&self, stream_id: u32, reason: u16) {
+        {
+            let streams = self.streams.lock().await;
+            if !streams.contains_key(&stream_id) {
+                metric_outcome("signal_close_noop");
+                return;
+            }
+        }
+        let body = TunnelClose { stream_id, reason };
+        let body_bytes = postcard::to_allocvec(&body)
+            .expect("TunnelClose postcard encode is infallible");
+        let rx = match self.chain.send_control(
+            ControlBodyType::TunnelClose.as_byte(),
+            body_bytes,
+        ) {
+            Ok(rx) => rx,
+            Err(_) => {
+                metric_outcome("signal_close_client_shutdown");
+                return;
+            }
+        };
+        match rx.await {
+            Ok(Ok(())) => metric_outcome("signal_close_ok"),
+            Ok(Err(SendError::Rejected(_))) => metric_outcome("signal_close_rejected"),
+            Ok(Err(_)) => metric_outcome("signal_close_send_failed"),
+            Err(_) => metric_outcome("signal_close_ack_channel_closed"),
+        }
+    }
+
     /// Snapshot of currently-open stream ids. Test + diagnostic only.
     #[doc(hidden)]
     pub async fn open_stream_ids(&self) -> Vec<u32> {
@@ -571,14 +620,21 @@ impl TunnelInitiator {
                 "initiator: peer-initiated close"
             );
             metric_outcome("inbound_close_ok");
+            AckStatus::Ok
         } else {
+            // Unknown stream id — mirror `handle_data`'s behaviour:
+            // return `STREAM_NOT_FOUND` so the combined body handler
+            // can fall through to the forwarder (which owns proxied
+            // streams). For a pure initiator without a forwarder this
+            // surfaces a stream-not-found ack to the upstream, which
+            // it treats as "already gone" semantically.
             tracing::debug!(
                 stream_id = close.stream_id,
-                "initiator: TunnelClose for unknown stream id (idempotent)"
+                "initiator: TunnelClose for unknown stream id (falling through if forwarder attached)"
             );
-            metric_outcome("inbound_close_unknown");
+            metric_outcome("inbound_close_stream_not_found");
+            AckStatus::Reject(tunnel_reject::STREAM_NOT_FOUND)
         }
-        AckStatus::Ok
     }
 
     /// Pubkey of this node's chain upstream. Surfaced so a UDS bridge

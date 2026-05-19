@@ -129,10 +129,11 @@ impl HeartbeatServer {
 
     /// Run the receive loop until the cancellation token fires.
     pub async fn run(mut self) -> Result<()> {
-        // Heartbeat packets are tiny (a handful of bytes plus Noise/AEAD
-        // overhead). 2 KiB leaves plenty of headroom for future packet
-        // types without paying for the maximum UDP payload.
-        let mut buf = [0u8; 2048];
+        // Sized to fit the largest single Noise packet we accept on the
+        // wire — currently a TunnelData chunk carrying up to
+        // `TUNNEL_DATA_MAX_PAYLOAD` (16 KiB) plus envelope and AEAD
+        // overhead. See `ratatoskr::wire::MAX_PACKET_LEN`.
+        let mut buf = [0u8; ratatoskr::wire::MAX_PACKET_LEN];
         loop {
             tokio::select! {
                 biased;
@@ -460,6 +461,7 @@ impl HeartbeatServer {
         state.next_outbound_seq = seq.wrapping_add(1);
         env.seq = seq;
 
+        let body_len = env.body.len();
         let packet = match state.session.encode_control(&env) {
             Ok((_, p)) => p,
             Err(e) => {
@@ -473,6 +475,7 @@ impl HeartbeatServer {
             }
         };
         let dest = state.last_peer_addr;
+        let packet_len = packet.len();
         if let Err(e) = self.socket.send_to(&packet, dest).await {
             tracing::warn!(
                 seq,
@@ -480,6 +483,15 @@ impl HeartbeatServer {
                 dest = %dest,
                 error = %e,
                 "send outbound Control failed"
+            );
+        } else {
+            tracing::debug!(
+                seq,
+                body_type = env.body_type,
+                body_len,
+                packet_len,
+                dest = %dest,
+                "heartbeat server: outbound Control sent"
             );
         }
     }

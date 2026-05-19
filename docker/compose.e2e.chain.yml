@@ -1,0 +1,188 @@
+# End-to-end network-stack test for the 3-level chain control plane.
+#
+# Topology:
+#
+#   ┌────────────────┐
+#   │  client-chain  │ 172.30.1.40
+#   │   (tester)     │
+#   └────────┬───────┘
+#            │ wan-chain (172.30.1.0/24)
+#            │
+#   ┌────────┼────────────────────────────────────────────────────┐
+#   │        ▼                                                    │
+#   │  ┌──────────────┐    chain ctrl     ┌──────────────┐        │
+#   │  │   home-chain │ ────heartbeat──►  │    midbox    │        │
+#   │  │   172.30.1.30│  predicate push   │   172.30.1.20│        │
+#   │  │   terminal   │  + tunnel open    │ relay+forward│        │
+#   │  │  upstream=mb │                   │ upstream=vps │        │
+#   │  │  rules dir:  │                   │ downstream=hm│        │
+#   │  │  home-tcp-   │                   │  listener    │        │
+#   │  │  echo :7200  │                   │  :51820      │        │
+#   │  │  +loopback   │                   │              │        │
+#   │  │  echo:7100   │                   │              │        │
+#   │  └──────────────┘                   └──────┬───────┘        │
+#   │                                            │ chain ctrl     │
+#   │                                            │ heartbeat      │
+#   │                                            │ + tunnel       │
+#   │                                            │ forward        │
+#   │                                            ▼                │
+#   │                                     ┌──────────────┐        │
+#   │                                     │  vps-chain   │        │
+#   │                                     │  172.30.1.10 │        │
+#   │                                     │  relay       │        │
+#   │                                     │  downstream= │        │
+#   │                                     │   midbox     │        │
+#   │                                     │  listener    │        │
+#   │                                     │   :51820     │        │
+#   │                                     │  +loopback   │        │
+#   │                                     │  echo:7100   │        │
+#   │                                     └──────────────┘        │
+#   └─────────────────────────────────────────────────────────────┘
+#
+# What the smoke driver exercises:
+#
+#   * Predicate flow: home publishes the home-tcp-echo predicate over the
+#     chain control plane to midbox. midbox derives a matching listener
+#     on midbox:7200 that proxies to home:7200, which proxies to
+#     127.0.0.1:7100 on home (the loopback echo). vps stays unaware —
+#     v1 relays do not re-project predicates upward.
+#
+#   * Chain tunnel forwarding: the smoke driver issues
+#     `yggdrasilctl chain tunnel open --pubkey x25519:<vps_pk> --dest
+#     127.0.0.1:7100` from inside the home-chain container. The tunnel
+#     traverses home → midbox (forwarder, target != midbox) → vps-chain
+#     (terminator, target == vps), which dials its own loopback echo.
+#
+#   * `yggdrasilctl chain diff`: the smoke driver runs the diff from
+#     home and asserts exit 0 (predicates published from home match what
+#     midbox accepted; vps is end-of-chain and has nothing to compare).
+
+x-yggdrasil-image: &yggdrasil-image
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+
+networks:
+  wan-chain:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+
+volumes:
+  vps_chain_etc:
+  vps_chain_run:
+  vps_chain_state:
+  midbox_etc:
+  midbox_run:
+  midbox_state:
+  home_chain_etc:
+  home_chain_run:
+  home_chain_state:
+
+services:
+  init-chain:
+    <<: *yggdrasil-image
+    container_name: e2e-chain-init
+    entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/bootstrap-chain.sh"]
+    volumes:
+      - vps_chain_etc:/etc/yggdrasil-vps
+      - midbox_etc:/etc/yggdrasil-midbox
+      - home_chain_etc:/etc/yggdrasil-home
+    restart: "no"
+    networks:
+      - wan-chain
+
+  vps-chain:
+    <<: *yggdrasil-image
+    container_name: e2e-chain-vps
+    # `init-chain` must run to completion BEFORE the daemons start. We
+    # rely on tests/e2e/run-chain.sh orchestrating that explicitly with
+    # `run --rm init-chain` because podman-compose 1.5 doesn't honour
+    # `depends_on.condition: service_completed_successfully`.
+    command:
+      - /usr/local/bin/chain-loopback-echo-entrypoint.sh
+    environment:
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
+      # vps's loopback echo is the destination of the chain-tunnel test.
+      ECHO_TCP_PORT: "7100"
+    volumes:
+      - vps_chain_etc:/etc/yggdrasil
+      - vps_chain_run:/run/yggdrasil
+      - vps_chain_state:/var/lib/yggdrasil
+    networks:
+      wan-chain:
+        ipv4_address: 172.30.1.10
+    expose:
+      - "51820/udp"
+      - "9090/tcp"
+
+  midbox:
+    <<: *yggdrasil-image
+    container_name: e2e-chain-midbox
+    depends_on:
+      vps-chain:
+        condition: service_started
+    command:
+      - yggdrasil
+      - run
+      - --config
+      - /etc/yggdrasil/config.toml
+    environment:
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
+    volumes:
+      - midbox_etc:/etc/yggdrasil
+      - midbox_run:/run/yggdrasil
+      - midbox_state:/var/lib/yggdrasil
+    networks:
+      wan-chain:
+        ipv4_address: 172.30.1.20
+    expose:
+      - "7200/tcp"
+      - "51820/udp"
+      - "9090/tcp"
+
+  home-chain:
+    <<: *yggdrasil-image
+    container_name: e2e-chain-home
+    depends_on:
+      midbox:
+        condition: service_started
+    command:
+      - /usr/local/bin/chain-loopback-echo-entrypoint.sh
+    environment:
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
+      # home's loopback echo is the local backend for the terminal-mode
+      # rule (listen=:7200, upstream_addr=127.0.0.1:7100).
+      ECHO_TCP_PORT: "7100"
+    volumes:
+      - home_chain_etc:/etc/yggdrasil
+      - home_chain_run:/run/yggdrasil
+      - home_chain_state:/var/lib/yggdrasil
+    networks:
+      wan-chain:
+        ipv4_address: 172.30.1.30
+    expose:
+      - "7200/tcp"
+      - "9090/tcp"
+
+  client-chain:
+    image: python:3.12-slim
+    container_name: e2e-chain-client
+    depends_on:
+      vps-chain:
+        condition: service_started
+      midbox:
+        condition: service_started
+      home-chain:
+        condition: service_started
+    working_dir: /tests
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ../tests/e2e:/tests:ro
+    networks:
+      wan-chain:
+        ipv4_address: 172.30.1.40
