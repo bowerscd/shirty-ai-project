@@ -33,6 +33,11 @@ pub enum Cmd {
     /// Compare the local terminal's published predicate set with what
     /// each upstream node believes it accepted.
     Diff(DiffArgs),
+    /// One-line-per-hop overview of the chain (pubkey, role, version,
+    /// uptime, rule count). Pure projection of the same
+    /// `Request::ChainSummary` RPC that backs `chain diff`; no extra
+    /// daemon plumbing.
+    Summary(SummaryArgs),
 }
 
 #[derive(Debug, Args)]
@@ -61,10 +66,24 @@ pub struct DiffArgs {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Args)]
+pub struct SummaryArgs {
+    /// Overall budget for assembling the chain summary across all
+    /// hops. Local-only replies effectively ignore this.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = humantime::parse_duration,
+        default_value = "5s",
+    )]
+    pub timeout: Duration,
+}
+
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     match cmd {
         Cmd::Apply(args) => apply(socket, &args).await,
         Cmd::Diff(args) => diff(socket, &args, json).await,
+        Cmd::Summary(args) => summary(socket, &args, json).await,
     }
 }
 
@@ -540,6 +559,111 @@ fn render_human(report: &DiffReport) {
         println!("\nDRIFT detected on at least one hop.");
     } else {
         println!("\nin sync across {} hop(s).", report.hops.len());
+    }
+    if report.partial {
+        println!(
+            "note: chain summary is partial — some upstream hops could \
+             not be reached within the timeout."
+        );
+    }
+}
+
+// =============================================================================
+// CP22: `chain summary`
+// =============================================================================
+
+/// One-line-per-hop entry in the structured summary report.
+#[derive(Debug, Clone, Serialize)]
+struct SummaryHop {
+    /// `0 = local`, `1 = local's upstream`, …
+    index: u32,
+    /// Hop's tagged x25519 pubkey.
+    pubkey: PubKey,
+    /// Runtime mode the hop is operating in.
+    mode: ratatoskr::control::Mode,
+    /// Hop's process uptime in whole seconds.
+    uptime_secs: u64,
+    /// Number of derived rules currently loaded by the proxy supervisor.
+    rule_count: usize,
+    /// Number of accepted predicates (relays) or projected predicates
+    /// (terminals).
+    predicate_count: usize,
+    /// `PredicateSet.version` of the most recently applied push, if any.
+    predicate_version: Option<u64>,
+}
+
+/// Structured top-level summary report. The `--json` rendering serialises
+/// this directly; the human renderer projects it onto one line per hop.
+#[derive(Debug, Clone, Serialize)]
+struct SummaryReport {
+    hops: Vec<SummaryHop>,
+    /// Mirrors [`ChainSummaryResponse::partial`] so JSON consumers and
+    /// the human renderer can both surface the truncation note.
+    partial: bool,
+}
+
+/// Render the chain summary. Reuses [`fetch_chain_summary`] so any
+/// improvements to the wire path (multi-hop fanout, retry semantics)
+/// are picked up here automatically.
+async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result<()> {
+    let resp = fetch_chain_summary(socket, args.timeout)
+        .await
+        .context("fetching chain summary over UDS")?;
+
+    if resp.hops.is_empty() {
+        bail!("daemon returned an empty chain summary; no hops to render");
+    }
+
+    let hops: Vec<SummaryHop> = resp
+        .hops
+        .iter()
+        .map(|h| SummaryHop {
+            index: h.hop_index,
+            pubkey: h.view.chain.local,
+            mode: h.mode,
+            uptime_secs: h.uptime_secs,
+            rule_count: h.view.derived_rules.len(),
+            predicate_count: h.view.predicates.len(),
+            predicate_version: h.view.chain.predicate_version,
+        })
+        .collect();
+    let report = SummaryReport {
+        hops,
+        partial: resp.partial,
+    };
+
+    if json_output {
+        let s = serde_json::to_string_pretty(&report)
+            .context("serialise chain summary report")?;
+        println!("{s}");
+    } else {
+        render_summary_human(&report);
+    }
+    Ok(())
+}
+
+/// Render the report in the default human-readable form. Format:
+///
+/// ```text
+/// hop 0  terminal  x25519:abc…  uptime=12s  rules=2  predicates=2 v=7
+/// hop 1  relay     x25519:def…  uptime=304s rules=2  predicates=2 v=7
+/// hop 2  gateway   x25519:fff…  uptime=304s rules=0  predicates=0
+/// ```
+fn render_summary_human(report: &SummaryReport) {
+    for hop in &report.hops {
+        let version_label = hop
+            .predicate_version
+            .map(|v| format!(" v={v}"))
+            .unwrap_or_default();
+        println!(
+            "hop {idx}  {mode:<8}  {pk}  uptime={uptime}s  rules={rules}  predicates={preds}{version_label}",
+            idx = hop.index,
+            mode = format!("{:?}", hop.mode).to_lowercase(),
+            pk = hop.pubkey,
+            uptime = hop.uptime_secs,
+            rules = hop.rule_count,
+            preds = hop.predicate_count,
+        );
     }
     if report.partial {
         println!(
