@@ -43,16 +43,25 @@ Print the build version. Identical to `yggdrasil --version`.
 
 ## `yggdrasilctl`
 
-Admin CLI. Three scopes — `local`, `chain`, `identity` — selected as the
-first positional argument.
+Admin CLI. Four scopes — `local`, `chain`, `identity`, `validate` —
+selected as the first positional argument.
 
 ### Global flags
 
 | Flag       | Env var                   | Default                          | Notes                                                                                                |
 | ---------- | ------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `--socket` | `YGGDRASIL_CONTROL_SOCKET`| `/run/yggdrasil/control.sock`    | Path to the daemon's control socket. Used by `local` and `chain` scopes.                              |
-| `--config` | `YGGDRASIL_CONFIG`        | `/etc/yggdrasil/config.toml`     | Path to the daemon's config file. Used by `identity` scope to mutate `[dial]` / `[accept]` and resolve `identity_file`. |
+| `--config` | `YGGDRASIL_CONFIG`        | `/etc/yggdrasil/config.toml`     | Path to the daemon's config file. Used by `identity` (mutates `[dial]` / `[accept]` and resolves `identity_file`) and `validate`. |
 | `--json`   | —                         | (off)                            | Emit raw JSON responses where possible. Otherwise human-readable text.                                |
+
+### Per-scope flags
+
+| Flag       | Env var                   | Default                          | Scopes               |
+| ---------- | ------------------------- | -------------------------------- | -------------------- |
+| `--socket` | `YGGDRASIL_CONTROL_SOCKET`| `/run/yggdrasil/control.sock`    | `local`, `chain` only |
+
+`--socket` is **not** accepted by `identity` or `validate` (those scopes
+never contact the daemon). It must appear after the scope keyword, e.g.
+`yggdrasilctl local --socket /tmp/x.sock status`.
 
 ### Exit codes
 

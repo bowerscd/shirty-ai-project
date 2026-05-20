@@ -60,12 +60,12 @@ echo "==> bringing daemons up"
 
 ctl() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps \
-        yggdrasilctl --socket /run/yggdrasil/control.sock local "$@"
+        yggdrasilctl local --socket /run/yggdrasil/control.sock "$@"
 }
 
 ctl_json() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps \
-        yggdrasilctl --socket /run/yggdrasil/control.sock --json local "$@"
+        yggdrasilctl --json local --socket /run/yggdrasil/control.sock "$@"
 }
 
 wait_for() {
@@ -233,7 +233,7 @@ echo "==> [chain-summary] yggdrasilctl chain diff --json from home (2 hops)"
 # upstream step to vps (hop 1). With predicate forwarding both hops
 # converge to the same view (drift_detected=false).
 chain_summary_2hop=$("${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T home \
-    yggdrasilctl --socket /run/yggdrasil/control.sock --json chain diff) \
+    yggdrasilctl --json chain --socket /run/yggdrasil/control.sock diff) \
     || fail "chain diff --json from home failed"
 echo "$chain_summary_2hop" | python3 -c '
 import json, sys

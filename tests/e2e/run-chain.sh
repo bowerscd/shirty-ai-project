@@ -59,13 +59,13 @@ dc_exec() {
 ctl_on() {
     local node="$1"; shift
     dc_exec "$node" \
-        yggdrasilctl --socket /run/yggdrasil/control.sock local "$@"
+        yggdrasilctl local --socket /run/yggdrasil/control.sock "$@"
 }
 
 ctl_json_on() {
     local node="$1"; shift
     dc_exec "$node" \
-        yggdrasilctl --socket /run/yggdrasil/control.sock --json local "$@"
+        yggdrasilctl --json local --socket /run/yggdrasil/control.sock "$@"
 }
 
 wait_for() {
@@ -167,16 +167,16 @@ echo "==> [chain-diff] yggdrasilctl chain diff from home (full traversal)"
 run_chain_diff() {
     rc=0
     dc_exec home-chain yggdrasilctl \
-        --socket /run/yggdrasil/control.sock \
-        chain diff >/dev/null 2>&1 || rc=$?
+        chain --socket /run/yggdrasil/control.sock \
+        diff >/dev/null 2>&1 || rc=$?
     [[ $rc -eq 0 ]]
 }
 WAIT_TIMEOUT=15 wait_for "chain diff (human) reachable and returns rc=0" run_chain_diff
 
 echo "==> [chain-diff] yggdrasilctl --json chain diff structured output"
 diff_json=$(dc_exec home-chain yggdrasilctl \
-    --socket /run/yggdrasil/control.sock --json \
-    chain diff || true)
+    --json chain --socket /run/yggdrasil/control.sock \
+    diff || true)
 echo "$diff_json" | python3 -c '
 import json, sys
 report = json.load(sys.stdin)

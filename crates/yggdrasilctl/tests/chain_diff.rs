@@ -126,9 +126,9 @@ fn spawn_oneshot_uds_chain_summary(
 fn run_cli(socket: &PathBuf, extra_args: &[&str]) -> Output {
     let bin = env!("CARGO_BIN_EXE_yggdrasilctl");
     let mut cmd = Command::new(bin);
-    cmd.arg("--socket")
+    cmd.arg("chain")
+        .arg("--socket")
         .arg(socket)
-        .arg("chain")
         .arg("diff");
     for a in extra_args {
         cmd.arg(a);
@@ -309,14 +309,13 @@ fn diff_json_output_round_trips() {
     );
     let join = spawn_oneshot_uds_chain_summary(socket_path.clone(), resp);
 
-    // `--json` is a global flag; it must come before the `chain` subcommand
-    // in clap argument order.
+    // `--json` is a global flag; `--socket` is per-scope on `chain`/`local`.
     let bin = env!("CARGO_BIN_EXE_yggdrasilctl");
     let out = Command::new(bin)
-        .arg("--socket")
-        .arg(&socket_path)
         .arg("--json")
         .arg("chain")
+        .arg("--socket")
+        .arg(&socket_path)
         .arg("diff")
         .output()
         .expect("spawn yggdrasilctl");

@@ -31,16 +31,8 @@ const DEFAULT_SOCKET_PATH: &str = "/run/yggdrasil/control.sock";
 #[derive(Debug, Parser)]
 #[command(name = "yggdrasilctl", version, about, propagate_version = true)]
 struct Cli {
-    /// Path to the yggdrasil control socket (used by `local` and `chain` scopes).
-    #[arg(
-        long,
-        default_value = DEFAULT_SOCKET_PATH,
-        env = "YGGDRASIL_CONTROL_SOCKET",
-        global = true
-    )]
-    socket: PathBuf,
-
-    /// Path to the yggdrasil config file (used by `identity` scope).
+    /// Path to the yggdrasil config file. Used by the `identity` and
+    /// `validate` scopes; `local` and `chain` ignore it.
     #[arg(
         long,
         default_value = DEFAULT_CONFIG_PATH,
@@ -57,15 +49,33 @@ struct Cli {
     scope: Scope,
 }
 
+/// Shared `--socket` option for the daemon-talking scopes (`local` and
+/// `chain`). Identity and validate scopes never contact the daemon and
+/// deliberately don't accept this flag (config-UX item 28).
+#[derive(Debug, clap::Args)]
+struct SocketOpts {
+    /// Path to the yggdrasil control socket.
+    #[arg(
+        long,
+        default_value = DEFAULT_SOCKET_PATH,
+        env = "YGGDRASIL_CONTROL_SOCKET",
+    )]
+    socket: PathBuf,
+}
+
 #[derive(Debug, Subcommand)]
 enum Scope {
     /// Daemon-local operations over the control socket.
     Local {
+        #[command(flatten)]
+        socket: SocketOpts,
         #[command(subcommand)]
         cmd: local::Cmd,
     },
-    /// Chain-control plane operations (Phase 4+ — stubs only).
+    /// Chain-control plane operations.
     Chain {
+        #[command(flatten)]
+        socket: SocketOpts,
         #[command(subcommand)]
         cmd: chain::Cmd,
     },
@@ -88,9 +98,15 @@ fn main() -> Result<ExitCode> {
 
     runtime.block_on(async move {
         match cli.scope {
-            Scope::Local { cmd } => local::run(cmd, &cli.socket, cli.json).await.map(|()| ExitCode::SUCCESS),
-            Scope::Chain { cmd } => chain::run(cmd, &cli.socket, cli.json).await.map(|()| ExitCode::SUCCESS),
-            Scope::Identity { cmd } => identity::run(cmd, &cli.config, cli.json).await.map(|()| ExitCode::SUCCESS),
+            Scope::Local { socket, cmd } => local::run(cmd, &socket.socket, cli.json)
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            Scope::Chain { socket, cmd } => chain::run(cmd, &socket.socket, cli.json)
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            Scope::Identity { cmd } => identity::run(cmd, &cli.config, cli.json)
+                .await
+                .map(|()| ExitCode::SUCCESS),
             Scope::Validate(args) => validate::run(args, &cli.config, cli.json).await,
         }
     })
