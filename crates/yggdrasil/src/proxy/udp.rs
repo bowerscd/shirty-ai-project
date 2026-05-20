@@ -57,7 +57,7 @@ pub const MAX_FLOWS_PER_RULE_DEFAULT: usize = 65_536;
 /// arrive intact will not be truncated by us.
 const RECV_BUFFER_LEN: usize = 65_535;
 
-/// One per active `(client_addr) → (peer_ip, upstream_port)` flow.
+/// One per active `(client_addr) → (peer_ip, target_port)` flow.
 struct FlowEntry {
     upstream_sock: Arc<UdpSocket>,
     /// Milliseconds since [`UdpProxy::start`]. Updated on every datagram in
@@ -262,7 +262,7 @@ impl UdpProxyInner {
         }
 
         // No flow yet. Need a resolved dial target and capacity.
-        let Some(upstream_addr) = self.resolver.current_target() else {
+        let Some(target_addr) = self.resolver.current_target() else {
             tracing::debug!(
                 rule = %self.rule.name,
                 client = %client_addr,
@@ -287,7 +287,7 @@ impl UdpProxyInner {
             return;
         }
 
-        let entry = match self.create_flow(client_addr, upstream_addr).await {
+        let entry = match self.create_flow(client_addr, target_addr).await {
             Some(e) => e,
             None => return,
         };
@@ -296,7 +296,7 @@ impl UdpProxyInner {
             tracing::debug!(
                 rule = %self.rule.name,
                 client = %client_addr,
-                upstream = %upstream_addr,
+                upstream = %target_addr,
                 error = %e,
                 "first upstream send on new flow failed"
             );
@@ -308,11 +308,11 @@ impl UdpProxyInner {
     async fn create_flow(
         &self,
         client_addr: SocketAddr,
-        upstream_addr: SocketAddr,
+        target_addr: SocketAddr,
     ) -> Option<Arc<FlowEntry>> {
         // Ephemeral upstream socket, connected so subsequent send/recv go
         // directly without an addr lookup.
-        let bind_addr: SocketAddr = match upstream_addr.ip() {
+        let bind_addr: SocketAddr = match target_addr.ip() {
             IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             IpAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
@@ -328,11 +328,11 @@ impl UdpProxyInner {
                 return None;
             }
         };
-        if let Err(e) = sock.connect(upstream_addr).await {
+        if let Err(e) = sock.connect(target_addr).await {
             tracing::warn!(
                 rule = %self.rule.name,
                 client = %client_addr,
-                upstream = %upstream_addr,
+                upstream = %target_addr,
                 error = %e,
                 "connect upstream UDP socket failed"
             );
@@ -385,7 +385,7 @@ impl UdpProxyInner {
                 tracing::debug!(
                     rule = %self.rule.name,
                     client = %client_addr,
-                    upstream = %upstream_addr,
+                    upstream = %target_addr,
                     "new UDP flow"
                 );
                 v.insert(entry.clone());
@@ -565,7 +565,7 @@ mod tests {
         addr
     }
 
-    fn udp_rule(name: &str, upstream_port: u16, idle_secs: u64) -> Rule {
+    fn udp_rule(name: &str, target_port: u16, idle_secs: u64) -> Rule {
         let f = ratatoskr::rule::RuleFile::from_toml(
             "test.toml",
             &format!(
@@ -574,7 +574,7 @@ mod tests {
                 name = "{name}"
                 listen = "127.0.0.1:0"
                 protocol = "udp"
-                upstream_port = {upstream_port}
+                target_port = {target_port}
                 idle_timeout = "{idle_secs}s"
                 "#,
             ),

@@ -163,11 +163,11 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             if b.rules.is_empty() {
                 println!("(no rules loaded)");
             } else {
-                println!("{:<24}  {:<5}  {:<24}  upstream", "name", "proto", "listen");
+                println!("{:<24}  {:<5}  {:<24}  target", "name", "proto", "listen");
                 for br in &b.rules {
                     println!(
                         "{:<24}  {:<5}  {:<24}  {}",
-                        br.name, br.protocol, br.listen, br.upstream
+                        br.name, br.protocol, br.listen, br.target
                     );
                 }
             }

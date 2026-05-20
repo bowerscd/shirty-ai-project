@@ -22,7 +22,7 @@ fn synth_toml(n_rules: usize) -> String {
         // and keep the test bytes realistic.
         let port = 20_000 + i;
         out.push_str(&format!(
-            "[[rule]]\nname = \"rule-{i}\"\nprotocol = \"{protocol}\"\nlisten = \"0.0.0.0:{port}\"\nupstream_port = {port}\n\n"
+            "[[rule]]\nname = \"rule-{i}\"\nprotocol = \"{protocol}\"\nlisten = \"0.0.0.0:{port}\"\ntarget_port = {port}\n\n"
         ));
     }
     out

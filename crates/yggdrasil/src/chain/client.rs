@@ -209,20 +209,20 @@ impl ChainClient {
     }
 
     async fn run_session_once(&mut self) -> Result<SessionExit> {
-        let upstream_addr = resolve_endpoint(&self.config.endpoint).await?;
-        let bind_addr: SocketAddr = match upstream_addr {
+        let target_addr = resolve_endpoint(&self.config.endpoint).await?;
+        let bind_addr: SocketAddr = match target_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
         let socket = UdpSocket::bind(bind_addr)
             .await
-            .with_context(|| format!("bind UDP socket toward {upstream_addr}"))?;
+            .with_context(|| format!("bind UDP socket toward {target_addr}"))?;
         socket
-            .connect(upstream_addr)
+            .connect(target_addr)
             .await
-            .with_context(|| format!("connect UDP socket to {upstream_addr}"))?;
+            .with_context(|| format!("connect UDP socket to {target_addr}"))?;
         tracing::info!(
-            upstream = %upstream_addr,
+            upstream = %target_addr,
             local    = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             "udp socket ready"
         );

@@ -266,7 +266,7 @@ mod tests {
             name = "a"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         );
         let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
@@ -289,7 +289,7 @@ mod tests {
             name = "new"
             listen = "0.0.0.0:2222"
             protocol = "udp"
-            upstream_port = 53
+            target_port = 53
             "#,
         );
 
@@ -310,7 +310,7 @@ mod tests {
             name = "r"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             "#,
         );
         let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
@@ -323,7 +323,7 @@ mod tests {
             name = "r"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 23
+            target_port = 23
             "#,
         );
 
@@ -331,8 +331,8 @@ mod tests {
         assert!(upd.diff.added.is_empty());
         assert!(upd.diff.removed.is_empty());
         assert_eq!(upd.diff.changed.len(), 1);
-        assert_eq!(upd.diff.changed[0].old.upstream_port, Some(22));
-        assert_eq!(upd.diff.changed[0].new.upstream_port, Some(23));
+        assert_eq!(upd.diff.changed[0].old.target_port, Some(22));
+        assert_eq!(upd.diff.changed[0].new.target_port, Some(23));
     }
 
     #[tokio::test]
@@ -345,7 +345,7 @@ mod tests {
             name = "g"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         );
         let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
@@ -368,7 +368,7 @@ mod tests {
             name = "good"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         );
         let mut w = RuleWatcher::spawn(d.path(), Duration::from_millis(50)).unwrap();
@@ -389,7 +389,7 @@ mod tests {
             name = "second"
             listen = "0.0.0.0:2222"
             protocol = "tcp"
-            upstream_port = 2
+            target_port = 2
             "#,
         );
 
@@ -420,7 +420,7 @@ mod tests {
             name = "forced"
             listen = "0.0.0.0:9999"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         );
         w.force_reload();

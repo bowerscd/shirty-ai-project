@@ -467,7 +467,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
         };
 
     // 4. Rule-driven proxy supervisor with a terminal-mode factory: every
-    //    rule must carry `upstream_addr`; `upstream_port` rules are
+    //    rule must carry `target_addr`; `target_port` rules are
     //    rejected by `ResolverFactory::build`.
     let resolver_factory = ResolverFactory::new_terminal();
     let supervisor = ProxySupervisor::spawn(

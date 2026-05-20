@@ -4,7 +4,7 @@
 //! topology:
 //!
 //! 1. **Chained TCP**: a terminal-mode supervisor accepts TCP on its rule's
-//!    `listen` socket and dials the rule's static `upstream_addr` on the
+//!    `listen` socket and dials the rule's static `target_addr` on the
 //!    LAN. Chained behind a relay-mode supervisor, the round-trip from
 //!    client → relay → terminal → echo is byte-stable.
 //! 2. **Chained UDP**: the same shape with UDP datagrams. Both proxies are
@@ -318,7 +318,7 @@ async fn proxy_protocol_v2_passes_through_terminal_unchanged() {
 name = "echo"
 protocol = "tcp"
 listen = "127.0.0.1:{relay_listen_port}"
-upstream_port = {terminal_listen_port}
+target_port = {terminal_listen_port}
 proxy_protocol = "v2"
 "#
     );

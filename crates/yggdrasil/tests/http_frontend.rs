@@ -273,9 +273,9 @@ fn write_https_rule_two_routes(
     rule_name: &str,
     listen: SocketAddr,
     api_host: &str,
-    api_upstream: &str,
+    api_target: &str,
     app_host: &str,
-    app_upstream: &str,
+    app_target: &str,
 ) {
     let toml = format!(
         r#"
@@ -286,12 +286,12 @@ listen = "{listen}"
 
 [[rule.route]]
 hostname = "{api_host}"
-upstream = "{api_upstream}"
+target = "{api_target}"
 cert = "ephemeral"
 
 [[rule.route]]
 hostname = "{app_host}"
-upstream = "{app_upstream}"
+target = "{app_target}"
 cert = "ephemeral"
 "#,
     );
@@ -305,7 +305,7 @@ fn write_https_rule_one_route_with_paths(
     rule_name: &str,
     listen: SocketAddr,
     host: &str,
-    upstream: &str,
+    target: &str,
     cert: &Path,
     key: &Path,
     hsts: bool,
@@ -320,7 +320,7 @@ listen = "{listen}"
 
 [[rule.route]]
 hostname = "{host}"
-upstream = "{upstream}"
+target = "{target}"
 cert = "{}"
 key = "{}"
 {hsts_line}"#,
@@ -586,7 +586,7 @@ listen = "{frontend_addr}"
 
 [[rule.route]]
 hostname = "{host}"
-upstream = "http://127.0.0.1:{dead_port}"
+target = "http://127.0.0.1:{dead_port}"
 cert = "ephemeral"
 "#,
     );

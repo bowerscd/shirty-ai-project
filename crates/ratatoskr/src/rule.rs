@@ -12,14 +12,14 @@
 //! name           = "minecraft-survival"
 //! listen         = "0.0.0.0:25565"
 //! protocol       = "tcp"
-//! upstream_port  = 25565
+//! target_port  = 25565
 //! proxy_protocol = "v2"          # optional, off by default
 //!
 //! [[rule]]
 //! name           = "minecraft-bedrock"
 //! listen         = "0.0.0.0:19132"
 //! protocol       = "udp"
-//! upstream_port  = 19132
+//! target_port  = 19132
 //! idle_timeout   = "30s"          # optional, defaults to 60s for udp
 //! ```
 //!
@@ -30,13 +30,13 @@
 //! name          = "home-ssh"
 //! listen        = "0.0.0.0:2222"
 //! protocol      = "tcp"
-//! upstream_addr = "192.168.1.10:22"
+//! target_addr = "192.168.1.10:22"
 //!
 //! [[rule]]
 //! name          = "home-dns"
 //! listen        = "0.0.0.0:53"
 //! protocol      = "udp"
-//! upstream_addr = "192.168.1.1:53"
+//! target_addr = "192.168.1.1:53"
 //! idle_timeout  = "30s"
 //! ```
 //!
@@ -48,13 +48,13 @@
 //! name          = "home-printer"
 //! listen        = "0.0.0.0:9100"
 //! protocol      = "tcp"
-//! upstream_host = "printer.lan:9100"
+//! target_host = "printer.lan:9100"
 //! ```
 //!
-//! `upstream_addr` (a literal `IP:PORT`) and `upstream_host`
+//! `target_addr` (a literal `IP:PORT`) and `target_host`
 //! (a `HOSTNAME:PORT` resolved via the OS resolver, refreshed every 30s)
-//! are siblings — use `upstream_addr` when you have a static IP, and
-//! `upstream_host` when the LAN device's IP comes from DHCP or you want to
+//! are siblings — use `target_addr` when you have a static IP, and
+//! `target_host` when the LAN device's IP comes from DHCP or you want to
 //! pin to a mDNS name. Picking exactly one is a per-rule validation
 //! requirement.
 //!
@@ -69,14 +69,14 @@
 //!
 //!   [[rule.route]]
 //!   hostname = "api.home.example"
-//!   upstream = "http://192.168.1.10:8080"
+//!   target = "http://192.168.1.10:8080"
 //!   cert     = "/etc/yggdrasil/certs/api.home.example/fullchain.pem"
 //!   key      = "/etc/yggdrasil/certs/api.home.example/privkey.pem"
 //!   hsts     = true
 //!
 //!   [[rule.route]]
 //!   hostname = "app.local"
-//!   upstream = "http://192.168.1.11:3000"
+//!   target = "http://192.168.1.11:3000"
 //!   cert     = "ephemeral"          # self-signed, in-memory, 10y validity
 //! ```
 //!
@@ -90,18 +90,18 @@
 //!   HTTPS rule is rejected.
 //! * `listen` port must be non-zero (binding to port 0 makes no sense for a
 //!   fixed-listener proxy).
-//! * For `protocol = "tcp" | "udp"`: exactly one of `upstream_port` /
-//!   `upstream_addr` / `upstream_host` is set (3-way XOR). `upstream_port`,
-//!   when set, must be non-zero; `upstream_addr`, when set, must have a
-//!   non-zero port; `upstream_host`, when set, must be a syntactically
+//! * For `protocol = "tcp" | "udp"`: exactly one of `target_port` /
+//!   `target_addr` / `target_host` is set (3-way XOR). `target_port`,
+//!   when set, must be non-zero; `target_addr`, when set, must have a
+//!   non-zero port; `target_host`, when set, must be a syntactically
 //!   valid DNS hostname with a non-zero port.
-//! * `proxy_protocol` is rejected when `upstream_addr` or `upstream_host`
+//! * `proxy_protocol` is rejected when `target_addr` or `target_host`
 //!   is set — terminal rules cannot emit headers (the relay's header
 //!   passes through verbatim).
 //! * For `protocol = "https"`: `routes` is present and non-empty;
-//!   `upstream_port` / `upstream_addr` / `upstream_host` / `proxy_protocol`
+//!   `target_port` / `target_addr` / `target_host` / `proxy_protocol`
 //!   / `idle_timeout` are all absent. Per-route invariants: hostname is a syntactically
-//!   valid DNS name (no duplicates within the rule); `upstream` URL scheme
+//!   valid DNS name (no duplicates within the rule); `target` URL scheme
 //!   is `"http"` with explicit host + port; `cert` as a path requires `key`
 //!   alongside; `cert = "ephemeral"` requires the hostname to match
 //!   `localhost`, `*.localhost`, or `*.local`.
@@ -163,18 +163,18 @@ pub enum ProxyProto {
 /// `yggdrasil::proxy::resolver::UpstreamResolver::Dns`), refreshed
 /// periodically; the rule itself only carries the (host, port) tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamHost {
+pub struct TargetHost {
     pub host: String,
     pub port: u16,
 }
 
-impl std::fmt::Display for UpstreamHost {
+impl std::fmt::Display for TargetHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.host, self.port)
     }
 }
 
-impl std::str::FromStr for UpstreamHost {
+impl std::str::FromStr for TargetHost {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         // Split on the *last* `:` so `host` may contain colons in IPv6
@@ -183,44 +183,44 @@ impl std::str::FromStr for UpstreamHost {
         // colon keeps the error message focused on the hostname rather
         // than producing a confusing "port not a number" message.
         let (host, port_str) = s.rsplit_once(':').ok_or_else(|| {
-            format!("upstream_host {s:?}: expected \"hostname:port\"")
+            format!("target_host {s:?}: expected \"hostname:port\"")
         })?;
         if host.is_empty() {
-            return Err(format!("upstream_host {s:?}: empty hostname"));
+            return Err(format!("target_host {s:?}: empty hostname"));
         }
         let port: u16 = port_str
             .parse()
-            .map_err(|_| format!("upstream_host {s:?}: port {port_str:?} is not a u16"))?;
+            .map_err(|_| format!("target_host {s:?}: port {port_str:?} is not a u16"))?;
         if port == 0 {
-            return Err(format!("upstream_host {s:?}: port must be non-zero"));
+            return Err(format!("target_host {s:?}: port must be non-zero"));
         }
         if !is_valid_dns_hostname(host) {
             return Err(format!(
-                "upstream_host {s:?}: hostname {host:?} is not a valid DNS \
+                "target_host {s:?}: hostname {host:?} is not a valid DNS \
                  name (LDH labels, no wildcards, no underscores)"
             ));
         }
-        Ok(UpstreamHost {
+        Ok(TargetHost {
             host: host.to_string(),
             port,
         })
     }
 }
 
-impl Serialize for UpstreamHost {
+impl Serialize for TargetHost {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.collect_str(self)
     }
 }
 
-impl<'de> Deserialize<'de> for UpstreamHost {
+impl<'de> Deserialize<'de> for TargetHost {
     fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         use serde::de::Error as _;
         let s = String::deserialize(de)?;
-        s.parse::<UpstreamHost>().map_err(D::Error::custom)
+        s.parse::<TargetHost>().map_err(D::Error::custom)
     }
 }
 
@@ -414,16 +414,16 @@ impl<'de> Deserialize<'de> for CertSource {
 /// A single HTTPS route attached to a `Protocol::Https` rule.
 ///
 /// Routes are matched by exact `Host` header against the inbound request
-/// (after SNI). All fields beyond `hostname` and `upstream` are optional.
+/// (after SNI). All fields beyond `hostname` and `target` are optional.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRoute {
     /// DNS hostname the route is served as. Matched as an exact, case-
     /// insensitive string against both SNI and the `Host` header.
     pub hostname: String,
-    /// Plaintext HTTP upstream URL — must use scheme `http` and include an
+    /// Plaintext HTTP target URL — must use scheme `http` and include an
     /// explicit host + port (path/query are ignored; only the authority is
     /// used to dial the backend).
-    pub upstream: Url,
+    pub target: Url,
     /// Certificate source for this hostname. Precedence when resolving
     /// effective cert at load time:
     /// 1. `cert == Some(Path(p))` plus `key` → load `p` + `key` from disk.
@@ -501,12 +501,12 @@ where
 
 /// A single proxy rule as deserialised from a `[[rule]]` table.
 ///
-/// Exactly one of `upstream_port` / `upstream_addr` / `upstream_host` is
+/// Exactly one of `target_port` / `target_addr` / `target_host` is
 /// set for L4 (`protocol = "tcp" | "udp"`):
-/// * `upstream_port` — relay mode. The destination IP is supplied by the
+/// * `target_port` — relay mode. The destination IP is supplied by the
 ///   heartbeat-discovered peer at runtime; this field selects the port.
-/// * `upstream_addr` — terminal mode. A fixed LAN socket dialed verbatim.
-/// * `upstream_host` — terminal mode. A `host:port` resolved via the OS
+/// * `target_addr` — terminal mode. A fixed LAN socket dialed verbatim.
+/// * `target_host` — terminal mode. A `host:port` resolved via the OS
 ///   resolver at startup and refreshed periodically. Useful when the LAN
 ///   device gets its address from DHCP or is reachable by an mDNS name.
 ///
@@ -521,28 +521,28 @@ pub struct Rule {
     /// `"tcp"`, `"udp"`, or `"https"`.
     pub protocol: Protocol,
     /// Relay mode: destination port on the upstream peer (the residential host's
-    /// IP comes from the heartbeat, not from this file). XOR with `upstream_addr`
-    /// and `upstream_host`. Forbidden when `protocol = "https"`.
+    /// IP comes from the heartbeat, not from this file). XOR with `target_addr`
+    /// and `target_host`. Forbidden when `protocol = "https"`.
     #[serde(default)]
-    pub upstream_port: Option<u16>,
+    pub target_port: Option<u16>,
     /// Terminal mode: fixed LAN socket address dialed verbatim. XOR with
-    /// `upstream_port` and `upstream_host`. Forbidden when
+    /// `target_port` and `target_host`. Forbidden when
     /// `protocol = "https"`.
     #[serde(default)]
-    pub upstream_addr: Option<SocketAddr>,
+    pub target_addr: Option<SocketAddr>,
     /// Terminal mode: `"hostname:port"` resolved at runtime via the OS
-    /// resolver and refreshed periodically. XOR with `upstream_port` and
-    /// `upstream_addr`. Forbidden when `protocol = "https"`. The host
+    /// resolver and refreshed periodically. XOR with `target_port` and
+    /// `target_addr`. Forbidden when `protocol = "https"`. The host
     /// portion must be a syntactically valid DNS label sequence (same rules
     /// as `[[rule.route]] hostname`).
     #[serde(default)]
-    pub upstream_host: Option<UpstreamHost>,
+    pub target_host: Option<TargetHost>,
     /// UDP only: time without activity before a flow is evicted from the flow table.
     /// Default applied at load time (see [`Rule::resolved_idle_timeout`]).
     #[serde(default, with = "humantime_serde::option")]
     pub idle_timeout: Option<Duration>,
     /// TCP only: emit a PROXY-protocol header to the upstream before forwarding.
-    /// Rejected when `upstream_addr` or `upstream_host` is set (terminal rules
+    /// Rejected when `target_addr` or `target_host` is set (terminal rules
     /// must not synthesise PROXY-protocol headers; relay-written headers pass
     /// through verbatim).
     #[serde(default)]
@@ -601,14 +601,14 @@ impl Rule {
             )));
         }
 
-        // 3-way XOR over (upstream_port, upstream_addr, upstream_host).
-        // The Deserialize impl for `UpstreamHost` already enforces a valid
+        // 3-way XOR over (target_port, target_addr, target_host).
+        // The Deserialize impl for `TargetHost` already enforces a valid
         // hostname + non-zero port; here we only check inter-field
         // consistency.
         let set_count = [
-            self.upstream_port.is_some(),
-            self.upstream_addr.is_some(),
-            self.upstream_host.is_some(),
+            self.target_port.is_some(),
+            self.target_addr.is_some(),
+            self.target_host.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
@@ -616,8 +616,8 @@ impl Rule {
         match set_count {
             0 => {
                 return Err(Error::InvalidRule(format!(
-                    "rule {:?}: must set exactly one of upstream_port (relay), \
-                     upstream_addr (terminal, static), or upstream_host \
+                    "rule {:?}: must set exactly one of target_port (relay), \
+                     target_addr (terminal, static), or target_host \
                      (terminal, DNS-resolved)",
                     self.name
                 )));
@@ -625,33 +625,33 @@ impl Rule {
             1 => {}
             _ => {
                 return Err(Error::InvalidRule(format!(
-                    "rule {:?}: set exactly one of upstream_port (relay), \
-                     upstream_addr (terminal, static), or upstream_host \
+                    "rule {:?}: set exactly one of target_port (relay), \
+                     target_addr (terminal, static), or target_host \
                      (terminal, DNS-resolved); not multiple",
                     self.name
                 )));
             }
         }
-        if matches!(self.upstream_port, Some(0)) {
+        if matches!(self.target_port, Some(0)) {
             return Err(Error::InvalidRule(format!(
-                "rule {:?}: upstream_port must be non-zero",
+                "rule {:?}: target_port must be non-zero",
                 self.name
             )));
         }
-        if let Some(addr) = self.upstream_addr {
+        if let Some(addr) = self.target_addr {
             if addr.port() == 0 {
                 return Err(Error::InvalidRule(format!(
-                    "rule {:?}: upstream_addr port must be non-zero",
+                    "rule {:?}: target_addr port must be non-zero",
                     self.name
                 )));
             }
         }
-        if (self.upstream_addr.is_some() || self.upstream_host.is_some())
+        if (self.target_addr.is_some() || self.target_host.is_some())
             && self.proxy_protocol.is_some()
         {
             return Err(Error::InvalidRule(format!(
                 "rule {:?}: proxy_protocol is invalid on terminal rules \
-                 (upstream_addr or upstream_host is set); relay-written \
+                 (target_addr or target_host is set); relay-written \
                  headers pass through verbatim",
                 self.name
             )));
@@ -681,23 +681,23 @@ impl Rule {
     /// Per-protocol checks for HTTPS rules.
     fn validate_l7(&self) -> Result<()> {
         // L4 dial-target fields must all be absent.
-        if self.upstream_port.is_some() {
+        if self.target_port.is_some() {
             return Err(Error::InvalidRule(format!(
-                "rule {:?}: `upstream_port` is not valid for protocol = \
+                "rule {:?}: `target_port` is not valid for protocol = \
                  \"https\" (dial targets live in [[rule.route]])",
                 self.name
             )));
         }
-        if self.upstream_addr.is_some() {
+        if self.target_addr.is_some() {
             return Err(Error::InvalidRule(format!(
-                "rule {:?}: `upstream_addr` is not valid for protocol = \
+                "rule {:?}: `target_addr` is not valid for protocol = \
                  \"https\" (dial targets live in [[rule.route]])",
                 self.name
             )));
         }
-        if self.upstream_host.is_some() {
+        if self.target_host.is_some() {
             return Err(Error::InvalidRule(format!(
-                "rule {:?}: `upstream_host` is not valid for protocol = \
+                "rule {:?}: `target_host` is not valid for protocol = \
                  \"https\" (dial targets live in [[rule.route]])",
                 self.name
             )));
@@ -780,7 +780,7 @@ impl Rule {
 ///
 /// Checks:
 /// * `hostname` non-empty and a syntactically valid DNS label sequence.
-/// * `upstream` scheme is exactly `"http"`; host and explicit port present.
+/// * `target` scheme is exactly `"http"`; host and explicit port present.
 /// * `cert = Path(_)` requires `key = Some(_)`; XOR.
 /// * `cert = Ephemeral` restricts `hostname` to local-only patterns
 ///   (`localhost`, `*.localhost`, `*.local`).
@@ -799,24 +799,24 @@ fn validate_http_route(rule_name: &str, route: &HttpRoute) -> Result<()> {
         )));
     }
 
-    if route.upstream.scheme() != "http" {
+    if route.target.scheme() != "http" {
         return Err(Error::InvalidRule(format!(
-            "rule {:?}: route {:?}: upstream URL scheme must be \"http\" \
+            "rule {:?}: route {:?}: target URL scheme must be \"http\" \
              (got {:?})",
             rule_name,
             route.hostname,
-            route.upstream.scheme()
+            route.target.scheme()
         )));
     }
-    if route.upstream.host_str().is_none() {
+    if route.target.host_str().is_none() {
         return Err(Error::InvalidRule(format!(
-            "rule {:?}: route {:?}: upstream URL is missing a host",
+            "rule {:?}: route {:?}: target URL is missing a host",
             rule_name, route.hostname
         )));
     }
-    if route.upstream.port_or_known_default().is_none() {
+    if route.target.port_or_known_default().is_none() {
         return Err(Error::InvalidRule(format!(
-            "rule {:?}: route {:?}: upstream URL has no port and no known \
+            "rule {:?}: route {:?}: target URL has no port and no known \
              default for its scheme",
             rule_name, route.hostname
         )));
@@ -1090,7 +1090,7 @@ mod tests {
             name = "ssh"
             listen = "0.0.0.0:2222"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             "#,
         )
         .unwrap();
@@ -1098,8 +1098,8 @@ mod tests {
         let r = &f.rule[0];
         assert_eq!(r.name, "ssh");
         assert_eq!(r.protocol, Protocol::Tcp);
-        assert_eq!(r.upstream_port, Some(22));
-        assert_eq!(r.upstream_addr, None);
+        assert_eq!(r.target_port, Some(22));
+        assert_eq!(r.target_addr, None);
         assert_eq!(r.idle_timeout, None);
         assert_eq!(r.proxy_protocol, None);
         f.validate_each().unwrap();
@@ -1113,14 +1113,14 @@ mod tests {
             name = "home-ssh"
             listen = "0.0.0.0:2222"
             protocol = "tcp"
-            upstream_addr = "192.168.1.10:22"
+            target_addr = "192.168.1.10:22"
             "#,
         )
         .unwrap();
         let r = &f.rule[0];
-        assert_eq!(r.upstream_port, None);
+        assert_eq!(r.target_port, None);
         assert_eq!(
-            r.upstream_addr,
+            r.target_addr,
             Some("192.168.1.10:22".parse::<SocketAddr>().unwrap())
         );
         f.validate_each().unwrap();
@@ -1134,7 +1134,7 @@ mod tests {
             name = "home-dns"
             listen = "0.0.0.0:53"
             protocol = "udp"
-            upstream_addr = "192.168.1.1:53"
+            target_addr = "192.168.1.1:53"
             idle_timeout = "30s"
             "#,
         )
@@ -1142,7 +1142,7 @@ mod tests {
         let r = &f.rule[0];
         assert_eq!(r.protocol, Protocol::Udp);
         assert_eq!(
-            r.upstream_addr,
+            r.target_addr,
             Some("192.168.1.1:53".parse::<SocketAddr>().unwrap())
         );
         assert_eq!(r.idle_timeout, Some(Duration::from_secs(30)));
@@ -1157,7 +1157,7 @@ mod tests {
             name = "minecraft-bedrock"
             listen = "0.0.0.0:19132"
             protocol = "udp"
-            upstream_port = 19132
+            target_port = 19132
             idle_timeout = "30s"
             "#,
         )
@@ -1177,7 +1177,7 @@ mod tests {
             name = "http"
             listen = "0.0.0.0:80"
             protocol = "tcp"
-            upstream_port = 8080
+            target_port = 8080
             proxy_protocol = "v2"
             "#,
         )
@@ -1194,7 +1194,7 @@ mod tests {
             name = "ssh"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             idle_timeout = "30s"
             "#,
         )
@@ -1211,7 +1211,7 @@ mod tests {
             name = "dns"
             listen = "0.0.0.0:53"
             protocol = "udp"
-            upstream_port = 53
+            target_port = 53
             proxy_protocol = "v1"
             "#,
         )
@@ -1228,7 +1228,7 @@ mod tests {
             name = "bad"
             listen = "0.0.0.0:0"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             "#,
         )
         .unwrap();
@@ -1237,43 +1237,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_upstream_port() {
+    fn rejects_zero_target_port() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_port = 0
+            target_port = 0
             "#,
         )
         .unwrap();
         let err = f.validate_each().err();
-        assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("upstream_port")));
+        assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("target_port")));
     }
 
     #[test]
-    fn rejects_both_upstream_port_and_upstream_addr() {
+    fn rejects_both_target_port_and_target_addr() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_port = 22
-            upstream_addr = "192.168.1.1:22"
+            target_port = 22
+            target_addr = "192.168.1.1:22"
             "#,
         )
         .unwrap();
         let err = f.validate_each().err();
         assert!(matches!(
             err,
-            Some(Error::InvalidRule(s)) if s.contains("exactly one of upstream_port")
+            Some(Error::InvalidRule(s)) if s.contains("exactly one of target_port")
         ));
     }
 
     #[test]
-    fn rejects_neither_upstream_port_nor_upstream_addr() {
+    fn rejects_neither_target_port_nor_target_addr() {
         let f = parse(
             r#"
             [[rule]]
@@ -1291,33 +1291,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upstream_addr_with_zero_port() {
+    fn rejects_target_addr_with_zero_port() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_addr = "192.168.1.1:0"
+            target_addr = "192.168.1.1:0"
             "#,
         )
         .unwrap();
         let err = f.validate_each().err();
         assert!(matches!(
             err,
-            Some(Error::InvalidRule(s)) if s.contains("upstream_addr port")
+            Some(Error::InvalidRule(s)) if s.contains("target_addr port")
         ));
     }
 
     #[test]
-    fn rejects_proxy_protocol_with_upstream_addr() {
+    fn rejects_proxy_protocol_with_target_addr() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_addr = "192.168.1.1:22"
+            target_addr = "192.168.1.1:22"
             proxy_protocol = "v2"
             "#,
         )
@@ -1330,25 +1330,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_upstream_host_as_terminal_rule() {
+    fn parses_target_host_as_terminal_rule() {
         let f = parse(
             r#"
             [[rule]]
             name = "dns-rule"
             listen = "0.0.0.0:9100"
             protocol = "tcp"
-            upstream_host = "printer.lan:9100"
+            target_host = "printer.lan:9100"
             "#,
         )
         .unwrap();
         f.validate_each().expect("should validate");
-        let h = f.rule[0].upstream_host.as_ref().expect("upstream_host set");
+        let h = f.rule[0].target_host.as_ref().expect("target_host set");
         assert_eq!(h.host, "printer.lan");
         assert_eq!(h.port, 9100);
     }
 
     #[test]
-    fn rejects_upstream_host_with_invalid_hostname() {
+    fn rejects_target_host_with_invalid_hostname() {
         // Wildcards are not valid DNS hostnames in `is_valid_dns_hostname`.
         let f = parse(
             r#"
@@ -1356,7 +1356,7 @@ mod tests {
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_host = "*.example.com:22"
+            target_host = "*.example.com:22"
             "#,
         );
         // The Deserialize impl rejects this at TOML-parse time, so we expect
@@ -1367,14 +1367,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upstream_host_with_zero_port() {
+    fn rejects_target_host_with_zero_port() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_host = "host.example:0"
+            target_host = "host.example:0"
             "#,
         );
         assert!(f.is_err(), "zero port should be rejected at parse time");
@@ -1383,14 +1383,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upstream_host_missing_port() {
+    fn rejects_target_host_missing_port() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_host = "hostnoport"
+            target_host = "hostnoport"
             "#,
         );
         assert!(f.is_err(), "missing port should be rejected at parse time");
@@ -1402,15 +1402,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upstream_host_combined_with_upstream_addr() {
+    fn rejects_target_host_combined_with_target_addr() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_addr = "192.168.1.1:22"
-            upstream_host = "example.lan:22"
+            target_addr = "192.168.1.1:22"
+            target_host = "example.lan:22"
             "#,
         )
         .unwrap();
@@ -1422,15 +1422,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upstream_host_combined_with_upstream_port() {
+    fn rejects_target_host_combined_with_target_port() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_port = 22
-            upstream_host = "example.lan:22"
+            target_port = 22
+            target_host = "example.lan:22"
             "#,
         )
         .unwrap();
@@ -1442,14 +1442,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_proxy_protocol_with_upstream_host() {
+    fn rejects_proxy_protocol_with_target_host() {
         let f = parse(
             r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_host = "example.lan:22"
+            target_host = "example.lan:22"
             proxy_protocol = "v2"
             "#,
         )
@@ -1469,7 +1469,7 @@ mod tests {
             name = ""
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             "#,
         )
         .unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
             name = "bad name"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             "#,
         )
         .unwrap();
@@ -1514,7 +1514,7 @@ mod tests {
             name = "a"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         )
         .unwrap();
@@ -1524,7 +1524,7 @@ mod tests {
             name = "b"
             listen = "0.0.0.0:2222"
             protocol = "udp"
-            upstream_port = 2
+            target_port = 2
             "#,
         )
         .unwrap();
@@ -1543,7 +1543,7 @@ mod tests {
             name = "dup"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         )
         .unwrap();
@@ -1553,7 +1553,7 @@ mod tests {
             name = "dup"
             listen = "0.0.0.0:2222"
             protocol = "tcp"
-            upstream_port = 2
+            target_port = 2
             "#,
         )
         .unwrap();
@@ -1569,7 +1569,7 @@ mod tests {
             name = "x"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         )
         .unwrap();
@@ -1579,7 +1579,7 @@ mod tests {
             name = "y"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 2
+            target_port = 2
             "#,
         )
         .unwrap();
@@ -1596,7 +1596,7 @@ mod tests {
             name = "x-tcp"
             listen = "0.0.0.0:53"
             protocol = "tcp"
-            upstream_port = 53
+            target_port = 53
             "#,
         )
         .unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
             name = "x-udp"
             listen = "0.0.0.0:53"
             protocol = "udp"
-            upstream_port = 53
+            target_port = 53
             "#,
         )
         .unwrap();
@@ -1622,7 +1622,7 @@ mod tests {
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "sctp"
-            upstream_port = 22
+            target_port = 22
             "#,
         )
         .err();
@@ -1637,7 +1637,7 @@ mod tests {
             name = "udp"
             listen = "0.0.0.0:1234"
             protocol = "udp"
-            upstream_port = 1234
+            target_port = 1234
             "#,
         )
         .unwrap();
@@ -1650,14 +1650,14 @@ mod tests {
 
     // ---- diff tests ----
 
-    fn rule(name: &str, port: u16, proto: Protocol, upstream: u16) -> Rule {
+    fn rule(name: &str, port: u16, proto: Protocol, target: u16) -> Rule {
         let f = parse(&format!(
             r#"
             [[rule]]
             name = "{name}"
             listen = "0.0.0.0:{port}"
             protocol = "{}"
-            upstream_port = {upstream}
+            target_port = {target}
             "#,
             proto.as_str()
         ))
@@ -1694,7 +1694,7 @@ mod tests {
             rule("gone", 2000, Protocol::Tcp, 23),
             rule("mod",  3000, Protocol::Tcp, 24),
         ]);
-        // "keep" unchanged, "gone" removed, "mod" upstream port changed, "new" added.
+        // "keep" unchanged, "gone" removed, "mod" target port changed, "new" added.
         let new = set(vec![
             rule("keep", 1000, Protocol::Tcp, 22),
             rule("mod",  3000, Protocol::Tcp, 99),
@@ -1707,8 +1707,8 @@ mod tests {
         assert_eq!(d.removed[0].name, "gone");
         assert_eq!(d.changed.len(), 1);
         assert_eq!(d.changed[0].old.name, "mod");
-        assert_eq!(d.changed[0].old.upstream_port, Some(24));
-        assert_eq!(d.changed[0].new.upstream_port, Some(99));
+        assert_eq!(d.changed[0].old.target_port, Some(24));
+        assert_eq!(d.changed[0].new.target_port, Some(99));
         assert_eq!(d.unchanged, vec!["keep".to_string()]);
         assert_eq!(d.touched(), 3);
         assert!(!d.is_noop());
@@ -1795,7 +1795,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "app.localhost"
-              upstream = "http://127.0.0.1:8080"
+              target = "http://127.0.0.1:8080"
               cert     = "ephemeral"
             "#,
         )
@@ -1804,8 +1804,8 @@ mod tests {
         let routes = r.routes.as_ref().expect("routes present");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].hostname, "app.localhost");
-        assert_eq!(routes[0].upstream.scheme(), "http");
-        assert_eq!(routes[0].upstream.port(), Some(8080));
+        assert_eq!(routes[0].target.scheme(), "http");
+        assert_eq!(routes[0].target.port(), Some(8080));
         assert_eq!(routes[0].cert, Some(CertSource::Ephemeral));
         assert_eq!(routes[0].key, None);
         assert_eq!(routes[0].hsts, None);
@@ -1823,7 +1823,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "api.home.example"
-              upstream = "http://192.168.1.10:8080"
+              target = "http://192.168.1.10:8080"
               cert     = "/tls/api/fullchain.pem"
               key      = "/tls/api/privkey.pem"
             "#,
@@ -1849,12 +1849,12 @@ mod tests {
 
               [[rule.route]]
               hostname = "a.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "ephemeral"
 
               [[rule.route]]
               hostname = "b.local"
-              upstream = "http://10.0.0.2:80"
+              target = "http://10.0.0.2:80"
               cert     = "ephemeral"
             "#,
         )
@@ -1874,12 +1874,12 @@ mod tests {
 
               [[rule.route]]
               hostname = "App.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "ephemeral"
 
               [[rule.route]]
               hostname = "app.LOCAL"
-              upstream = "http://10.0.0.2:80"
+              target = "http://10.0.0.2:80"
               cert     = "ephemeral"
             "#,
         )
@@ -1909,18 +1909,18 @@ mod tests {
     }
 
     #[test]
-    fn https_rule_rejects_upstream_port() {
+    fn https_rule_rejects_target_port() {
         let err = parse_one(
             r#"
             [[rule]]
             name = "h"
             listen = "0.0.0.0:443"
             protocol = "https"
-            upstream_port = 80
+            target_port = 80
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://127.0.0.1:80"
+              target = "http://127.0.0.1:80"
               cert     = "ephemeral"
             "#,
         )
@@ -1928,23 +1928,23 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("`upstream_port` is not valid")),
+            matches!(err, Error::InvalidRule(s) if s.contains("`target_port` is not valid")),
         );
     }
 
     #[test]
-    fn https_rule_rejects_upstream_addr() {
+    fn https_rule_rejects_target_addr() {
         let err = parse_one(
             r#"
             [[rule]]
             name = "h"
             listen = "0.0.0.0:443"
             protocol = "https"
-            upstream_addr = "127.0.0.1:80"
+            target_addr = "127.0.0.1:80"
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://127.0.0.1:80"
+              target = "http://127.0.0.1:80"
               cert     = "ephemeral"
             "#,
         )
@@ -1952,23 +1952,23 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("`upstream_addr` is not valid")),
+            matches!(err, Error::InvalidRule(s) if s.contains("`target_addr` is not valid")),
         );
     }
 
     #[test]
-    fn https_rule_rejects_upstream_host() {
+    fn https_rule_rejects_target_host() {
         let err = parse_one(
             r#"
             [[rule]]
             name = "h"
             listen = "0.0.0.0:443"
             protocol = "https"
-            upstream_host = "backend.lan:80"
+            target_host = "backend.lan:80"
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://127.0.0.1:80"
+              target = "http://127.0.0.1:80"
               cert     = "ephemeral"
             "#,
         )
@@ -1976,7 +1976,7 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("`upstream_host` is not valid")),
+            matches!(err, Error::InvalidRule(s) if s.contains("`target_host` is not valid")),
         );
     }
 
@@ -1992,7 +1992,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://127.0.0.1:80"
+              target = "http://127.0.0.1:80"
               cert     = "ephemeral"
             "#,
         )
@@ -2016,7 +2016,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://127.0.0.1:80"
+              target = "http://127.0.0.1:80"
               cert     = "ephemeral"
             "#,
         )
@@ -2034,11 +2034,11 @@ mod tests {
             name = "x"
             listen = "0.0.0.0:1234"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://127.0.0.1:80"
+              target = "http://127.0.0.1:80"
               cert     = "ephemeral"
             "#,
         )
@@ -2056,7 +2056,7 @@ mod tests {
             name = "x"
             listen = "0.0.0.0:1234"
             protocol = "tcp"
-            upstream_port = 22
+            target_port = 22
             cert_dir = "/tls"
             "#,
         )
@@ -2067,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn https_rule_rejects_non_http_upstream_scheme() {
+    fn https_rule_rejects_non_http_target_scheme() {
         let err = parse_one(
             r#"
             [[rule]]
@@ -2077,7 +2077,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "https://10.0.0.1:443"
+              target = "https://10.0.0.1:443"
               cert     = "ephemeral"
             "#,
         )
@@ -2085,12 +2085,12 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("upstream URL scheme")),
+            matches!(err, Error::InvalidRule(s) if s.contains("target URL scheme")),
         );
     }
 
     #[test]
-    fn https_rule_accepts_upstream_with_default_http_port() {
+    fn https_rule_accepts_target_with_default_http_port() {
         // http://10.0.0.1 (no explicit port) → url crate sets known default
         // port 80; we accept it. Adopting the URL semantics avoids forcing
         // operators to write `:80` redundantly.
@@ -2103,7 +2103,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://10.0.0.1"
+              target = "http://10.0.0.1"
               cert     = "ephemeral"
             "#,
         )
@@ -2111,7 +2111,7 @@ mod tests {
         r.validate().unwrap();
         assert_eq!(
             r.routes.as_ref().unwrap()[0]
-                .upstream
+                .target
                 .port_or_known_default(),
             Some(80)
         );
@@ -2128,7 +2128,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "api.home.example"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "/tls/cert.pem"
             "#,
         )
@@ -2149,7 +2149,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "ephemeral"
               key      = "/tls/k.pem"
             "#,
@@ -2171,7 +2171,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               key      = "/tls/k.pem"
             "#,
         )
@@ -2199,7 +2199,7 @@ mod tests {
 
                   [[rule.route]]
                   hostname = "{host}"
-                  upstream = "http://127.0.0.1:8080"
+                  target = "http://127.0.0.1:8080"
                   cert     = "ephemeral"
                 "#
             ))
@@ -2220,7 +2220,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "api.example.com"
-              upstream = "http://127.0.0.1:8080"
+              target = "http://127.0.0.1:8080"
               cert     = "ephemeral"
             "#,
         )
@@ -2247,7 +2247,7 @@ mod tests {
 
                   [[rule.route]]
                   hostname = "{bad}"
-                  upstream = "http://127.0.0.1:8080"
+                  target = "http://127.0.0.1:8080"
                   cert     = "ephemeral"
                 "#
             ))
@@ -2272,7 +2272,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "ephemeral"
               hsts     = true
             "#,
@@ -2297,7 +2297,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "ephemeral"
               hsts     = false
             "#,
@@ -2317,7 +2317,7 @@ mod tests {
 
               [[rule.route]]
               hostname = "x.local"
-              upstream = "http://10.0.0.1:80"
+              target = "http://10.0.0.1:80"
               cert     = "ephemeral"
 
               [rule.route.hsts]

@@ -27,7 +27,7 @@
 //!
 //! * `name`, `listen_port`, `protocol`, `idle_timeout` from the predicate.
 //! * `listen = (bind_addr, predicate.listen_port)`.
-//! * `upstream_port = Some(predicate.listen_port)` — relay mode: dial
+//! * `target_port = Some(predicate.listen_port)` — relay mode: dial
 //!   the heartbeat-discovered downstream peer on the same port the
 //!   predicate listens on. The downstream IP lives in the heartbeat
 //!   session state, not in the derived rule.
@@ -181,9 +181,9 @@ fn rule_from_predicate(p: &Predicate, cfg: &DeriveConfig) -> Rule {
         name: p.name.clone(),
         listen: SocketAddr::new(cfg.bind_addr, p.listen_port),
         protocol: p.protocol,
-        upstream_port: Some(p.listen_port),
-        upstream_addr: None,
-        upstream_host: None,
+        target_port: Some(p.listen_port),
+        target_addr: None,
+        target_host: None,
         idle_timeout,
         proxy_protocol,
         routes: None,
@@ -239,9 +239,9 @@ mod tests {
         assert_eq!(rule.protocol, Protocol::Tcp);
         assert_eq!(rule.listen.port(), 2222);
         assert_eq!(rule.listen.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(rule.upstream_port, Some(2222));
-        assert_eq!(rule.upstream_addr, None);
-        assert_eq!(rule.upstream_host, None);
+        assert_eq!(rule.target_port, Some(2222));
+        assert_eq!(rule.target_addr, None);
+        assert_eq!(rule.target_host, None);
         assert_eq!(rule.proxy_protocol, Some(ProxyProto::V2));
         assert_eq!(rule.idle_timeout, None);
     }
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(ruleset.rules().len(), 1);
         let rule = &ruleset.rules()[0];
         assert_eq!(rule.protocol, Protocol::Udp);
-        assert_eq!(rule.upstream_port, Some(53));
+        assert_eq!(rule.target_port, Some(53));
         // UDP never gets PROXY-protocol even if the config carries one.
         assert_eq!(rule.proxy_protocol, None);
         assert_eq!(rule.idle_timeout, Some(Duration::from_millis(45_000)));

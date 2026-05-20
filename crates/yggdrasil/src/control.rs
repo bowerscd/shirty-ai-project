@@ -341,7 +341,7 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                     name: s.name,
                     protocol: s.protocol.as_str().to_string(),
                     listen: s.listen.to_string(),
-                    upstream: s.upstream_description,
+                    target: s.upstream_description,
                 })
                 .collect();
             Response::Rules(RulesResponse { rules })

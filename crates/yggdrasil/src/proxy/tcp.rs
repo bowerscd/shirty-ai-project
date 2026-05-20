@@ -135,7 +135,7 @@ async fn run_accept_loop(
                     }
                 };
 
-                let upstream_addr = match resolver.current_target() {
+                let target_addr = match resolver.current_target() {
                     Some(addr) => addr,
                     None => {
                         // Relay before first heartbeat. (Static resolvers
@@ -156,7 +156,7 @@ async fn run_accept_loop(
                         conn_rule,
                         client,
                         client_addr,
-                        upstream_addr,
+                        target_addr,
                         local_addr,
                         conn_cancel,
                     )
@@ -171,19 +171,19 @@ async fn handle_connection(
     rule: Rule,
     mut client: TcpStream,
     client_addr: SocketAddr,
-    upstream_addr: SocketAddr,
+    target_addr: SocketAddr,
     server_listen: SocketAddr,
     cancel: CancellationToken,
 ) {
     // Connect to upstream first. If this fails, close the client without
     // sending anything (no PROXY-protocol header, no half-open).
-    let mut upstream = match TcpStream::connect(upstream_addr).await {
+    let mut upstream = match TcpStream::connect(target_addr).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 rule = %rule.name,
                 client = %client_addr,
-                upstream = %upstream_addr,
+                upstream = %target_addr,
                 error = %e,
                 "upstream connect failed"
             );
@@ -199,7 +199,7 @@ async fn handle_connection(
             tracing::warn!(
                 rule = %rule.name,
                 client = %client_addr,
-                upstream = %upstream_addr,
+                upstream = %target_addr,
                 version = ?version,
                 error = %e,
                 "PROXY-protocol header write failed"
@@ -230,7 +230,7 @@ async fn handle_connection(
                 tracing::debug!(
                     rule = %rule.name,
                     client = %client_addr,
-                    upstream = %upstream_addr,
+                    upstream = %target_addr,
                     client_to_upstream_bytes = c2u,
                     upstream_to_client_bytes = u2c,
                     "TCP connection closed cleanly"
@@ -240,7 +240,7 @@ async fn handle_connection(
                 tracing::trace!(
                     rule = %rule.name,
                     client = %client_addr,
-                    upstream = %upstream_addr,
+                    upstream = %target_addr,
                     error = %e,
                     "TCP connection closed (peer reset or shutdown)"
                 );
@@ -249,7 +249,7 @@ async fn handle_connection(
                 tracing::warn!(
                     rule = %rule.name,
                     client = %client_addr,
-                    upstream = %upstream_addr,
+                    upstream = %target_addr,
                     error = %e,
                     "TCP copy_bidirectional failed"
                 );
@@ -308,8 +308,8 @@ mod tests {
     }
 
     /// Build a rule that listens on `127.0.0.1:0` (kernel-assigned port) and
-    /// forwards to `127.0.0.1:upstream_port`.
-    fn rule(name: &str, upstream_port: u16, proxy_protocol: Option<ProxyProto>) -> Rule {
+    /// forwards to `127.0.0.1:target_port`.
+    fn rule(name: &str, target_port: u16, proxy_protocol: Option<ProxyProto>) -> Rule {
         use std::str::FromStr;
         let f = ratatoskr::rule::RuleFile::from_toml(
             "test.toml",
@@ -319,7 +319,7 @@ mod tests {
                 name = "{name}"
                 listen = "127.0.0.1:0"
                 protocol = "tcp"
-                upstream_port = {upstream_port}
+                target_port = {target_port}
                 {}
                 "#,
                 proxy_protocol
@@ -410,7 +410,7 @@ mod tests {
     async fn emits_proxy_protocol_v1_header_to_upstream() {
         // Custom upstream that captures the first bytes it receives.
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
+        let target_addr = upstream.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut sock, _) = upstream.accept().await.unwrap();
@@ -436,8 +436,8 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         let proxy = TcpProxy::spawn(
-            rule("v1head", upstream_addr.port(), Some(ProxyProto::V1)),
-            dynamic_resolver(peer, upstream_addr.port()),
+            rule("v1head", target_addr.port(), Some(ProxyProto::V1)),
+            dynamic_resolver(peer, target_addr.port()),
         )
         .await
         .unwrap();

@@ -109,7 +109,7 @@ mod tests {
             name = "a"
             listen = "0.0.0.0:1111"
             protocol = "tcp"
-            upstream_port = 1
+            target_port = 1
             "#,
         );
         write(
@@ -120,7 +120,7 @@ mod tests {
             name = "b"
             listen = "0.0.0.0:2222"
             protocol = "udp"
-            upstream_port = 2
+            target_port = 2
             idle_timeout = "10s"
             "#,
         );
@@ -163,7 +163,7 @@ mod tests {
             name="dup"
             listen="0.0.0.0:1"
             protocol="tcp"
-            upstream_port=1
+            target_port=1
             "#,
         );
         write(
@@ -173,7 +173,7 @@ mod tests {
             name="dup"
             listen="0.0.0.0:2"
             protocol="tcp"
-            upstream_port=2
+            target_port=2
             "#,
         );
         let err = load_dir(d.path()).err();

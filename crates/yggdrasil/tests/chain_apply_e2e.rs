@@ -38,14 +38,14 @@ use crate::common::{
 };
 
 /// Build a minimal terminal-mode TCP rule with a unique listen port.
-fn terminal_rule(name: &str, listen_port: u16, upstream: &str) -> Rule {
+fn terminal_rule(name: &str, listen_port: u16, target: &str) -> Rule {
     Rule {
         name: name.into(),
         listen: format!("127.0.0.1:{listen_port}").parse().unwrap(),
         protocol: Protocol::Tcp,
-        upstream_port: None,
-        upstream_addr: Some(upstream.parse().unwrap()),
-        upstream_host: None,
+        target_port: None,
+        target_addr: Some(target.parse().unwrap()),
+        target_host: None,
         idle_timeout: None,
         proxy_protocol: None,
         routes: None,

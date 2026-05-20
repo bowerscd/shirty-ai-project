@@ -906,26 +906,26 @@ mod tests {
         (factory, peer)
     }
 
-    fn tcp_rule_toml(name: &str, port: u16, upstream_port: u16) -> String {
+    fn tcp_rule_toml(name: &str, port: u16, target_port: u16) -> String {
         format!(
             r#"
             [[rule]]
             name = "{name}"
             listen = "127.0.0.1:{port}"
             protocol = "tcp"
-            upstream_port = {upstream_port}
+            target_port = {target_port}
             "#,
         )
     }
 
-    fn udp_rule_toml(name: &str, port: u16, upstream_port: u16) -> String {
+    fn udp_rule_toml(name: &str, port: u16, target_port: u16) -> String {
         format!(
             r#"
             [[rule]]
             name = "{name}"
             listen = "127.0.0.1:{port}"
             protocol = "udp"
-            upstream_port = {upstream_port}
+            target_port = {target_port}
             idle_timeout = "30s"
             "#,
         )
@@ -1110,7 +1110,7 @@ mod tests {
         let alpha_listen_before = snap0.iter().find(|s| s.name == "alpha").unwrap().listen;
         let beta_listen_before = snap0.iter().find(|s| s.name == "beta").unwrap().listen;
 
-        // Change beta's upstream_port only (listen stays the same so we can
+        // Change beta's target_port only (listen stays the same so we can
         // assert socket-address stability). alpha must NOT be touched.
         std::fs::write(
             dir.path().join("b.toml"),
@@ -1160,7 +1160,7 @@ mod tests {
             "alpha's listen address changed across an unrelated reload"
         );
         // Beta's listen port hasn't changed (we kept the port and only swapped
-        // upstream_port), but the proxy was respawned (which is fine — we're
+        // target_port), but the proxy was respawned (which is fine — we're
         // not promising socket-identity across changes to the same rule).
         assert_eq!(beta_listen_before, beta_listen_after);
         assert!(
@@ -1271,9 +1271,9 @@ mod tests {
             name: "ext-alpha".to_string(),
             listen: format!("127.0.0.1:{port}").parse().unwrap(),
             protocol: Protocol::Tcp,
-            upstream_port: Some(9001),
-            upstream_addr: None,
-            upstream_host: None,
+            target_port: Some(9001),
+            target_addr: None,
+            target_host: None,
             idle_timeout: None,
             proxy_protocol: None,
             routes: None,

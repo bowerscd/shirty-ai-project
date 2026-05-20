@@ -929,9 +929,9 @@ mod tests {
             name: "h".to_string(),
             listen: SocketAddr::from_str("127.0.0.1:443").unwrap(),
             protocol: Protocol::Https,
-            upstream_port: None,
-            upstream_addr: None,
-            upstream_host: None,
+            target_port: None,
+            target_addr: None,
+            target_host: None,
             proxy_protocol: None,
             idle_timeout: None,
             routes: Some(routes),
@@ -942,7 +942,7 @@ mod tests {
     fn ephemeral_route(host: &str) -> HttpRoute {
         HttpRoute {
             hostname: host.to_string(),
-            upstream: Url::parse("http://10.0.0.1:8080").unwrap(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
             cert:     Some(CertSource::Ephemeral),
             key:      None,
             hsts:     None,
@@ -1012,7 +1012,7 @@ mod tests {
 
         let route = HttpRoute {
             hostname: "api.local".to_string(),
-            upstream: Url::parse("http://10.0.0.1:8080").unwrap(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
             cert:     Some(CertSource::Path(cert_path.clone())),
             key:      Some(key_path.clone()),
             hsts:     None,
@@ -1042,7 +1042,7 @@ mod tests {
 
         let route = HttpRoute {
             hostname: "api.local".to_string(),
-            upstream: Url::parse("http://10.0.0.1:8080").unwrap(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
             cert:     None,
             key:      None,
             hsts:     None,
@@ -1063,7 +1063,7 @@ mod tests {
 
         let route = HttpRoute {
             hostname: "api.local".to_string(),
-            upstream: Url::parse("http://10.0.0.1:8080").unwrap(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
             cert:     None,
             key:      None,
             hsts:     None,
@@ -1085,7 +1085,7 @@ mod tests {
     fn no_source_error_when_chain_exhausted() {
         let route = HttpRoute {
             hostname: "api.local".to_string(),
-            upstream: Url::parse("http://10.0.0.1:8080").unwrap(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
             cert:     None,
             key:      None,
             hsts:     None,
@@ -1117,7 +1117,7 @@ mod tests {
         let key_path = write_file(dir.path(), "privkey.pem", &key_pem);
         let route = HttpRoute {
             hostname: "api.local".to_string(),
-            upstream: Url::parse("http://10.0.0.1:8080").unwrap(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
             cert:     Some(CertSource::Path(cert_path)),
             key:      Some(key_path),
             hsts:     None,

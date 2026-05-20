@@ -49,7 +49,7 @@ pub struct ServerConfig {
 /// * `Terminal` — only dials upstream; never accepts inbound chain traffic.
 ///
 /// "relay vs terminal" gates proxy resolver behaviour (relay uses dynamic
-/// peer-IP rules; terminal uses static `upstream_addr`), but both modes
+/// peer-IP rules; terminal uses static `target_addr`), but both modes
 /// can now run an outbound chain client when `[chain.upstream]` is
 /// configured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

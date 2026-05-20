@@ -3,7 +3,7 @@
 //! A **predicate** is the chain-invariant projection of a [`Rule`]: the
 //! match-side fields a terminal advertises to its upstream so the upstream
 //! can synthesise a derived rule that forwards toward the terminal. Target
-//! fields (`upstream_port` / `upstream_addr` / `upstream_host`) are
+//! fields (`target_port` / `target_addr` / `target_host`) are
 //! deliberately absent — relays resolve those locally from the
 //! heartbeat-discovered downstream peer address.
 //!

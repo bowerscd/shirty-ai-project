@@ -30,7 +30,7 @@ use crate::rule::Rule;
 ///
 /// `relay` is the cloud-side daemon with heartbeat + dynamic peer-IP
 /// resolution; `terminal` is the home-side daemon with static
-/// `upstream_addr` rules and no peer identity. Wire serialisation matches
+/// `target_addr` rules and no peer identity. Wire serialisation matches
 /// the on-disk `[server] mode = "..."` and `--mode` CLI strings exactly.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -38,7 +38,7 @@ pub enum Mode {
     /// Cloud-side daemon. Heartbeat + dynamic peer-IP resolution.
     #[default]
     Relay,
-    /// Home-side daemon. Static `upstream_addr` rules. No peer identity.
+    /// Home-side daemon. Static `target_addr` rules. No peer identity.
     Terminal,
 }
 
@@ -201,7 +201,7 @@ pub struct RuleInfo {
     /// Stable, human-readable description of the dial target. Renders as
     /// `dynamic:peer:<port>` for relay-mode rules and as `static:<ip>:<port>`
     /// for terminal-mode rules. Not a parse target — diagnostic only.
-    pub upstream: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -483,9 +483,9 @@ mod tests {
                 name: "echo-tcp".into(),
                 listen: "127.0.0.1:9100".parse().unwrap(),
                 protocol: Protocol::Tcp,
-                upstream_addr: Some("10.0.0.5:9000".parse().unwrap()),
-                upstream_port: None,
-                upstream_host: None,
+                target_addr: Some("10.0.0.5:9000".parse().unwrap()),
+                target_port: None,
+                target_host: None,
                 idle_timeout: None,
                 proxy_protocol: None,
                 routes: None,

@@ -9,7 +9,7 @@
 //!
 //! ## What is projected away
 //!
-//! * **Target fields** (`upstream_port`, `upstream_addr`, `upstream_host`)
+//! * **Target fields** (`target_port`, `target_addr`, `target_host`)
 //!   are stripped — every node in the chain resolves its own target
 //!   locally (from heartbeat-discovered peer for relays, from the rule
 //!   file for terminals).
@@ -112,14 +112,14 @@ mod tests {
         PubKey::x25519([0x11u8; PUBLIC_KEY_LEN])
     }
 
-    fn tcp_rule(name: &str, port: u16, upstream_port: u16) -> Rule {
+    fn tcp_rule(name: &str, port: u16, target_port: u16) -> Rule {
         Rule {
             name: name.to_string(),
             listen: SocketAddr::from(([0, 0, 0, 0], port)),
             protocol: Protocol::Tcp,
-            upstream_port: Some(upstream_port),
-            upstream_addr: None,
-            upstream_host: None,
+            target_port: Some(target_port),
+            target_addr: None,
+            target_host: None,
             idle_timeout: None,
             proxy_protocol: None,
             routes: None,
@@ -132,9 +132,9 @@ mod tests {
             name: name.to_string(),
             listen: SocketAddr::from(([0, 0, 0, 0], port)),
             protocol: Protocol::Udp,
-            upstream_port: Some(port),
-            upstream_addr: None,
-            upstream_host: None,
+            target_port: Some(port),
+            target_addr: None,
+            target_host: None,
             idle_timeout: idle,
             proxy_protocol: None,
             routes: None,
@@ -147,9 +147,9 @@ mod tests {
             name: name.to_string(),
             listen: SocketAddr::from(([0, 0, 0, 0], 443)),
             protocol: Protocol::Https,
-            upstream_port: None,
-            upstream_addr: None,
-            upstream_host: None,
+            target_port: None,
+            target_addr: None,
+            target_host: None,
             idle_timeout: None,
             proxy_protocol: None,
             routes: None,

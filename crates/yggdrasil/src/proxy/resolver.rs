@@ -22,8 +22,8 @@
 //!   keeps the UDP flow table out of the resolver's blast radius.
 //!
 //! Built by [`ResolverFactory`], which enforces the per-mode rule-shape
-//! invariant: relay-mode rules must carry `upstream_port`; terminal-mode
-//! rules must carry `upstream_addr` or `upstream_host`. Construction
+//! invariant: relay-mode rules must carry `target_port`; terminal-mode
+//! rules must carry `target_addr` or `target_host`. Construction
 //! failures bubble up to the supervisor's per-rule-failure policy
 //! (log + skip).
 
@@ -34,7 +34,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
-use ratatoskr::rule::{Rule, UpstreamHost};
+use ratatoskr::rule::{Rule, TargetHost};
 
 use crate::config::Mode;
 use crate::heartbeat::PeerState;
@@ -223,28 +223,28 @@ impl ResolverFactory {
     }
 
     /// Build a resolver for one rule. Errors when the rule's shape doesn't
-    /// match the daemon's mode (relay rule with `upstream_addr` /
-    /// `upstream_host`, or terminal rule with `upstream_port`). The
+    /// match the daemon's mode (relay rule with `target_addr` /
+    /// `target_host`, or terminal rule with `target_port`). The
     /// supervisor logs the error and skips that rule per its existing
     /// per-rule-failure policy.
     pub fn build(&self, rule: &Rule) -> Result<UpstreamResolver, ResolverBuildError> {
-        // Compress (upstream_port, upstream_addr, upstream_host) into a
+        // Compress (target_port, target_addr, target_host) into a
         // single enum to keep the match readable. Validation guarantees
         // exactly one is set.
         enum Target<'a> {
             Port(u16),
             Addr(SocketAddr),
-            Host(&'a UpstreamHost),
+            Host(&'a TargetHost),
             None,
         }
-        let target = match (rule.upstream_port, rule.upstream_addr, rule.upstream_host.as_ref()) {
+        let target = match (rule.target_port, rule.target_addr, rule.target_host.as_ref()) {
             (Some(p), None, None) => Target::Port(p),
             (None, Some(a), None) => Target::Addr(a),
             (None, None, Some(h)) => Target::Host(h),
             (None, None, None) => Target::None,
             _ => {
                 return Err(ResolverBuildError::Internal(
-                    "rule has multiple of upstream_port / upstream_addr / upstream_host \
+                    "rule has multiple of target_port / target_addr / target_host \
                      set (validation bug)",
                 ))
             }
@@ -263,14 +263,14 @@ impl ResolverFactory {
                 rule: rule.name.clone(),
                 mode: Mode::Relay,
                 detail:
-                    "rule has upstream_addr (terminal-style) but daemon is in relay mode; \
+                    "rule has target_addr (terminal-style) but daemon is in relay mode; \
                      terminal rules cannot run on a relay",
             }),
             (Mode::Relay, Target::Host(_)) => Err(ResolverBuildError::ModeMismatch {
                 rule: rule.name.clone(),
                 mode: Mode::Relay,
                 detail:
-                    "rule has upstream_host (terminal-style) but daemon is in relay mode; \
+                    "rule has target_host (terminal-style) but daemon is in relay mode; \
                      terminal rules cannot run on a relay",
             }),
             (Mode::Terminal, Target::Addr(addr)) => Ok(UpstreamResolver::Static { addr }),
@@ -287,11 +287,11 @@ impl ResolverFactory {
                 rule: rule.name.clone(),
                 mode: Mode::Terminal,
                 detail:
-                    "rule has upstream_port (relay-style) but daemon is in terminal mode; \
+                    "rule has target_port (relay-style) but daemon is in terminal mode; \
                      relay rules cannot run on a terminal",
             }),
             (_, Target::None) => Err(ResolverBuildError::Internal(
-                "rule has no upstream_port / upstream_addr / upstream_host (validation bug)",
+                "rule has no target_port / target_addr / target_host (validation bug)",
             )),
         }
     }
@@ -312,16 +312,16 @@ pub enum ResolverBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatoskr::rule::{Protocol, Rule, UpstreamHost};
+    use ratatoskr::rule::{Protocol, Rule, TargetHost};
 
     fn relay_rule(port: u16) -> Rule {
         Rule {
             name: "relay-rule".into(),
             listen: "127.0.0.1:1111".parse().unwrap(),
             protocol: Protocol::Tcp,
-            upstream_port: Some(port),
-            upstream_addr: None,
-            upstream_host: None,
+            target_port: Some(port),
+            target_addr: None,
+            target_host: None,
             idle_timeout: None,
             proxy_protocol: None,
             routes: None,
@@ -334,9 +334,9 @@ mod tests {
             name: "terminal-rule".into(),
             listen: "127.0.0.1:2222".parse().unwrap(),
             protocol: Protocol::Tcp,
-            upstream_port: None,
-            upstream_addr: Some(addr.parse().unwrap()),
-            upstream_host: None,
+            target_port: None,
+            target_addr: Some(addr.parse().unwrap()),
+            target_host: None,
             idle_timeout: None,
             proxy_protocol: None,
             routes: None,
@@ -452,9 +452,9 @@ mod tests {
             name: "dns-rule".into(),
             listen: "127.0.0.1:3333".parse().unwrap(),
             protocol: Protocol::Tcp,
-            upstream_port: None,
-            upstream_addr: None,
-            upstream_host: Some(UpstreamHost {
+            target_port: None,
+            target_addr: None,
+            target_host: Some(TargetHost {
                 host: host.to_string(),
                 port,
             }),

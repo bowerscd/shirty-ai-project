@@ -232,8 +232,8 @@ pub struct RouteTable {
 }
 
 struct RouteEntry {
-    upstream: Url,
-    hsts:     Option<HstsHeader>,
+    target: Url,
+    hsts:   Option<HstsHeader>,
 }
 
 #[derive(Clone)]
@@ -257,7 +257,7 @@ impl RouteTable {
             by_host.insert(
                 r.hostname.to_ascii_lowercase(),
                 RouteEntry {
-                    upstream: r.upstream.clone(),
+                    target: r.target.clone(),
                     hsts,
                 },
             );
@@ -598,7 +598,7 @@ async fn serve_request(
     let is_websocket =
         req.version() == Version::HTTP_11 && is_websocket_upgrade(req.headers());
 
-    let upstream_url = route.upstream.clone();
+    let upstream_url = route.target.clone();
     let hsts_header = route.hsts.clone();
 
     // -------------------------------------------------------------------
@@ -1228,7 +1228,7 @@ mod tests {
     fn route_table_lookup_is_case_insensitive_and_strips_port() {
         let routes = vec![HttpRoute {
             hostname: "API.example.com".into(),
-            upstream: "http://10.0.0.1:8080".parse().unwrap(),
+            target: "http://10.0.0.1:8080".parse().unwrap(),
             cert:     None,
             key:      None,
             hsts:     None,

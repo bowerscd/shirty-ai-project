@@ -48,7 +48,7 @@ async fn ip_change_drains_inflight_udp_flow() {
 
     // Echo socket bound to 127.0.0.1 — but we also need a *different* upstream
     // address corresponding to the "new" peer IP 127.0.0.2. The proxy
-    // connects upstream to `peer_ip:upstream_port`. We bind the same echo
+    // connects upstream to `peer_ip:target_port`. We bind the same echo
     // service on both 127.0.0.1:PORT and 127.0.0.2:PORT (loopback handles
     // both via the lo interface).
     let echo_port = pick_free_udp_port().await;
