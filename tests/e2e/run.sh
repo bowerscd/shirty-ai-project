@@ -150,10 +150,10 @@ echo "==> [hot-reload] dropping a new branch file"
 
 "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps bash -c "cat >/etc/yggdrasil/rules/tcp-echo-alt.toml" <<'EOF'
 [[rule]]
-name          = "tcp-echo-alt"
-listen        = "0.0.0.0:7010"
-protocol      = "tcp"
-upstream_port = 7100
+name        = "tcp-echo-alt"
+listen      = "0.0.0.0:7010"
+protocol    = "tcp"
+target_port = 7100
 EOF
 
 rule_visible() {

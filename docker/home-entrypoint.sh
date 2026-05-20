@@ -2,8 +2,8 @@
 # home-entrypoint.sh — runs the python echo backends in the background and
 # the yggdrasil terminal-mode daemon in the foreground. They must share a
 # network namespace because the upstream relay (vps) dials
-# downstream_ip:upstream_port, where downstream_ip is the source of this
-# node's heartbeats and upstream_port is whatever the relay's rule says —
+# downstream_ip:target_port, where downstream_ip is the source of this
+# node's heartbeats and target_port is whatever the relay's rule says —
 # so the echo backends must be listening on this container's IP.
 set -euo pipefail
 

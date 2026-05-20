@@ -120,8 +120,8 @@ yggdrasilctl --config "$HOME_CFG" identity rotate \
 
 # home-chain publishes a single TCP predicate. midbox will derive a matching
 # listener; vps remains unaware (v1 relays don't re-project predicates).
-# The terminal-mode rule needs an upstream_addr because terminal-mode
-# rules can't use peer-relative upstream_port. We point it at home's own
+# The terminal-mode rule needs a target_addr because terminal-mode
+# rules can't use peer-relative target_port. We point it at home's own
 # loopback echo (started by the chain entrypoint).
 echo "[init-chain] writing home-chain predicate-publishing rule"
 cat >/etc/yggdrasil-home/rules/home-tcp-echo.toml <<'EOF'
@@ -129,7 +129,7 @@ cat >/etc/yggdrasil-home/rules/home-tcp-echo.toml <<'EOF'
 name          = "home-tcp-echo"
 listen        = "0.0.0.0:7200"
 protocol      = "tcp"
-upstream_addr = "127.0.0.1:7100"
+target_addr   = "127.0.0.1:7100"
 EOF
 
 # ---- handshake 1: home-chain <-> midbox -----------------------------------

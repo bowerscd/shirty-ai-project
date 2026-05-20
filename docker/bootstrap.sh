@@ -17,7 +17,7 @@ VPS_KEY=/etc/yggdrasil/identity.key
 
 # home: terminal-mode downstream. Heartbeats up to vps. Runs the echo
 # backends in the same network namespace so vps's rule targets
-# `downstream_ip:upstream_port` land on the python echo servers.
+# `downstream_ip:target_port` land on the python echo servers.
 HOME_CFG=/etc/yggdrasil-home/config.toml
 HOME_KEY=/etc/yggdrasil-home/identity.key
 
@@ -68,19 +68,19 @@ yggdrasilctl --config "$VPS_CFG" identity rotate \
 echo "[init] writing default rules (vps)"
 cat >/etc/yggdrasil/rules/tcp-echo.toml <<'EOF'
 [[rule]]
-name          = "tcp-echo"
-listen        = "0.0.0.0:7000"
-protocol      = "tcp"
-upstream_port = 7100
+name        = "tcp-echo"
+listen      = "0.0.0.0:7000"
+protocol    = "tcp"
+target_port = 7100
 EOF
 
 cat >/etc/yggdrasil/rules/udp-echo.toml <<'EOF'
 [[rule]]
-name          = "udp-echo"
-listen        = "0.0.0.0:7001"
-protocol      = "udp"
-upstream_port = 7101
-idle_timeout  = "30s"
+name         = "udp-echo"
+listen       = "0.0.0.0:7001"
+protocol     = "udp"
+target_port  = 7101
+idle_timeout = "30s"
 EOF
 
 # ---- home (terminal-mode downstream) ---------------------------------------
