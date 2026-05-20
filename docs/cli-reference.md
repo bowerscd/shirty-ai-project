@@ -209,10 +209,20 @@ Identity-file resolution order:
 
 Print this node's tagged pubkey and fingerprint.
 
-### `identity rotate [--identity-file <PATH>] [--force]`
+### `identity rotate [--identity-file <PATH>] [--force] [--yes-i-understand-this-breaks-existing-chains]`
 
 Generate a fresh X25519 keypair and write it to the identity file with
-mode 0600. Refuses to clobber an existing file unless `--force` is given.
+mode 0600.
+
+* **Fresh install** (no identity file present): writes the new key
+  unconditionally; `--force` is a no-op.
+* **Existing identity**: refuses without `--force`. Rotation invalidates
+  every chain enrollment that pins this node's pubkey, so before clobbering
+  the on-disk key `rotate` lists the `[dial]` / `[accept]` entries that
+  will break and prompts the operator to type the *current* identity's
+  short fingerprint (8 hex chars). Pass
+  `--yes-i-understand-this-breaks-existing-chains` to skip the prompt
+  for scripted use; without it, a non-interactive stdin is rejected.
 
 ### `identity export-intro [--identity-file <PATH>] [--out PATH] [--note STR]`
 

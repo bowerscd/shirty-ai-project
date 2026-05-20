@@ -201,7 +201,9 @@ always emits the intro; the upstream always emits the invite.
 Workflow (upstream-side rotation — relay rotating its own key):
 
 ```bash
-# On the relay (the upstream):
+# On the relay (the upstream): interactive prompt asks you to type the
+# current identity's short fingerprint (8 hex chars) before clobbering it.
+# For scripted use, append `--yes-i-understand-this-breaks-existing-chains`.
 sudo yggdrasilctl identity rotate --force
 # pubkey:      x25519:NEW...
 # fingerprint: NEW...
@@ -233,6 +235,8 @@ own key):
 ```bash
 # On the downstream:
 sudo yggdrasilctl identity rotate --force
+# (interactive fingerprint confirmation; pass
+#  `--yes-i-understand-this-breaks-existing-chains` for scripted use)
 
 # The downstream's pubkey changed, so its upstream needs to re-pin it.
 sudo yggdrasilctl identity export-intro --out /tmp/downstream.intro

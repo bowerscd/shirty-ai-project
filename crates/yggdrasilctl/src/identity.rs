@@ -84,9 +84,18 @@ pub struct RotateArgs {
     identity_file: Option<PathBuf>,
 
     /// Overwrite an existing identity file. Without this flag, `rotate`
-    /// refuses to clobber an existing key.
+    /// refuses to clobber an existing key. When the identity file is
+    /// absent (fresh install), `--force` is a no-op.
     #[arg(long)]
     force: bool,
+
+    /// Skip the interactive fingerprint-confirmation prompt. Required for
+    /// non-interactive overwrite of an existing identity. Use only when
+    /// you have already audited the chain enrollments that this rotation
+    /// will break (`identity show` lists the breakage). Pair with
+    /// `--force`.
+    #[arg(long = "yes-i-understand-this-breaks-existing-chains")]
+    yes_i_understand_this_breaks_existing_chains: bool,
 }
 
 #[derive(Debug, Args)]
@@ -263,19 +272,93 @@ fn show(args: ShowArgs, config_path: &Path, json: bool) -> Result<()> {
 
 fn rotate(args: RotateArgs, config_path: &Path, json: bool) -> Result<()> {
     let identity_file = resolve_identity_file(args.identity_file, config_path)?;
-    if identity_file.exists() && !args.force {
-        bail!(
-            "identity file already exists at {}. Re-run with `--force` to \
-             rotate (the existing key will be permanently overwritten).",
-            identity_file.display()
-        );
-    }
-    // If --force, remove the old file so save_to_file's `create_new(true)`
-    // semantics still apply (we always want exclusive create).
+
+    // Existing identity → must confirm before clobbering.
     if identity_file.exists() {
+        if !args.force {
+            bail!(
+                "identity file already exists at {}. Re-run with `--force` to \
+                 rotate (the existing key will be permanently overwritten). \
+                 Rotation invalidates every chain enrollment that pins this \
+                 node's pubkey, so audit `identity show` first.",
+                identity_file.display()
+            );
+        }
+
+        // Load the current keypair so we know which fingerprint operators
+        // must type to confirm.
+        let current_kp = StaticKeyPair::load_from_file(&identity_file)
+            .with_context(|| format!("load {}", identity_file.display()))?;
+        let current_fp = current_kp.fingerprint();
+        let current_short = &current_fp[..8];
+
+        // Enumerate breakage from the daemon config (if it exists).
+        let enrollments = list_chain_enrollments(config_path);
+
+        eprintln!(
+            "Rotating identity at {} (current fingerprint {}).",
+            identity_file.display(),
+            current_fp
+        );
+        eprintln!(
+            "After rotation, peers that pin this node's pubkey must be \
+             re-enrolled (issue a fresh invite/intro pair)."
+        );
+        if enrollments.is_empty() {
+            eprintln!(
+                "  No `[dial]` or `[accept]` enrollments are configured in {}.",
+                config_path.display()
+            );
+        } else {
+            eprintln!(
+                "Chain enrollments in {} that will break:",
+                config_path.display()
+            );
+            for e in &enrollments {
+                eprintln!("  - [{}] peer={} {}", e.section, e.peer_pubkey, e.endpoint_label);
+            }
+        }
+
+        if !args.yes_i_understand_this_breaks_existing_chains {
+            // Interactive confirmation: must type the short fingerprint of
+            // the *current* (about-to-be-replaced) identity.
+            use std::io::{IsTerminal, Write};
+            let stdin = std::io::stdin();
+            if !stdin.is_terminal() {
+                bail!(
+                    "rotation of an existing identity requires interactive \
+                     confirmation (stdin is not a TTY). Re-run with \
+                     `--yes-i-understand-this-breaks-existing-chains` to \
+                     skip the prompt for scripted use."
+                );
+            }
+            eprintln!(
+                "\nType the current identity's short fingerprint ({} hex chars) to confirm:",
+                current_short.len()
+            );
+            eprint!("> ");
+            std::io::stderr().flush().ok();
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("read confirmation from stdin")?;
+            let typed = line.trim().to_ascii_lowercase();
+            if typed != current_short.to_ascii_lowercase() {
+                bail!(
+                    "fingerprint mismatch (expected `{}`, got `{}`). Aborting \
+                     rotation; identity file unchanged.",
+                    current_short,
+                    typed
+                );
+            }
+        }
+
+        // Confirmed — remove the old file so save_to_file's `create_new(true)`
+        // semantics still apply (we always want exclusive create).
         std::fs::remove_file(&identity_file)
             .with_context(|| format!("removing old identity {}", identity_file.display()))?;
     }
+
     let kp = StaticKeyPair::generate().context("generate keypair")?;
     kp.save_to_file(&identity_file)
         .with_context(|| format!("write {}", identity_file.display()))?;
@@ -291,6 +374,65 @@ fn rotate(args: RotateArgs, config_path: &Path, json: bool) -> Result<()> {
             ("action:", "generated"),
         ],
     )
+}
+
+/// One enumerated chain enrollment that pins this node's identity. Used to
+/// list breakage before a `rotate`.
+struct EnrollmentEntry {
+    /// `"dial"` or `"accept"`.
+    section: &'static str,
+    /// Peer's tagged pubkey (`x25519:<hex>`).
+    peer_pubkey: String,
+    /// Human-readable endpoint hint (`endpoint=...` for dial, `listen=...`
+    /// for accept).
+    endpoint_label: String,
+}
+
+/// Read `config_path` and return the `[dial]` / `[accept]` enrollments
+/// declared there. Tolerant of a missing or unparseable config (returns an
+/// empty list); enumeration is best-effort and only ever displayed to the
+/// operator as breakage hints.
+fn list_chain_enrollments(config_path: &Path) -> Vec<EnrollmentEntry> {
+    let mut out = Vec::new();
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return out;
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return out;
+    };
+    if let Some(dial) = doc.get("dial").and_then(|v| v.as_table()) {
+        let pk = dial
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unset>")
+            .to_string();
+        let ep = dial
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unset>");
+        out.push(EnrollmentEntry {
+            section: "dial",
+            peer_pubkey: pk,
+            endpoint_label: format!("endpoint={ep}"),
+        });
+    }
+    if let Some(accept) = doc.get("accept").and_then(|v| v.as_table()) {
+        let pk = accept
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unset>")
+            .to_string();
+        let listen = accept
+            .get("listen")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unset>");
+        out.push(EnrollmentEntry {
+            section: "accept",
+            peer_pubkey: pk,
+            endpoint_label: format!("listen={listen}"),
+        });
+    }
+    out
 }
 
 // ---------- export-intro ----------
