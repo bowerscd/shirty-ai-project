@@ -224,6 +224,30 @@ echo "$derived_json" | grep -q '"predicate_version"' \
     || fail "derived-rules missing chain.predicate_version"
 echo "    [ok] derived-rules snapshot contains pushed predicates"
 
+# -------- test 6b: chain summary 2-hop fanout (home -> vps) -----------------
+
+echo "==> [chain-summary] yggdrasilctl chain diff --json from home (2 hops)"
+
+# `chain diff` issues a Request::ChainSummary which fans out over the
+# chain control plane: home is the terminal (hop 0) and walks one
+# upstream step to vps (hop 1). With predicate forwarding both hops
+# converge to the same view (drift_detected=false).
+chain_summary_2hop=$("${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T home \
+    yggdrasilctl --socket /run/yggdrasil/control.sock --json chain diff) \
+    || fail "chain diff --json from home failed"
+echo "$chain_summary_2hop" | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+hops = report["hops"]
+assert len(hops) == 2, f"expected 2 hops (home + vps), got {len(hops)}: {hops}"
+for i, hop in enumerate(hops):
+    names = [p["name"] for p in hop["view"]["predicates"]]
+    assert "tcp-echo" in names, f"hop {i} missing tcp-echo: {names}"
+assert report["drift_detected"] is False, f"unexpected drift: {report}"
+print(f"[chain-summary] 2 hops; both see tcp-echo; drift_detected=False")
+' || fail "chain diff --json output did not match 2-hop expectations"
+echo "    [ok] chain diff --json reports 2 hops in sync"
+
 # -------- test 7: metrics scrape over UDS -----------------------------------
 
 echo "==> [metrics] yggdrasilctl local metrics exposes build_info + last_heartbeat gauge"
