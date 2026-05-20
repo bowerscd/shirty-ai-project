@@ -66,11 +66,11 @@ struct ControlState {
     cert_store: Arc<crate::proxy::certs::CertStore>,
     pending_store: Option<Arc<PendingPeerStore>>,
     /// Path to the main server config; the approve flow rewrites
-    /// `[chain.downstream].pubkey` atomically (tmp + rename). Held even in
+    /// `[accept].pubkey` atomically (tmp + rename). Held even in
     /// terminal mode (unused; cheap to carry).
     config_path: PathBuf,
     /// Initiator-side of the chain tunnel. `Some` only when this node
-    /// has a chain upstream configured (`[chain.upstream]`); without an
+    /// has a chain upstream configured (`[dial]`); without an
     /// upstream we have nowhere to forward `TunnelOpen` envelopes, so
     /// the `OpenChainTunnel` UDS request returns
     /// [`error_codes::NO_CHAIN_UPSTREAM`].
@@ -811,7 +811,7 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
             message: format!(
                 "approve: failed to write {} ({e:#}). \
                  Candidate has been removed from the pending queue; \
-                 set `chain.downstream.pubkey = \"{tagged}\"` manually.",
+                 set `accept.pubkey = \"{tagged}\"` manually.",
                 state.config_path.display()
             ),
         };
@@ -826,7 +826,7 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
     }
 }
 
-/// Atomic rewrite of `[chain.downstream].pubkey` in `config_path`. Round-trips
+/// Atomic rewrite of `[accept].pubkey` in `config_path`. Round-trips
 /// the file through `toml::Value` so other keys are preserved (formatting
 /// and comments are lost — acceptable trade-off; explicit `*.tmp` + rename
 /// keeps the change crash-safe).
@@ -838,22 +838,16 @@ fn update_downstream_pubkey(config_path: &Path, tagged_pubkey: &str) -> Result<(
     let table = doc
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a TOML table", config_path.display()))?;
-    let chain_entry = table
-        .entry("chain".to_string())
+    let accept_entry = table
+        .entry("accept".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let chain_table = chain_entry
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("`chain` in {} is not a table", config_path.display()))?;
-    let downstream_entry = chain_table
-        .entry("downstream".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let downstream_table = downstream_entry
+    let accept_table = accept_entry
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!(
-            "`chain.downstream` in {} is not a table",
+            "`accept` in {} is not a table",
             config_path.display()
         ))?;
-    downstream_table.insert(
+    accept_table.insert(
         "pubkey".to_string(),
         toml::Value::String(tagged_pubkey.to_string()),
     );
@@ -1228,8 +1222,8 @@ mod tests {
             "config not rewritten with tagged pubkey: {rewritten}"
         );
         assert!(
-            rewritten.contains("[chain.downstream]"),
-            "config missing [chain.downstream]: {rewritten}"
+            rewritten.contains("[accept]"),
+            "config missing [accept]: {rewritten}"
         );
 
         shutdown.cancel();

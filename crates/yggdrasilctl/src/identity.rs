@@ -2,9 +2,9 @@
 //! the daemon's config TOML.
 //!
 //! All commands here are file-based and run without contacting the daemon.
-//! Changes to `[chain.*]` sections take effect on the next daemon restart
-//! (chain endpoints are wired at startup; there is no hot-reload path for
-//! them yet).
+//! Changes to `[dial]` / `[accept]` sections take effect on the next
+//! daemon restart (chain endpoints are wired at startup; there is no
+//! hot-reload path for them yet).
 //!
 //! ## Files involved
 //!
@@ -12,8 +12,8 @@
 //!   public). Mode `0600`. Default location `/etc/yggdrasil/identity.key`;
 //!   overridable with `--identity-file`, or, when not given, resolved from
 //!   `[server].identity_file` in `--config`.
-//! * Config file: standard yggdrasil TOML. We mutate the `[chain.upstream]`
-//!   and `[chain.downstream]` sections atomically (tmp + rename); other
+//! * Config file: standard yggdrasil TOML. We mutate the `[dial]`
+//!   and `[accept]` sections atomically (tmp + rename); other
 //!   sections are preserved.
 //! * Intro file (`intro.txt` by convention): emitted by a node that wants to
 //!   advertise itself as a downstream candidate. Contains this node's
@@ -22,7 +22,6 @@
 //!   accepting an intro. Contains both pubkeys + the upstream's reachable
 //!   endpoint. Hand-delivered back to the downstream (the issuer of the
 //!   original intro), which feeds it to `identity add-upstream`.
-
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -52,20 +51,20 @@ pub enum Cmd {
     ExportIntro(ExportIntroArgs),
 
     /// Apply an invite file: verify it targets this node and write
-    /// `[chain.upstream]` into the daemon config.
+    /// `[dial]` into the daemon config.
     #[command(name = "add-upstream")]
     AddUpstream(AddUpstreamArgs),
 
     /// Apply an intro file: mint an invite for the introducer, and write
-    /// `[chain.downstream]` into the daemon config.
+    /// `[accept]` into the daemon config.
     #[command(name = "add-downstream")]
     AddDownstream(AddDownstreamArgs),
 
-    /// Remove `[chain.upstream]` from the daemon config.
+    /// Remove `[dial]` from the daemon config.
     #[command(name = "remove-upstream")]
     RemoveUpstream,
 
-    /// Remove `[chain.downstream]` from the daemon config.
+    /// Remove `[accept]` from the daemon config.
     #[command(name = "remove-downstream")]
     RemoveDownstream,
 }
@@ -125,7 +124,7 @@ pub struct AddDownstreamArgs {
 
     /// The endpoint string (`host:port`) this node advertises as its
     /// upstream-facing address. Written into both the invite file and the
-    /// `[chain.upstream].endpoint` field that the downstream will paste in.
+    /// `[dial].endpoint` field that the downstream will paste in.
     #[arg(long = "my-endpoint")]
     my_endpoint: String,
 
@@ -212,16 +211,9 @@ fn save_config_doc(path: &Path, doc: &toml::Value) -> Result<()> {
     Ok(())
 }
 
-fn chain_table_mut(doc: &mut toml::Value) -> Result<&mut toml::value::Table> {
-    let table = doc
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("config is not a TOML table"))?;
-    let entry = table
-        .entry("chain".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    entry
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("`chain` is not a table"))
+fn top_table_mut(doc: &mut toml::Value) -> Result<&mut toml::value::Table> {
+    doc.as_table_mut()
+        .ok_or_else(|| anyhow!("config is not a TOML table"))
 }
 
 fn print_kv(json: bool, kvs: &[(&str, &str)]) -> Result<()> {
@@ -361,17 +353,17 @@ fn add_upstream(args: AddUpstreamArgs, config_path: &Path, json: bool) -> Result
     }
 
     let mut doc = load_config_doc(config_path)?;
-    let chain = chain_table_mut(&mut doc)?;
-    let upstream_table = chain
-        .entry("upstream".to_string())
+    let top = top_table_mut(&mut doc)?;
+    let dial_table = top
+        .entry("dial".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
         .as_table_mut()
-        .ok_or_else(|| anyhow!("`chain.upstream` is not a table"))?;
-    upstream_table.insert(
+        .ok_or_else(|| anyhow!("`dial` is not a table"))?;
+    dial_table.insert(
         "pubkey".to_string(),
         toml::Value::String(invite.invite.upstream_pubkey.to_string()),
     );
-    upstream_table.insert(
+    dial_table.insert(
         "endpoint".to_string(),
         toml::Value::String(invite.invite.upstream_endpoint.clone()),
     );
@@ -386,12 +378,12 @@ fn add_upstream(args: AddUpstreamArgs, config_path: &Path, json: bool) -> Result
             ("upstream_pubkey:", upstream_pubkey_str.as_str()),
             ("upstream_fingerprint:", invite.invite.upstream_fingerprint.as_str()),
             ("upstream_endpoint:", invite.invite.upstream_endpoint.as_str()),
-            ("action:", "wrote_[chain.upstream]"),
+            ("action:", "wrote_[dial]"),
         ],
     )?;
     eprintln!(
         "note: chain endpoints are wired at daemon startup; restart yggdrasil \
-         to pick up the new [chain.upstream] section."
+         to pick up the new [dial] section."
     );
     Ok(())
 }
@@ -436,24 +428,20 @@ fn add_downstream(args: AddDownstreamArgs, config_path: &Path, json: bool) -> Re
     write_file_secret(&args.out, invite_toml.as_bytes())
         .with_context(|| format!("write {}", args.out.display()))?;
 
-    // Mutate config.
+    // Mutate config: write `[accept].pubkey`. `listen` is left for the
+    // operator to fill in (the daemon validator will surface a missing
+    // `listen` field on the next restart).
     let mut doc = load_config_doc(config_path)?;
-    let chain = chain_table_mut(&mut doc)?;
-    let downstream_table = chain
-        .entry("downstream".to_string())
+    let top = top_table_mut(&mut doc)?;
+    let accept_table = top
+        .entry("accept".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
         .as_table_mut()
-        .ok_or_else(|| anyhow!("`chain.downstream` is not a table"))?;
-    downstream_table.insert(
+        .ok_or_else(|| anyhow!("`accept` is not a table"))?;
+    accept_table.insert(
         "pubkey".to_string(),
         toml::Value::String(downstream_pubkey.to_string()),
     );
-    // Ensure a [chain.listener] section exists (operator may already have
-    // set `listen`; if not, we leave it unset so the daemon's config
-    // validation surfaces the missing-listener error explicitly).
-    chain
-        .entry("listener".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
     save_config_doc(config_path, &doc)?;
 
     let cfg_str = config_path.display().to_string();
@@ -467,13 +455,13 @@ fn add_downstream(args: AddDownstreamArgs, config_path: &Path, json: bool) -> Re
             ("downstream_pubkey:", downstream_pubkey_str.as_str()),
             ("downstream_fingerprint:", invite.invite.downstream_fingerprint.as_str()),
             ("upstream_endpoint:", args.my_endpoint.as_str()),
-            ("action:", "wrote_[chain.downstream]_and_invite"),
+            ("action:", "wrote_[accept]_and_invite"),
         ],
     )?;
     eprintln!(
         "note: chain endpoints are wired at daemon startup; restart yggdrasil \
-         to pick up the new [chain.downstream] section. Ensure \
-         [chain.listener].listen is also configured."
+         to pick up the new [accept] section. Ensure [accept].listen is also \
+         configured."
     );
     Ok(())
 }
@@ -481,14 +469,14 @@ fn add_downstream(args: AddDownstreamArgs, config_path: &Path, json: bool) -> Re
 // ---------- remove-upstream / remove-downstream ----------
 
 fn remove_upstream(config_path: &Path, json: bool) -> Result<()> {
-    remove_chain_section(config_path, "upstream", json)
+    remove_top_section(config_path, "dial", json)
 }
 
 fn remove_downstream(config_path: &Path, json: bool) -> Result<()> {
-    remove_chain_section(config_path, "downstream", json)
+    remove_top_section(config_path, "accept", json)
 }
 
-fn remove_chain_section(config_path: &Path, section: &str, json: bool) -> Result<()> {
+fn remove_top_section(config_path: &Path, section: &str, json: bool) -> Result<()> {
     if !config_path.exists() {
         bail!(
             "no config file at {} — nothing to remove.",
@@ -497,15 +485,15 @@ fn remove_chain_section(config_path: &Path, section: &str, json: bool) -> Result
     }
     let mut doc = load_config_doc(config_path)?;
     let removed = {
-        let chain = chain_table_mut(&mut doc)?;
-        chain.remove(section).is_some()
+        let top = top_table_mut(&mut doc)?;
+        top.remove(section).is_some()
     };
     if !removed {
-        bail!("no `[chain.{section}]` section in {}", config_path.display());
+        bail!("no `[{section}]` section in {}", config_path.display());
     }
     save_config_doc(config_path, &doc)?;
     let cfg_str = config_path.display().to_string();
-    let section_label = format!("[chain.{section}]");
+    let section_label = format!("[{section}]");
     print_kv(
         json,
         &[

@@ -60,7 +60,7 @@ listen = "0.0.0.0:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
 EOF
 
@@ -88,7 +88,7 @@ listen = "0.0.0.0:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
 EOF
 
@@ -143,7 +143,7 @@ yggdrasilctl --config "$HOME_CFG" identity export-intro \
     --out "$HOME_INTRO" \
     --note "chain e2e home" >/dev/null
 
-echo "[init-chain] midbox add-downstream from home-chain (writes midbox's [chain.downstream])"
+echo "[init-chain] midbox add-downstream from home-chain (writes midbox's [accept])"
 yggdrasilctl --config "$MIDBOX_CFG" identity add-downstream \
     --identity-file "$MIDBOX_KEY" \
     --from "$HOME_INTRO" \
@@ -164,7 +164,7 @@ yggdrasilctl --config "$MIDBOX_CFG" identity export-intro \
     --out "$MIDBOX_INTRO" \
     --note "chain e2e midbox" >/dev/null
 
-echo "[init-chain] vps-chain add-downstream from midbox (writes vps's [chain.downstream])"
+echo "[init-chain] vps-chain add-downstream from midbox (writes vps's [accept])"
 yggdrasilctl --config "$VPS_CFG" identity add-downstream \
     --identity-file "$VPS_KEY" \
     --from "$MIDBOX_INTRO" \

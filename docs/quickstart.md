@@ -51,14 +51,14 @@ listen = "127.0.0.1:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
 EOF
 ```
 
 The chain listener is UDP only. Pick any port you like; the example uses
 WireGuard's traditional `51820` because it's already well-known as
-"VPN-ish UDP" to most firewalls. `[chain.downstream]` will be added by
+"VPN-ish UDP" to most firewalls. `[accept]` will be added by
 the next step.
 
 ## 3. Write the terminal config (home)
@@ -76,8 +76,8 @@ socket = "/run/yggdrasil/control.sock"
 EOF
 ```
 
-`[chain.upstream]` will be added by the next step. Terminal nodes don't
-have `[chain.listener]` or `[chain.downstream]` (the config validator
+`[dial]` will be added by the next step. Terminal nodes don't
+have `[accept]` or `[accept]` (the config validator
 rejects either in `mode = "terminal"`).
 
 ## 4. Run the intro / invite handshake
@@ -85,7 +85,7 @@ rejects either in `mode = "terminal"`).
 The enrolment ceremony is two files exchanged out-of-band. The home box
 emits an **intro** advertising its pubkey; the VPS replies with an
 **invite** committing both pubkeys plus the VPS's reachable endpoint;
-the home box applies the invite to populate `[chain.upstream]`.
+the home box applies the invite to populate `[dial]`.
 
 On the home box:
 
@@ -109,7 +109,7 @@ sudo yggdrasilctl identity add-downstream \
     --from /tmp/home.intro \
     --my-endpoint vps.example.net:51820 \
     --out /tmp/home.invite
-# updated /etc/yggdrasil/config.toml: [chain.downstream].pubkey
+# updated /etc/yggdrasil/config.toml: [accept].pubkey
 # wrote invite file
 #   upstream_pubkey:   x25519:6c5a30bb...0ff1
 #   downstream_pubkey: x25519:9d2f04a3...4b7c
@@ -127,7 +127,7 @@ On the home box:
 ```bash
 sudo yggdrasilctl identity add-upstream --from /tmp/home.invite
 # verified invite targets this node (downstream_pubkey matches local identity)
-# updated /etc/yggdrasil/config.toml: [chain.upstream]
+# updated /etc/yggdrasil/config.toml: [dial]
 #   pubkey:   x25519:6c5a30bb...0ff1
 #   endpoint: vps.example.net:51820
 ```

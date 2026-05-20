@@ -20,10 +20,10 @@
 #                                                 └─────────────────────────┘
 #
 # Notes on the topology:
-# - vps runs in relay mode with `[chain.listener]` + `[chain.downstream]`
+# - vps runs in relay mode with `[accept]` + `[accept]`
 #   pinned to home's pubkey. Its rule files forward traffic from
 #   :7000/:7001 to downstream_ip:7100/7101.
-# - home runs in terminal mode with `[chain.upstream]` pointing at
+# - home runs in terminal mode with `[dial]` pointing at
 #   vps:51820. It also runs the python echo backends in the same network
 #   namespace so vps's rule-dial target lands on a real listener.
 # - The `init` service performs one-shot key generation + offline

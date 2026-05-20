@@ -51,7 +51,7 @@ first positional argument.
 | Flag       | Env var                   | Default                          | Notes                                                                                                |
 | ---------- | ------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `--socket` | `YGGDRASIL_CONTROL_SOCKET`| `/run/yggdrasil/control.sock`    | Path to the daemon's control socket. Used by `local` and `chain` scopes.                              |
-| `--config` | `YGGDRASIL_CONFIG`        | `/etc/yggdrasil/config.toml`     | Path to the daemon's config file. Used by `identity` scope to mutate `[chain.*]` and resolve `identity_file`. |
+| `--config` | `YGGDRASIL_CONFIG`        | `/etc/yggdrasil/config.toml`     | Path to the daemon's config file. Used by `identity` scope to mutate `[dial]` / `[accept]` and resolve `identity_file`. |
 | `--json`   | —                         | (off)                            | Emit raw JSON responses where possible. Otherwise human-readable text.                                |
 
 ### Exit codes
@@ -96,12 +96,12 @@ Print the currently-enrolled downstream's tagged pubkey and fingerprint.
 ### `local downstream pending`
 
 List staged TOFU candidates — peers that have attempted a handshake but
-aren't yet enrolled in `[chain.downstream]`.
+aren't yet enrolled in `[accept]`.
 
 ### `local downstream approve <fingerprint>`
 
 Approve a staged TOFU candidate. After approval the candidate is written
-into `[chain.downstream].pubkey` and the next heartbeat from that key is
+into `[accept].pubkey` and the next heartbeat from that key is
 accepted.
 
 | Positional        | Notes                                                                                |
@@ -121,7 +121,7 @@ closes or the peer closes the tunnel.
 | Flag        | Type           | Notes                                                                                                       |
 | ----------- | -------------- | ----------------------------------------------------------------------------------------------------------- |
 | `--pubkey`  | tagged pubkey  | Target node where the tunnel terminates. May be any node along the chain — the daemon's tunnel forwarder routes onward until the pubkey matches. |
-| `--dest`    | `host:port`    | Destination socket the terminator should dial after the tunnel arrives. Subject to the terminator's `[chain.tunnel]` allow-list. |
+| `--dest`    | `host:port`    | Destination socket the terminator should dial after the tunnel arrives. In v1, tunnel destination policy is loopback-only. |
 
 Useful for `ssh -o ProxyCommand='yggdrasilctl chain tunnel open --pubkey
 … --dest …'` style wiring, or for one-shot pipelines like `echo PAYLOAD
@@ -143,7 +143,7 @@ Terminal mode only. Relay-mode daemons return
 | `--file`   | path | Candidate rule file. Parsed via `ratatoskr::rule::RuleFile::from_toml` before shipping.            |
 
 On success, the predicate publisher emits a fresh `PredicateSetUpdate`
-on its next tick (if `[chain.upstream]` is set).
+on its next tick (if `[dial]` is set).
 
 ### `chain diff`
 
@@ -185,7 +185,7 @@ suitable for piping into `jq`.
 ## `yggdrasilctl identity <cmd>` — offline identity & enrollment
 
 All `identity` commands are file-based and run without contacting the
-daemon. Changes to `[chain.*]` take effect on the next daemon restart
+daemon. Changes to `[dial]` / `[accept]` take effect on the next daemon restart
 (chain endpoints are wired at startup; there is no hot-reload path for
 them).
 
@@ -213,7 +213,7 @@ pubkey + fingerprint + operator note. Not a secret.
 ### `identity add-downstream --from <INTRO> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
 
 Apply an intro file received from a prospective downstream. Writes
-`[chain.downstream].pubkey = <downstream-pubkey>` into the daemon
+`[accept].pubkey = <downstream-pubkey>` into the daemon
 config and emits an invite file (default `./invite.txt`) containing
 both pubkeys plus `my_endpoint`. Hand-deliver the invite back to the
 downstream.
@@ -222,17 +222,17 @@ downstream.
 
 Apply an invite file received from an upstream. Verifies the invite's
 `downstream_pubkey` matches the local identity (catches "wrong invite
-file" mistakes), then writes `[chain.upstream]` into the daemon config:
+file" mistakes), then writes `[dial]` into the daemon config:
 the upstream's pubkey + endpoint.
 
 ### `identity remove-upstream`
 
-Remove `[chain.upstream]` from the daemon config. Useful for re-enrolling
+Remove `[dial]` from the daemon config. Useful for re-enrolling
 against a new upstream.
 
 ### `identity remove-downstream`
 
-Remove `[chain.downstream]` from the daemon config. The next downstream
+Remove `[accept]` from the daemon config. The next downstream
 that handshakes lands in the pending-peer TOFU store.
 
 ---

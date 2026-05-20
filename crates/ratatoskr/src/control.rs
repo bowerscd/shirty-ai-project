@@ -104,7 +104,7 @@ pub enum Request {
     /// validation, and ships the resulting `Vec<Rule>` over the wire.
     /// The daemon performs defensive re-validation (cross-rule
     /// uniqueness, listen/protocol conflicts) and refuses the apply if
-    /// any rule fails. On terminals with `[chain.upstream]` configured,
+    /// any rule fails. On terminals with `[dial]` configured,
     /// the daemon additionally pre-checks the projected predicate set
     /// against [`crate::predicate::PREDICATE_SET_MAX_WIRE_BYTES`] so an
     /// oversize push fails synchronously here instead of silently
@@ -181,7 +181,7 @@ pub struct StatusResponse {
     pub rule_count: usize,
     /// Server uptime in seconds.
     pub uptime_secs: u64,
-    /// Whether a downstream has been enrolled (`[chain.downstream]` present
+    /// Whether a downstream has been enrolled (`[accept]` present
     /// in config). Always `false` in terminal mode.
     pub downstream_enrolled: bool,
 }
@@ -254,7 +254,7 @@ pub struct ChainAppliedResponse {
     pub applied_rule_count: usize,
     /// Predicates that will be projected upstream from the new rule
     /// set, if the daemon has a chain upstream. Zero on terminals
-    /// without `[chain.upstream]` and on pure-local nodes.
+    /// without `[dial]` and on pure-local nodes.
     pub predicate_count: usize,
     /// Names of rules dropped during predicate projection because their
     /// protocol isn't representable as a predicate (currently HTTPS).
@@ -275,7 +275,7 @@ pub mod error_codes {
     /// identity. Peer-related commands (`peer show`, `peer pending`,
     /// `peer approve`) are not meaningful and return this code.
     pub const NOT_SUPPORTED_IN_TERMINAL_MODE: &str = "not_supported_in_terminal_mode";
-    /// The daemon has no chain upstream configured (no `[chain.upstream]`
+    /// The daemon has no chain upstream configured (no `[dial]`
     /// section in its config), so it has no way to forward tunnel control
     /// frames. `chain tunnel open` requests return this code.
     pub const NO_CHAIN_UPSTREAM: &str = "no_chain_upstream";

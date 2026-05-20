@@ -40,7 +40,7 @@
 //! ## Allow-list
 //!
 //! The tunnel terminator (the node where `target_pubkey == self`) enforces
-//! a destination allow-list configured in `[chain.tunnel]`. Default
+//! a destination allow-list hardcoded in the daemon for v1. Default
 //! configuration is `127.0.0.1` only. Open requests outside the allow-list
 //! are rejected with [`tunnel_reject::TARGET_NOT_ALLOWED`].
 //!

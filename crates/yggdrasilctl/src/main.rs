@@ -9,7 +9,7 @@
 //!   filled in in Phase 4-5 once the chain wire protocol lands.
 //! * `identity` — offline operations on this node's identity file and the
 //!   daemon's config TOML. Mints intro/invite files and edits
-//!   `[chain.upstream]` / `[chain.downstream]` sections. No daemon required.
+//!   `[dial]` / `[accept]` sections. No daemon required.
 
 use std::path::PathBuf;
 

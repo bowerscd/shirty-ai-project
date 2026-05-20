@@ -11,12 +11,12 @@
 //! 2. **invite.txt** — produced by U's
 //!    `yggdrasilctl identity add-downstream --from intro.txt`. Echoes D's
 //!    pubkey, declares U's own pubkey + endpoint, plus matching note +
-//!    timestamp. U's own config is updated with `[chain.downstream]` as a
+//!    timestamp. U's own config is updated with `[accept]` as a
 //!    side effect. Transferred back to D.
 //!
 //! On D's box, `yggdrasilctl identity add-upstream invite.txt` parses the
 //! invite, verifies that `downstream_pubkey` matches D's local identity
-//! (sanity check against a swapped file), and writes `[chain.upstream]`
+//! (sanity check against a swapped file), and writes `[dial]`
 //! into D's config.
 //!
 //! Both files are TOML; pubkeys are tagged (`x25519:<hex>`). No hex

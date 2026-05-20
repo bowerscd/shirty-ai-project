@@ -170,7 +170,7 @@ WAIT_TIMEOUT=15 wait_for "TCP echo round-trips through the derived chain" run_ch
 
 echo "==> [chain-tunnel] open from home, forward through midbox, terminate at vps"
 
-# Extract vps-chain's tagged pubkey. midbox's [chain.upstream] block holds
+# Extract vps-chain's tagged pubkey. midbox's [dial] block holds
 # it (written by `identity add-upstream` during bootstrap). awk walks the
 # TOML to extract the pubkey under that specific section, ignoring the
 # downstream block which holds a different pubkey.

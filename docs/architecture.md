@@ -18,11 +18,11 @@ control sessions.
 ## Cast of characters
 
 There is exactly one daemon binary, `yggdrasil`, running in one of two modes
-selected by `[server].mode` and the `[chain.*]` sub-tables:
+selected by `[server].mode` and the `[dial]` / `[accept]` tables:
 
 | Mode       | Accepts inbound chain traffic | Dials upstream | Typical role                               |
 | ---------- | ----------------------------- | -------------- | ------------------------------------------ |
-| `relay`    | Yes (when `[chain.listener]` set) | Optional   | Root VPS, or mid-chain forwarder.          |
+| `relay`    | Yes (when `[accept]` set) | Optional   | Root VPS, or mid-chain forwarder.          |
 | `terminal` | No                            | Yes (required) | Home box / chain leaf.                     |
 
 The auxiliary binaries are:
@@ -57,7 +57,7 @@ clients |   yggdrasil     |   forwarded TCP / UDP             |   yggdrasil     
 
 Both nodes bind:
 
-1. **Chain listener** (relay only, when `[chain.listener]` is set). UDP.
+1. **Chain listener** (relay only, when `[accept]` is set). UDP.
    Carries Noise_IK-protected control frames — heartbeats, predicate pushes,
    tunnel envelopes. No application bytes.
 2. **Per-rule data-plane sockets**. Each rule (on the terminal: from
@@ -68,7 +68,7 @@ Both nodes bind:
    `/internal/derived-rules`.
 
 The terminal additionally maintains an outbound UDP connection (the **chain
-client**) to its `[chain.upstream]` endpoint, performs the Noise_IK
+client**) to its `[dial]` endpoint, performs the Noise_IK
 handshake, and runs the heartbeat / predicate-push tasks against it.
 
 ## High-level shape — multi-hop chain
@@ -172,7 +172,7 @@ scope of `yggdrasilctl`:
 2. **Upstream issues an invite.** On the would-be upstream:
    `yggdrasilctl identity add-downstream --from intro.txt
    --my-endpoint vps.example.net:51820 --out invite.txt`
-   writes `[chain.downstream]` into the upstream's config (pinning the
+   writes `[accept]` into the upstream's config (pinning the
    downstream's pubkey) and emits an invite file containing both pubkeys
    plus the upstream's reachable endpoint.
 
@@ -180,7 +180,7 @@ scope of `yggdrasilctl`:
    `yggdrasilctl identity add-upstream --from invite.txt`
    verifies that the invite's `downstream_pubkey` matches the local
    identity (catches "wrong invite file" mistakes) and writes
-   `[chain.upstream]` into the downstream's config (pinning the upstream's
+   `[dial]` into the downstream's config (pinning the upstream's
    pubkey + endpoint).
 
 The intro and invite files are not secrets. Both contain only public
@@ -192,11 +192,11 @@ boundary; if you skip it, you trust whoever transported the files.
 ### TOFU fallback
 
 If a downstream attempts a handshake whose pubkey isn't pinned in
-`[chain.downstream]`, the upstream stages it in the **pending peer
+`[accept]`, the upstream stages it in the **pending peer
 store** and refuses traffic. The operator inspects candidates with
 `yggdrasilctl local downstream pending`, verifies the fingerprint
 out-of-band, and approves with `yggdrasilctl local downstream approve
-<fingerprint>`. Approval writes `[chain.downstream].pubkey` into the
+<fingerprint>`. Approval writes `[accept].pubkey` into the
 upstream's config.
 
 TOFU staging never accepts data on its own — it only collects candidates
@@ -318,7 +318,7 @@ with a 250 ms debounce. The worker task:
 4. Validation failures keep the previous `RuleSet` live. There is no
    "partial apply" mode — half-good reloads are worse than no reload.
 5. The new `RuleSet` is fed to the **predicate publisher** (if
-   `[chain.upstream]` is set), which projects it through
+   `[dial]` is set), which projects it through
    `predicate_extractor::extract` and pushes the resulting `PredicateSet`
    to the upstream chain client on its next tick.
 
@@ -399,7 +399,7 @@ ordered byte-channel above the per-datagram Noise layer.
   along a multi-hop tunnel.
 * **`tunnel_terminator`** — destination-side. For tunnel frames whose
   `target_pubkey` is us, splice against a freshly-dialled TCP socket to
-  the `dest` address (subject to the `[chain.tunnel]` allow-list).
+  the `dest` address (subject to the v1 loopback-only tunnel destination policy).
 * **`client`** — chain-client state machine. Owns the Noise handshake,
   the heartbeat tick, and the dispatch of inbound body types to the
   combined handler stack.

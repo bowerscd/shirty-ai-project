@@ -86,14 +86,14 @@ pub async fn run(args: cli::RunArgs) -> Result<()> {
 
 /// Run the relay-mode daemon: optional inbound chain listener, peer
 /// state, pending-peer store, dynamic-IP-resolved proxies. May also dial
-/// an upstream chain client when `[chain.upstream]` is configured.
+/// an upstream chain client when `[dial]` is configured.
 pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
         mode = config.server.mode.as_str(),
-        chain_listener = ?config.chain.listener.as_ref().map(|l| l.listen),
-        chain_upstream = ?config.chain.upstream.as_ref().map(|u| &u.endpoint),
+        accept_listen = ?config.accept.as_ref().map(|a| a.listen),
+        dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
     );
@@ -101,25 +101,16 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     // 1. Load (or auto-generate) our long-term X25519 identity.
     let local_keys = load_or_generate_identity(&config.server.identity_file)?;
 
-    // 2. Resolve the configured downstream. No `[chain.downstream]` means
-    //    the daemon comes up in TOFU staging mode (when a listener is also
-    //    configured); a candidate may then be approved via
-    //    `yggdrasilctl identity add-downstream`.
-    let downstream_pubkey = match config.chain.downstream.as_ref() {
-        Some(dn) => *dn
+    // 2. Resolve the configured inbound peer from `[accept].pubkey`.
+    //    No `[accept]` means the daemon has no inbound chain peer at
+    //    all; we still keep a TOFU staging hook here for the future
+    //    `yggdrasilctl identity add-accept` flow.
+    let downstream_pubkey = match config.accept.as_ref() {
+        Some(acc) => *acc
             .pubkey
             .as_x25519()
             .expect("PubKey::X25519 only variant in v1"),
-        None => {
-            if config.chain.listener.is_some() {
-                tracing::warn!(
-                    "no downstream enrolled ([chain.downstream] absent). \
-                     Daemon will accept no traffic until you approve a candidate via \
-                     `yggdrasilctl identity add-downstream`."
-                );
-            }
-            UNENROLLED_PEER_KEY
-        }
+        None => UNENROLLED_PEER_KEY,
     };
     let peer_state = PeerState::new(downstream_pubkey);
     if peer_state.is_peer_enrolled() {
@@ -183,8 +174,8 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     //       [`crate::run_terminal`].
     let introspection_state = crate::chain::IntrospectionState::new(
         ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
-        config.chain.upstream.as_ref().map(|u| u.pubkey),
-        config.chain.downstream.as_ref().map(|d| d.pubkey),
+        config.dial.as_ref().map(|d| d.pubkey),
+        config.accept.as_ref().map(|a| a.pubkey),
         supervisor.handle(),
     );
     if introspection_slot.set(introspection_state.clone()).is_err() {
@@ -199,7 +190,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     //     configured: without a listener we never receive Control
     //     packets, so the acceptor would be unused. Persists per-origin
     //     versions under `state_dir/chain-predicates.toml`.
-    let chain_acceptor = if config.chain.listener.is_some() {
+    let chain_acceptor = if config.accept.is_some() {
         use std::net::{IpAddr, Ipv4Addr};
         let bind_addr = config
             .server
@@ -236,7 +227,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
             .map_err(|_| anyhow::anyhow!("introspection set twice on acceptor"))?;
     }
 
-    // 6. Heartbeat (chain) listener — only when [chain.listener] is set.
+    // 6. Heartbeat (chain) listener — only when [accept] is set.
     //    A pure-proxy relay (no downstream/listener, only an upstream) is
     //    a legitimate mid-chain configuration that does no inbound work.
     //
@@ -250,9 +241,9 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     let mut downstream_outbound_sender: Option<
         tokio::sync::mpsc::UnboundedSender<ratatoskr::control_frame::ControlEnvelope>,
     > = None;
-    let hb_handle = if let Some(listener) = config.chain.listener.as_ref() {
+    let hb_handle = if let Some(accept) = config.accept.as_ref() {
         let (hb, outbound) = HeartbeatServer::bind(
-            listener.listen,
+            accept.listen,
             local_keys.clone(),
             peer_state.clone(),
             pending_store.clone(),
@@ -266,15 +257,12 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         // chain listener (the inbound side decodes `TunnelOpen`); a
         // pure-upstream relay has nothing to terminate.
         if let Some(acc) = chain_acceptor.as_ref() {
+            // Tunnel destination policy is hardcoded for v1: loopback
+            // destinations only. The wider tunnel feature is scheduled
+            // for removal; until then, no operator-facing knob exists.
             let allow = TunnelAllowList {
-                allow_loopback: config.chain.tunnel.allow_loopback,
-                allowed_targets: config
-                    .chain
-                    .tunnel
-                    .allowed_targets
-                    .iter()
-                    .copied()
-                    .collect(),
+                allow_loopback: true,
+                allowed_targets: Default::default(),
             };
             let mgr = TunnelManager::new(
                 allow,
@@ -304,7 +292,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
         None
     };
 
-    // 6b. Outbound chain client — only when [chain.upstream] is set.
+    // 6b. Outbound chain client — only when [dial] is set.
     //     Phase 3B does not push predicates from relays; the handle is
     //     therefore unused on this path. We still keep the chain client
     //     spawned so mid-chain relays maintain their upstream session.
@@ -409,7 +397,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
         mode = config.server.mode.as_str(),
-        chain_upstream = ?config.chain.upstream.as_ref().map(|u| &u.endpoint),
+        dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
     );
@@ -492,7 +480,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     //     connections).
     let introspection_state = crate::chain::IntrospectionState::new(
         ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
-        config.chain.upstream.as_ref().map(|u| u.pubkey),
+        config.dial.as_ref().map(|d| d.pubkey),
         None,
         supervisor.handle(),
     );
@@ -606,10 +594,9 @@ struct BuiltChainClient {
     initiator: Arc<crate::chain::TunnelInitiator>,
 }
 
-/// Build the outbound chain client when `[chain.upstream]` is
-/// configured, *without* spawning. Returns `None` when no upstream is
-/// set (a legitimate configuration for pure-proxy nodes and root
-/// relays).
+/// Build the outbound chain client when `[dial]` is configured,
+/// *without* spawning. Returns `None` when no `[dial]` section is set
+/// (a legitimate configuration for pure-proxy nodes and root relays).
 ///
 /// The caller is responsible for installing a body handler via
 /// [`ChainClient::set_body_handler`] (typically the combined
@@ -621,7 +608,7 @@ fn build_chain_client(
     local_keys: &StaticKeyPair,
     shutdown: CancellationToken,
 ) -> Option<BuiltChainClient> {
-    let up = config.chain.upstream.as_ref()?;
+    let up = config.dial.as_ref()?;
     let upstream_pubkey = *up
         .pubkey
         .as_x25519()

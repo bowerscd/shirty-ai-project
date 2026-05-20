@@ -15,7 +15,7 @@
 //!   upstream predicates on a relay).
 //! * Chain identity: local pubkey plus optional upstream / downstream
 //!   pubkeys, copied at construction from
-//!   [`crate::config::ChainSection`].
+//!   [`crate::config::ServerConfig`].
 //! * `last_apply_unix` — wall-clock seconds at which `record_apply`
 //!   last fired. Held in an [`AtomicI64`] so reads are lock-free; the
 //!   value `0` means "no apply yet" and surfaces as JSON `null` in the
@@ -205,9 +205,9 @@ pub struct ChainSnapshot {
     /// `chain diff` tooling confirm which node it actually reached
     /// through the tunnel.
     pub local: PubKey,
-    /// Upstream node pubkey when `[chain.upstream]` is configured.
+    /// Upstream node pubkey when `[dial]` is configured.
     pub upstream: Option<PubKey>,
-    /// Downstream node pubkey when `[chain.downstream]` is configured.
+    /// Downstream node pubkey when `[accept]` is configured.
     pub downstream: Option<PubKey>,
     /// `PredicateSet.origin` of the most recently applied push. On a
     /// terminal this equals `local`; on a relay it equals the terminal

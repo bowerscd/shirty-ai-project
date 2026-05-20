@@ -15,7 +15,7 @@
 //!   file for terminals).
 //! * **PROXY-protocol toggle** is stripped — relays decide independently
 //!   whether to emit PROXY headers based on their local
-//!   `[chain.listener]` configuration. The terminal cannot dictate that.
+//!   `[accept]` configuration. The terminal cannot dictate that.
 //! * **HTTPS routes / cert directories** are stripped along with the
 //!   entire rule: Phase 3 only supports TCP and UDP predicates. HTTPS
 //!   rules are filtered out of the projection with a warning log; a

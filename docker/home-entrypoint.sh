@@ -47,7 +47,7 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-# Run yggdrasil in terminal mode with [chain.upstream] pointing at vps.
+# Run yggdrasil in terminal mode with [dial] pointing at vps.
 # The config + identity were provisioned by the init container.
 yggdrasil run --config /etc/yggdrasil/config.toml &
 YGG_PID=$!

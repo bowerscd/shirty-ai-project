@@ -99,7 +99,7 @@ pub struct DiffArgs {
     pub metrics_port: u16,
     /// Maximum number of upstream hops to walk before stopping. Each
     /// hop's `/internal/derived-rules` reveals the next hop via its
-    /// `chain.upstream` pubkey. A chain deeper than the default of 8
+    /// `dial` pubkey. A chain deeper than the default of 8
     /// is unusual; tune up only if you've explicitly designed one.
     #[arg(long, value_name = "N", default_value_t = 8)]
     pub max_hops: usize,
@@ -373,7 +373,7 @@ struct HopReport {
     /// 0 for the local hop, 1 for its immediate upstream, etc.
     index: usize,
     /// Pubkey we *expected* at this hop — the previous hop's
-    /// `chain.upstream`. For hop 0 this is the local node's own
+    /// `dial`. For hop 0 this is the local node's own
     /// `chain.local`; we record it for cross-check symmetry.
     expected_pubkey: PubKey,
     /// Snapshot the hop returned. `chain.local` is asserted to equal

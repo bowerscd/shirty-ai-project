@@ -25,7 +25,7 @@ hex is rejected on parse.
 
 | Key                | Type                   | Default                          | Notes                                                                                          |
 | ------------------ | ---------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `mode`             | `"relay"`/`"terminal"` | `"relay"`                        | `relay` accepts inbound chain traffic (when `[chain.listener]` is set) and uses dynamic peer-IP rule resolution. `terminal` only dials upstream and uses fixed-address rule resolution; never accepts inbound chain traffic. |
+| `mode`             | `"relay"`/`"terminal"` | `"relay"`                        | `relay` accepts inbound chain traffic (when `[accept]` is set) and uses dynamic peer-IP rule resolution. `terminal` only dials upstream and uses fixed-address rule resolution; never accepts inbound chain traffic. |
 | `rules_dir`        | path                   | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
 | `default_bind`     | IP                     | unset                            | If set, hard-rewrites every rule's `listen` IP to this address (the port is preserved). Used to share one config across hosts with different network interfaces. |
 | `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
@@ -46,7 +46,7 @@ hex is rejected on parse.
 | -------- | ---- | ------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `socket` | path | `/run/yggdrasil/control.sock`   | Unix domain socket for `yggdrasilctl`. Restrict to an admin group via filesystem permissions.    |
 
-### `[chain.upstream]` — optional
+### `[dial]` — optional
 
 Configures this node as a chain client (terminal- and mid-chain-relay
 nodes). When set, the daemon dials `endpoint`, performs Noise_IK against
@@ -60,40 +60,17 @@ this section; pure root relays omit it.
 | `heartbeat_interval` | `humantime`    | `5s`    | How often to emit a heartbeat. Lower = faster IP-change reaction; higher = fewer wakeups.       |
 | `rekey_interval`     | `humantime`    | `1h`    | Force a fresh Noise handshake at most this often, regardless of traffic.                       |
 
-### `[chain.downstream]` — optional
+### `[accept]` — optional
 
 Pins the single enrolled downstream identity. When set, this node accepts
-inbound chain traffic only from `pubkey`. `[chain.listener]` must also be
-set; an enrolled downstream without a listener is rejected at load.
-Forbidden in `mode = "terminal"`.
+inbound chain traffic only from `pubkey` and binds UDP `listen` for that
+session. Forbidden in `mode = "terminal"`.
 
 | Key                  | Type           | Default | Notes                                                                  |
 | -------------------- | -------------- | ------- | ---------------------------------------------------------------------- |
 | `pubkey`             | tagged pubkey  | **required** | `x25519:<hex>` of the downstream node. Written by `yggdrasilctl identity add-downstream` or `local downstream approve`. |
+| `listen`             | `host:port`    | **required** | UDP socket to bind. Public-facing on the root relay.                  |
 | `rekey_interval`     | `humantime`    | `1h`    | Force a fresh Noise handshake at most this often.                      |
-
-### `[chain.listener]` — optional
-
-Required when `[chain.downstream]` is set; forbidden when it isn't. UDP
-listener parameters for inbound chain traffic.
-
-| Key      | Type        | Default        | Notes                                                              |
-| -------- | ----------- | -------------- | ------------------------------------------------------------------ |
-| `listen` | `host:port` | **required**   | UDP socket to bind. Public-facing on the root relay.                |
-
-### `[chain.tunnel]` — optional
-
-Allow-list governing what the **tunnel terminator** is allowed to dial.
-A `TunnelOpen` whose `target_pubkey` matches this node's identity is
-permitted only if its `dest` address falls in the allow-list. Defaults
-permit only loopback destinations, so `yggdrasilctl chain` can reach the
-daemon's own `/internal/derived-rules` / health endpoints without
-exposing anything to other downstreams.
-
-| Key                | Type                  | Default                              | Notes                                                                                                          |
-| ------------------ | --------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| `allow_loopback`   | bool                  | `true`                               | Permit any port on `127.0.0.0/8` or `::1`. The v1 introspection use case is loopback-only.                     |
-| `allowed_targets`  | `Vec<SocketAddr>`     | `[]`                                 | Explicit `host:port` destinations the terminator may dial. Exact-match (IP + port) against `TunnelOpen.dest`.  |
 
 ### Complete example (root relay)
 
@@ -107,10 +84,8 @@ listen = "127.0.0.1:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
-
-[chain.downstream]
 pubkey = "x25519:9d2f04a3...4b7c"
 ```
 
@@ -126,14 +101,14 @@ listen = "127.0.0.1:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[chain.upstream]
+[dial]
 pubkey   = "x25519:6c5a30bb...0ff1"
 endpoint = "vps.example.net:51820"
 ```
 
 ### Complete example (mid-chain relay)
 
-Same as a root relay, plus `[chain.upstream]` pointing at the next-hop
+Same as a root relay, plus `[dial]` pointing at the next-hop
 relay. Mode is `"relay"` because the node still accepts inbound chain
 traffic from its downstream.
 
@@ -141,14 +116,12 @@ traffic from its downstream.
 [server]
 mode = "relay"
 
-[chain.upstream]
+[dial]
 pubkey   = "x25519:0123abcd...ef"
 endpoint = "next-hop.example.net:51820"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
-
-[chain.downstream]
 pubkey = "x25519:9d2f04a3...4b7c"
 ```
 
@@ -311,7 +284,7 @@ completeness:
   rule set keeps serving traffic; the error is logged.
 * Changes to **`/etc/yggdrasil/config.toml`** itself are not hot-reloaded;
   restart the daemon (`systemctl restart yggdrasil`). Only `conf.d/*.toml`
-  files are picked up live. In particular, the `[chain.*]` sub-tables are
+  files are picked up live. In particular, the `[dial]` and `[accept]` tables are
   read once at startup — `yggdrasilctl identity add-upstream` /
   `add-downstream` / `remove-*` mutations require a restart to take
   effect.

@@ -5,14 +5,12 @@
 //! * `[server]` — runtime mode, paths, defaults.
 //! * `[metrics]` — Prometheus exporter listen address.
 //! * `[control]` — `yggdrasilctl` Unix-domain socket path.
-//! * `[chain.upstream]` (optional) — this node's outbound chain client:
-//!   who to dial, what to pin, how often to heartbeat. Drives both relay-
-//!   and terminal-mode nodes when set.
-//! * `[chain.downstream]` (optional) — single accepted downstream
-//!   identity (for v1 — one downstream per node). When present and
-//!   `pubkey` is set, the node listens for inbound chain traffic.
-//! * `[chain.listener]` (optional) — listener parameters (UDP socket) for
-//!   inbound chain traffic. Required when `[chain.downstream]` is set.
+//! * `[dial]` (optional) — this node's outbound chain client: who to
+//!   dial, what to pin, how often to heartbeat. Drives both relay- and
+//!   terminal-mode nodes when set.
+//! * `[accept]` (optional) — single enrolled inbound chain peer plus its
+//!   listener socket. When present and `pubkey` is set, the node listens
+//!   for inbound chain traffic on `listen` and accepts only from `pubkey`.
 //!
 //! All public keys use the tagged textual form `<algo>:<hex>`; bare hex is
 //! rejected.
@@ -35,12 +33,16 @@ pub struct ServerConfig {
     pub metrics: MetricsSection,
     #[serde(default)]
     pub control: ControlSection,
-    /// Chain-control configuration: who this node dials upstream, who it
-    /// accepts downstream, and where it listens for inbound chain traffic.
-    /// All sub-tables are optional; an absent `[chain]` table is identical
-    /// to one with no subsections set.
+    /// Outbound chain client. When set, this node dials the configured
+    /// upstream and sends heartbeats. Terminal-mode nodes with no upstream
+    /// link omit this entirely.
     #[serde(default)]
-    pub chain:   ChainSection,
+    pub dial:    Option<DialSection>,
+    /// Inbound chain peer. When set, the node accepts inbound chain
+    /// traffic on `listen` only from `pubkey`. v1 supports exactly one
+    /// inbound peer per node.
+    #[serde(default)]
+    pub accept:  Option<AcceptSection>,
 }
 
 /// Runtime mode selector. English-only operator surface (no serde aliases).
@@ -50,8 +52,7 @@ pub struct ServerConfig {
 ///
 /// "relay vs terminal" gates proxy resolver behaviour (relay uses dynamic
 /// peer-IP rules; terminal uses static `target_addr`), but both modes
-/// can now run an outbound chain client when `[chain.upstream]` is
-/// configured.
+/// can now run an outbound chain client when `[dial]` is configured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -136,36 +137,10 @@ impl Default for ControlSection {
     }
 }
 
-/// Container for all `[chain.*]` sub-tables.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChainSection {
-    /// Outbound chain client config. When set, this node dials the
-    /// configured upstream and sends heartbeats. Optional — terminal-mode
-    /// nodes with no upstream link omit this entirely.
-    #[serde(default)]
-    pub upstream:   Option<ChainUpstream>,
-    /// Single enrolled downstream identity. When set, the node accepts
-    /// inbound chain traffic only from this pubkey. v1 supports exactly
-    /// one downstream per node; multi-downstream lands in a later phase.
-    #[serde(default)]
-    pub downstream: Option<ChainDownstream>,
-    /// Inbound listener parameters. Required when `[chain.downstream]` is
-    /// set. Forbidden when `[chain.downstream]` is absent.
-    #[serde(default)]
-    pub listener:   Option<ChainListener>,
-    /// Tunnel-over-chain settings (`yggdrasilctl chain` introspection
-    /// commands open chain tunnels to reach upstream `/healthz`,
-    /// `/metrics`, and friends without exposing those endpoints publicly).
-    /// Default policy = allow loopback destinations only.
-    #[serde(default)]
-    pub tunnel:     ChainTunnel,
-}
-
-/// `[chain.upstream]` — outbound chain client configuration.
+/// `[dial]` — outbound chain client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChainUpstream {
+pub struct DialSection {
     /// Tagged pubkey (`x25519:<hex>`) of the upstream node we dial.
     pub pubkey: PubKey,
     /// Endpoint to dial: `host:port` or `[ipv6]:port`. Re-resolved on
@@ -180,58 +155,18 @@ pub struct ChainUpstream {
     pub rekey_interval: Duration,
 }
 
-/// `[chain.downstream]` — accepted downstream identity.
+/// `[accept]` — single enrolled inbound chain peer plus its listener socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChainDownstream {
-    /// Tagged pubkey (`x25519:<hex>`) of the enrolled downstream node.
+pub struct AcceptSection {
+    /// Tagged pubkey (`x25519:<hex>`) of the enrolled inbound peer.
     pub pubkey: PubKey,
+    /// UDP socket to bind on. Required.
+    pub listen: SocketAddr,
     /// Re-handshake after at most this much time (default 1h).
     #[serde(default = "default_rekey_interval", with = "humantime_serde")]
     pub rekey_interval: Duration,
 }
-
-/// `[chain.listener]` — inbound chain listener parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChainListener {
-    /// UDP socket to bind on. Required.
-    pub listen: SocketAddr,
-}
-
-/// `[chain.tunnel]` — tunnel-over-chain allow-list.
-///
-/// The tunnel terminator (a relay where `TunnelOpen.target_pubkey ==
-/// self`) enforces these rules before dialling the open's `dest` socket
-/// address. The default policy is **loopback-only**: operator
-/// introspection endpoints listening on `127.0.0.1` or `::1` are
-/// reachable through `yggdrasilctl chain`; everything else returns
-/// `tunnel_reject::TARGET_NOT_ALLOWED`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChainTunnel {
-    /// Allow any port on the local loopback address (`127.0.0.0/8` or
-    /// `::1`). Default `true` — reaches the daemon's own metrics /
-    /// health endpoints, which is the v1 use case.
-    #[serde(default = "default_allow_loopback")]
-    pub allow_loopback: bool,
-    /// Additional explicit `host:port` destinations the terminator is
-    /// permitted to dial. Empty by default. Each entry is exact-match
-    /// against the open request's `dest` (both IP and port).
-    #[serde(default)]
-    pub allowed_targets: Vec<SocketAddr>,
-}
-
-impl Default for ChainTunnel {
-    fn default() -> Self {
-        Self {
-            allow_loopback: true,
-            allowed_targets: Vec::new(),
-        }
-    }
-}
-
-fn default_allow_loopback() -> bool { true }
 
 fn default_state_dir() -> PathBuf       { PathBuf::from("/var/lib/yggdrasil") }
 fn default_identity_file() -> PathBuf   { PathBuf::from("/etc/yggdrasil/identity.key") }
@@ -257,57 +192,45 @@ impl ServerConfig {
 
     /// Validate the in-memory config.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // ---- [chain.listener] ↔ [chain.downstream] coupling ----
-        match (&self.chain.listener, &self.chain.downstream) {
-            (Some(_), None) => {
-                return Err(ConfigError::Invalid(
-                    "[chain.listener] is set but [chain.downstream] is not; \
-                     a listener with no enrolled downstream would accept no traffic"
-                        .into(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(ConfigError::Invalid(
-                    "[chain.downstream] is set but [chain.listener] is not; \
-                     an enrolled downstream cannot reach this node without a listener"
-                        .into(),
-                ));
-            }
-            _ => {}
-        }
-
         // ---- Terminal-mode constraints ----
-        if matches!(self.server.mode, Mode::Terminal)
-            && (self.chain.downstream.is_some() || self.chain.listener.is_some())
-        {
+        if matches!(self.server.mode, Mode::Terminal) && self.accept.is_some() {
             return Err(ConfigError::Invalid(
-                "terminal-mode nodes must not declare [chain.downstream] or \
-                 [chain.listener] — they never accept inbound chain traffic"
+                "terminal-mode nodes must not declare [accept] — they never \
+                 accept inbound chain traffic"
                     .into(),
             ));
         }
 
-        // ---- [chain.upstream] sanity ----
-        if let Some(up) = &self.chain.upstream {
+        // ---- [dial] sanity ----
+        if let Some(up) = &self.dial {
             if up.endpoint.trim().is_empty() {
                 return Err(ConfigError::Invalid(
-                    "[chain.upstream].endpoint must not be empty".into(),
+                    "[dial].endpoint must not be empty".into(),
                 ));
             }
             if !up.endpoint.contains(':') {
                 return Err(ConfigError::Invalid(format!(
-                    "[chain.upstream].endpoint must be host:port (got {:?})",
+                    "[dial].endpoint must be host:port (got {:?})",
                     up.endpoint
                 )));
             }
             if up.heartbeat_interval.is_zero() {
                 return Err(ConfigError::Invalid(
-                    "[chain.upstream].heartbeat_interval must be > 0".into(),
+                    "[dial].heartbeat_interval must be > 0".into(),
                 ));
             }
             if up.rekey_interval.is_zero() {
                 return Err(ConfigError::Invalid(
-                    "[chain.upstream].rekey_interval must be > 0".into(),
+                    "[dial].rekey_interval must be > 0".into(),
+                ));
+            }
+        }
+
+        // ---- [accept] sanity ----
+        if let Some(acc) = &self.accept {
+            if acc.rekey_interval.is_zero() {
+                return Err(ConfigError::Invalid(
+                    "[accept].rekey_interval must be > 0".into(),
                 ));
             }
         }
@@ -505,21 +428,21 @@ mod tests {
         );
     }
 
-    // ---- [chain.upstream] ----
+    // ---- [dial] ----
 
     #[test]
-    fn parses_chain_upstream() {
+    fn parses_dial_section() {
         let cfg = parse(
             r#"
             [server]
 
-            [chain.upstream]
+            [dial]
             pubkey   = "x25519:1111111111111111111111111111111111111111111111111111111111111111"
             endpoint = "u.example.com:7117"
             "#,
         )
         .unwrap();
-        let up = cfg.chain.upstream.expect("upstream parsed");
+        let up = cfg.dial.expect("dial parsed");
         assert_eq!(up.endpoint, "u.example.com:7117");
         assert_eq!(up.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(up.rekey_interval, Duration::from_secs(3600));
@@ -530,12 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_upstream_rejects_untagged_pubkey() {
+    fn dial_rejects_untagged_pubkey() {
         let err = parse(
             r#"
             [server]
 
-            [chain.upstream]
+            [dial]
             pubkey   = "1111111111111111111111111111111111111111111111111111111111111111"
             endpoint = "host:1"
             "#,
@@ -546,12 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_upstream_rejects_empty_endpoint() {
+    fn dial_rejects_empty_endpoint() {
         let err = parse(
             r#"
             [server]
 
-            [chain.upstream]
+            [dial]
             pubkey   = "x25519:1111111111111111111111111111111111111111111111111111111111111111"
             endpoint = ""
             "#,
@@ -562,12 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_upstream_rejects_endpoint_without_port() {
+    fn dial_rejects_endpoint_without_port() {
         let err = parse(
             r#"
             [server]
 
-            [chain.upstream]
+            [dial]
             pubkey   = "x25519:1111111111111111111111111111111111111111111111111111111111111111"
             endpoint = "host-no-port"
             "#,
@@ -578,12 +501,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_upstream_parses_humantime_intervals() {
+    fn dial_parses_humantime_intervals() {
         let cfg = parse(
             r#"
             [server]
 
-            [chain.upstream]
+            [dial]
             pubkey             = "x25519:2222222222222222222222222222222222222222222222222222222222222222"
             endpoint           = "host:1"
             heartbeat_interval = "2s"
@@ -591,78 +514,75 @@ mod tests {
             "#,
         )
         .unwrap();
-        let up = cfg.chain.upstream.unwrap();
+        let up = cfg.dial.unwrap();
         assert_eq!(up.heartbeat_interval, Duration::from_secs(2));
         assert_eq!(up.rekey_interval, Duration::from_secs(30 * 60));
     }
 
-    // ---- [chain.downstream] + [chain.listener] ----
+    // ---- [accept] ----
 
     #[test]
-    fn relay_with_chain_downstream_and_listener_parses() {
+    fn relay_with_accept_section_parses() {
         let cfg = parse(
             r#"
             [server]
 
-            [chain.downstream]
+            [accept]
             pubkey = "x25519:3333333333333333333333333333333333333333333333333333333333333333"
-
-            [chain.listener]
             listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
-        let dn = cfg.chain.downstream.expect("downstream parsed");
-        let ln = cfg.chain.listener.expect("listener parsed");
+        let acc = cfg.accept.expect("accept parsed");
         assert_eq!(
-            dn.pubkey,
+            acc.pubkey,
             PubKey::X25519([0x33; ratatoskr::auth::PUBLIC_KEY_LEN])
         );
-        assert_eq!(ln.listen, "0.0.0.0:51820".parse::<SocketAddr>().unwrap());
-        assert_eq!(dn.rekey_interval, Duration::from_secs(3600));
+        assert_eq!(acc.listen, "0.0.0.0:51820".parse::<SocketAddr>().unwrap());
+        assert_eq!(acc.rekey_interval, Duration::from_secs(3600));
     }
 
     #[test]
-    fn chain_downstream_without_listener_is_rejected() {
+    fn accept_missing_listen_is_rejected() {
         let err = parse(
             r#"
             [server]
 
-            [chain.downstream]
+            [accept]
             pubkey = "x25519:4444444444444444444444444444444444444444444444444444444444444444"
             "#,
         )
         .err()
         .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("[chain.listener] is not")));
+        // Missing required `listen` is a TOML / serde deserialisation error,
+        // surfaced through ConfigError::Proto.
+        assert!(matches!(err, ConfigError::Proto(_)));
     }
 
     #[test]
-    fn chain_listener_without_downstream_is_rejected() {
+    fn accept_missing_pubkey_is_rejected() {
         let err = parse(
             r#"
             [server]
 
-            [chain.listener]
+            [accept]
             listen = "0.0.0.0:51820"
             "#,
         )
         .err()
         .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("[chain.downstream] is not")));
+        assert!(matches!(err, ConfigError::Proto(_)));
     }
 
     #[test]
-    fn terminal_mode_rejects_chain_downstream() {
+    fn terminal_mode_rejects_accept_section() {
         let err = parse(
             r#"
             [server]
             mode = "terminal"
 
-            [chain.downstream]
+            [accept]
             pubkey = "x25519:5555555555555555555555555555555555555555555555555555555555555555"
-
-            [chain.listener]
             listen = "0.0.0.0:51820"
             "#,
         )
@@ -672,52 +592,47 @@ mod tests {
     }
 
     #[test]
-    fn terminal_mode_accepts_only_upstream() {
+    fn terminal_mode_accepts_only_dial() {
         let cfg = parse(
             r#"
             [server]
             mode = "terminal"
 
-            [chain.upstream]
+            [dial]
             pubkey   = "x25519:6666666666666666666666666666666666666666666666666666666666666666"
             endpoint = "u.example.com:7117"
             "#,
         )
         .unwrap();
         assert_eq!(cfg.server.mode, Mode::Terminal);
-        assert!(cfg.chain.upstream.is_some());
-        assert!(cfg.chain.downstream.is_none());
-        assert!(cfg.chain.listener.is_none());
+        assert!(cfg.dial.is_some());
+        assert!(cfg.accept.is_none());
     }
 
     #[test]
-    fn relay_with_both_upstream_and_downstream_parses() {
+    fn relay_with_both_dial_and_accept_parses() {
         let cfg = parse(
             r#"
             [server]
 
-            [chain.upstream]
+            [dial]
             pubkey   = "x25519:7777777777777777777777777777777777777777777777777777777777777777"
             endpoint = "uu.example.com:7117"
 
-            [chain.downstream]
+            [accept]
             pubkey = "x25519:8888888888888888888888888888888888888888888888888888888888888888"
-
-            [chain.listener]
             listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
-        assert!(cfg.chain.upstream.is_some());
-        assert!(cfg.chain.downstream.is_some());
-        assert!(cfg.chain.listener.is_some());
+        assert!(cfg.dial.is_some());
+        assert!(cfg.accept.is_some());
     }
 
     #[test]
-    fn empty_chain_section_is_valid() {
+    fn empty_chain_sections_are_valid() {
         let cfg = parse(relay_minimal_toml()).unwrap();
-        assert!(cfg.chain.upstream.is_none());
-        assert!(cfg.chain.downstream.is_none());
-        assert!(cfg.chain.listener.is_none());
+        assert!(cfg.dial.is_none());
+        assert!(cfg.accept.is_none());
     }
 }

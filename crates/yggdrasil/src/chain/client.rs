@@ -1,6 +1,6 @@
 //! Outbound chain control client.
 //!
-//! Every node — relay or terminal — that declares `[chain.upstream]` in its
+//! Every node — relay or terminal — that declares `[dial]` in its
 //! config dials that upstream over UDP and maintains a single Noise_IK
 //! session, emitting an authenticated heartbeat every `heartbeat_interval`.
 //! Re-handshakes every `rekey_interval`. On any transport / decode error

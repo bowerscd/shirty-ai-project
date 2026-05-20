@@ -10,7 +10,7 @@ A residential reverse proxy with a chain control plane. One binary, two modes:
   local rule set as a predicate set the relay derives its own listeners from.
 
 Both modes are the same `yggdrasil` binary; the difference is `[server].mode`
-plus whether `[chain.downstream]` or `[chain.upstream]` is configured. A
+plus whether `[accept]` or `[dial]` is configured. A
 deployment is a chain of one or more relays terminating in exactly one
 terminal — `home -> midbox -> vps` works the same way `home -> vps` does.
 
@@ -44,7 +44,7 @@ sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
 mode = "relay"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
 EOF
 ```
@@ -68,8 +68,8 @@ The enrolment handshake is two files exchanged out-of-band: an **intro** file
 the terminal emits (advertising its pubkey to the relay) and an **invite**
 file the relay emits in reply (committing both pubkeys plus the relay's
 reachable endpoint). The terminal applies the invite to populate
-`[chain.upstream]`; the relay's `identity add-downstream` step has already
-written `[chain.downstream]` locally.
+`[dial]`; the relay's `identity add-downstream` step has already
+written `[accept]` locally.
 
 ```bash
 # Terminal: export an intro file.
@@ -81,7 +81,7 @@ sudo yggdrasilctl identity add-downstream \
     --my-endpoint vps.example.net:51820 \
     --out /tmp/home.invite
 
-# Terminal: apply the invite (writes [chain.upstream]).
+# Terminal: apply the invite (writes [dial]).
 sudo yggdrasilctl identity add-upstream --from /tmp/home.invite
 ```
 

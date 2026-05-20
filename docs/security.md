@@ -74,7 +74,7 @@ out-of-band:
 
 `yggdrasilctl identity add-upstream --from invite.txt` verifies that
 `downstream_pubkey` in the invite matches the local identity (catches
-"wrong invite file" mistakes) before writing `[chain.upstream]`.
+"wrong invite file" mistakes) before writing `[dial]`.
 
 This buys you **two** things over TOFU:
 
@@ -122,12 +122,10 @@ inside the relay is still part of your attack surface).
   handshake from a wrong static key is rejected.
 * **Pending-peer takeover.** Until an operator approves, a candidate's
   traffic is not forwarded — the boundary is your operator process.
-* **Rogue tunnel destinations.** The terminator's `[chain.tunnel]`
-  allow-list (`allow_loopback = true` default + explicit
-  `allowed_targets`) bounds what an upstream can ask the terminator to
-  dial. Without an explicit allow-list entry, a `TunnelOpen` for
-  `192.168.1.1:80` is rejected even if the chain neighbour is
-  legitimate.
+* **Rogue tunnel destinations.** In v1, tunnel destination policy is
+  loopback-only, which bounds what an upstream can ask the terminator to
+  dial. A `TunnelOpen` for `192.168.1.1:80` is rejected even if the
+  chain neighbour is legitimate.
 
 ## What yggdrasil does NOT protect against
 
@@ -145,7 +143,7 @@ inside the relay is still part of your attack surface).
   drop / inject application-layer traffic if it isn't end-to-end
   encrypted, can publish bogus derived rules under a captured chain
   position (subject to chain-diff visibility), and can dial any
-  destination the downstream's `[chain.tunnel]` allow-list permits.
+  destination allowed by the v1 loopback-only tunnel destination policy.
 * **Long-term-key compromise.** If `identity.key` leaks, the attacker
   can impersonate the node. Yggdrasil does not currently warn on
   out-of-band rotation by your peers; you'd notice only when the
@@ -164,7 +162,7 @@ inside the relay is still part of your attack surface).
 
 ### Root relay
 
-* **Inbound UDP** on `[chain.listener].listen` from the open internet.
+* **Inbound UDP** on `[accept].listen` from the open internet.
   Downstream IPs can roam, so this can't be pinned. Apply UDP rate
   limits if you're exposed to broad-internet traffic.
 * **Inbound TCP / UDP** on every derived rule's `listen` from whatever
@@ -177,10 +175,10 @@ inside the relay is still part of your attack surface).
 
 ### Mid-chain relay
 
-* **Inbound UDP** on `[chain.listener].listen` from the immediate
+* **Inbound UDP** on `[accept].listen` from the immediate
   downstream's known IP only. Pin it — your mid-relay is not exposed
   to the open internet.
-* **Outbound UDP** to the next-hop upstream's `[chain.listener].listen`.
+* **Outbound UDP** to the next-hop upstream's `[accept].listen`.
 * Same proxy-rule and control-socket / metrics-listener rules as the
   root relay.
 
@@ -188,7 +186,7 @@ inside the relay is still part of your attack surface).
 
 * **No inbound** firewall openings required. The terminal never accepts
   inbound chain traffic.
-* **Outbound UDP** to the upstream's `[chain.upstream].endpoint`. Don't
+* **Outbound UDP** to the upstream's `[dial].endpoint`. Don't
   block it at your residential router.
 
 ## Operational hardening

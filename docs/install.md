@@ -135,7 +135,7 @@ to run `yggdrasilctl` without sudo.
 
 Inbound:
 
-* UDP for `[chain.listener].listen` from the open internet — downstreams
+* UDP for `[accept].listen` from the open internet — downstreams
   can roam, so you can't tighten this to a single IP.
 * TCP / UDP for every derived `listen` port from the chain.
 * Nothing for the control socket — it's `AF_UNIX`, not a TCP port.
@@ -148,15 +148,15 @@ by default.
 
 ### Mid-chain relay
 
-* Inbound UDP for `[chain.listener].listen` from the immediate downstream
+* Inbound UDP for `[accept].listen` from the immediate downstream
   only (you know its public IP — pin it).
-* Outbound UDP to the next-hop upstream's `[chain.listener].listen`.
+* Outbound UDP to the next-hop upstream's `[accept].listen`.
 * TCP / UDP for derived rules at this hop, if any.
 
 ### Terminal (home)
 
 * Inbound: none. The terminal never accepts inbound chain traffic.
-* Outbound UDP to the upstream's `[chain.upstream].endpoint` port.
+* Outbound UDP to the upstream's `[dial].endpoint` port.
 
 If the home box is double-NATted / behind CGNAT, that's fine — the
 terminal initiates the heartbeats, so it punches through. Just don't

@@ -58,7 +58,7 @@ listen = "0.0.0.0:9090"
 [control]
 socket = "/run/yggdrasil/control.sock"
 
-[chain.listener]
+[accept]
 listen = "0.0.0.0:51820"
 EOF
 
@@ -120,7 +120,7 @@ yggdrasilctl --config "$HOME_CFG" identity export-intro \
     --out "$INTRO_PATH" \
     --note "e2e home downstream" >/dev/null
 
-echo "[init] vps mints invite for home (writes [chain.downstream])"
+echo "[init] vps mints invite for home (writes [accept])"
 yggdrasilctl --config "$VPS_CFG" identity add-downstream \
     --identity-file "$VPS_KEY" \
     --from "$INTRO_PATH" \
@@ -128,7 +128,7 @@ yggdrasilctl --config "$VPS_CFG" identity add-downstream \
     --out "$INVITE_PATH" \
     --note "e2e vps→home" >/dev/null
 
-echo "[init] home applies invite (writes [chain.upstream])"
+echo "[init] home applies invite (writes [dial])"
 yggdrasilctl --config "$HOME_CFG" identity add-upstream \
     --identity-file "$HOME_KEY" \
     --from "$INVITE_PATH" >/dev/null
