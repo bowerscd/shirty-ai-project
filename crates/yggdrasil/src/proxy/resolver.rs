@@ -215,6 +215,13 @@ impl ResolverFactory {
         }
     }
 
+    pub fn new_gateway(peer_state: Arc<PeerState>) -> Self {
+        Self {
+            mode: Mode::Gateway,
+            peer_state: Some(peer_state),
+        }
+    }
+
     pub fn new_terminal() -> Self {
         Self {
             mode: Mode::Terminal,
@@ -251,7 +258,7 @@ impl ResolverFactory {
         };
 
         match (self.mode, target) {
-            (Mode::Relay, Target::Port(port)) => {
+            (Mode::Gateway | Mode::Relay, Target::Port(port)) => {
                 let peer_state = self.peer_state.clone().ok_or(
                     ResolverBuildError::Internal(
                         "relay-mode factory has no peer_state (logic error)",
@@ -259,19 +266,19 @@ impl ResolverFactory {
                 )?;
                 Ok(UpstreamResolver::Dynamic { peer_state, port })
             }
-            (Mode::Relay, Target::Addr(_)) => Err(ResolverBuildError::ModeMismatch {
+            (mode @ (Mode::Gateway | Mode::Relay), Target::Addr(_)) => Err(ResolverBuildError::ModeMismatch {
                 rule: rule.name.clone(),
-                mode: Mode::Relay,
+                mode,
                 detail:
-                    "rule has target_addr (terminal-style) but daemon is in relay mode; \
-                     terminal rules cannot run on a relay",
+                    "rule has target_addr (terminal-style) but daemon accepts inbound chain traffic; \
+                     terminal rules cannot run on a relay or gateway",
             }),
-            (Mode::Relay, Target::Host(_)) => Err(ResolverBuildError::ModeMismatch {
+            (mode @ (Mode::Gateway | Mode::Relay), Target::Host(_)) => Err(ResolverBuildError::ModeMismatch {
                 rule: rule.name.clone(),
-                mode: Mode::Relay,
+                mode,
                 detail:
-                    "rule has target_host (terminal-style) but daemon is in relay mode; \
-                     terminal rules cannot run on a relay",
+                    "rule has target_host (terminal-style) but daemon accepts inbound chain traffic; \
+                     terminal rules cannot run on a relay or gateway",
             }),
             (Mode::Terminal, Target::Addr(addr)) => Ok(UpstreamResolver::Static { addr }),
             (Mode::Terminal, Target::Host(uh)) => {

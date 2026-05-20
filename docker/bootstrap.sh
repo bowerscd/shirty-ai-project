@@ -2,29 +2,28 @@
 # bootstrap.sh — one-shot key-and-config setup for the compose e2e stack.
 #
 # Runs in the `init` service (entrypoint = this script). Mounts the state
-# volumes for vps (upstream relay), home (downstream terminal), and the
-# standalone terminal-mode yggdrasil; provisions identities, writes
-# configs, and runs the offline intro/invite handshake via
-# `yggdrasilctl identity`. vps/home/terminal `depends_on: { init: ... }`
-# so they don't start until this completes.
+# volumes for vps (gateway-mode acceptor) and home (terminal-mode dialer);
+# provisions identities, writes configs, and runs the offline
+# intro/invite handshake via `yggdrasilctl identity`. vps/home
+# `depends_on: { init: ... }` so they don't start until this completes.
+#
+# Note: in three-mode design, proxy rules are owned by the terminal and
+# pushed to the gateway via the chain predicate. Hence rules go in home's
+# rules dir, not vps's.
 set -euo pipefail
 
 # ---- paths -----------------------------------------------------------------
 
-# vps: relay-mode upstream. Owns rules + accepts heartbeats from home.
+# vps: gateway-mode acceptor. Accepts the chain dial from home and binds
+# the listeners that home pushes via the chain predicate.
 VPS_CFG=/etc/yggdrasil/config.toml
 VPS_KEY=/etc/yggdrasil/identity.key
 
-# home: terminal-mode downstream. Heartbeats up to vps. Runs the echo
-# backends in the same network namespace so vps's rule targets
-# `downstream_ip:target_port` land on the python echo servers.
+# home: terminal-mode dialer. Owns the rule set + runs the python echo
+# backends in the same network namespace so the rule targets terminate
+# locally on home.
 HOME_CFG=/etc/yggdrasil-home/config.toml
 HOME_KEY=/etc/yggdrasil-home/identity.key
-
-# terminal: standalone terminal-mode yggdrasil. No chain config; exists
-# only to exercise the DNS-resolved `upstream_host` proxy path.
-YGT_CFG=/etc/yggdrasil-terminal/config.toml
-YGT_KEY=/etc/yggdrasil-terminal/identity.key
 
 INTRO_PATH=/tmp/home-intro.txt
 INVITE_PATH=/tmp/home-invite.txt
@@ -32,8 +31,7 @@ INVITE_PATH=/tmp/home-invite.txt
 # Re-running the init service should be idempotent so `podman compose up`
 # after a partial failure works without manual cleanup.
 if [[ -f "$VPS_KEY"  && -f "$VPS_CFG"  \
-   && -f "$HOME_KEY" && -f "$HOME_CFG" \
-   && -f "$YGT_KEY"  && -f "$YGT_CFG" ]]; then
+   && -f "$HOME_KEY" && -f "$HOME_CFG" ]]; then
     echo "[init] already bootstrapped; skipping"
     exit 0
 fi
@@ -42,6 +40,8 @@ fi
 
 echo "[init] preparing vps dirs"
 mkdir -p /etc/yggdrasil/rules /etc/yggdrasil/certs
+# vps owns no rules; the chain predicate from home dictates the rule set.
+# An empty rules_dir is fine (the supervisor only complains on parse errors).
 
 echo "[init] writing vps seed config"
 cat >"$VPS_CFG" <<EOF
@@ -64,24 +64,6 @@ EOF
 echo "[init] generating vps identity"
 yggdrasilctl --config "$VPS_CFG" identity rotate \
     --identity-file "$VPS_KEY" --force >/dev/null
-
-echo "[init] writing default rules (vps)"
-cat >/etc/yggdrasil/rules/tcp-echo.toml <<'EOF'
-[[rule]]
-name        = "tcp-echo"
-listen      = "0.0.0.0:7000"
-protocol    = "tcp"
-target_port = 7100
-EOF
-
-cat >/etc/yggdrasil/rules/udp-echo.toml <<'EOF'
-[[rule]]
-name         = "udp-echo"
-listen       = "0.0.0.0:7001"
-protocol     = "udp"
-target_port  = 7101
-idle_timeout = "30s"
-EOF
 
 # ---- home (terminal-mode downstream) ---------------------------------------
 #
@@ -133,41 +115,38 @@ yggdrasilctl --config "$HOME_CFG" identity add-upstream \
 
 rm -f "$INTRO_PATH" "$INVITE_PATH"
 
-# ---- terminal (standalone, DNS-upstream test) ------------------------------
+# ---- home rules ------------------------------------------------------------
 #
-# Separate identity + config + rules dir for the `terminal` container. The
-# rule listens on :7200 and forwards to `home-echo-dns:7100`. That hostname
-# is pinned to the home box's IP via the terminal container's `extra_hosts:`
-# entry, so the DNS resolver path exercises both the resolution loop and
-# the dial-after-resolve hot path in tcp.rs. No chain config on this side —
-# the daemon runs purely as a local proxy.
+# All proxy rules live on the terminal in three-mode design and are pushed
+# up to the gateway (vps) via the chain predicate. The gateway binds the
+# listeners; traffic tunnels back to the terminal which delivers it locally.
 
-echo "[init] preparing terminal dirs"
-mkdir -p /etc/yggdrasil-terminal/rules /etc/yggdrasil-terminal/certs
-
-echo "[init] writing terminal seed config"
-cat >"$YGT_CFG" <<'EOF'
-[server]
-rules_dir     = "/etc/yggdrasil/rules"
-cert_dir      = "/etc/yggdrasil/certs"
-state_dir     = "/var/lib/yggdrasil"
-identity_file = "/etc/yggdrasil/identity.key"
-
-[control]
-socket = "/run/yggdrasil/control.sock"
+echo "[init] writing home rules: tcp-echo, udp-echo, dns-echo"
+cat >/etc/yggdrasil-home/rules/tcp-echo.toml <<'EOF'
+[[rule]]
+name        = "tcp-echo"
+listen      = "0.0.0.0:7000"
+protocol    = "tcp"
+target_addr = "127.0.0.1:7100"
 EOF
 
-echo "[init] generating terminal identity"
-yggdrasilctl --config "$YGT_CFG" identity rotate \
-    --identity-file "$YGT_KEY" --force >/dev/null
-
-echo "[init] writing terminal DNS-upstream rule"
-cat >/etc/yggdrasil-terminal/rules/dns-echo.toml <<'EOF'
+cat >/etc/yggdrasil-home/rules/udp-echo.toml <<'EOF'
 [[rule]]
-name          = "dns-echo"
-listen        = "0.0.0.0:7200"
-protocol      = "tcp"
-upstream_host = "home-echo-dns:7100"
+name         = "udp-echo"
+listen       = "0.0.0.0:7001"
+protocol     = "udp"
+target_addr  = "127.0.0.1:7101"
+idle_timeout = "30s"
+EOF
+
+# DNS-resolved target_host: pinned via home's `extra_hosts:` entry to the
+# home container's own IP. Exercises the OS-resolver path on the terminal.
+cat >/etc/yggdrasil-home/rules/dns-echo.toml <<'EOF'
+[[rule]]
+name        = "dns-echo"
+listen      = "0.0.0.0:7200"
+protocol    = "tcp"
+target_host = "home-echo-dns:7100"
 EOF
 
 echo "[init] done"

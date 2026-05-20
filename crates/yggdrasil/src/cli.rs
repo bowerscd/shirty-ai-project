@@ -64,6 +64,7 @@ pub struct RunArgs {
 /// CLI-side mirror of [`crate::config::Mode`].
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RequireModeArg {
+    Gateway,
     Relay,
     Terminal,
 }
@@ -71,6 +72,7 @@ pub enum RequireModeArg {
 impl From<RequireModeArg> for Mode {
     fn from(m: RequireModeArg) -> Self {
         match m {
+            RequireModeArg::Gateway => Mode::Gateway,
             RequireModeArg::Relay => Mode::Relay,
             RequireModeArg::Terminal => Mode::Terminal,
         }

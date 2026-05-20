@@ -131,14 +131,17 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
         Response::Status(s) => {
             // `mode` controls which fields are meaningful: terminal-mode
             // daemons have no downstream concept, so we omit the heartbeat /
-            // enrollment lines.
+            // enrollment lines. Gateway and relay both accept inbound chain
+            // traffic and so do have a downstream.
             let mode_str = match s.mode {
+                Mode::Gateway => "gateway",
                 Mode::Relay => "relay",
                 Mode::Terminal => "terminal",
             };
+            let has_downstream = matches!(s.mode, Mode::Gateway | Mode::Relay);
             println!("version:         {}", s.version);
             println!("mode:            {mode_str}");
-            if matches!(s.mode, Mode::Relay) {
+            if has_downstream {
                 println!(
                     "downstream_ip:   {}",
                     s.downstream_ip
@@ -155,7 +158,7 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             }
             println!("rules:           {}", s.rule_count);
             println!("uptime:          {} s", s.uptime_secs);
-            if matches!(s.mode, Mode::Relay) {
+            if has_downstream {
                 println!("downstream_enrolled: {}", s.downstream_enrolled);
             }
         }

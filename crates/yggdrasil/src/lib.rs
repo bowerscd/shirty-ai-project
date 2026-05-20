@@ -86,19 +86,24 @@ pub async fn run(args: cli::RunArgs) -> Result<()> {
     }
 
     match mode {
-        config::Mode::Relay => run_relay(args, config).await,
-        config::Mode::Terminal => run_terminal(args, config).await,
+        config::Mode::Gateway | config::Mode::Relay => run_relay(args, config, mode).await,
+        config::Mode::Terminal => run_terminal(args, config, mode).await,
     }
 }
 
 /// Run the relay-mode daemon: optional inbound chain listener, peer
 /// state, pending-peer store, dynamic-IP-resolved proxies. May also dial
 /// an upstream chain client when `[dial]` is configured.
-pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Result<()> {
+pub async fn run_relay(
+    args: cli::RunArgs,
+    config: config::ServerConfig,
+    mode: config::Mode,
+) -> Result<()> {
+    let wire_mode: ratatoskr::control::Mode = mode.into();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
-        mode = "relay",
+        mode = mode.as_str(),
         accept_listen = ?config.accept.as_ref().map(|a| a.listen),
         dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
@@ -144,7 +149,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     let introspection_slot = metrics::new_introspection_slot();
     if let Err(e) = metrics::init(
         config.metrics.listen,
-        ratatoskr::control::Mode::Relay,
+        wire_mode,
         Some(introspection_slot.clone()),
     )
     .await
@@ -154,7 +159,11 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
 
     // 5. Rule-driven proxy supervisor. Built *before* the heartbeat
     //    listener so the chain acceptor can hold a handle to it.
-    let resolver_factory = ResolverFactory::new_relay(peer_state.clone());
+    let resolver_factory = match mode {
+        config::Mode::Gateway => ResolverFactory::new_gateway(peer_state.clone()),
+        config::Mode::Relay => ResolverFactory::new_relay(peer_state.clone()),
+        config::Mode::Terminal => unreachable!("run_relay only dispatched for gateway/relay"),
+    };
     let supervisor = ProxySupervisor::spawn(
         config.server.rules_dir.clone(),
         RULE_DEBOUNCE,
@@ -362,7 +371,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     // 7. UDS control surface for `yggdrasilctl`.
     let control = ControlServer::bind(
         config.control.socket.clone(),
-        ratatoskr::control::Mode::Relay,
+        wire_mode,
         Some(peer_state.clone()),
         &supervisor,
         Some(pending_store.clone()),
@@ -380,7 +389,8 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
 
     health::mark_ready();
     systemd::notify_ready_with_status(&format!(
-        "mode=relay, accept={}, dial={}",
+        "mode={}, accept={}, dial={}",
+        mode.as_str(),
         if config.accept.is_some() { "yes" } else { "no" },
         if config.dial.is_some() { "yes" } else { "no" },
     ));
@@ -403,11 +413,16 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
 /// state, no pending peers. Just the proxy supervisor (with a static
 /// resolver factory), metrics exporter, the control socket, and an
 /// optional outbound chain client.
-pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> Result<()> {
+pub async fn run_terminal(
+    args: cli::RunArgs,
+    config: config::ServerConfig,
+    mode: config::Mode,
+) -> Result<()> {
+    let wire_mode: ratatoskr::control::Mode = mode.into();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
-        mode = "terminal",
+        mode = mode.as_str(),
         dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
@@ -427,7 +442,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     let introspection_slot = metrics::new_introspection_slot();
     if let Err(e) = metrics::init(
         config.metrics.listen,
-        ratatoskr::control::Mode::Terminal,
+        wire_mode,
         Some(introspection_slot.clone()),
     )
     .await
@@ -503,7 +518,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     //    peer-related endpoints return `not_supported_in_terminal_mode`.
     let control = ControlServer::bind(
         config.control.socket.clone(),
-        ratatoskr::control::Mode::Terminal,
+        wire_mode,
         None,
         &supervisor,
         None,
@@ -543,7 +558,8 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
 
     health::mark_ready();
     systemd::notify_ready_with_status(&format!(
-        "mode=terminal, dial={}",
+        "mode={}, dial={}",
+        mode.as_str(),
         if config.dial.is_some() { "yes" } else { "no" },
     ));
 

@@ -45,12 +45,18 @@ pub struct ServerConfig {
     pub accept:  Option<AcceptSection>,
 }
 
-/// Effective runtime mode, derived from top-level chain sections.
+/// Effective runtime mode, derived from top-level chain section presence.
 ///
-/// * `Relay` — `[accept]` is present (with or without `[dial]`).
-/// * `Terminal` — only `[dial]` is present.
+/// | mode       | `[dial]` | `[accept]` |
+/// |------------|----------|------------|
+/// | `Gateway`  | absent   | present    |
+/// | `Relay`    | present  | present    |
+/// | `Terminal` | present  | absent     |
+///
+/// (Both absent is rejected at config-load time.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    Gateway,
     Relay,
     Terminal,
 }
@@ -58,8 +64,19 @@ pub enum Mode {
 impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Gateway => "gateway",
             Self::Relay => "relay",
             Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl From<Mode> for ratatoskr::control::Mode {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::Gateway => Self::Gateway,
+            Mode::Relay => Self::Relay,
+            Mode::Terminal => Self::Terminal,
         }
     }
 }
@@ -184,8 +201,9 @@ impl ServerConfig {
     /// Derive effective runtime mode from section presence.
     pub fn derived_mode(&self) -> Result<Mode, ConfigError> {
         match (self.dial.is_some(), self.accept.is_some()) {
-            (true, false) => Ok(Mode::Terminal),
-            (false, true) | (true, true) => Ok(Mode::Relay),
+            (false, true)  => Ok(Mode::Gateway),
+            (true,  true)  => Ok(Mode::Relay),
+            (true,  false) => Ok(Mode::Terminal),
             (false, false) => Err(ConfigError::Invalid(
                 "config must define at least one of [dial] or [accept]".into(),
             )),
@@ -297,9 +315,9 @@ mod tests {
     }
 
     #[test]
-    fn derived_mode_is_relay_when_accept_only() {
+    fn derived_mode_is_gateway_when_accept_only() {
         let cfg = parse(relay_minimal_toml()).unwrap();
-        assert_eq!(cfg.derived_mode().unwrap(), Mode::Relay);
+        assert_eq!(cfg.derived_mode().unwrap(), Mode::Gateway);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 #
 #   ┌────────────┐      wan (172.30.0.0/24)       ┌─────────────────────┐
 #   │  client    │ ────────────────────────────►  │  vps (yggdrasil)    │
-#   │  (tester)  │                                │   relay-mode        │
+#   │  (tester)  │                                │   gateway-mode      │
 #   └────────────┘                                │   :7000/tcp         │
 #                                                 │   :7001/udp         │
 #                                                 │   :51820/udp chain  │
@@ -16,18 +16,22 @@
 #                                                 │  home (yggdrasil        │
 #                                                 │  terminal-mode +        │
 #                                                 │  echo backends on       │
-#                                                 │  :7100/tcp, :7101/udp)  │
+#                                                 │  :7100/tcp, :7101/udp;  │
+#                                                 │  dns-echo rule :7200)   │
 #                                                 └─────────────────────────┘
 #
 # Notes on the topology:
-# - vps runs in relay mode with `[accept]` + `[accept]`
-#   pinned to home's pubkey. Its rule files forward traffic from
-#   :7000/:7001 to downstream_ip:7100/7101.
-# - home runs in terminal mode with `[dial]` pointing at
-#   vps:51820. It also runs the python echo backends in the same network
+# - vps runs in gateway mode with `[accept]` pinned to home's pubkey.
+#   Its rule files forward traffic from :7000/:7001 to
+#   downstream_ip:7100/7101.
+# - home runs in terminal mode with `[dial]` pointing at vps:51820.
+#   It also runs the python echo backends in the same network
 #   namespace so vps's rule-dial target lands on a real listener.
+#   home additionally hosts a `dns-echo` rule on :7200 that exercises
+#   the DNS resolver path (target_host="home-echo-dns:7100", with
+#   home-echo-dns pinned to home's own IP via `extra_hosts`).
 # - The `init` service performs one-shot key generation + offline
-#   intro/invite handshake via `yggdrasilctl identity`. vps/home/terminal
+#   intro/invite handshake via `yggdrasilctl identity`. vps/home
 #   wait for it to complete cleanly.
 # - The `client` container is a vanilla python:slim that runs the test
 #   harness via a bind-mounted scripts directory.
@@ -51,9 +55,6 @@ volumes:
   home_etc:
   home_run:
   home_state:
-  terminal_etc:
-  terminal_run:
-  terminal_state:
 
 services:
   init:
@@ -66,7 +67,6 @@ services:
       # config + rules without colliding. Each daemon service mounts
       # the same volume at its canonical /etc/yggdrasil path.
       - home_etc:/etc/yggdrasil-home
-      - terminal_etc:/etc/yggdrasil-terminal
     restart: "no"
     networks:
       - wan
@@ -118,38 +118,15 @@ services:
       - home_etc:/etc/yggdrasil
       - home_run:/run/yggdrasil
       - home_state:/var/lib/yggdrasil
-    networks:
-      wan:
-        ipv4_address: 172.30.0.20
-
-  # Second yggdrasil instance running in terminal mode. Exercises the
-  # DNS-resolved `upstream_host` dial target by listening on :7200 and
-  # forwarding to a synthetic DNS name (`home-echo-dns`) pinned to the
-  # home container's IP via `extra_hosts`. Proves the resolver path runs
-  # end-to-end against the system resolver inside a real container.
-  terminal:
-    <<: *yggdrasil-image
-    container_name: e2e-terminal
-    depends_on:
-      home:
-        condition: service_started
-    command:
-      - yggdrasil
-      - run
-      - --config
-      - /etc/yggdrasil/config.toml
-    environment:
-      YGGDRASIL_LOG: info
-      YGGDRASIL_LOG_FORMAT: pretty
-    volumes:
-      - terminal_etc:/etc/yggdrasil
-      - terminal_run:/run/yggdrasil
-      - terminal_state:/var/lib/yggdrasil
+    # `home-echo-dns` resolves to home's own IP — the python TCP echo on
+    # :7100 lives in the same network namespace. Used by the dns-echo
+    # rule (listen=:7200, target_host=home-echo-dns:7100) to exercise
+    # the OS resolver path in the proxy.
     extra_hosts:
       - "home-echo-dns:172.30.0.20"
     networks:
       wan:
-        ipv4_address: 172.30.0.40
+        ipv4_address: 172.30.0.20
     expose:
       - "7200/tcp"
 
@@ -160,8 +137,6 @@ services:
       vps:
         condition: service_started
       home:
-        condition: service_started
-      terminal:
         condition: service_started
     working_dir: /tests
     entrypoint: ["sleep", "infinity"]

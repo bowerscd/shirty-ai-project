@@ -54,7 +54,7 @@ fi
 echo "==> bringing daemons up"
 # podman-compose has no `--wait`; the wait_for loops below poll the actual
 # readiness condition (control socket + first authenticated heartbeat).
-"${DC[@]}" "${COMPOSE_ARGS[@]}" up -d vps home terminal client
+"${DC[@]}" "${COMPOSE_ARGS[@]}" up -d vps home client
 
 # -------- helpers -----------------------------------------------------------
 
@@ -148,12 +148,12 @@ echo "    [ok] UDP echo via 172.30.0.10:7001 → home:7101"
 
 echo "==> [hot-reload] dropping a new branch file"
 
-"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps bash -c "cat >/etc/yggdrasil/rules/tcp-echo-alt.toml" <<'EOF'
+"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T home bash -c "cat >/etc/yggdrasil/rules/tcp-echo-alt.toml" <<'EOF'
 [[rule]]
 name        = "tcp-echo-alt"
 listen      = "0.0.0.0:7010"
 protocol    = "tcp"
-target_port = 7100
+target_addr = "127.0.0.1:7100"
 EOF
 
 rule_visible() {
@@ -182,7 +182,7 @@ echo "    [ok] traffic flows through hot-reloaded rule"
 echo "==> [invariance] removing one rule does not break another"
 
 # Remove the alt rule and verify the supervisor picks it up.
-"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps rm -f /etc/yggdrasil/rules/tcp-echo-alt.toml
+"${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T home rm -f /etc/yggdrasil/rules/tcp-echo-alt.toml
 
 rule_gone() {
     ! ctl rules list | grep -q '^tcp-echo-alt '
@@ -200,7 +200,7 @@ echo "    [ok] original rule still works post-reload"
 echo "==> [status] yggdrasilctl status returns sensible data"
 status_json=$(ctl_json status)
 echo "$status_json" | grep -q '"downstream_enrolled": true'   || fail "status: downstream_enrolled not true"
-echo "$status_json" | grep -q '"rule_count": 2'              || fail "status: expected 2 rules (tcp-echo + udp-echo)"
+echo "$status_json" | grep -q '"rule_count": 3'              || fail "status: expected 3 rules (tcp-echo + udp-echo + dns-echo)"
 echo "$status_json" | grep -q '"downstream_ip": "172.30.0.20"' || fail "status: downstream_ip wrong"
 echo "    [ok] status JSON consistent"
 
@@ -278,23 +278,25 @@ if (( age < 0 || age > 30 )); then
 fi
 echo "    [ok] yggdrasil_last_heartbeat_timestamp_seconds fresh (age ${age}s)"
 
-# -------- test 8: DNS-resolved upstream_host (terminal mode) ----------------
+# -------- test 8: DNS-resolved target_host (terminal mode) ------------------
 
-echo "==> [dns-upstream] terminal-mode rule with upstream_host"
+echo "==> [dns-upstream] terminal-mode rule with target_host"
 
-# The terminal container at 172.30.0.40 hosts a TCP rule on :7200 whose
-# upstream is `home-echo-dns:7100`. `home-echo-dns` is pinned to
-# 172.30.0.20 via `extra_hosts:` in compose.e2e.yml. The DNS resolver
-# converges within ~ms of the supervisor binding the rule, but on a cold
-# container start the listener may accept before the first resolution
-# lands — `wait_for` polls until at least one connection round-trips.
+# home hosts a TCP rule on :7200 whose upstream is `home-echo-dns:7100`.
+# `home-echo-dns` is pinned to home's own IP (172.30.0.20) via
+# `extra_hosts:` in compose.e2e.yml, so the OS resolver returns home's
+# IP and the rule TCP-connects back to the python TCP echo running in
+# the same network namespace. The DNS resolver converges within ~ms of
+# the supervisor binding the rule, but on a cold container start the
+# listener may accept before the first resolution lands — `wait_for`
+# polls until at least one connection round-trips.
 
 run_dns_echo() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T client python3 - <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)
-s.connect(("172.30.0.40", 7200))
+s.connect(("172.30.0.20", 7200))
 payload = b"dns-resolved-" + b"z" * 200
 s.sendall(payload)
 got = b""
@@ -307,7 +309,7 @@ s.close()
 sys.exit(0 if got == payload else 1)
 PY
 }
-WAIT_TIMEOUT=15 wait_for "DNS-resolved upstream echo via terminal:7200" run_dns_echo
+WAIT_TIMEOUT=15 wait_for "DNS-resolved upstream echo via home:7200" run_dns_echo
 
 # -------- done --------------------------------------------------------------
 

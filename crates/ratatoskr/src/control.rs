@@ -28,17 +28,29 @@ use crate::rule::Rule;
 
 /// Runtime mode the daemon is operating in, surfaced in status responses.
 ///
-/// `relay` is the cloud-side daemon with heartbeat + dynamic peer-IP
-/// resolution; `terminal` is the home-side daemon with static
-/// `target_addr` rules and no peer identity. Wire serialisation matches
-/// the daemon's derived runtime mode and `--require-mode` CLI values.
+/// Derived from `[dial]`/`[accept]` presence in the daemon's config:
+///
+/// | mode       | `[dial]` | `[accept]` |
+/// |------------|----------|------------|
+/// | `gateway`  | absent   | present    |
+/// | `relay`    | present  | present    |
+/// | `terminal` | present  | absent     |
+///
+/// (Both absent is rejected at config-load time.) Wire serialisation
+/// matches the daemon's derived runtime mode and `--require-mode` CLI
+/// values exactly.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Cloud-side daemon. Heartbeat + dynamic peer-IP resolution.
+    /// Head of chain. `[accept]` only — accepts inbound chain traffic
+    /// but does not dial any further upstream.
+    Gateway,
+    /// Mid-chain. `[accept]` + `[dial]` — accepts inbound and
+    /// republishes predicates upward.
     #[default]
     Relay,
-    /// Home-side daemon. Static `target_addr` rules. No peer identity.
+    /// Tail. `[dial]` only — no inbound chain traffic; dials upstream
+    /// to publish its own predicates.
     Terminal,
 }
 
@@ -46,6 +58,7 @@ impl Mode {
     /// Stable English string for log/metric formatting.
     pub fn as_str(&self) -> &'static str {
         match self {
+            Mode::Gateway => "gateway",
             Mode::Relay => "relay",
             Mode::Terminal => "terminal",
         }
@@ -386,6 +399,7 @@ mod tests {
 
     #[test]
     fn mode_serialises_as_lowercase() {
+        assert_eq!(serde_json::to_string(&Mode::Gateway).unwrap(), "\"gateway\"");
         assert_eq!(serde_json::to_string(&Mode::Relay).unwrap(), "\"relay\"");
         assert_eq!(
             serde_json::to_string(&Mode::Terminal).unwrap(),
@@ -393,6 +407,8 @@ mod tests {
         );
         let back: Mode = serde_json::from_str("\"terminal\"").unwrap();
         assert_eq!(back, Mode::Terminal);
+        let back: Mode = serde_json::from_str("\"gateway\"").unwrap();
+        assert_eq!(back, Mode::Gateway);
     }
 
     #[test]
