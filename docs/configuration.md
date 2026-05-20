@@ -25,7 +25,6 @@ hex is rejected on parse.
 
 | Key                | Type                   | Default                          | Notes                                                                                          |
 | ------------------ | ---------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `mode`             | `"relay"`/`"terminal"` | `"relay"`                        | `relay` accepts inbound chain traffic (when `[accept]` is set) and uses dynamic peer-IP rule resolution. `terminal` only dials upstream and uses fixed-address rule resolution; never accepts inbound chain traffic. |
 | `rules_dir`        | path                   | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
 | `default_bind`     | IP                     | unset                            | If set, hard-rewrites every rule's `listen` IP to this address (the port is preserved). Used to share one config across hosts with different network interfaces. |
 | `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
@@ -33,6 +32,13 @@ hex is rejected on parse.
 | `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the convention cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). |
 | `default_cert`     | path                   | unset                            | HTTPS only. Wildcard / fallback certificate PEM. Must be set together with `default_key`.       |
 | `default_key`      | path                   | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
+
+Mode is derived from section presence:
+
+* `[dial]` only => `terminal`
+* `[accept]` only => `relay` (root relay)
+* `[dial]` + `[accept]` => `relay` (mid-chain relay)
+* neither => invalid config
 
 ### `[metrics]` — optional
 
@@ -64,7 +70,7 @@ this section; pure root relays omit it.
 
 Pins the single enrolled downstream identity. When set, this node accepts
 inbound chain traffic only from `pubkey` and binds UDP `listen` for that
-session. Forbidden in `mode = "terminal"`.
+session. Presence of `[accept]` makes the effective mode `relay`.
 
 | Key                  | Type           | Default | Notes                                                                  |
 | -------------------- | -------------- | ------- | ---------------------------------------------------------------------- |
@@ -76,7 +82,6 @@ session. Forbidden in `mode = "terminal"`.
 
 ```toml
 [server]
-mode = "relay"
 
 [metrics]
 listen = "127.0.0.1:9090"
@@ -93,7 +98,6 @@ pubkey = "x25519:9d2f04a3...4b7c"
 
 ```toml
 [server]
-mode = "terminal"
 
 [metrics]
 listen = "127.0.0.1:9090"
@@ -114,7 +118,6 @@ traffic from its downstream.
 
 ```toml
 [server]
-mode = "relay"
 
 [dial]
 pubkey   = "x25519:0123abcd...ef"

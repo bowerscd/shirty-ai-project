@@ -17,8 +17,8 @@ Conventions:
 ## `yggdrasil`
 
 The chain daemon. Same binary in relay and terminal modes; the mode is
-selected by `[server].mode` in the config file (or overridden with
-`--mode`).
+derived from config shape: `[dial]` only => terminal, `[accept]` only
+or both => relay.
 
 ### `yggdrasil run`
 
@@ -28,7 +28,7 @@ Start the daemon. The foreground process you'll wire into systemd.
 | ------------------- | ------------------------ | ------------------------------------ | ---------------------------------------------------------------------- |
 | `--config`          | `YGGDRASIL_CONFIG`       | `/etc/yggdrasil/config.toml`         | Path to the server config file.                                        |
 | `--rules-dir`       | `YGGDRASIL_RULES_DIR`    | (value from config)                  | Override `[server].rules_dir` without editing the config — useful for tests. |
-| `--mode`            | —                        | (value from config)                  | Override `[server].mode`. `relay` or `terminal`. No aliases.           |
+| `--require-mode`    | —                        | (unset)                              | Assert derived mode is `relay` or `terminal`; exit non-zero if it doesn't match. |
 | `--bind`            | —                        | (value from config)                  | Override `[server].default_bind`. Hard-rewrites every rule's `listen` IP to this address. |
 
 The daemon exits 0 on SIGTERM/SIGINT, non-zero on startup error (bad

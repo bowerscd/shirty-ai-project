@@ -60,14 +60,8 @@ pub async fn run(args: cli::RunArgs) -> Result<()> {
     let mut config = config::ServerConfig::load(&args.config)
         .with_context(|| format!("loading server config from {}", args.config.display()))?;
 
-    // CLI overrides applied after config load. `--mode` overrides the
-    // `[server].mode` field, `--rules-dir` overrides `[server].rules_dir`,
-    // `--bind` overrides `[server].default_bind`. We re-validate so that an
-    // override (e.g. flipping mode → terminal on a relay-shaped config) is
-    // caught by the same matrix as a TOML-only config would be.
-    if let Some(mode) = args.mode {
-        config.server.mode = mode.into();
-    }
+    // CLI overrides applied after config load. `--rules-dir` overrides
+    // `[server].rules_dir`, `--bind` overrides `[server].default_bind`.
     if let Some(ref dir) = args.rules_dir {
         config.server.rules_dir = dir.clone();
     }
@@ -78,7 +72,20 @@ pub async fn run(args: cli::RunArgs) -> Result<()> {
         .validate()
         .with_context(|| "re-validating config after applying CLI overrides")?;
 
-    match config.server.mode {
+    let mode = config
+        .derived_mode()
+        .with_context(|| "deriving effective mode from [dial]/[accept]")?;
+    if let Some(required) = args.require_mode {
+        let required = config::Mode::from(required);
+        anyhow::ensure!(
+            mode == required,
+            "--require-mode={} but config resolves to {}",
+            required.as_str(),
+            mode.as_str()
+        );
+    }
+
+    match mode {
         config::Mode::Relay => run_relay(args, config).await,
         config::Mode::Terminal => run_terminal(args, config).await,
     }
@@ -91,7 +98,7 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
-        mode = config.server.mode.as_str(),
+        mode = "relay",
         accept_listen = ?config.accept.as_ref().map(|a| a.listen),
         dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
@@ -372,7 +379,11 @@ pub async fn run_relay(args: cli::RunArgs, config: config::ServerConfig) -> Resu
     );
 
     health::mark_ready();
-    systemd::notify_ready();
+    systemd::notify_ready_with_status(&format!(
+        "mode=relay, accept={}, dial={}",
+        if config.accept.is_some() { "yes" } else { "no" },
+        if config.dial.is_some() { "yes" } else { "no" },
+    ));
 
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");
@@ -396,7 +407,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
-        mode = config.server.mode.as_str(),
+        mode = "terminal",
         dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
@@ -424,7 +435,7 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
         tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
     }
 
-    // 3b. Outbound chain client — only when [chain.upstream] is set.
+    // 3b. Outbound chain client — only when [dial] is set.
     //     A terminal node without an upstream is still useful (pure local
     //     proxy), so absence is not an error.
     //
@@ -531,7 +542,10 @@ pub async fn run_terminal(args: cli::RunArgs, config: config::ServerConfig) -> R
     );
 
     health::mark_ready();
-    systemd::notify_ready();
+    systemd::notify_ready_with_status(&format!(
+        "mode=terminal, dial={}",
+        if config.dial.is_some() { "yes" } else { "no" },
+    ));
 
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");

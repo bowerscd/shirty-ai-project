@@ -70,8 +70,9 @@ daemon), run `yggdrasilctl identity rotate`.
 
 ### systemd — `yggdrasil.service`
 
-The same unit works in relay and terminal modes. The mode is selected
-by `[server].mode` in `/etc/yggdrasil/config.toml`.
+The same unit works in relay and terminal modes. The mode is derived
+from `/etc/yggdrasil/config.toml` shape (`[dial]` only => terminal,
+`[accept]` present => relay).
 
 ```ini
 # /etc/systemd/system/yggdrasil.service

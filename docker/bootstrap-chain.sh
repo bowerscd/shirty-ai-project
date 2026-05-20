@@ -48,7 +48,6 @@ mkdir -p /etc/yggdrasil-vps/rules /etc/yggdrasil-vps/certs
 echo "[init-chain] writing vps-chain seed config"
 cat >"$VPS_CFG" <<EOF
 [server]
-mode          = "relay"
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
@@ -76,7 +75,6 @@ mkdir -p /etc/yggdrasil-midbox/rules /etc/yggdrasil-midbox/certs
 echo "[init-chain] writing midbox seed config"
 cat >"$MIDBOX_CFG" <<EOF
 [server]
-mode          = "relay"
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
@@ -104,7 +102,6 @@ mkdir -p /etc/yggdrasil-home/rules /etc/yggdrasil-home/certs
 echo "[init-chain] writing home-chain seed config"
 cat >"$HOME_CFG" <<EOF
 [server]
-mode          = "terminal"
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"

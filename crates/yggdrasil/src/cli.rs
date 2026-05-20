@@ -50,9 +50,9 @@ pub struct RunArgs {
     #[arg(long, env = "YGGDRASIL_RULES_DIR")]
     pub rules_dir: Option<PathBuf>,
 
-    /// Override `[server].mode`. English-only; no aliases.
+    /// Assert the config resolves to this derived mode and fail fast if not.
     #[arg(long, value_enum)]
-    pub mode: Option<ModeArg>,
+    pub require_mode: Option<RequireModeArg>,
 
     /// Hard-override every rule's `listen` IP with this address. The rule's
     /// port is preserved; only the IP is replaced. Overrides
@@ -61,20 +61,18 @@ pub struct RunArgs {
     pub bind: Option<IpAddr>,
 }
 
-/// CLI-side mirror of [`crate::config::Mode`]. Kept as a separate type so
-/// clap's `ValueEnum` derive doesn't have to coexist with serde's
-/// `rename_all = "lowercase"` on the same enum.
+/// CLI-side mirror of [`crate::config::Mode`].
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ModeArg {
+pub enum RequireModeArg {
     Relay,
     Terminal,
 }
 
-impl From<ModeArg> for Mode {
-    fn from(m: ModeArg) -> Self {
+impl From<RequireModeArg> for Mode {
+    fn from(m: RequireModeArg) -> Self {
         match m {
-            ModeArg::Relay => Mode::Relay,
-            ModeArg::Terminal => Mode::Terminal,
+            RequireModeArg::Relay => Mode::Relay,
+            RequireModeArg::Terminal => Mode::Terminal,
         }
     }
 }

@@ -31,7 +31,7 @@ use crate::rule::Rule;
 /// `relay` is the cloud-side daemon with heartbeat + dynamic peer-IP
 /// resolution; `terminal` is the home-side daemon with static
 /// `target_addr` rules and no peer identity. Wire serialisation matches
-/// the on-disk `[server] mode = "..."` and `--mode` CLI strings exactly.
+/// the daemon's derived runtime mode and `--require-mode` CLI values.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {

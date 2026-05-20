@@ -36,6 +36,21 @@ pub fn notify_ready() {
     }
 }
 
+/// Send `STATUS=...` and `READY=1` together so `systemctl status` shows the
+/// effective runtime shape (`mode=..., dial=..., accept=...`) at startup.
+pub fn notify_ready_with_status(status: &str) {
+    match sd_notify::notify(
+        true,
+        &[
+            sd_notify::NotifyState::Status(status),
+            sd_notify::NotifyState::Ready,
+        ],
+    ) {
+        Ok(()) => tracing::debug!(status, "sent sd_notify STATUS + READY=1"),
+        Err(e) => tracing::warn!(error = %e, "sd_notify STATUS + READY=1 failed; continuing"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +68,6 @@ mod tests {
         // invoked inside `notify_ready` below.
         unsafe { std::env::remove_var("NOTIFY_SOCKET") };
         notify_ready();
+        notify_ready_with_status("mode=relay, accept=yes, dial=no");
     }
 }

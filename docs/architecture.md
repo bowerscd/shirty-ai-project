@@ -18,7 +18,7 @@ control sessions.
 ## Cast of characters
 
 There is exactly one daemon binary, `yggdrasil`, running in one of two modes
-selected by `[server].mode` and the `[dial]` / `[accept]` tables:
+derived from the `[dial]` / `[accept]` tables:
 
 | Mode       | Accepts inbound chain traffic | Dials upstream | Typical role                               |
 | ---------- | ----------------------------- | -------------- | ------------------------------------------ |

@@ -257,9 +257,8 @@ To insert a mid-chain relay between an existing terminal and its
 upstream:
 
 1. Provision the mid-relay (binary, identity, base config) per
-   [install.md](install.md). Set `mode = "relay"`, populate
-   `[accept]`, leave both `[dial]` and
-   `[accept]` unset for now.
+  [install.md](install.md). Create a base `[server]` section but do not
+  start the daemon yet; enrollment will write `[accept]` and `[dial]`.
 2. On the terminal, `yggdrasilctl identity remove-upstream`. Heartbeats
    to the old upstream stop.
 3. Mid-relay ↔ old-upstream enrollment: run the intro/invite ceremony

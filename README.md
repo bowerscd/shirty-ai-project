@@ -9,8 +9,8 @@ A residential reverse proxy with a chain control plane. One binary, two modes:
   relay upstream over UDP, sends authenticated heartbeats, publishes the
   local rule set as a predicate set the relay derives its own listeners from.
 
-Both modes are the same `yggdrasil` binary; the difference is `[server].mode`
-plus whether `[accept]` or `[dial]` is configured. A
+Both modes are the same `yggdrasil` binary; the difference is section shape:
+`[dial]` only => terminal, `[accept]` only or both => relay. A
 deployment is a chain of one or more relays terminating in exactly one
 terminal — `home -> midbox -> vps` works the same way `home -> vps` does.
 
@@ -42,7 +42,6 @@ sudo yggdrasilctl identity rotate
 # Minimal /etc/yggdrasil/config.toml — listener for inbound chain traffic.
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-mode = "relay"
 
 [accept]
 listen = "0.0.0.0:51820"
@@ -58,7 +57,6 @@ sudo yggdrasilctl identity rotate
 # Minimal /etc/yggdrasil/config.toml — terminal mode, no listener.
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-mode = "terminal"
 EOF
 ```
 

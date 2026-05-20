@@ -43,7 +43,6 @@ Both pubkeys are public — copy them around freely. The secrets stay in
 ```bash
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-mode = "relay"
 
 [metrics]
 listen = "127.0.0.1:9090"
@@ -66,7 +65,6 @@ the next step.
 ```bash
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-mode = "terminal"
 
 [metrics]
 listen = "127.0.0.1:9090"
@@ -77,8 +75,8 @@ EOF
 ```
 
 `[dial]` will be added by the next step. Terminal nodes don't
-have `[accept]` or `[accept]` (the config validator
-rejects either in `mode = "terminal"`).
+have `[accept]`; the daemon derives terminal mode from `[dial]`-only
+shape.
 
 ## 4. Run the intro / invite handshake
 

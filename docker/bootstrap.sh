@@ -46,7 +46,6 @@ mkdir -p /etc/yggdrasil/rules /etc/yggdrasil/certs
 echo "[init] writing vps seed config"
 cat >"$VPS_CFG" <<EOF
 [server]
-mode          = "relay"
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
@@ -98,7 +97,6 @@ mkdir -p /etc/yggdrasil-home/rules /etc/yggdrasil-home/certs
 echo "[init] writing home seed config"
 cat >"$HOME_CFG" <<EOF
 [server]
-mode          = "terminal"
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
@@ -150,7 +148,6 @@ mkdir -p /etc/yggdrasil-terminal/rules /etc/yggdrasil-terminal/certs
 echo "[init] writing terminal seed config"
 cat >"$YGT_CFG" <<'EOF'
 [server]
-mode          = "terminal"
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"

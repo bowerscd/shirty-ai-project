@@ -2,7 +2,7 @@
 //!
 //! The config is organised into a small number of named tables:
 //!
-//! * `[server]` — runtime mode, paths, defaults.
+//! * `[server]` — paths and defaults.
 //! * `[metrics]` — Prometheus exporter listen address.
 //! * `[control]` — `yggdrasilctl` Unix-domain socket path.
 //! * `[dial]` (optional) — this node's outbound chain client: who to
@@ -45,18 +45,12 @@ pub struct ServerConfig {
     pub accept:  Option<AcceptSection>,
 }
 
-/// Runtime mode selector. English-only operator surface (no serde aliases).
+/// Effective runtime mode, derived from top-level chain sections.
 ///
-/// * `Relay` — accepts inbound chain traffic AND may dial further upstream.
-/// * `Terminal` — only dials upstream; never accepts inbound chain traffic.
-///
-/// "relay vs terminal" gates proxy resolver behaviour (relay uses dynamic
-/// peer-IP rules; terminal uses static `target_addr`), but both modes
-/// can now run an outbound chain client when `[dial]` is configured.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// * `Relay` — `[accept]` is present (with or without `[dial]`).
+/// * `Terminal` — only `[dial]` is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    #[default]
     Relay,
     Terminal,
 }
@@ -73,9 +67,6 @@ impl Mode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
-    /// Runtime mode. Defaults to `relay`.
-    #[serde(default)]
-    pub mode: Mode,
     /// Directory containing `*.toml` rule files. Defaults to `/etc/yggdrasil/conf.d`.
     #[serde(default = "default_rules_dir")]
     pub rules_dir: PathBuf,
@@ -190,16 +181,21 @@ impl ServerConfig {
         Ok(cfg)
     }
 
+    /// Derive effective runtime mode from section presence.
+    pub fn derived_mode(&self) -> Result<Mode, ConfigError> {
+        match (self.dial.is_some(), self.accept.is_some()) {
+            (true, false) => Ok(Mode::Terminal),
+            (false, true) | (true, true) => Ok(Mode::Relay),
+            (false, false) => Err(ConfigError::Invalid(
+                "config must define at least one of [dial] or [accept]".into(),
+            )),
+        }
+    }
+
     /// Validate the in-memory config.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // ---- Terminal-mode constraints ----
-        if matches!(self.server.mode, Mode::Terminal) && self.accept.is_some() {
-            return Err(ConfigError::Invalid(
-                "terminal-mode nodes must not declare [accept] — they never \
-                 accept inbound chain traffic"
-                    .into(),
-            ));
-        }
+        // ---- Derived mode shape ----
+        let _ = self.derived_mode()?;
 
         // ---- [dial] sanity ----
         if let Some(up) = &self.dial {
@@ -283,51 +279,64 @@ mod tests {
     fn relay_minimal_toml() -> &'static str {
         r#"
         [server]
+
+        [accept]
+        pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        listen = "0.0.0.0:51820"
         "#
     }
 
     fn terminal_minimal_toml() -> &'static str {
         r#"
         [server]
-        mode = "terminal"
+
+        [dial]
+        pubkey   = "x25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        endpoint = "u.example.com:7117"
         "#
     }
 
     #[test]
-    fn default_mode_is_relay() {
+    fn derived_mode_is_relay_when_accept_only() {
         let cfg = parse(relay_minimal_toml()).unwrap();
-        assert_eq!(cfg.server.mode, Mode::Relay);
+        assert_eq!(cfg.derived_mode().unwrap(), Mode::Relay);
     }
 
     #[test]
-    fn parses_explicit_relay() {
+    fn derived_mode_is_terminal_when_dial_only() {
+        let cfg = parse(terminal_minimal_toml()).unwrap();
+        assert_eq!(cfg.derived_mode().unwrap(), Mode::Terminal);
+    }
+
+    #[test]
+    fn derived_mode_is_relay_when_dial_and_accept_present() {
         let cfg = parse(
             r#"
             [server]
-            mode = "relay"
+
+            [dial]
+            pubkey   = "x25519:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            endpoint = "u.example.com:7117"
+
+            [accept]
+            pubkey = "x25519:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.server.mode, Mode::Relay);
+        assert_eq!(cfg.derived_mode().unwrap(), Mode::Relay);
     }
 
     #[test]
-    fn parses_explicit_terminal() {
-        let cfg = parse(terminal_minimal_toml()).unwrap();
-        assert_eq!(cfg.server.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn unknown_mode_is_rejected() {
+    fn missing_dial_and_accept_is_rejected() {
         let err = parse(
             r#"
             [server]
-            mode = "verdfolnir"
             "#,
         )
         .err()
         .unwrap();
-        assert!(matches!(err, ConfigError::Proto(_)));
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]")));
     }
 
     #[test]
@@ -342,6 +351,10 @@ mod tests {
             r#"
             [server]
             rules_dir = "/srv/yggdrasil/rules"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
@@ -354,6 +367,10 @@ mod tests {
             r#"
             [server]
             default_bind = "192.168.1.5"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
@@ -389,6 +406,10 @@ mod tests {
             [server]
             default_cert = "/etc/yggdrasil/certs/wildcard.pem"
             default_key  = "/etc/yggdrasil/certs/wildcard.key"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
             "#,
         )
         .unwrap();
@@ -402,6 +423,10 @@ mod tests {
             r#"
             [server]
             default_cert = "/etc/yggdrasil/certs/wildcard.pem"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
             "#,
         )
         .err()
@@ -418,6 +443,10 @@ mod tests {
             r#"
             [server]
             default_key = "/etc/yggdrasil/certs/wildcard.key"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
             "#,
         )
         .err()
@@ -575,28 +604,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_mode_rejects_accept_section() {
-        let err = parse(
-            r#"
-            [server]
-            mode = "terminal"
-
-            [accept]
-            pubkey = "x25519:5555555555555555555555555555555555555555555555555555555555555555"
-            listen = "0.0.0.0:51820"
-            "#,
-        )
-        .err()
-        .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("terminal-mode nodes must not declare")));
-    }
-
-    #[test]
     fn terminal_mode_accepts_only_dial() {
         let cfg = parse(
             r#"
             [server]
-            mode = "terminal"
 
             [dial]
             pubkey   = "x25519:6666666666666666666666666666666666666666666666666666666666666666"
@@ -604,7 +615,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.server.mode, Mode::Terminal);
+        assert_eq!(cfg.derived_mode().unwrap(), Mode::Terminal);
         assert!(cfg.dial.is_some());
         assert!(cfg.accept.is_none());
     }
@@ -630,9 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_chain_sections_are_valid() {
-        let cfg = parse(relay_minimal_toml()).unwrap();
-        assert!(cfg.dial.is_none());
-        assert!(cfg.accept.is_none());
+    fn empty_chain_sections_are_invalid() {
+        let err = parse(
+            r#"
+            [server]
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]")));
     }
 }
