@@ -29,10 +29,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use ratatoskr::control::{Request, Response};
+use ratatoskr::control::{ChainSummaryResponse, Request, Response};
 use ratatoskr::predicate::Predicate;
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::{RuleFile, RuleSet};
@@ -90,27 +90,18 @@ pub struct ApplyArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffArgs {
-    /// TCP port on each upstream hop's loopback that exposes the
-    /// metrics listener (the `[metrics] listen` setting in
-    /// `config.toml`). Used only for upstream hops, which are still
-    /// reached via HTTP-over-tunnel; the local hop now uses
-    /// [`Request::DerivedRules`] over UDS and ignores this field.
-    /// Stage B3 will collapse the upstream path onto UDS too and
-    /// remove this argument.
-    #[arg(long, value_name = "PORT", default_value_t = 9090)]
-    pub metrics_port: u16,
-    /// Maximum number of upstream hops to walk before stopping. Each
-    /// hop's `/internal/derived-rules` reveals the next hop via its
-    /// `dial` pubkey. A chain deeper than the default of 8
-    /// is unusual; tune up only if you've explicitly designed one.
-    #[arg(long, value_name = "N", default_value_t = 8)]
-    pub max_hops: usize,
-    /// Per-fetch deadline. Applies to each individual hop's request
-    /// (UDS for the local hop, HTTP-over-tunnel for upstream hops).
-    /// The overall walk time is bounded by `max_hops *
-    /// per_hop_timeout`.
-    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration, default_value = "5s")]
-    pub per_hop_timeout: Duration,
+    /// Overall budget for the daemon to assemble its chain summary
+    /// reply. Applies once across the whole walk; multi-hop fanout (a
+    /// follow-up increment) will respect it as a per-hop deadline.
+    /// Local-only replies return synchronously and effectively ignore
+    /// this value.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = humantime::parse_duration,
+        default_value = "5s",
+    )]
+    pub timeout: Duration,
 }
 
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
@@ -407,75 +398,48 @@ struct DiffReport {
     /// the previous hop pointed at could not be reached. The CLI's
     /// exit code reflects this so CI pipelines can gate on it.
     drift_detected: bool,
+    /// Whether the daemon's chain summary was incomplete (some
+    /// upstream hop could not be reached within the timeout). Always
+    /// `false` for local-only summaries; multi-hop fanout flips it
+    /// when the walk truncates.
+    partial: bool,
 }
 
 /// Walk the chain upward from the local node, fetch each hop's
 /// derived-rules snapshot, and emit a structured diff. See module
 /// docstring for the operator-facing semantics.
 ///
-/// The walk:
-/// 1. Fetches hop 0 (local) over the UDS control socket via
-///    [`Request::DerivedRules`].
-/// 2. For each `chain.upstream` it finds, opens a chain tunnel via
-///    the daemon's UDS and fetches that hop's `/internal/derived-rules`
-///    through the tunnel. (The tunneled path is still HTTP today;
-///    stage B3 will collapse it onto the same UDS request shape.)
-/// 3. Bounds total work at `args.max_hops` to keep a misconfigured
-///    chain (or a forwarding loop) from running forever.
+/// Wire path (B3b): the CLI sends a single
+/// [`Request::ChainSummary`] over UDS; the daemon assembles a
+/// [`ChainSummaryResponse`] containing one [`ChainHop`] per chain
+/// node it can reach (today only the local hop; multi-hop fanout via
+/// the chain control plane is a follow-up increment). The diff is a
+/// pure function over the resulting `Vec<ChainHop>` — no HTTP, no
+/// tunnel, no per-hop dialing from the CLI.
 async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
-    let local_view = fetch_local_introspection(socket, args.per_hop_timeout)
+    let summary = fetch_chain_summary(socket, args.timeout)
         .await
-        .context("fetching local derived-rules snapshot over UDS")?;
+        .context("fetching chain summary over UDS")?;
 
-    let mut hops: Vec<HopReport> = Vec::new();
-    let local_pubkey = local_view.chain.local;
-    let mut next_upstream = local_view.chain.upstream;
-    let mut previous = local_view.clone();
-    hops.push(HopReport {
-        index: 0,
-        expected_pubkey: local_pubkey,
-        view: local_view,
-        drift: None,
-    });
+    if summary.hops.is_empty() {
+        bail!("daemon returned an empty chain summary; no hops to diff");
+    }
 
-    let mut hop_index = 1usize;
-    while let Some(target) = next_upstream {
-        if hop_index > args.max_hops {
-            tracing::warn!(
-                max_hops = args.max_hops,
-                "chain diff walk stopped at max-hops; chain may continue further"
-            );
-            break;
-        }
-        let hop_view = fetch_upstream_introspection(
-            socket,
-            target,
-            args.metrics_port,
-            args.per_hop_timeout,
-        )
-        .await
-        .with_context(|| {
-            format!("fetching hop {hop_index} (target {target}) /internal/derived-rules through chain tunnel")
-        })?;
-
-        if hop_view.chain.local != target {
-            bail!(
-                "hop {hop_index} routing mismatch: tunnel reached pubkey {actual}, expected {target}",
-                actual = hop_view.chain.local,
-                target = target
-            );
-        }
-
-        let drift = compute_diff(&previous, &hop_view);
-        next_upstream = hop_view.chain.upstream;
-        previous = hop_view.clone();
+    let mut hops: Vec<HopReport> = Vec::with_capacity(summary.hops.len());
+    let mut prev_view: Option<IntrospectionView> = None;
+    for wire_hop in summary.hops {
+        let drift = match &prev_view {
+            None => None,
+            Some(prev) => compute_diff(prev, &wire_hop.view),
+        };
+        let expected_pubkey = wire_hop.view.chain.local;
+        prev_view = Some(wire_hop.view.clone());
         hops.push(HopReport {
-            index: hop_index,
-            expected_pubkey: target,
-            view: hop_view,
+            index: wire_hop.hop_index as usize,
+            expected_pubkey,
+            view: wire_hop.view,
             drift,
         });
-        hop_index += 1;
     }
 
     let drift_detected = hops
@@ -484,6 +448,7 @@ async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
     let report = DiffReport {
         hops,
         drift_detected,
+        partial: summary.partial,
     };
 
     if json_output {
@@ -498,6 +463,50 @@ async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Send `Request::ChainSummary` over UDS and read back the single
+/// `Response::ChainSummary` ndjson line. Errors are wrapped with the
+/// socket path for operator-friendly diagnostics.
+async fn fetch_chain_summary(
+    socket: &Path,
+    timeout: Duration,
+) -> Result<ChainSummaryResponse> {
+    let socket_path: PathBuf = socket.to_path_buf();
+    let stream = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
+        .await
+        .with_context(|| format!("UDS connect timeout to {}", socket_path.display()))?
+        .with_context(|| format!("connecting to {}", socket_path.display()))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let request = Request::ChainSummary {
+        timeout_ms: Some(timeout.as_millis().min(u64::MAX as u128) as u64),
+    };
+    let mut buf = serde_json::to_vec(&request).context("encode ChainSummary request")?;
+    buf.push(b'\n');
+    tokio::time::timeout(timeout, writer.write_all(&buf))
+        .await
+        .context("write timeout sending ChainSummary")?
+        .context("writing ChainSummary request")?;
+
+    let mut line = String::new();
+    let n = tokio::time::timeout(timeout, reader.read_line(&mut line))
+        .await
+        .context("read timeout awaiting ChainSummary response")?
+        .context("reading ChainSummary response")?;
+    if n == 0 {
+        bail!("daemon closed UDS without responding to ChainSummary");
+    }
+    let response: Response = serde_json::from_str(line.trim())
+        .with_context(|| format!("parsing daemon response: {line:?}"))?;
+    match response {
+        Response::ChainSummary(s) => Ok(s),
+        Response::Error { code, message } => {
+            bail!("daemon returned error for ChainSummary: code={code} message={message}");
+        }
+        other => bail!("unexpected response to ChainSummary: {other:?}"),
+    }
 }
 
 /// Compare two hops' predicate sets. Returns `None` when no comparison
@@ -679,182 +688,12 @@ fn render_human(report: &DiffReport) {
     } else {
         println!("\nin sync across {} hop(s).", report.hops.len());
     }
-}
-
-/// Fetch the local node's derived-rules snapshot via the daemon's
-/// UDS control socket using [`Request::DerivedRules`]. Replaces the
-/// previous loopback-gated `GET /internal/derived-rules` HTTP path:
-/// the operator already has UDS access (every other `yggdrasilctl`
-/// command uses it), and the UDS gate is filesystem-permission-based
-/// rather than a runtime loopback check, which is strictly stronger.
-async fn fetch_local_introspection(
-    socket: &Path,
-    timeout: Duration,
-) -> Result<IntrospectionView> {
-    let socket_path: PathBuf = socket.to_path_buf();
-    let stream = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
-        .await
-        .with_context(|| format!("UDS connect timeout to {}", socket_path.display()))?
-        .with_context(|| format!("connecting to {}", socket_path.display()))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    let mut buf = serde_json::to_vec(&Request::DerivedRules)
-        .context("encode DerivedRules request")?;
-    buf.push(b'\n');
-    tokio::time::timeout(timeout, writer.write_all(&buf))
-        .await
-        .context("write timeout sending DerivedRules")?
-        .context("writing DerivedRules request")?;
-
-    let mut line = String::new();
-    let n = tokio::time::timeout(timeout, reader.read_line(&mut line))
-        .await
-        .context("read timeout awaiting DerivedRules response")?
-        .context("reading DerivedRules response")?;
-    if n == 0 {
-        bail!("daemon closed UDS without responding to DerivedRules");
-    }
-    let response: Response = serde_json::from_str(line.trim())
-        .with_context(|| format!("parsing daemon response: {line:?}"))?;
-    match response {
-        Response::DerivedRules(snap) => Ok(snap),
-        Response::Error { code, message } => {
-            bail!("daemon returned error for DerivedRules: code={code} message={message}");
-        }
-        other => bail!("unexpected response to DerivedRules: {other:?}"),
-    }
-}
-
-/// Fetch an upstream hop's `/internal/derived-rules` over a chain
-/// tunnel via the local daemon's UDS. The tunnel terminates at the
-/// upstream hop's loopback and dials `127.0.0.1:metrics_port` from
-/// there, so the metrics listener sees a 127.0.0.1 peer and passes
-/// the loopback gate.
-async fn fetch_upstream_introspection(
-    socket: &Path,
-    target_pubkey: PubKey,
-    metrics_port: u16,
-    timeout: Duration,
-) -> Result<IntrospectionView> {
-    let socket_path: PathBuf = socket.to_path_buf();
-    let dest: SocketAddr = format!("127.0.0.1:{metrics_port}")
-        .parse()
-        .with_context(|| format!("constructing dest addr for port {metrics_port}"))?;
-
-    let stream = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
-        .await
-        .with_context(|| format!("UDS connect timeout to {}", socket_path.display()))?
-        .with_context(|| format!("connecting to {}", socket_path.display()))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    // 1. Send OpenChainTunnel.
-    let request = Request::OpenChainTunnel {
-        target_pubkey,
-        dest,
-    };
-    let mut buf = serde_json::to_vec(&request).context("encode OpenChainTunnel")?;
-    buf.push(b'\n');
-    tokio::time::timeout(timeout, writer.write_all(&buf))
-        .await
-        .context("write timeout sending OpenChainTunnel")?
-        .context("writing OpenChainTunnel request")?;
-
-    // 2. Read exactly one JSON response line.
-    let mut line = String::new();
-    let n = tokio::time::timeout(timeout, reader.read_line(&mut line))
-        .await
-        .context("read timeout awaiting OpenChainTunnel response")?
-        .context("reading OpenChainTunnel response")?;
-    if n == 0 {
-        bail!("daemon closed UDS without responding to OpenChainTunnel");
-    }
-    let response: Response = serde_json::from_str(line.trim())
-        .with_context(|| format!("parsing daemon response: {line:?}"))?;
-    match response {
-        Response::ChainTunnelOpened { .. } => {}
-        Response::Error { code, message } => {
-            bail!("daemon refused tunnel to {target_pubkey}: code={code} message={message}");
-        }
-        other => bail!(
-            "daemon returned unexpected response to OpenChainTunnel: {other:?}"
-        ),
-    }
-    // 3. The socket is now in raw-bytes mode. Splice an HTTP GET
-    //    through it. `reader` may hold buffered bytes past the JSON
-    //    response's `\n`; the BufReader will surface them first on
-    //    subsequent reads, which is correct.
-    let raw = tokio::time::timeout(
-        timeout,
-        http_get_through_split(&mut reader, &mut writer, "127.0.0.1", "/internal/derived-rules"),
-    )
-    .await
-    .context("HTTP GET through chain tunnel timed out")??;
-    parse_introspection_response(&raw)
-}
-
-/// Write an HTTP/1.1 GET to a split tunnel stream and read until EOF.
-/// Used by [`fetch_upstream_introspection`]; the local hop now goes
-/// through UDS via [`Request::DerivedRules`] and no longer needs an
-/// HTTP helper.
-async fn http_get_through_split<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    host: &str,
-    path: &str,
-) -> Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
-    writer
-        .write_all(req.as_bytes())
-        .await
-        .context("writing HTTP GET through tunnel")?;
-    // Send EOF to the tunnel's write half so the terminator-side dial
-    // proxy closes its end and the server emits Connection: close +
-    // EOF on read. Without this the read below would block forever
-    // waiting for the server to close.
-    writer
-        .shutdown()
-        .await
-        .context("shutting down tunnel write half after GET")?;
-    let mut buf = Vec::with_capacity(8192);
-    reader
-        .read_to_end(&mut buf)
-        .await
-        .context("reading HTTP response through tunnel")?;
-    Ok(buf)
-}
-
-/// Parse a raw HTTP/1.1 response. Expects status 200; otherwise
-/// surfaces the status line in the error so the operator can debug.
-fn parse_introspection_response(raw: &[u8]) -> Result<IntrospectionView> {
-    let text = std::str::from_utf8(raw)
-        .context("HTTP response was not valid UTF-8")?;
-    let status_end = text
-        .find("\r\n")
-        .ok_or_else(|| anyhow!("HTTP response missing CRLF after status line"))?;
-    let status_line = &text[..status_end];
-    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
-        bail!(
-            "/internal/derived-rules returned non-200 status: {status_line:?}\n\
-             (404 means the daemon was built without chain introspection; \
-             403 means the connection didn't appear loopback to the listener; \
-             5xx means a daemon-side error)"
+    if report.partial {
+        println!(
+            "note: chain summary is partial — some upstream hops could \
+             not be reached within the timeout."
         );
     }
-    let body_start = text
-        .find("\r\n\r\n")
-        .ok_or_else(|| anyhow!("HTTP response missing CRLF/CRLF body separator"))?
-        + 4;
-    let body = &text[body_start..];
-    serde_json::from_str::<IntrospectionView>(body)
-        .with_context(|| format!("parsing /internal/derived-rules body as JSON: {body:.256}"))
 }
 
 // =============================================================================
@@ -1048,40 +887,5 @@ mod tests {
         assert_eq!(v.chain.upstream, Some(pk(2)));
         assert_eq!(v.chain.predicate_version, Some(42));
         assert_eq!(v.chain.last_apply_unix, Some(1737244800));
-    }
-
-    #[test]
-    fn parse_introspection_response_rejects_non_200() {
-        let raw = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-        let err = parse_introspection_response(raw).unwrap_err();
-        assert!(
-            err.to_string().contains("403"),
-            "error should mention 403, got: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_introspection_response_parses_well_formed_200() {
-        let body = serde_json::json!({
-            "predicates": [],
-            "derived_rules": [],
-            "chain": {
-                "local": "x25519:0101010101010101010101010101010101010101010101010101010101010101",
-                "upstream": null,
-                "downstream": null,
-                "predicate_origin": null,
-                "predicate_version": null,
-                "last_apply_unix": null,
-            }
-        })
-        .to_string();
-        let raw = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let v = parse_introspection_response(raw.as_bytes()).expect("200 should parse");
-        assert_eq!(v.chain.local, pk(1));
-        assert!(v.predicates.is_empty());
     }
 }
