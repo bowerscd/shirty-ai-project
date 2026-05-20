@@ -38,6 +38,10 @@ pub enum Cmd {
     /// `Request::ChainSummary` RPC that backs `chain diff`; no extra
     /// daemon plumbing.
     Summary(SummaryArgs),
+    /// Per-hop health (healthy / degraded / down / starting), aggregated
+    /// to a chain-wide worst-of-hops verdict. Exit code reflects the
+    /// worst hop: 0=healthy/starting, 1=degraded, 2=down, 3=RPC error.
+    Health(HealthArgs),
 }
 
 #[derive(Debug, Args)]
@@ -79,11 +83,25 @@ pub struct SummaryArgs {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Args)]
+pub struct HealthArgs {
+    /// Overall budget for assembling the chain summary across all
+    /// hops. Local-only replies effectively ignore this.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = humantime::parse_duration,
+        default_value = "5s",
+    )]
+    pub timeout: Duration,
+}
+
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     match cmd {
         Cmd::Apply(args) => apply(socket, &args).await,
         Cmd::Diff(args) => diff(socket, &args, json).await,
         Cmd::Summary(args) => summary(socket, &args, json).await,
+        Cmd::Health(args) => health(socket, &args, json).await,
     }
 }
 
@@ -674,6 +692,191 @@ fn render_summary_human(report: &SummaryReport) {
 }
 
 // =============================================================================
+// CP22: `chain health`
+// =============================================================================
+
+/// Health tier per hop. `worst-of-hops` becomes the chain-wide verdict.
+///
+/// Order matters: `Down > Degraded > Starting > Healthy`. Comparisons
+/// use the derived `PartialOrd` to bubble worst tiers up.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum HealthTier {
+    /// All checks pass.
+    Healthy,
+    /// Daemon recently started; predicate freshness has not had time
+    /// to be measured. Distinct tier so monitoring doesn't page on
+    /// initial boot.
+    Starting,
+    /// One or more checks are warning. Operator should investigate but
+    /// no immediate action required.
+    Degraded,
+    /// One or more checks are failing. Operator should act now.
+    Down,
+}
+
+/// Per-hop health entry. The `reasons` field carries the human-readable
+/// findings that drove the tier; empty when `tier == Healthy`.
+#[derive(Debug, Clone, Serialize)]
+struct HealthHop {
+    index: u32,
+    pubkey: PubKey,
+    mode: ratatoskr::control::Mode,
+    uptime_secs: u64,
+    tier: HealthTier,
+    /// Plain English notes explaining how the tier was reached. Always
+    /// present (possibly empty) so JSON consumers can rely on the
+    /// field shape.
+    reasons: Vec<String>,
+}
+
+/// Top-level health report.
+#[derive(Debug, Clone, Serialize)]
+struct HealthReport {
+    /// Worst-of-hops tier; drives the process exit code.
+    overall: HealthTier,
+    hops: Vec<HealthHop>,
+    /// Mirrors [`ChainSummaryResponse::partial`].
+    partial: bool,
+}
+
+/// Boot grace window: hops with `uptime_secs < 30` are reported as
+/// `Starting` regardless of predicate freshness.
+const STARTING_GRACE_SECS: u64 = 30;
+/// Predicate freshness thresholds (seconds since `last_apply_unix`).
+const PREDICATE_DEGRADED_AGE_SECS: i64 = 300; // 5 min
+const PREDICATE_DOWN_AGE_SECS: i64 = 1_800; // 30 min
+
+async fn health(socket: &Path, args: &HealthArgs, json_output: bool) -> Result<()> {
+    let resp = fetch_chain_summary(socket, args.timeout)
+        .await
+        .context("fetching chain summary over UDS")?;
+    if resp.hops.is_empty() {
+        bail!("daemon returned an empty chain summary; no hops to health-check");
+    }
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let hops: Vec<HealthHop> = resp
+        .hops
+        .iter()
+        .map(|h| classify_hop(h, now_unix))
+        .collect();
+    let overall = hops.iter().map(|h| h.tier).max().unwrap_or(HealthTier::Healthy);
+    let report = HealthReport {
+        overall,
+        hops,
+        partial: resp.partial,
+    };
+
+    if json_output {
+        let s = serde_json::to_string_pretty(&report)
+            .context("serialise chain health report")?;
+        println!("{s}");
+    } else {
+        render_health_human(&report);
+    }
+
+    let code = match report.overall {
+        HealthTier::Healthy | HealthTier::Starting => 0,
+        HealthTier::Degraded => 1,
+        HealthTier::Down => 2,
+    };
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Classify a single hop. Currently considers (a) the boot grace
+/// window and (b) predicate freshness from `last_apply_unix`.
+/// Heartbeat-age, rekey-age, and TLS-cert-expiry checks are deferred
+/// until [`ratatoskr::control::ChainHop`] grows the corresponding
+/// fields (CP37).
+fn classify_hop(hop: &ratatoskr::control::ChainHop, now_unix: i64) -> HealthHop {
+    let mut reasons: Vec<String> = Vec::new();
+    let mut tier = HealthTier::Healthy;
+
+    // Predicate freshness — only meaningful if a push has ever
+    // happened. Hops that never receive predicates (deeper relays in
+    // v1) legitimately report `last_apply_unix = None` and are not
+    // penalised.
+    if let Some(last_apply) = hop.view.chain.last_apply_unix {
+        let age = now_unix.saturating_sub(last_apply);
+        if age >= PREDICATE_DOWN_AGE_SECS {
+            tier = tier.max(HealthTier::Down);
+            reasons.push(format!(
+                "predicate set is stale ({}s since last apply; threshold {}s)",
+                age, PREDICATE_DOWN_AGE_SECS,
+            ));
+        } else if age >= PREDICATE_DEGRADED_AGE_SECS {
+            tier = tier.max(HealthTier::Degraded);
+            reasons.push(format!(
+                "predicate set is aging ({}s since last apply; threshold {}s)",
+                age, PREDICATE_DEGRADED_AGE_SECS,
+            ));
+        }
+    }
+
+    // Boot grace window — overrides Healthy with Starting only.
+    // Degraded/Down findings already raised above stay as-is so
+    // monitoring still surfaces actionable problems even during boot.
+    if hop.uptime_secs < STARTING_GRACE_SECS && tier == HealthTier::Healthy {
+        tier = HealthTier::Starting;
+        reasons.push(format!(
+            "daemon recently started ({}s uptime; grace window {}s)",
+            hop.uptime_secs, STARTING_GRACE_SECS,
+        ));
+    }
+
+    HealthHop {
+        index: hop.hop_index,
+        pubkey: hop.view.chain.local,
+        mode: hop.mode,
+        uptime_secs: hop.uptime_secs,
+        tier,
+        reasons,
+    }
+}
+
+fn render_health_human(report: &HealthReport) {
+    for hop in &report.hops {
+        let tier_label = match hop.tier {
+            HealthTier::Healthy => "healthy",
+            HealthTier::Starting => "starting",
+            HealthTier::Degraded => "degraded",
+            HealthTier::Down => "down",
+        };
+        println!(
+            "hop {idx}  {mode:<8}  {pk}  {tier}",
+            idx = hop.index,
+            mode = format!("{:?}", hop.mode).to_lowercase(),
+            pk = hop.pubkey,
+            tier = tier_label,
+        );
+        for reason in &hop.reasons {
+            println!("    - {reason}");
+        }
+    }
+    let overall_label = match report.overall {
+        HealthTier::Healthy => "healthy",
+        HealthTier::Starting => "starting",
+        HealthTier::Degraded => "degraded",
+        HealthTier::Down => "down",
+    };
+    println!("\noverall: {overall_label}");
+    if report.partial {
+        println!(
+            "note: chain summary is partial — some upstream hops could \
+             not be reached within the timeout."
+        );
+    }
+}
+
+// =============================================================================
 // Tests — diff comparison + serde round-trip
 // =============================================================================
 
@@ -864,5 +1067,85 @@ mod tests {
         assert_eq!(v.chain.upstream, Some(pk(2)));
         assert_eq!(v.chain.predicate_version, Some(42));
         assert_eq!(v.chain.last_apply_unix, Some(1737244800));
+    }
+
+    // ---------- chain health classification ----------
+
+    fn hop(uptime_secs: u64, last_apply_unix: Option<i64>) -> ratatoskr::control::ChainHop {
+        ratatoskr::control::ChainHop {
+            hop_index: 0,
+            mode: ratatoskr::control::Mode::Terminal,
+            uptime_secs,
+            view: view(Vec::new(), pk(1), None, None, None).pipe(|mut v| {
+                v.chain.last_apply_unix = last_apply_unix;
+                v
+            }),
+        }
+    }
+
+    /// Tiny helper trait so the closure form above reads cleanly.
+    trait Pipe: Sized {
+        fn pipe<F: FnOnce(Self) -> Self>(self, f: F) -> Self {
+            f(self)
+        }
+    }
+    impl<T> Pipe for T {}
+
+    #[test]
+    fn health_starting_when_uptime_under_grace_and_no_predicate_age() {
+        let h = hop(5, None);
+        let r = classify_hop(&h, 1_700_000_000);
+        assert_eq!(r.tier, HealthTier::Starting);
+        assert_eq!(r.reasons.len(), 1);
+    }
+
+    #[test]
+    fn health_healthy_after_grace_with_no_predicate_history() {
+        let h = hop(120, None);
+        let r = classify_hop(&h, 1_700_000_000);
+        assert_eq!(r.tier, HealthTier::Healthy);
+        assert!(r.reasons.is_empty());
+    }
+
+    #[test]
+    fn health_healthy_when_predicate_recently_applied() {
+        let now = 1_700_000_000;
+        let h = hop(120, Some(now - 30));
+        let r = classify_hop(&h, now);
+        assert_eq!(r.tier, HealthTier::Healthy);
+    }
+
+    #[test]
+    fn health_degraded_when_predicate_aging() {
+        let now = 1_700_000_000;
+        let h = hop(120, Some(now - PREDICATE_DEGRADED_AGE_SECS - 1));
+        let r = classify_hop(&h, now);
+        assert_eq!(r.tier, HealthTier::Degraded);
+    }
+
+    #[test]
+    fn health_down_when_predicate_stale() {
+        let now = 1_700_000_000;
+        let h = hop(120, Some(now - PREDICATE_DOWN_AGE_SECS - 1));
+        let r = classify_hop(&h, now);
+        assert_eq!(r.tier, HealthTier::Down);
+    }
+
+    #[test]
+    fn health_tier_ordering_bubbles_worst_up() {
+        assert!(HealthTier::Down > HealthTier::Degraded);
+        assert!(HealthTier::Degraded > HealthTier::Starting);
+        assert!(HealthTier::Starting > HealthTier::Healthy);
+    }
+
+    #[test]
+    fn health_down_overrides_starting_during_boot() {
+        // Stale predicate should not be masked by the starting grace
+        // window — operators must see persistent down conditions even
+        // during boot.
+        let now = 1_700_000_000;
+        let h = hop(5, Some(now - PREDICATE_DOWN_AGE_SECS - 1));
+        let r = classify_hop(&h, now);
+        assert_eq!(r.tier, HealthTier::Down);
     }
 }
