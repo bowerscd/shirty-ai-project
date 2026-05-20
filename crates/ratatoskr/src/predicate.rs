@@ -26,10 +26,6 @@
 //!   as milliseconds so the wire format does not depend on
 //!   `humantime_serde`. `None` means "use the daemon default".
 //!
-//! Additional predicate fields (SNI patterns, ALPN, source CIDRs, HTTPS
-//! routes) are deliberately deferred — postcard's tagged-struct encoding
-//! lets them be appended without breaking older parsers.
-//!
 //! [`Rule`]: crate::rule::Rule
 //! [`Rule::protocol`]: crate::rule::Rule::protocol
 //! [`ControlEnvelope`]: crate::control_frame::ControlEnvelope
