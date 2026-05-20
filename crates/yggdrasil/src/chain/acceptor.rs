@@ -411,6 +411,49 @@ impl ChainAcceptor {
             ix.record_apply(&set);
         }
 
+        // Mid-chain forwarding: if this relay also has an upstream
+        // (`[dial]` configured), forward the original body bytes
+        // verbatim up the chain. The wire-level origin/version is
+        // preserved so each hop applies the same monotone-version
+        // invariant against the terminal's pubkey. Failures here are
+        // logged but do not fail the downstream ack — the downstream
+        // has already done its job by getting the predicate to us.
+        if let Some(upstream) = self.upstream.get() {
+            match upstream.send_control(
+                ControlBodyType::PredicateSetUpdate.as_byte(),
+                body.to_vec(),
+            ) {
+                Ok(_completion) => {
+                    // Fire-and-forget: drop the completion receiver. The
+                    // chain client's ControlChannel handles retransmits
+                    // internally; if the upstream session is down we
+                    // rely on the publisher's reliability layer there.
+                    metrics::counter!(
+                        "yggdrasil_chain_predicate_forward_total",
+                        "outcome" => "enqueued",
+                    )
+                    .increment(1);
+                    tracing::debug!(
+                        origin = %set.origin,
+                        version = set.version,
+                        "predicate set forwarded upstream"
+                    );
+                }
+                Err(_) => {
+                    metrics::counter!(
+                        "yggdrasil_chain_predicate_forward_total",
+                        "outcome" => "client_down",
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        origin = %set.origin,
+                        version = set.version,
+                        "chain client down; predicate set not forwarded upstream"
+                    );
+                }
+            }
+        }
+
         AckStatus::Ok
     }
 

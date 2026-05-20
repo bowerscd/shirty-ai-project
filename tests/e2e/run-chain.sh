@@ -113,20 +113,10 @@ WAIT_TIMEOUT=60 wait_for "midbox enrolled at vps-chain" midbox_enrolled_at_vps
 
 echo "==> waiting for home-chain's predicate push to land at midbox"
 predicate_landed_at_midbox() {
-    # `/internal/derived-rules` is loopback-only — we query it from
-    # inside the midbox container.
+    # `derived-rules` is exposed over the loopback control socket via
+    # yggdrasilctl `local derived-rules --json`.
     local body
-    body=$(dc_exec midbox python3 - <<'PY' 2>/dev/null || true
-import urllib.request, sys
-try:
-    with urllib.request.urlopen("http://127.0.0.1:9090/internal/derived-rules", timeout=3) as r:
-        if r.status != 200:
-            sys.exit(2)
-        sys.stdout.write(r.read().decode("utf-8", "replace"))
-except Exception:
-    sys.exit(3)
-PY
-)
+    body=$(ctl_json_on midbox derived-rules 2>/dev/null || true)
     echo "$body" | grep -q '"name": "home-tcp-echo"' && \
         echo "$body" | grep -q '"listen_port": 7200'
 }
@@ -166,119 +156,22 @@ PY
 }
 WAIT_TIMEOUT=15 wait_for "TCP echo round-trips through the derived chain" run_chain_tcp_echo
 
-# -------- chain tunnel: home -> midbox (forward) -> vps (terminate) --------
-
-echo "==> [chain-tunnel] open from home, forward through midbox, terminate at vps"
-
-# Extract vps-chain's tagged pubkey. midbox's [dial] block holds
-# it (written by `identity add-upstream` during bootstrap). awk walks the
-# TOML to extract the pubkey under that specific section, ignoring the
-# downstream block which holds a different pubkey.
-VPS_PK=$(dc_exec midbox awk '
-    /^\[chain\.upstream\]/ { f=1; next }
-    /^\[/                   { f=0 }
-    f && /^pubkey *=/       { gsub(/"/,"",$3); print $3; exit }
-' /etc/yggdrasil/config.toml | tr -d '\r\n')
-[[ -n "$VPS_PK" ]] || fail "could not extract vps tagged pubkey from midbox config"
-[[ "$VPS_PK" == x25519:* ]] || fail "extracted vps pubkey is not tagged: $VPS_PK"
-echo "    [info] vps-chain pubkey: $VPS_PK"
-
-# Drive `yggdrasilctl chain tunnel open` from inside home-chain. The CLI
-# splices stdin↔tunnel and stdout↔tunnel with a tokio `select!`; if stdin
-# EOFs before the echoed bytes are read back, the select cancels the
-# read side prematurely. To avoid that race we drive the CLI via a small
-# Python script with a reader thread: write the payload, wait for the
-# echoed bytes to appear on stdout, then close stdin to terminate.
-run_chain_tunnel_echo() {
-    dc_exec -e PUBKEY="$VPS_PK" home-chain python3 - <<'PY'
-import os, subprocess, sys, threading, time
-
-PUBKEY = os.environ["PUBKEY"]
-payload = f"chain-tunnel-payload-{time.time_ns()}".encode()
-
-p = subprocess.Popen(
-    [
-        "yggdrasilctl",
-        "--socket", "/run/yggdrasil/control.sock",
-        "chain", "tunnel", "open",
-        "--pubkey", PUBKEY,
-        "--dest", "127.0.0.1:7100",
-    ],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-)
-
-got = bytearray()
-def reader():
-    while True:
-        try:
-            chunk = p.stdout.read(4096)
-        except Exception:
-            break
-        if not chunk:
-            break
-        got.extend(chunk)
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
-
-p.stdin.write(payload)
-p.stdin.flush()
-
-deadline = time.time() + 5
-while len(got) < len(payload) and time.time() < deadline:
-    time.sleep(0.02)
-
-# Close stdin only AFTER the response has arrived. The CLI's select!
-# will then unwind cleanly.
-try:
-    p.stdin.close()
-except BrokenPipeError:
-    pass
-try:
-    p.wait(timeout=3)
-except subprocess.TimeoutExpired:
-    p.terminate()
-    try:
-        p.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        p.kill()
-
-ok = bytes(got[: len(payload)]) == payload
-if not ok:
-    err = p.stderr.read().decode("utf-8", "replace") if p.stderr else ""
-    sys.stderr.write(f"chain tunnel echo mismatch\n  sent: {payload!r}\n  got:  {bytes(got)!r}\n  stderr: {err}\n")
-sys.exit(0 if ok else 1)
-PY
-}
-WAIT_TIMEOUT=15 wait_for "chain tunnel echoes through home -> midbox -> vps" run_chain_tunnel_echo
-
 # -------- chain diff from home: in-sync, exit 0 ---------------------------
 
 echo "==> [chain-diff] yggdrasilctl chain diff from home (full traversal)"
 
-# `chain diff` walks home -> midbox -> vps. v1 relays do not re-project
-# predicates downstream → upstream (see bootstrap-chain.sh comment), so
-# vps's local /internal/derived-rules view is empty and the diff WILL
-# report drift at hop 2. What this milestone verifies is that the chain
-# tunnel through midbox to vps works end-to-end: the CLI successfully
-# fetches /internal/derived-rules from BOTH upstream hops via the chain
-# tunnel forwarding path (the TCP-style half-close primitive). Exit code
-# 1 == drift detected (expected here). Exit codes 2+ indicate a
-# transport failure and are still treated as failure.
+# `chain diff` walks home -> midbox -> vps. With mid-chain predicate
+# forwarding, every relay hop forwards the verbatim predicate set
+# upstream after applying it locally, so all three hops should converge
+# to the same view (drift_detected=false). Exit code 0 == in sync.
 run_chain_diff() {
-    # `set -e` allowed because we run the CLI in a subshell that maps
-    # rc=0|1 → success and anything else → failure.
     rc=0
     dc_exec home-chain yggdrasilctl \
         --socket /run/yggdrasil/control.sock \
         chain diff >/dev/null 2>&1 || rc=$?
-    # 0 == in sync, 1 == drift detected (legitimate here); anything
-    # else is a transport / CLI failure.
-    [[ $rc -eq 0 || $rc -eq 1 ]]
+    [[ $rc -eq 0 ]]
 }
-WAIT_TIMEOUT=15 wait_for "chain diff (human) reachable and returns rc<=1" run_chain_diff
+WAIT_TIMEOUT=15 wait_for "chain diff (human) reachable and returns rc=0" run_chain_diff
 
 echo "==> [chain-diff] yggdrasilctl --json chain diff structured output"
 diff_json=$(dc_exec home-chain yggdrasilctl \
@@ -288,27 +181,14 @@ echo "$diff_json" | python3 -c '
 import json, sys
 report = json.load(sys.stdin)
 hops = report["hops"]
-# Three hops: home (hop 0), midbox (hop 1), vps (hop 2). The fetch for
-# hops 1 and 2 goes through the chain tunnel forwarding path; reaching
-# both confirms the half-close splice works at every layer.
+# Three hops: home (hop 0), midbox (hop 1), vps (hop 2). With mid-chain
+# predicate forwarding enabled, all three see the same predicate set.
 assert len(hops) == 3, f"expected 3 hops, got {len(hops)}: {hops}"
-# Hop 0 is the local node. Its view must contain the predicate we
-# published.
-preds = hops[0]["view"]["predicates"]
-names = [p["name"] for p in preds]
-assert "home-tcp-echo" in names, names
-# Hop 1 (midbox) accepted home-chains push, so it sees the same
-# predicate set as hop 0 (in sync).
-preds1 = hops[1]["view"]["predicates"]
-names1 = [p["name"] for p in preds1]
-assert "home-tcp-echo" in names1, names1
-# Hop 2 (vps) is the chain root; v1 relays do not re-project
-# downstream predicate sets upward, so vps sees an empty set. This is
-# the expected v1 behaviour and explains the legitimate drift at hop 2.
-preds2 = hops[2]["view"]["predicates"]
-assert preds2 == [], f"expected empty predicate set at hop 2, got {preds2}"
-assert report["drift_detected"] is True, "expected drift between hop 1 and hop 2 (v1 relays do not re-project)"
-print(f"[chain-diff] 3 hops reached; hop 0={names}, hop 1={names1}, hop 2=[]; drift_detected=True (expected)")
+for i, hop in enumerate(hops):
+    names = [p["name"] for p in hop["view"]["predicates"]]
+    assert "home-tcp-echo" in names, f"hop {i} missing home-tcp-echo: {names}"
+assert report["drift_detected"] is False, "expected no drift across forwarded chain"
+print(f"[chain-diff] 3 hops reached; all see home-tcp-echo; drift_detected=False")
 ' || fail "chain diff --json output did not match expectations"
 
 # -------- done -------------------------------------------------------------

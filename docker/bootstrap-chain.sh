@@ -109,8 +109,9 @@ echo "[init-chain] generating home-chain identity"
 yggdrasilctl --config "$HOME_CFG" identity rotate \
     --identity-file "$HOME_KEY" --force >/dev/null
 
-# home-chain publishes a single TCP predicate. midbox will derive a matching
-# listener; vps remains unaware (v1 relays don't re-project predicates).
+# home-chain publishes a single TCP predicate. midbox derives a matching
+# listener AND forwards the verbatim predicate set upstream to vps, so
+# vps applies the same predicate against home's origin pubkey.
 # The terminal-mode rule needs a target_addr because terminal-mode
 # rules can't use peer-relative target_port. We point it at home's own
 # loopback echo (started by the chain entrypoint).
