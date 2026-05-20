@@ -115,33 +115,91 @@ impl PendingPeerStore {
             .collect()
     }
 
-    /// Pop the candidate matching `fingerprint`. Returns the decoded 32-byte
-    /// public key on success, or `None` if no such fingerprint is staged.
-    /// On success the store is persisted with that entry removed.
-    pub fn approve(&self, fingerprint: &str) -> Result<Option<[u8; PUBLIC_KEY_LEN]>> {
+    /// Pop the candidate matching `query`. The query may be a full
+    /// fingerprint or any unique prefix of at least
+    /// [`MIN_FINGERPRINT_PREFIX_LEN`] hex characters. Returns the
+    /// resolved full fingerprint and decoded 32-byte public key on a
+    /// unique match, [`ApproveOutcome::NotFound`] when no candidate
+    /// shares the prefix, or [`ApproveOutcome::Ambiguous`] with the
+    /// list of full fingerprints that share it.
+    ///
+    /// The store is persisted (with the matching entry removed) only on
+    /// the unique-match path.
+    pub fn approve(&self, query: &str) -> Result<ApproveOutcome> {
+        if query.len() < MIN_FINGERPRINT_PREFIX_LEN {
+            return Ok(ApproveOutcome::PrefixTooShort {
+                provided: query.len(),
+                required: MIN_FINGERPRINT_PREFIX_LEN,
+            });
+        }
+        if !query.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(ApproveOutcome::NotFound);
+        }
+        let lower = query.to_ascii_lowercase();
         let mut guard = self.inner.lock().unwrap();
-        let idx = match guard
+        let matches: Vec<usize> = guard
             .candidates
             .iter()
-            .position(|c| c.fingerprint == fingerprint)
-        {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        let removed = guard.candidates.remove(idx);
-        let bytes = hex::decode(&removed.public_key_hex)
-            .with_context(|| format!("decode staged pubkey for {fingerprint}"))?;
-        if bytes.len() != PUBLIC_KEY_LEN {
-            anyhow::bail!(
-                "staged pubkey for {fingerprint} has wrong length {} (want {PUBLIC_KEY_LEN})",
-                bytes.len()
-            );
+            .enumerate()
+            .filter(|(_, c)| c.fingerprint.starts_with(&lower))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(ApproveOutcome::NotFound),
+            [idx] => {
+                let removed = guard.candidates.remove(*idx);
+                let bytes = hex::decode(&removed.public_key_hex).with_context(|| {
+                    format!("decode staged pubkey for {}", removed.fingerprint)
+                })?;
+                if bytes.len() != PUBLIC_KEY_LEN {
+                    anyhow::bail!(
+                        "staged pubkey for {} has wrong length {} (want {PUBLIC_KEY_LEN})",
+                        removed.fingerprint,
+                        bytes.len()
+                    );
+                }
+                let mut key = [0u8; PUBLIC_KEY_LEN];
+                key.copy_from_slice(&bytes);
+                write_atomic(&self.path, &guard)?;
+                Ok(ApproveOutcome::Approved {
+                    fingerprint: removed.fingerprint,
+                    key,
+                })
+            }
+            many => Ok(ApproveOutcome::Ambiguous {
+                matches: many
+                    .iter()
+                    .map(|i| guard.candidates[*i].fingerprint.clone())
+                    .collect(),
+            }),
         }
-        let mut key = [0u8; PUBLIC_KEY_LEN];
-        key.copy_from_slice(&bytes);
-        write_atomic(&self.path, &guard)?;
-        Ok(Some(key))
     }
+}
+
+/// Minimum hex characters accepted by [`PendingPeerStore::approve`] when
+/// resolving a fingerprint by prefix. Picked so that two random
+/// fingerprints colliding on a prefix is implausible at any realistic
+/// pending-queue size while still saving the operator from typing all 32
+/// hex characters of a BLAKE2s-128 fingerprint.
+pub const MIN_FINGERPRINT_PREFIX_LEN: usize = 8;
+
+/// Result of a fingerprint-prefix lookup against the pending store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    /// Exactly one candidate matched the prefix; it has been popped from
+    /// the queue and persisted. The full fingerprint and decoded public
+    /// key are returned for the caller to commit downstream.
+    Approved {
+        fingerprint: String,
+        key: [u8; PUBLIC_KEY_LEN],
+    },
+    /// No staged candidate shares the prefix.
+    NotFound,
+    /// More than one candidate shares the prefix. The store is left
+    /// untouched; the operator must re-run with a longer prefix.
+    Ambiguous { matches: Vec<String> },
+    /// The supplied prefix is shorter than [`MIN_FINGERPRINT_PREFIX_LEN`].
+    PrefixTooShort { provided: usize, required: usize },
 }
 
 fn current_unix_millis() -> u64 {
@@ -215,19 +273,97 @@ mod tests {
         store.record_candidate(k1).unwrap();
         store.record_candidate(k2).unwrap();
         let fp1 = public_key_fingerprint(&k1);
-        let approved = store.approve(&fp1).unwrap();
-        assert_eq!(approved, Some(k1));
+        match store.approve(&fp1).unwrap() {
+            ApproveOutcome::Approved { fingerprint, key } => {
+                assert_eq!(fingerprint, fp1);
+                assert_eq!(key, k1);
+            }
+            other => panic!("expected Approved, got {other:?}"),
+        }
         let list = store.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].fingerprint, public_key_fingerprint(&k2));
-        // Double approve of the same fingerprint now yields None.
-        assert_eq!(store.approve(&fp1).unwrap(), None);
+        // Double approve of the same fingerprint now yields NotFound.
+        assert_eq!(store.approve(&fp1).unwrap(), ApproveOutcome::NotFound);
     }
 
     #[test]
-    fn approve_unknown_fingerprint_returns_none() {
+    fn approve_unknown_fingerprint_returns_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let store = PendingPeerStore::load(dir.path()).unwrap();
-        assert_eq!(store.approve("nope").unwrap(), None);
+        assert_eq!(
+            store.approve("deadbeef").unwrap(),
+            ApproveOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn approve_rejects_prefix_under_eight_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingPeerStore::load(dir.path()).unwrap();
+        store.record_candidate([4u8; PUBLIC_KEY_LEN]).unwrap();
+        let fp = public_key_fingerprint(&[4u8; PUBLIC_KEY_LEN]);
+        let short = &fp[..7];
+        match store.approve(short).unwrap() {
+            ApproveOutcome::PrefixTooShort { provided, required } => {
+                assert_eq!(provided, 7);
+                assert_eq!(required, MIN_FINGERPRINT_PREFIX_LEN);
+            }
+            other => panic!("expected PrefixTooShort, got {other:?}"),
+        }
+        // Store is untouched.
+        assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn approve_resolves_unique_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingPeerStore::load(dir.path()).unwrap();
+        let k = [9u8; PUBLIC_KEY_LEN];
+        store.record_candidate(k).unwrap();
+        let fp = public_key_fingerprint(&k);
+        let prefix = &fp[..MIN_FINGERPRINT_PREFIX_LEN];
+        match store.approve(prefix).unwrap() {
+            ApproveOutcome::Approved { fingerprint, key } => {
+                assert_eq!(fingerprint, fp);
+                assert_eq!(key, k);
+            }
+            other => panic!("expected Approved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approve_returns_ambiguous_when_two_candidates_share_prefix() {
+        // Manually craft a store with two candidates that collide on an
+        // 8-char prefix (real BLAKE2s output won't collide at that
+        // length in any realistic pending-queue, but the prefix-match
+        // path is data-driven so we can fake it).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending_peers.toml");
+        let body = "\
+[[candidates]]
+fingerprint = \"abcdef0011112222\"
+public_key_hex = \"0101010101010101010101010101010101010101010101010101010101010101\"
+first_seen_unix_ms = 1
+attempt_count = 1
+
+[[candidates]]
+fingerprint = \"abcdef0033334444\"
+public_key_hex = \"0202020202020202020202020202020202020202020202020202020202020202\"
+first_seen_unix_ms = 2
+attempt_count = 1
+";
+        std::fs::write(&path, body).unwrap();
+        let store = PendingPeerStore::load(dir.path()).unwrap();
+        match store.approve("abcdef00").unwrap() {
+            ApproveOutcome::Ambiguous { matches } => {
+                assert_eq!(matches.len(), 2);
+                assert!(matches.iter().any(|m| m == "abcdef0011112222"));
+                assert!(matches.iter().any(|m| m == "abcdef0033334444"));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        // Both candidates still staged.
+        assert_eq!(store.list().len(), 2);
     }
 }

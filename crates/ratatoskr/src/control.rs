@@ -80,9 +80,15 @@ pub enum Request {
     DownstreamShow,
     /// Staged (TOFU) downstream candidates awaiting approval.
     DownstreamPending,
-    /// Approve a staged candidate by its short fingerprint.
+    /// Approve a staged candidate by its fingerprint or any unique
+    /// 8+-hex-char prefix. The daemon disambiguates: a unique match
+    /// pops the candidate and emits [`Response::DownstreamApproved`];
+    /// an ambiguous prefix returns
+    /// [`error_codes::AMBIGUOUS_FINGERPRINT`] with the colliding
+    /// fingerprints in the message.
     DownstreamApprove {
-        /// Short BLAKE2s-128 fingerprint (32 hex chars).
+        /// Full BLAKE2s-128 fingerprint (32 hex chars) or any unique
+        /// prefix of at least 8 hex chars.
         fingerprint: String,
     },
     /// List TLS certificates currently loaded into the cert store, one
@@ -420,6 +426,13 @@ pub struct ChainAppliedResponse {
 /// so tests on both sides can assert against them without typos.
 pub mod error_codes {
     pub const NO_SUCH_FINGERPRINT: &str = "no_such_fingerprint";
+    /// The fingerprint prefix supplied to
+    /// [`super::Request::DownstreamApprove`] matched more than one
+    /// staged candidate, or was shorter than the minimum prefix length.
+    /// The error `message` lists the colliding full fingerprints (or
+    /// the required minimum length) so the operator can re-run with a
+    /// longer / more specific prefix.
+    pub const AMBIGUOUS_FINGERPRINT: &str = "ambiguous_fingerprint";
     pub const CONFIG_WRITE_FAILED: &str = "config_write_failed";
     pub const RELOAD_FAILED:       &str = "reload_failed";
     pub const DOWNSTREAM_ALREADY_ENROLLED: &str = "downstream_already_enrolled";

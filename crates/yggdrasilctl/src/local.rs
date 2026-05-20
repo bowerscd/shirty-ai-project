@@ -74,13 +74,17 @@ pub enum DownstreamAction {
     Show,
     /// List staged TOFU candidates awaiting approval.
     Pending,
-    /// Approve a staged candidate by its short fingerprint.
+    /// Approve a staged candidate by its fingerprint or any unique
+    /// 8+-hex-char prefix.
     Approve(ApproveArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ApproveArgs {
-    /// Short BLAKE2s-128 fingerprint (32 hex chars) of the downstream to approve.
+    /// Full BLAKE2s-128 fingerprint (32 hex chars) of the downstream
+    /// to approve, or any unique prefix of at least 8 hex chars. The
+    /// daemon disambiguates against the staged queue; ambiguous
+    /// prefixes return an error listing every match.
     pub fingerprint: String,
 }
 

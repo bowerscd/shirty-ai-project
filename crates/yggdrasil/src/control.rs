@@ -723,12 +723,36 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
         (Some(ps), Some(store)) => (ps, store),
         _ => return terminal_mode_unsupported("downstream approve"),
     };
-    let key = match pending_store.approve(fingerprint) {
-        Ok(Some(k)) => k,
-        Ok(None) => {
+    let (resolved_fp, key) = match pending_store.approve(fingerprint) {
+        Ok(crate::pending_peers::ApproveOutcome::Approved { fingerprint, key }) => {
+            (fingerprint, key)
+        }
+        Ok(crate::pending_peers::ApproveOutcome::NotFound) => {
             return Response::Error {
                 code: error_codes::NO_SUCH_FINGERPRINT.into(),
-                message: format!("fingerprint {fingerprint:?} is not in the pending queue"),
+                message: format!(
+                    "no pending candidate matches fingerprint prefix {fingerprint:?}"
+                ),
+            };
+        }
+        Ok(crate::pending_peers::ApproveOutcome::Ambiguous { matches }) => {
+            return Response::Error {
+                code: error_codes::AMBIGUOUS_FINGERPRINT.into(),
+                message: format!(
+                    "fingerprint prefix {fingerprint:?} is ambiguous; matches {} candidates: {}. \
+                     Re-run `local downstream approve` with a longer prefix.",
+                    matches.len(),
+                    matches.join(", ")
+                ),
+            };
+        }
+        Ok(crate::pending_peers::ApproveOutcome::PrefixTooShort { provided, required }) => {
+            return Response::Error {
+                code: error_codes::AMBIGUOUS_FINGERPRINT.into(),
+                message: format!(
+                    "fingerprint prefix {fingerprint:?} is too short ({provided} hex chars); \
+                     a minimum of {required} hex chars is required to disambiguate."
+                ),
             };
         }
         Err(e) => {
@@ -752,11 +776,11 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
     }
     peer_state.set_peer_static_key(key);
     tracing::info!(
-        fingerprint = fingerprint,
+        fingerprint = %resolved_fp,
         "downstream approved via control surface; key is now live"
     );
     Response::DownstreamApproved {
-        fingerprint: fingerprint.to_string(),
+        fingerprint: resolved_fp,
     }
 }
 
