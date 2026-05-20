@@ -443,6 +443,30 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                       hoisted by handle_connection)"
                 .to_string(),
         },
+        Request::TraceSet { directive } => match directive {
+            Some(d) => match crate::log::set_trace_directive(&d) {
+                Ok(active) => {
+                    let default = crate::log::trace_directives()
+                        .map(|(_, def)| def)
+                        .unwrap_or_default();
+                    Response::TraceSet { active, default }
+                }
+                Err(msg) => Response::Error {
+                    code: error_codes::INVALID_REQUEST.into(),
+                    message: format!("invalid tracing directive: {msg}"),
+                },
+            },
+            None => match crate::log::reset_trace_directive() {
+                Ok(active) => {
+                    let default = active.clone();
+                    Response::TraceSet { active, default }
+                }
+                Err(msg) => Response::Error {
+                    code: error_codes::INTERNAL_ERROR.into(),
+                    message: format!("could not reset tracing filter: {msg}"),
+                },
+            },
+        },
     }
 }
 

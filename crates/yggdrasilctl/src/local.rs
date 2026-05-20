@@ -42,6 +42,22 @@ pub enum Cmd {
     /// data the previous loopback-gated `GET /internal/derived-rules`
     /// HTTP endpoint served, now retrieved over UDS.
     DerivedRules,
+    /// Adjust the daemon's tracing-subscriber filter at runtime.
+    /// Pass a directive (`debug`, `yggdrasil::heartbeat=trace,info`,
+    /// etc.) or `--reset` to revert to the startup filter. With no
+    /// args, prints the current and default directives without
+    /// changing anything.
+    Trace(TraceArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TraceArgs {
+    /// New EnvFilter directive to install. Required unless `--reset` is set.
+    #[arg(conflicts_with = "reset", required_unless_present = "reset")]
+    pub directive: Option<String>,
+    /// Restore the directive the daemon was launched with.
+    #[arg(long)]
+    pub reset: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -104,6 +120,19 @@ fn build_request(cmd: &Cmd) -> Request {
         Cmd::Metrics => Request::Metrics,
         Cmd::Health => Request::Health,
         Cmd::DerivedRules => Request::DerivedRules,
+        Cmd::Trace(args) => {
+            if args.reset {
+                Request::TraceSet { directive: None }
+            } else {
+                let d = args
+                    .directive
+                    .clone()
+                    .expect("clap enforces directive XOR --reset");
+                Request::TraceSet {
+                    directive: Some(d),
+                }
+            }
+        }
     }
 }
 
@@ -278,6 +307,10 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                 "server returned unexpected ChainSummary response \
                  to local request {request:?}"
             );
+        }
+        Response::TraceSet { active, default } => {
+            println!("trace: active={active}");
+            println!("       default={default}");
         }
     }
     Ok(())

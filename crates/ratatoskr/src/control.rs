@@ -146,6 +146,18 @@ pub enum Request {
         /// checks run on the daemon side.
         rules: Vec<Rule>,
     },
+    /// Adjust the daemon's `tracing` filter at runtime. `directive` is
+    /// any string accepted by [`tracing_subscriber::EnvFilter`] (a bare
+    /// level like `"debug"`, or a comma-separated set of
+    /// `target=level` rules). When `directive` is `None`, the filter
+    /// reverts to the value the daemon was started with (from the
+    /// `YGGDRASIL_LOG` env var, or `info` if unset). Backs
+    /// `yggdrasilctl local trace [<DIRECTIVE>] [--reset]`.
+    TraceSet {
+        /// New filter directive, or `None` to reset to the startup
+        /// default.
+        directive: Option<String>,
+    },
 }
 
 /// All possible server → client messages.
@@ -182,6 +194,16 @@ pub enum Response {
     /// terminal daemons with a chain upstream, what the projected
     /// predicate set looks like.
     ChainApplied(ChainAppliedResponse),
+    /// Successful response to [`Request::TraceSet`]. `active` is the
+    /// directive now in effect (after the change applied);
+    /// `default` is the startup directive a `--reset` would restore.
+    TraceSet {
+        /// Filter directive currently in effect.
+        active: String,
+        /// Filter directive a `--reset` would restore (the value the
+        /// daemon was launched with).
+        default: String,
+    },
     /// Generic failure. Always preserves the request kind for diagnostics.
     Error {
         /// e.g. "no_such_fingerprint", "config_write_failed", "unknown_request".

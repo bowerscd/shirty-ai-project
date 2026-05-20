@@ -304,6 +304,17 @@ PY
 }
 WAIT_TIMEOUT=15 wait_for "DNS-resolved upstream echo via home:7200" run_dns_echo
 
+# -------- test 9: runtime tracing-filter swap -------------------------------
+
+echo "==> [trace] yggdrasilctl local trace round-trips a directive"
+trace_json=$(ctl_json trace debug) || fail "local trace debug failed"
+echo "$trace_json" | grep -q '"active": "debug"' \
+    || fail "trace response missing active=debug"
+trace_reset_json=$(ctl_json trace --reset) || fail "local trace --reset failed"
+echo "$trace_reset_json" | grep -q '"active": "info"' \
+    || fail "trace --reset did not restore startup directive (got $trace_reset_json)"
+echo "    [ok] trace directive applied + reset round-trip"
+
 # -------- done --------------------------------------------------------------
 
 echo
