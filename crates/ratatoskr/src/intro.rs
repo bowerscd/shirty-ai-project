@@ -9,12 +9,12 @@
 //!    out-of-band to U.
 //!
 //! 2. **invite.txt** — produced by U's
-//!    `yggdrasilctl identity add-downstream --from intro.txt`. Echoes D's
+//!    `yggdrasilctl identity add-accept --from intro.txt`. Echoes D's
 //!    pubkey, declares U's own pubkey + endpoint, plus matching note +
 //!    timestamp. U's own config is updated with `[accept]` as a
 //!    side effect. Transferred back to D.
 //!
-//! On D's box, `yggdrasilctl identity add-upstream invite.txt` parses the
+//! On D's box, `yggdrasilctl identity add-dial invite.txt` parses the
 //! invite, verifies that `downstream_pubkey` matches D's local identity
 //! (sanity check against a swapped file), and writes `[dial]`
 //! into D's config.

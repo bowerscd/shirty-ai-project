@@ -125,17 +125,17 @@ the relay caches the candidate pubkey in `[server].state_dir` and waits
 for an operator to bless it. Workflow:
 
 ```bash
-sudo yggdrasilctl local downstream pending
+sudo yggdrasilctl local accept pending
 # fingerprint        first_seen          peer_endpoint
 # 1234abcd...        2024-03-12T18:43Z   203.0.113.42:51820
 
-sudo yggdrasilctl local downstream approve 1234abcd5678efef...
+sudo yggdrasilctl local accept approve 1234abcd5678efef...
 # wrote [accept].pubkey = x25519:9d2f04a3...4b7c
 ```
 
 After approve, restart the daemon for `[accept]` to take effect.
 The same effect can also be produced offline via `yggdrasilctl identity
-add-downstream` against an intro file — see [quickstart.md](quickstart.md).
+add-accept` against an intro file — see [quickstart.md](quickstart.md).
 
 ### Hot-reloading rules
 
@@ -213,17 +213,17 @@ sudo yggdrasilctl identity rotate --force
 # it — the downstream pubkey is unchanged across an upstream-side rotation.)
 sudo yggdrasilctl identity export-intro --out /tmp/downstream.intro    # ON the downstream
 
-# Back on the relay, re-run add-downstream against the intro. This rewrites
+# Back on the relay, re-run add-accept against the intro. This rewrites
 # [accept].pubkey (no-op if unchanged) and emits a fresh invite
 # carrying the NEW relay pubkey + endpoint.
-sudo yggdrasilctl identity add-downstream \
+sudo yggdrasilctl identity add-accept \
     --from /tmp/downstream.intro \
     --my-endpoint relay.example.net:51820 \
     --out /tmp/relay.invite
 
 # Ship the invite to the downstream. There, apply it — it rewrites
 # [dial].pubkey to the relay's new key.
-sudo yggdrasilctl identity add-upstream --from /tmp/relay.invite       # ON the downstream
+sudo yggdrasilctl identity add-dial --from /tmp/relay.invite       # ON the downstream
 
 # Restart both daemons.
 sudo systemctl restart yggdrasil
@@ -242,14 +242,14 @@ sudo yggdrasilctl identity rotate --force
 sudo yggdrasilctl identity export-intro --out /tmp/downstream.intro
 
 # Ship intro to the upstream. There:
-sudo yggdrasilctl identity remove-downstream                            # ON the upstream
-sudo yggdrasilctl identity add-downstream \
+sudo yggdrasilctl identity remove-accept                            # ON the upstream
+sudo yggdrasilctl identity add-accept \
     --from /tmp/downstream.intro \
     --my-endpoint <upstream-public>:<chain-listener-port> \
     --out /tmp/upstream.invite
 
 # Ship the fresh invite back. On the downstream:
-sudo yggdrasilctl identity add-upstream --from /tmp/upstream.invite
+sudo yggdrasilctl identity add-dial --from /tmp/upstream.invite
 
 # Restart both daemons.
 ```
@@ -262,7 +262,7 @@ upstream:
 1. Provision the mid-relay (binary, identity, base config) per
   [install.md](install.md). Create a base `[server]` section but do not
   start the daemon yet; enrollment will write `[accept]` and `[dial]`.
-2. On the terminal, `yggdrasilctl identity remove-upstream`. Heartbeats
+2. On the terminal, `yggdrasilctl identity remove-dial`. Heartbeats
    to the old upstream stop.
 3. Mid-relay ↔ old-upstream enrollment: run the intro/invite ceremony
    so the mid-relay is the new downstream of the old upstream.
@@ -293,9 +293,9 @@ The terminal can't complete Noise_IK against the configured upstream.
 
 The relay shows a pending candidate but no `accept` is wired.
 
-* Run `yggdrasilctl local downstream pending` to confirm the fingerprint.
+* Run `yggdrasilctl local accept pending` to confirm the fingerprint.
 * Cross-check with `yggdrasilctl identity show` on the downstream.
-* If they match, `yggdrasilctl local downstream approve <fingerprint>`,
+* If they match, `yggdrasilctl local accept approve <fingerprint>`,
   then restart the relay.
 
 ### "rules don't show up on the relay after I edit them on the terminal"

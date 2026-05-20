@@ -98,7 +98,7 @@ yggdrasilctl --config "$HOME_CFG" identity export-intro \
     --note "e2e home downstream" >/dev/null
 
 echo "[init] vps mints invite for home (writes [accept])"
-yggdrasilctl --config "$VPS_CFG" identity add-downstream \
+yggdrasilctl --config "$VPS_CFG" identity add-accept \
     --identity-file "$VPS_KEY" \
     --from "$INTRO_PATH" \
     --my-endpoint vps:51820 \
@@ -106,7 +106,7 @@ yggdrasilctl --config "$VPS_CFG" identity add-downstream \
     --note "e2e vps→home" >/dev/null
 
 echo "[init] home applies invite (writes [dial])"
-yggdrasilctl --config "$HOME_CFG" identity add-upstream \
+yggdrasilctl --config "$HOME_CFG" identity add-dial \
     --identity-file "$HOME_KEY" \
     --from "$INVITE_PATH" >/dev/null
 

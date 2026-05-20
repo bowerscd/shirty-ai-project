@@ -170,14 +170,14 @@ scope of `yggdrasilctl`:
    writes the local pubkey + fingerprint + optional operator note.
 
 2. **Upstream issues an invite.** On the would-be upstream:
-   `yggdrasilctl identity add-downstream --from intro.txt
+   `yggdrasilctl identity add-accept --from intro.txt
    --my-endpoint vps.example.net:51820 --out invite.txt`
    writes `[accept]` into the upstream's config (pinning the
    downstream's pubkey) and emits an invite file containing both pubkeys
    plus the upstream's reachable endpoint.
 
 3. **Downstream applies the invite.** Back on the downstream:
-   `yggdrasilctl identity add-upstream --from invite.txt`
+   `yggdrasilctl identity add-dial --from invite.txt`
    verifies that the invite's `downstream_pubkey` matches the local
    identity (catches "wrong invite file" mistakes) and writes
    `[dial]` into the downstream's config (pinning the upstream's
@@ -194,8 +194,8 @@ boundary; if you skip it, you trust whoever transported the files.
 If a downstream attempts a handshake whose pubkey isn't pinned in
 `[accept]`, the upstream stages it in the **pending peer
 store** and refuses traffic. The operator inspects candidates with
-`yggdrasilctl local downstream pending`, verifies the fingerprint
-out-of-band, and approves with `yggdrasilctl local downstream approve
+`yggdrasilctl local accept pending`, verifies the fingerprint
+out-of-band, and approves with `yggdrasilctl local accept approve
 <fingerprint>`. Approval writes `[accept].pubkey` into the
 upstream's config.
 

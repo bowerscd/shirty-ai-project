@@ -20,10 +20,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: RuleAction,
     },
-    /// Inspect or manage the enrolled downstream peer (relay mode only).
-    Downstream {
+    /// Inspect or manage the enrolled accept-side peer (the inbound chain
+    /// peer pinned by `[accept]` — for relay-mode this is the downstream
+    /// terminal node).
+    Accept {
         #[command(subcommand)]
-        action: DownstreamAction,
+        action: AcceptAction,
     },
     /// Render the daemon's Prometheus metrics in text exposition format
     /// (the same body the `/metrics` HTTP endpoint serves), retrieved
@@ -64,8 +66,8 @@ pub enum RuleAction {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum DownstreamAction {
-    /// Show the currently enrolled downstream pubkey and fingerprint.
+pub enum AcceptAction {
+    /// Show the currently enrolled accept-side pubkey and fingerprint.
     Show,
     /// List staged TOFU candidates awaiting approval.
     Pending,
@@ -76,8 +78,8 @@ pub enum DownstreamAction {
 
 #[derive(Debug, Args)]
 pub struct ApproveArgs {
-    /// Full BLAKE2s-128 fingerprint (32 hex chars) of the downstream
-    /// to approve, or any unique prefix of at least 8 hex chars. The
+    /// Full BLAKE2s-128 fingerprint (32 hex chars) of the accept-side
+    /// peer to approve, or any unique prefix of at least 8 hex chars. The
     /// daemon disambiguates against the staged queue; ambiguous
     /// prefixes return an error listing every match.
     pub fingerprint: String,
@@ -100,10 +102,10 @@ fn build_request(cmd: &Cmd) -> Request {
             RuleAction::List => Request::RulesList,
             RuleAction::Reload => Request::RulesReload,
         },
-        Cmd::Downstream { action } => match action {
-            DownstreamAction::Show => Request::DownstreamShow,
-            DownstreamAction::Pending => Request::DownstreamPending,
-            DownstreamAction::Approve(a) => Request::DownstreamApprove {
+        Cmd::Accept { action } => match action {
+            AcceptAction::Show => Request::DownstreamShow,
+            AcceptAction::Pending => Request::DownstreamPending,
+            AcceptAction::Approve(a) => Request::DownstreamApprove {
                 fingerprint: a.fingerprint.clone(),
             },
         },

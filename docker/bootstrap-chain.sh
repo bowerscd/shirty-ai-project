@@ -132,16 +132,16 @@ yggdrasilctl --config "$HOME_CFG" identity export-intro \
     --out "$HOME_INTRO" \
     --note "chain e2e home" >/dev/null
 
-echo "[init-chain] midbox add-downstream from home-chain (writes midbox's [accept])"
-yggdrasilctl --config "$MIDBOX_CFG" identity add-downstream \
+echo "[init-chain] midbox add-accept from home-chain (writes midbox's [accept])"
+yggdrasilctl --config "$MIDBOX_CFG" identity add-accept \
     --identity-file "$MIDBOX_KEY" \
     --from "$HOME_INTRO" \
     --my-endpoint midbox:51820 \
     --out "$HOME_INVITE" \
     --note "chain e2e midbox->home" >/dev/null
 
-echo "[init-chain] home-chain add-upstream from midbox invite"
-yggdrasilctl --config "$HOME_CFG" identity add-upstream \
+echo "[init-chain] home-chain add-dial from midbox invite"
+yggdrasilctl --config "$HOME_CFG" identity add-dial \
     --identity-file "$HOME_KEY" \
     --from "$HOME_INVITE" >/dev/null
 
@@ -153,16 +153,16 @@ yggdrasilctl --config "$MIDBOX_CFG" identity export-intro \
     --out "$MIDBOX_INTRO" \
     --note "chain e2e midbox" >/dev/null
 
-echo "[init-chain] vps-chain add-downstream from midbox (writes vps's [accept])"
-yggdrasilctl --config "$VPS_CFG" identity add-downstream \
+echo "[init-chain] vps-chain add-accept from midbox (writes vps's [accept])"
+yggdrasilctl --config "$VPS_CFG" identity add-accept \
     --identity-file "$VPS_KEY" \
     --from "$MIDBOX_INTRO" \
     --my-endpoint vps-chain:51820 \
     --out "$MIDBOX_INVITE" \
     --note "chain e2e vps->midbox" >/dev/null
 
-echo "[init-chain] midbox add-upstream from vps-chain invite"
-yggdrasilctl --config "$MIDBOX_CFG" identity add-upstream \
+echo "[init-chain] midbox add-dial from vps-chain invite"
+yggdrasilctl --config "$MIDBOX_CFG" identity add-dial \
     --identity-file "$MIDBOX_KEY" \
     --from "$MIDBOX_INVITE" >/dev/null
 

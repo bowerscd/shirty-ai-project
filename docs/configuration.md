@@ -74,7 +74,7 @@ session. Presence of `[accept]` makes the effective mode `relay`.
 
 | Key                  | Type           | Default | Notes                                                                  |
 | -------------------- | -------------- | ------- | ---------------------------------------------------------------------- |
-| `pubkey`             | tagged pubkey  | **required** | `x25519:<hex>` of the downstream node. Written by `yggdrasilctl identity add-downstream` or `local downstream approve`. |
+| `pubkey`             | tagged pubkey  | **required** | `x25519:<hex>` of the downstream node. Written by `yggdrasilctl identity add-accept` or `local accept approve`. |
 | `listen`             | `host:port`    | **required** | UDP socket to bind. Public-facing on the root relay.                  |
 | `rekey_interval`     | `humantime`    | `1h`    | Force a fresh Noise handshake at most this often.                      |
 
@@ -288,8 +288,8 @@ completeness:
 * Changes to **`/etc/yggdrasil/config.toml`** itself are not hot-reloaded;
   restart the daemon (`systemctl restart yggdrasil`). Only `conf.d/*.toml`
   files are picked up live. In particular, the `[dial]` and `[accept]` tables are
-  read once at startup — `yggdrasilctl identity add-upstream` /
-  `add-downstream` / `remove-*` mutations require a restart to take
+  read once at startup — `yggdrasilctl identity add-dial` /
+  `add-accept` / `remove-*` mutations require a restart to take
   effect.
 * `yggdrasilctl local rules reload` forces a re-scan in case you suspect
   the inotify event was missed (NFS, container bind mounts with cached

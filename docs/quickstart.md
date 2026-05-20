@@ -103,7 +103,7 @@ scp /tmp/home.intro vps.example.net:/tmp/
 On the VPS:
 
 ```bash
-sudo yggdrasilctl identity add-downstream \
+sudo yggdrasilctl identity add-accept \
     --from /tmp/home.intro \
     --my-endpoint vps.example.net:51820 \
     --out /tmp/home.invite
@@ -123,7 +123,7 @@ scp /tmp/home.invite home.example.lan:/tmp/
 On the home box:
 
 ```bash
-sudo yggdrasilctl identity add-upstream --from /tmp/home.invite
+sudo yggdrasilctl identity add-dial --from /tmp/home.invite
 # verified invite targets this node (downstream_pubkey matches local identity)
 # updated /etc/yggdrasil/config.toml: [dial]
 #   pubkey:   x25519:6c5a30bb...0ff1

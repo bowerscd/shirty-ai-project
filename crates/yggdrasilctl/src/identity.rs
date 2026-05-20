@@ -21,7 +21,7 @@
 //! * Invite file (`invite.txt` by convention): emitted by an upstream after
 //!   accepting an intro. Contains both pubkeys + the upstream's reachable
 //!   endpoint. Hand-delivered back to the downstream (the issuer of the
-//!   original intro), which feeds it to `identity add-upstream`.
+//!   original intro), which feeds it to `identity add-dial`.
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -52,21 +52,21 @@ pub enum Cmd {
 
     /// Apply an invite file: verify it targets this node and write
     /// `[dial]` into the daemon config.
-    #[command(name = "add-upstream")]
-    AddUpstream(AddUpstreamArgs),
+    #[command(name = "add-dial")]
+    AddDial(AddDialArgs),
 
     /// Apply an intro file: mint an invite for the introducer, and write
     /// `[accept]` into the daemon config.
-    #[command(name = "add-downstream")]
-    AddDownstream(AddDownstreamArgs),
+    #[command(name = "add-accept")]
+    AddAccept(AddAcceptArgs),
 
     /// Remove `[dial]` from the daemon config.
-    #[command(name = "remove-upstream")]
-    RemoveUpstream,
+    #[command(name = "remove-dial")]
+    RemoveDial,
 
     /// Remove `[accept]` from the daemon config.
-    #[command(name = "remove-downstream")]
-    RemoveDownstream,
+    #[command(name = "remove-accept")]
+    RemoveAccept,
 }
 
 #[derive(Debug, Args)]
@@ -116,7 +116,7 @@ pub struct ExportIntroArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AddUpstreamArgs {
+pub struct AddDialArgs {
     /// Path to the invite file emitted by the upstream.
     #[arg(long = "from")]
     from: PathBuf,
@@ -127,7 +127,7 @@ pub struct AddUpstreamArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AddDownstreamArgs {
+pub struct AddAcceptArgs {
     /// Path to the intro file received from the prospective downstream.
     #[arg(long = "from")]
     from: PathBuf,
@@ -157,10 +157,10 @@ pub async fn run(cmd: Cmd, config_path: &Path, json: bool) -> Result<()> {
         Cmd::Show(a) => show(a, config_path, json),
         Cmd::Rotate(a) => rotate(a, config_path, json),
         Cmd::ExportIntro(a) => export_intro(a, config_path, json),
-        Cmd::AddUpstream(a) => add_upstream(a, config_path, json),
-        Cmd::AddDownstream(a) => add_downstream(a, config_path, json),
-        Cmd::RemoveUpstream => remove_upstream(config_path, json),
-        Cmd::RemoveDownstream => remove_downstream(config_path, json),
+        Cmd::AddDial(a) => add_dial(a, config_path, json),
+        Cmd::AddAccept(a) => add_accept(a, config_path, json),
+        Cmd::RemoveDial => remove_dial(config_path, json),
+        Cmd::RemoveAccept => remove_accept(config_path, json),
     }
 }
 
@@ -193,7 +193,7 @@ fn resolve_identity_file(explicit: Option<PathBuf>, config_path: &Path) -> Resul
 
 /// Load the config TOML for mutation. Returns the parsed `toml::Value` and
 /// the path it was read from. If `path` does not exist, returns an empty
-/// table so `add-upstream`/`add-downstream` can bootstrap a new file.
+/// table so `add-dial`/`add-accept` can bootstrap a new file.
 fn load_config_doc(path: &Path) -> Result<toml::Value> {
     if !path.exists() {
         return Ok(toml::Value::Table(toml::value::Table::new()));
@@ -472,7 +472,7 @@ fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result
         None => {
             // Stdout default: emit only the intro TOML body so the
             // output can be piped directly into the upstream's
-            // `identity add-downstream --from -` workflow without
+            // `identity add-accept --from -` workflow without
             // any text-mode chrome to strip first. Diagnostic
             // metadata (pubkey/fingerprint/note) goes to stderr so
             // pipelines stay clean while the operator still sees
@@ -490,9 +490,9 @@ fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result
     }
 }
 
-// ---------- add-upstream ----------
+// ---------- add-dial ----------
 
-fn add_upstream(args: AddUpstreamArgs, config_path: &Path, json: bool) -> Result<()> {
+fn add_dial(args: AddDialArgs, config_path: &Path, json: bool) -> Result<()> {
     let identity_file = resolve_identity_file(args.identity_file, config_path)?;
     if !identity_file.exists() {
         bail!(
@@ -555,9 +555,9 @@ fn add_upstream(args: AddUpstreamArgs, config_path: &Path, json: bool) -> Result
     Ok(())
 }
 
-// ---------- add-downstream ----------
+// ---------- add-accept ----------
 
-fn add_downstream(args: AddDownstreamArgs, config_path: &Path, json: bool) -> Result<()> {
+fn add_accept(args: AddAcceptArgs, config_path: &Path, json: bool) -> Result<()> {
     let identity_file = resolve_identity_file(args.identity_file, config_path)?;
     if !identity_file.exists() {
         bail!(
@@ -633,13 +633,13 @@ fn add_downstream(args: AddDownstreamArgs, config_path: &Path, json: bool) -> Re
     Ok(())
 }
 
-// ---------- remove-upstream / remove-downstream ----------
+// ---------- remove-dial / remove-accept ----------
 
-fn remove_upstream(config_path: &Path, json: bool) -> Result<()> {
+fn remove_dial(config_path: &Path, json: bool) -> Result<()> {
     remove_top_section(config_path, "dial", json)
 }
 
-fn remove_downstream(config_path: &Path, json: bool) -> Result<()> {
+fn remove_accept(config_path: &Path, json: bool) -> Result<()> {
     remove_top_section(config_path, "accept", json)
 }
 

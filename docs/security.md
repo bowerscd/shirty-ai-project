@@ -47,7 +47,7 @@ Don't grow it above 17 KiB without auditing every UDP path.
 When a previously-unseen pubkey attempts a handshake, the relay's
 acceptor caches the candidate in `[server].state_dir`, completes the
 handshake (no traffic is forwarded yet), and waits for an operator to
-explicitly approve via `yggdrasilctl local downstream approve <fingerprint>`.
+explicitly approve via `yggdrasilctl local accept approve <fingerprint>`.
 A persistent attacker who watches you boot a relay for the first time
 *can* land in the pending-peer store. The boundary is the operator
 running `approve` — never approve a fingerprint you haven't cross-checked
@@ -65,14 +65,14 @@ out-of-band:
     * optional operator `note`
   Encoded as base64-url-no-pad with a magic prefix; not a secret.
 * **invite.txt** — emitted by the upstream via `yggdrasilctl identity
-  add-downstream --from intro.txt --my-endpoint host:port`. Contents:
+  add-accept --from intro.txt --my-endpoint host:port`. Contents:
     * `upstream_pubkey`
     * `upstream_fingerprint`
     * `downstream_pubkey` (echoed from the intro)
     * `endpoint` (the upstream's reachable `host:port`)
     * optional `note`
 
-`yggdrasilctl identity add-upstream --from invite.txt` verifies that
+`yggdrasilctl identity add-dial --from invite.txt` verifies that
 `downstream_pubkey` in the invite matches the local identity (catches
 "wrong invite file" mistakes) before writing `[dial]`.
 
@@ -80,7 +80,7 @@ This buys you **two** things over TOFU:
 
 1. The pubkeys cross the air-gap before any network traffic flows, so
    a passive attacker cannot land in the pending-peer store.
-2. The downstream's `add-upstream` rejects an invite that targets a
+2. The downstream's `add-dial` rejects an invite that targets a
    different node, preventing a misrouted invite from compromising a
    sibling terminal.
 

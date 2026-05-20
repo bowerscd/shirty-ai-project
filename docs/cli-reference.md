@@ -99,16 +99,16 @@ Removed. Cert-store summary is now folded into `local status`: when at
 least one HTTPS rule is loaded, `status` prints a single
 `cert: <path> (loaded Xs ago); ephemeral certs: N` line.
 
-### `local downstream show`
+### `local accept show`
 
 Print the currently-enrolled downstream's tagged pubkey and fingerprint.
 
-### `local downstream pending`
+### `local accept pending`
 
 List staged TOFU candidates — peers that have attempted a handshake but
 aren't yet enrolled in `[accept]`.
 
-### `local downstream approve <fingerprint>`
+### `local accept approve <fingerprint>`
 
 Approve a staged TOFU candidate. After approval the candidate is written
 into `[accept].pubkey` and the next heartbeat from that key is
@@ -230,7 +230,7 @@ Emit an intro file (this node advertising itself as a downstream
 candidate). Defaults to `./intro.txt`. The intro contains the local
 pubkey + fingerprint + operator note. Not a secret.
 
-### `identity add-downstream --from <INTRO> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
+### `identity add-accept --from <INTRO> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
 
 Apply an intro file received from a prospective downstream. Writes
 `[accept].pubkey = <downstream-pubkey>` into the daemon
@@ -238,19 +238,19 @@ config and emits an invite file (default `./invite.txt`) containing
 both pubkeys plus `my_endpoint`. Hand-deliver the invite back to the
 downstream.
 
-### `identity add-upstream --from <INVITE> [--identity-file <PATH>]`
+### `identity add-dial --from <INVITE> [--identity-file <PATH>]`
 
 Apply an invite file received from an upstream. Verifies the invite's
 `downstream_pubkey` matches the local identity (catches "wrong invite
 file" mistakes), then writes `[dial]` into the daemon config:
 the upstream's pubkey + endpoint.
 
-### `identity remove-upstream`
+### `identity remove-dial`
 
 Remove `[dial]` from the daemon config. Useful for re-enrolling
 against a new upstream.
 
-### `identity remove-downstream`
+### `identity remove-accept`
 
 Remove `[accept]` from the daemon config. The next downstream
 that handshakes lands in the pending-peer TOFU store.

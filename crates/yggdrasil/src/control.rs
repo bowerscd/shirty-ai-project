@@ -758,7 +758,7 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
                 code: error_codes::AMBIGUOUS_FINGERPRINT.into(),
                 message: format!(
                     "fingerprint prefix {fingerprint:?} is ambiguous; matches {} candidates: {}. \
-                     Re-run `local downstream approve` with a longer prefix.",
+                     Re-run `local accept approve` with a longer prefix.",
                     matches.len(),
                     matches.join(", ")
                 ),

@@ -66,7 +66,7 @@ The enrolment handshake is two files exchanged out-of-band: an **intro** file
 the terminal emits (advertising its pubkey to the relay) and an **invite**
 file the relay emits in reply (committing both pubkeys plus the relay's
 reachable endpoint). The terminal applies the invite to populate
-`[dial]`; the relay's `identity add-downstream` step has already
+`[dial]`; the relay's `identity add-accept` step has already
 written `[accept]` locally.
 
 ```bash
@@ -74,13 +74,13 @@ written `[accept]` locally.
 sudo yggdrasilctl identity export-intro --out /tmp/home.intro
 
 # Relay: accept the intro, mint an invite.
-sudo yggdrasilctl identity add-downstream \
+sudo yggdrasilctl identity add-accept \
     --from /tmp/home.intro \
     --my-endpoint vps.example.net:51820 \
     --out /tmp/home.invite
 
 # Terminal: apply the invite (writes [dial]).
-sudo yggdrasilctl identity add-upstream --from /tmp/home.invite
+sudo yggdrasilctl identity add-dial --from /tmp/home.invite
 ```
 
 Verify the printed fingerprints match what `identity show` reports on the
