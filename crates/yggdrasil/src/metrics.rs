@@ -101,19 +101,15 @@ pub fn new_introspection_slot() -> IntrospectionSlot {
     Arc::new(OnceLock::new())
 }
 
-/// Install the prometheus recorder, emit the startup gauges, and spawn the
-/// HTTP listener that serves `/metrics`, `/healthz`, `/readyz`, `/`, and
-/// — when `introspection` resolves — the loopback-gated
-/// `/internal/derived-rules` chain-introspection endpoint.
+/// Install the prometheus recorder and emit the startup gauges.
 ///
 /// Must be called exactly once per process before any metric is emitted
-/// (otherwise that metric goes to the no-op recorder). Returns the actual
-/// bound address — primarily useful for tests that pass `127.0.0.1:0`.
-pub async fn init(
-    listen: SocketAddr,
-    mode: Mode,
-    introspection: Option<IntrospectionSlot>,
-) -> Result<SocketAddr> {
+/// (otherwise that metric goes to the no-op recorder). Returns the
+/// [`PrometheusHandle`] so callers can render the text exposition format
+/// directly (e.g. for the UDS-served `local metrics` command) and pass
+/// it on to [`spawn_http`] if they want the HTTP exposition surface as
+/// well.
+pub fn install_recorder(mode: Mode) -> Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
         .with_context(|| "installing prometheus recorder")?;
@@ -133,6 +129,24 @@ pub async fn init(
     )
     .set(1.0);
 
+    Ok(handle)
+}
+
+/// Spawn the HTTP listener that serves `/metrics`, `/healthz`,
+/// `/readyz`, `/`, and — when `introspection` resolves — the
+/// loopback-gated `/internal/derived-rules` chain-introspection
+/// endpoint.
+///
+/// Returns the actual bound address; primarily useful for tests that
+/// pass `127.0.0.1:0`. The Prometheus recorder must already be
+/// installed via [`install_recorder`]; pass the returned handle here
+/// (or any clone of it) to share the same metrics universe.
+pub async fn spawn_http(
+    listen: SocketAddr,
+    mode: Mode,
+    handle: PrometheusHandle,
+    introspection: Option<IntrospectionSlot>,
+) -> Result<SocketAddr> {
     // TcpListener::bind is what gives us EADDRINUSE if the port is taken.
     // Use std then convert so that we get the synchronous error directly.
     let std_listener = std::net::TcpListener::bind(listen)
@@ -154,6 +168,31 @@ pub async fn init(
         "metrics + health listener up (/metrics /healthz /readyz)"
     );
     Ok(bound)
+}
+
+/// Convenience wrapper that calls [`install_recorder`] followed by
+/// [`spawn_http`]. Returns the bound HTTP address and the handle.
+/// Tests that exercise the HTTP endpoints use this; the daemon does
+/// the two steps separately so the recorder is installed even when the
+/// HTTP listener fails to bind.
+pub async fn init(
+    listen: SocketAddr,
+    mode: Mode,
+    introspection: Option<IntrospectionSlot>,
+) -> Result<(SocketAddr, PrometheusHandle)> {
+    let handle = install_recorder(mode)?;
+    let bound = spawn_http(listen, mode, handle.clone(), introspection).await?;
+    Ok((bound, handle))
+}
+
+/// Build a fresh, unattached [`PrometheusHandle`] for tests that need
+/// to construct a [`crate::control::ControlServer`] without installing
+/// a global recorder. The returned handle renders an empty exposition
+/// (no metrics will route through it). Production code paths must use
+/// [`install_recorder`] instead.
+#[doc(hidden)]
+pub fn detached_handle_for_tests() -> PrometheusHandle {
+    PrometheusBuilder::new().build_recorder().handle()
 }
 
 async fn accept_loop(

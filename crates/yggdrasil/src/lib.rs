@@ -147,14 +147,17 @@ pub async fn run_relay(
     //    step 5b once the supervisor exists — see [`crate::chain::introspection`]
     //    for the ordering rationale.
     let introspection_slot = metrics::new_introspection_slot();
-    if let Err(e) = metrics::init(
+    let prom_handle = metrics::install_recorder(wire_mode)
+        .context("installing prometheus recorder")?;
+    if let Err(e) = metrics::spawn_http(
         config.metrics.listen,
         wire_mode,
+        prom_handle.clone(),
         Some(introspection_slot.clone()),
     )
     .await
     {
-        tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
+        tracing::warn!(error = %e, "metrics http listener failed to bind; continuing without it");
     }
 
     // 5. Rule-driven proxy supervisor. Built *before* the heartbeat
@@ -377,6 +380,7 @@ pub async fn run_relay(
         Some(pending_store.clone()),
         args.config.clone(),
         chain_initiator,
+        prom_handle.clone(),
         shutdown.clone(),
     )
     .await
@@ -440,14 +444,17 @@ pub async fn run_terminal(
     // 3. Metrics exporter. The [`IntrospectionSlot`] is created up
     //    front and populated in step 4a once the supervisor exists.
     let introspection_slot = metrics::new_introspection_slot();
-    if let Err(e) = metrics::init(
+    let prom_handle = metrics::install_recorder(wire_mode)
+        .context("installing prometheus recorder")?;
+    if let Err(e) = metrics::spawn_http(
         config.metrics.listen,
         wire_mode,
+        prom_handle.clone(),
         Some(introspection_slot.clone()),
     )
     .await
     {
-        tracing::warn!(error = %e, "metrics exporter failed to start; continuing without it");
+        tracing::warn!(error = %e, "metrics http listener failed to bind; continuing without it");
     }
 
     // 3b. Outbound chain client — only when [dial] is set.
@@ -524,6 +531,7 @@ pub async fn run_terminal(
         None,
         args.config.clone(),
         chain_initiator,
+        prom_handle.clone(),
         shutdown.clone(),
     )
     .await

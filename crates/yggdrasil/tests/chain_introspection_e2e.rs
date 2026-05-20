@@ -149,7 +149,7 @@ async fn predicate_set_update_surfaces_in_internal_derived_rules() {
     if slot.set(introspection.clone()).is_err() {
         panic!("slot set twice");
     }
-    let metrics_addr = yggdrasil::metrics::init(
+    let (metrics_addr, _handle) = yggdrasil::metrics::init(
         "127.0.0.1:0".parse().unwrap(),
         Mode::Relay,
         Some(slot.clone()),

@@ -406,6 +406,7 @@ async fn terminal_control_status_response_shape() {
         None,
         config_path,
         None,
+        yggdrasil::metrics::detached_handle_for_tests(),
         shutdown.clone(),
     )
     .await
@@ -464,6 +465,7 @@ async fn terminal_control_peer_commands_are_rejected() {
         None,
         config_path,
         None,
+        yggdrasil::metrics::detached_handle_for_tests(),
         shutdown.clone(),
     )
     .await

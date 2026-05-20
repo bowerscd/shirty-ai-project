@@ -88,6 +88,13 @@ pub enum Request {
     /// entry per `(rule, route)`. Each entry includes the resolved
     /// hostname, where the cert came from, and parsed metadata.
     CertsList,
+    /// Render the daemon's Prometheus metrics in text exposition format.
+    /// The daemon dispatches the request to its in-process recorder; no
+    /// HTTP listener is required. Backs `yggdrasilctl local metrics`.
+    Metrics,
+    /// Liveness/readiness probe served over the control socket. Backs
+    /// `yggdrasilctl local health`.
+    Health,
     /// Open a chain tunnel from this node toward `target_pubkey`, which
     /// must terminate the tunnel at `dest` (a TCP `host:port`). This
     /// request **hijacks the UDS connection**: once the server responds
@@ -151,6 +158,13 @@ pub enum Response {
         fingerprint: String,
     },
     Certs(CertsListResponse),
+    /// Successful response to [`Request::Metrics`]. Body is a single
+    /// string containing the Prometheus text exposition format. Newlines
+    /// inside `body` are preserved verbatim; clients should print as-is.
+    Metrics(MetricsResponse),
+    /// Successful response to [`Request::Health`]. See
+    /// [`HealthResponse`] for the field semantics.
+    Health(HealthResponse),
     /// Successful response to [`Request::ChainApply`]. Reports the
     /// number of rules that were handed to the supervisor and, for
     /// terminal daemons with a chain upstream, what the projected
@@ -246,6 +260,28 @@ pub struct PendingCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertsListResponse {
     pub certs: Vec<CertInfo>,
+}
+
+/// Response body for [`Request::Metrics`]. The `body` field is the
+/// Prometheus text exposition format, ready to be written to stdout or
+/// piped into a scraper.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsResponse {
+    pub body: String,
+}
+
+/// Response body for [`Request::Health`]. Mirrors the previous
+/// `/healthz` + `/readyz` HTTP endpoints: `ready` flips to `true` once
+/// every subsystem has signalled readiness via
+/// `yggdrasil::health::mark_ready`. `uptime_secs` is monotonic since
+/// process start and is convenient to gate "daemon is in `starting`
+/// tier" health logic against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthResponse {
+    /// `true` once the readiness latch has been triggered.
+    pub ready: bool,
+    /// Process uptime in whole seconds.
+    pub uptime_secs: u64,
 }
 
 /// Metadata for a single (hostname, cert) pair loaded into the cert store.

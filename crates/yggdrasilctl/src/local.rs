@@ -30,6 +30,13 @@ pub enum Cmd {
         #[command(subcommand)]
         action: CertAction,
     },
+    /// Render the daemon's Prometheus metrics in text exposition format
+    /// (the same body the `/metrics` HTTP endpoint serves), retrieved
+    /// over the control socket.
+    Metrics,
+    /// Liveness/readiness probe served over the control socket. Exit
+    /// status: 0 if ready, 1 if not yet ready, 2 on RPC error.
+    Health,
 }
 
 #[derive(Debug, Subcommand)]
@@ -89,6 +96,8 @@ fn build_request(cmd: &Cmd) -> Request {
         Cmd::Certs { action } => match action {
             CertAction::List => Request::CertsList,
         },
+        Cmd::Metrics => Request::Metrics,
+        Cmd::Health => Request::Health,
     }
 }
 
@@ -246,6 +255,18 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                 "server returned unexpected ChainApplied response \
                  to local request {request:?}"
             );
+        }
+        Response::Metrics(m) => {
+            // Prometheus text format — the body already ends with a
+            // trailing newline; print as-is to avoid double-spacing.
+            print!("{}", m.body);
+        }
+        Response::Health(h) => {
+            println!("ready:           {}", h.ready);
+            println!("uptime:          {} s", h.uptime_secs);
+            if !h.ready {
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

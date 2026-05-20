@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -25,8 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
-    error_codes, ChainAppliedResponse, CertInfo, CertsListResponse, DownstreamResponse, Mode,
-    PendingResponse, Request, Response, RuleInfo, RulesResponse, StatusResponse,
+    error_codes, ChainAppliedResponse, CertInfo, CertsListResponse, DownstreamResponse,
+    HealthResponse, MetricsResponse, Mode, PendingResponse, Request, Response, RuleInfo,
+    RulesResponse, StatusResponse,
 };
 use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
 use ratatoskr::pubkey::PubKey;
@@ -82,6 +84,10 @@ struct ControlState {
     /// operator's request against an in-flight reload). The handle is
     /// cheap to clone and tied to the supervisor task's lifetime.
     supervisor_handle: SupervisorHandle,
+    /// Prometheus recorder handle used by [`Request::Metrics`] to
+    /// render the text exposition format directly over the UDS,
+    /// without going through the HTTP listener.
+    prom_handle: PrometheusHandle,
 }
 
 impl ControlServer {
@@ -109,6 +115,7 @@ impl ControlServer {
         pending_store: Option<Arc<PendingPeerStore>>,
         config_path: PathBuf,
         tunnel_initiator: Option<Arc<TunnelInitiator>>,
+        prom_handle: PrometheusHandle,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -157,6 +164,7 @@ impl ControlServer {
             config_path,
             tunnel_initiator,
             supervisor_handle: supervisor.handle(),
+            prom_handle,
         });
 
         let main_cancel = cancel.clone();
@@ -400,6 +408,16 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                 })
                 .collect();
             Response::Certs(CertsListResponse { certs })
+        }
+        Request::Metrics => Response::Metrics(MetricsResponse {
+            body: state.prom_handle.render(),
+        }),
+        Request::Health => {
+            let uptime_secs = state.started_at.elapsed().as_secs();
+            Response::Health(HealthResponse {
+                ready: crate::health::is_ready(),
+                uptime_secs,
+            })
         }
         // `OpenChainTunnel` is handled by [`run_chain_tunnel_bridge`] in
         // [`handle_connection`] before reaching this synchronous
@@ -944,6 +962,7 @@ mod tests {
             Some(pending),
             cfg,
             None,
+            crate::metrics::detached_handle_for_tests(),
             shutdown,
         )
         .await

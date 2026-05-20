@@ -44,7 +44,7 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_listener_serves_health_and_metrics() {
     // 127.0.0.1:0 -> kernel picks a free port. init() returns the bound addr.
-    let addr = yggdrasil::metrics::init(
+    let (addr, _handle) = yggdrasil::metrics::init(
         "127.0.0.1:0".parse().unwrap(),
         Mode::Terminal,
         None,
