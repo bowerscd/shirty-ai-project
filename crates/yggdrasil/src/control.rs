@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
-    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse, CertInfo,
-    CertsListResponse, DownstreamResponse, HealthResponse, MetricsResponse, Mode,
+    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse,
+    DownstreamResponse, HealthResponse, MetricsResponse, Mode,
     PendingResponse, Request, Response, RuleInfo, RulesResponse, StatusResponse,
 };
 use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
@@ -331,6 +331,34 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                 None => (None, None, false),
             };
             let rule_count = state.snapshot_rx.borrow().len();
+            // Cert summary: traverse the cert store once for the
+            // default-cert age and ephemeral count. The default cert's
+            // path is taken from the first store entry whose origin is
+            // `Default`. `None` when the daemon has no HTTPS rules
+            // loaded against the operator-supplied default.
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let mut default_cert_path: Option<String> = None;
+            let mut default_cert_loaded_age_secs: Option<u64> = None;
+            let mut ephemeral_cert_count: usize = 0;
+            for (_host, origin, loaded_at_unix_ms) in state.cert_store.list_full() {
+                match origin {
+                    crate::proxy::certs::CertOrigin::Default { ref cert, .. }
+                        if default_cert_path.is_none() =>
+                    {
+                        default_cert_path = Some(cert.display().to_string());
+                        default_cert_loaded_age_secs =
+                            Some(now_ms.saturating_sub(loaded_at_unix_ms) / 1000);
+                    }
+                    crate::proxy::certs::CertOrigin::Ephemeral => {
+                        ephemeral_cert_count += 1;
+                    }
+                    _ => {}
+                }
+            }
             Response::Status(StatusResponse {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 mode: state.mode,
@@ -339,6 +367,9 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                 rule_count,
                 uptime_secs: state.started_at.elapsed().as_secs(),
                 downstream_enrolled,
+                default_cert_path,
+                default_cert_loaded_age_secs,
+                ephemeral_cert_count,
             })
         }
         Request::RulesList => {
@@ -394,19 +425,6 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
             })
         }
         Request::DownstreamApprove { fingerprint } => approve_downstream(state, &fingerprint),
-        Request::CertsList => {
-            let certs = state
-                .cert_store
-                .list_full()
-                .into_iter()
-                .map(|(hostname, origin, loaded_at_unix_ms)| CertInfo {
-                    hostname,
-                    cert_source: origin.as_label(),
-                    loaded_at_unix_ms,
-                })
-                .collect();
-            Response::Certs(CertsListResponse { certs })
-        }
         Request::Metrics => Response::Metrics(MetricsResponse {
             body: state.prom_handle.render(),
         }),
@@ -1228,7 +1246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn certs_list_returns_empty_when_no_https_rules_loaded() {
+    async fn status_reports_zero_certs_when_no_https_rules_loaded() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
         let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
@@ -1244,10 +1262,12 @@ mod tests {
         )
         .await;
 
-        let resp = send_request(&socket, &Request::CertsList).await;
+        let resp = send_request(&socket, &Request::Status).await;
         match resp {
-            Response::Certs(c) => {
-                assert!(c.certs.is_empty(), "expected empty certs list, got {:?}", c.certs);
+            Response::Status(s) => {
+                assert_eq!(s.ephemeral_cert_count, 0);
+                assert!(s.default_cert_path.is_none());
+                assert!(s.default_cert_loaded_age_secs.is_none());
             }
             other => panic!("unexpected response: {other:?}"),
         }

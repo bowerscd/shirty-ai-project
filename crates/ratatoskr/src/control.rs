@@ -94,7 +94,7 @@ pub enum Request {
     /// List TLS certificates currently loaded into the cert store, one
     /// entry per `(rule, route)`. Each entry includes the resolved
     /// hostname, where the cert came from, and parsed metadata.
-    CertsList,
+    // (`CertsList` was removed; cert summary now folded into `Status`.)
     /// Render the daemon's Prometheus metrics in text exposition format.
     /// The daemon dispatches the request to its in-process recorder; no
     /// HTTP listener is required. Backs `yggdrasilctl local metrics`.
@@ -184,7 +184,7 @@ pub enum Response {
     DownstreamApproved {
         fingerprint: String,
     },
-    Certs(CertsListResponse),
+    // (`Response::Certs` was removed; cert summary now folded into `Status`.)
     /// Successful response to [`Request::Metrics`]. Body is a single
     /// string containing the Prometheus text exposition format. Newlines
     /// inside `body` are preserved verbatim; clients should print as-is.
@@ -242,6 +242,19 @@ pub struct StatusResponse {
     /// Whether a downstream has been enrolled (`[accept]` present
     /// in config). Always `false` in terminal mode.
     pub downstream_enrolled: bool,
+    /// Path to the operator-supplied default cert, if loaded into the
+    /// cert store. `None` when no `[server].default_cert` was set or no
+    /// loaded cert traces back to it (terminal-without-https).
+    #[serde(default)]
+    pub default_cert_path: Option<String>,
+    /// Seconds since the default cert was loaded into the store. `None`
+    /// when [`Self::default_cert_path`] is `None`.
+    #[serde(default)]
+    pub default_cert_loaded_age_secs: Option<u64>,
+    /// Count of dynamically-generated ephemeral (self-signed) certs in
+    /// the store. Always `0` on a daemon without HTTPS rules.
+    #[serde(default)]
+    pub ephemeral_cert_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -285,12 +298,6 @@ pub struct PendingCandidate {
     pub first_seen_unix_ms: u64,
     /// Number of failed handshake attempts observed from this candidate.
     pub attempt_count: u64,
-}
-
-/// Response body for [`Request::CertsList`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CertsListResponse {
-    pub certs: Vec<CertInfo>,
 }
 
 /// Response body for [`Request::Metrics`]. The `body` field is the
@@ -395,18 +402,6 @@ pub struct ChainHop {
     pub view: DerivedRulesResponse,
 }
 
-/// Metadata for a single (hostname, cert) pair loaded into the cert store.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CertInfo {
-    /// The route's `hostname` (lowercased, no port, no trailing dot).
-    pub hostname: String,
-    /// Where the cert came from. One of: `"path"`, `"ephemeral"`,
-    /// `"convention"`, `"default"`. Stable English string, safe to print.
-    pub cert_source: String,
-    /// Unix epoch milliseconds when the cert was loaded into the store.
-    pub loaded_at_unix_ms: u64,
-}
-
 /// Response body for a successful [`Request::ChainApply`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainAppliedResponse {
@@ -485,7 +480,6 @@ mod tests {
             Request::DownstreamApprove {
                 fingerprint: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
             },
-            Request::CertsList,
             Request::ChainSummary { timeout_ms: None },
             Request::ChainSummary { timeout_ms: Some(2500) },
         ];
@@ -506,6 +500,9 @@ mod tests {
             rule_count: 3,
             uptime_secs: 60,
             downstream_enrolled: true,
+            default_cert_path: None,
+            default_cert_loaded_age_secs: None,
+            ephemeral_cert_count: 0,
         });
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
@@ -557,6 +554,9 @@ mod tests {
             rule_count: 2,
             uptime_secs: 30,
             downstream_enrolled: false,
+            default_cert_path: None,
+            default_cert_loaded_age_secs: None,
+            ephemeral_cert_count: 0,
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"mode\":\"terminal\""), "got: {s}");
@@ -621,30 +621,6 @@ mod tests {
         assert!(s.contains("\"mode\":\"terminal\""), "got: {s}");
         let back: Response = serde_json::from_str(&s).unwrap();
         assert_eq!(resp, back);
-    }
-
-    #[test]
-    fn certs_response_round_trip() {
-        let resp = Response::Certs(CertsListResponse {
-            certs: vec![
-                CertInfo {
-                    hostname: "api.example.com".into(),
-                    cert_source: "path".into(),
-                    loaded_at_unix_ms: 1_700_000_000_000,
-                },
-                CertInfo {
-                    hostname: "app.example.com".into(),
-                    cert_source: "ephemeral".into(),
-                    loaded_at_unix_ms: 1_700_000_001_000,
-                },
-            ],
-        });
-        let s = serde_json::to_string(&resp).unwrap();
-        let back: Response = serde_json::from_str(&s).unwrap();
-        assert_eq!(resp, back);
-        // kind is serialised at the top level for compatibility with the
-        // existing dispatcher.
-        assert!(s.contains("\"kind\":\"certs\""), "got: {s}");
     }
 
     #[test]

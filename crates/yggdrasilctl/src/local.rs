@@ -25,11 +25,6 @@ pub enum Cmd {
         #[command(subcommand)]
         action: DownstreamAction,
     },
-    /// Inspect loaded TLS certificates (HTTPS L7 frontend).
-    Certs {
-        #[command(subcommand)]
-        action: CertAction,
-    },
     /// Render the daemon's Prometheus metrics in text exposition format
     /// (the same body the `/metrics` HTTP endpoint serves), retrieved
     /// over the control socket.
@@ -88,12 +83,6 @@ pub struct ApproveArgs {
     pub fingerprint: String,
 }
 
-#[derive(Debug, Subcommand)]
-pub enum CertAction {
-    /// List loaded certificates (one entry per hostname).
-    List,
-}
-
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     let request = build_request(&cmd);
     let response = send(socket, &request, Duration::from_secs(5)).await?;
@@ -117,9 +106,6 @@ fn build_request(cmd: &Cmd) -> Request {
             DownstreamAction::Approve(a) => Request::DownstreamApprove {
                 fingerprint: a.fingerprint.clone(),
             },
-        },
-        Cmd::Certs { action } => match action {
-            CertAction::List => Request::CertsList,
         },
         Cmd::Metrics => Request::Metrics,
         Cmd::Health => Request::Health,
@@ -209,6 +195,22 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             if has_downstream {
                 println!("downstream_enrolled: {}", s.downstream_enrolled);
             }
+            // Cert summary (item 29 — folded in from the dropped
+            // `local certs list` subcommand). Only printed when the
+            // daemon has at least one TLS-aware rule loaded;
+            // otherwise both fields are absent and the operator gets
+            // no noise.
+            if s.default_cert_path.is_some() || s.ephemeral_cert_count > 0 {
+                let cert_part = match (&s.default_cert_path, s.default_cert_loaded_age_secs) {
+                    (Some(p), Some(age)) => format!("cert: {p} (loaded {age}s ago)"),
+                    (Some(p), None)      => format!("cert: {p}"),
+                    (None, _)            => "cert: (none)".to_string(),
+                };
+                println!(
+                    "{cert_part}; ephemeral certs: {}",
+                    s.ephemeral_cert_count
+                );
+            }
         }
         Response::Rules(b) => {
             if b.rules.is_empty() {
@@ -254,19 +256,6 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
         }
         Response::DownstreamApproved { fingerprint } => {
             println!("approved {fingerprint}");
-        }
-        Response::Certs(c) => {
-            if c.certs.is_empty() {
-                println!("(no certificates loaded)");
-            } else {
-                println!("{:<32}  {:<48}  loaded_unix_ms", "hostname", "source");
-                for entry in &c.certs {
-                    println!(
-                        "{:<32}  {:<48}  {}",
-                        entry.hostname, entry.cert_source, entry.loaded_at_unix_ms,
-                    );
-                }
-            }
         }
         Response::Error { code, message } => {
             // Annotate which command triggered it so error output is greppable.

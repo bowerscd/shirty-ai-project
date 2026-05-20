@@ -95,8 +95,9 @@ events (NFS, some FUSE filesystems, container bind mounts on macOS).
 
 ### `local certs list`
 
-List currently-loaded HTTPS certificates with their hostname, source
-(path / ephemeral / convention / default), and load timestamp.
+Removed. Cert-store summary is now folded into `local status`: when at
+least one HTTPS rule is loaded, `status` prints a single
+`cert: <path> (loaded Xs ago); ephemeral certs: N` line.
 
 ### `local downstream show`
 
@@ -115,7 +116,7 @@ accepted.
 
 | Positional        | Notes                                                                                |
 | ----------------- | ------------------------------------------------------------------------------------ |
-| `<fingerprint>`   | Short BLAKE2s-128 fingerprint (32 hex chars) shown by `downstream pending`.          |
+| `<fingerprint>`   | Full BLAKE2s-128 fingerprint (32 hex chars) shown by `downstream pending`, or any unique 8+-hex-char prefix. The daemon disambiguates against the staged queue; ambiguous prefixes return `error_codes::AMBIGUOUS_FINGERPRINT` listing every match. |
 
 ---
 

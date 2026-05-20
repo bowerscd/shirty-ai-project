@@ -44,7 +44,6 @@ ExecStartPre=/bin/sh -c 'curl -fsS http://127.0.0.1:9090/healthz >/dev/null'
 ```bash
 sudo yggdrasilctl local status
 sudo yggdrasilctl local rules list
-sudo yggdrasilctl local certs list      # only meaningful for HTTPS rules
 ```
 
 On the relay, `status` reports the downstream's currently-observed IP,
