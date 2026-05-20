@@ -12,6 +12,7 @@
 //!   `[dial]` / `[accept]` sections. No daemon required.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -19,6 +20,7 @@ use clap::{Parser, Subcommand};
 mod chain;
 mod identity;
 mod local;
+mod validate;
 
 /// Default path to the daemon's main config file.
 const DEFAULT_CONFIG_PATH: &str = "/etc/yggdrasil/config.toml";
@@ -72,9 +74,11 @@ enum Scope {
         #[command(subcommand)]
         cmd: identity::Cmd,
     },
+    /// Validate the daemon's config file and rules directory offline.
+    Validate(validate::ValidateArgs),
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -84,9 +88,10 @@ fn main() -> Result<()> {
 
     runtime.block_on(async move {
         match cli.scope {
-            Scope::Local { cmd } => local::run(cmd, &cli.socket, cli.json).await,
-            Scope::Chain { cmd } => chain::run(cmd, &cli.socket, cli.json).await,
-            Scope::Identity { cmd } => identity::run(cmd, &cli.config, cli.json).await,
+            Scope::Local { cmd } => local::run(cmd, &cli.socket, cli.json).await.map(|()| ExitCode::SUCCESS),
+            Scope::Chain { cmd } => chain::run(cmd, &cli.socket, cli.json).await.map(|()| ExitCode::SUCCESS),
+            Scope::Identity { cmd } => identity::run(cmd, &cli.config, cli.json).await.map(|()| ExitCode::SUCCESS),
+            Scope::Validate(args) => validate::run(args, &cli.config, cli.json).await,
         }
     })
 }

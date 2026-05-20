@@ -80,6 +80,7 @@ pin-project-lite = "0.2"
 
 # Internal crates
 ratatoskr = { path = "crates/ratatoskr" }
+yggdrasil = { path = "crates/yggdrasil" }
 
 [profile.release]
 opt-level     = 3
