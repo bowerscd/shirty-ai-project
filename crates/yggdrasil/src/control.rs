@@ -26,9 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
-    error_codes, ChainAppliedResponse, CertInfo, CertsListResponse, DownstreamResponse,
-    HealthResponse, MetricsResponse, Mode, PendingResponse, Request, Response, RuleInfo,
-    RulesResponse, StatusResponse,
+    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse, CertInfo,
+    CertsListResponse, DownstreamResponse, HealthResponse, MetricsResponse, Mode,
+    PendingResponse, Request, Response, RuleInfo, RulesResponse, StatusResponse,
 };
 use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
 use ratatoskr::pubkey::PubKey;
@@ -427,6 +427,25 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
         }
         Request::DerivedRules => match state.introspection.as_ref() {
             Some(ix) => Response::DerivedRules(ix.snapshot()),
+            None => Response::Error {
+                code: error_codes::INTERNAL_ERROR.into(),
+                message: "introspection state not configured for this daemon"
+                    .into(),
+            },
+        },
+        Request::ChainSummary { timeout_ms: _ } => match state.introspection.as_ref() {
+            // B3a-local: only the local hop. Upward fanout via the
+            // chain control plane is a follow-up increment; the wire
+            // shape already supports it via `Vec<ChainHop>` + `partial`.
+            Some(ix) => Response::ChainSummary(ChainSummaryResponse {
+                hops: vec![ChainHop {
+                    hop_index: 0,
+                    mode: state.mode,
+                    uptime_secs: state.started_at.elapsed().as_secs(),
+                    view: ix.snapshot(),
+                }],
+                partial: false,
+            }),
             None => Response::Error {
                 code: error_codes::INTERNAL_ERROR.into(),
                 message: "introspection state not configured for this daemon"

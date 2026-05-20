@@ -102,6 +102,25 @@ pub enum Request {
     /// `yggdrasilctl local derived-rules` and the local-hop fetch in
     /// `yggdrasilctl chain diff`.
     DerivedRules,
+    /// Walk the chain from this node upward and collect a per-hop
+    /// summary suitable for `yggdrasilctl chain summary` / `health` /
+    /// `diff` / `ping`. The single comprehensive reply
+    /// ([`ChainSummaryResponse`]) carries every per-hop field; CLI
+    /// subcommands project the slices they care about (CP23 in the
+    /// config-UX plan).
+    ///
+    /// In B3a-local this returns only the local hop synchronously
+    /// from [`crate::control::DerivedRulesResponse`] plus the
+    /// daemon's mode and uptime. Multi-hop fanout via the chain
+    /// control plane is a follow-up increment; the wire shape is
+    /// deliberately a `Vec<ChainHop>` so the upgrade is additive.
+    ChainSummary {
+        /// Optional overall budget in milliseconds the operator is
+        /// willing to wait for replies. `None` means "use the daemon
+        /// default". Local-only replies ignore this; multi-hop
+        /// fanout will respect it.
+        timeout_ms: Option<u64>,
+    },
     /// Open a chain tunnel from this node toward `target_pubkey`, which
     /// must terminate the tunnel at `dest` (a TCP `host:port`). This
     /// request **hijacks the UDS connection**: once the server responds
@@ -156,6 +175,9 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    /// Successful response to [`Request::ChainSummary`]. See
+    /// [`ChainSummaryResponse`] for the field semantics.
+    ChainSummary(ChainSummaryResponse),
     Status(StatusResponse),
     Rules(RulesResponse),
     RulesReloaded { reloaded_rule_count: usize },
@@ -337,6 +359,43 @@ pub struct ChainIdentity {
     pub last_apply_unix: Option<i64>,
 }
 
+/// Aggregated reply for [`Request::ChainSummary`]. Each hop is one
+/// element of `hops`; index 0 is the daemon that received the UDS
+/// request, index N is the head-of-chain.
+///
+/// CP23 (config-UX plan): single comprehensive reply struct covering
+/// every per-hop field; `chain summary`, `chain health`, `chain diff`,
+/// `chain ping` all hang off this primitive and project the slices
+/// they care about.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSummaryResponse {
+    /// One entry per chain hop, ordered from local (index 0) outward
+    /// to the head-of-chain. In B3a-local this is always exactly one
+    /// element.
+    pub hops: Vec<ChainHop>,
+    /// Whether the daemon was unable to collect every upstream hop
+    /// before the budget expired. Local-only replies always set this
+    /// to `false`; multi-hop fanout flips it when partial.
+    pub partial: bool,
+}
+
+/// One hop's view of itself, as reported on the chain control plane.
+/// Composed from this node's [`DerivedRulesResponse`] plus mode +
+/// uptime so the CLI can render summary / health / diff without a
+/// second RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainHop {
+    /// `0 = local`, `1 = local's upstream`, `2 = grandparent`, …
+    pub hop_index: u32,
+    /// Runtime mode (`gateway` / `relay` / `terminal`).
+    pub mode: Mode,
+    /// Process uptime in whole seconds.
+    pub uptime_secs: u64,
+    /// Predicates, derived rule set, and chain identity facts. Every
+    /// field of [`DerivedRulesResponse`] is wire-stable across hops.
+    pub view: DerivedRulesResponse,
+}
+
 /// Metadata for a single (hostname, cert) pair loaded into the cert store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertInfo {
@@ -438,6 +497,8 @@ mod tests {
                 target_pubkey: PubKey::x25519([0x42; 32]),
                 dest: "127.0.0.1:9100".parse().unwrap(),
             },
+            Request::ChainSummary { timeout_ms: None },
+            Request::ChainSummary { timeout_ms: Some(2500) },
         ];
         for r in cases {
             let s = serde_json::to_string(&r).unwrap();
@@ -554,6 +615,47 @@ mod tests {
         let s = r#"{"kind":"definitely_not_real"}"#;
         let r: Result<Request, _> = serde_json::from_str(s);
         assert!(r.is_err(), "expected serde to reject unknown variant");
+    }
+
+    #[test]
+    fn chain_summary_request_serialises() {
+        let r = Request::ChainSummary { timeout_ms: Some(1000) };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"kind\":\"chain_summary\""), "got: {s}");
+        assert!(s.contains("\"timeout_ms\":1000"), "got: {s}");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn chain_summary_response_round_trip() {
+        let view = DerivedRulesResponse {
+            predicates: vec![],
+            derived_rules: vec![],
+            chain: ChainIdentity {
+                local: PubKey::x25519([0xAA; 32]),
+                upstream: None,
+                downstream: None,
+                predicate_origin: None,
+                predicate_version: None,
+                last_apply_unix: None,
+            },
+        };
+        let resp = Response::ChainSummary(ChainSummaryResponse {
+            hops: vec![ChainHop {
+                hop_index: 0,
+                mode: Mode::Terminal,
+                uptime_secs: 42,
+                view,
+            }],
+            partial: false,
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"kind\":\"chain_summary\""), "got: {s}");
+        assert!(s.contains("\"hop_index\":0"), "got: {s}");
+        assert!(s.contains("\"mode\":\"terminal\""), "got: {s}");
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(resp, back);
     }
 
     #[test]

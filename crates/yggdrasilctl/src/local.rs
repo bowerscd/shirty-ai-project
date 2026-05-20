@@ -281,6 +281,15 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                 .context("serialise DerivedRulesResponse")?;
             println!("{s}");
         }
+        Response::ChainSummary(_) => {
+            // `ChainSummary` belongs to the `chain summary` / `diff`
+            // paths and is never produced for any request issued from
+            // the `local` scope.
+            bail!(
+                "server returned unexpected ChainSummary response \
+                 to local request {request:?}"
+            );
+        }
     }
     Ok(())
 }
