@@ -223,11 +223,28 @@ pub async fn run_relay(
             .map_err(|_| anyhow::anyhow!("introspection set twice on acceptor"))?;
     }
 
-    // 6. Heartbeat (chain) listener — only when [accept] is set.
+    // 6. Build the outbound chain client (un-spawned) *before* binding
+    //    the heartbeat listener so we can hand the chain client's
+    //    upstream handle to the acceptor for `ChainHopQuery`
+    //    forwarding. The client itself is spawned later, after its
+    //    body handler is wired.
+    let built_chain_client = build_chain_client(&config, &local_keys, shutdown.clone());
+    if let (Some(acc), Some(built)) =
+        (chain_acceptor.as_ref(), built_chain_client.as_ref())
+    {
+        acc.set_upstream(built.handle.clone())
+            .map_err(|_| anyhow::anyhow!("upstream set twice on acceptor"))?;
+    }
+    if let Some(acc) = chain_acceptor.as_ref() {
+        acc.set_mode(wire_mode)
+            .map_err(|_| anyhow::anyhow!("mode set twice on acceptor"))?;
+    }
+
+    // 6a. Heartbeat (chain) listener — only when [accept] is set.
     //    A pure-proxy relay (no downstream/listener, only an upstream) is
     //    a legitimate mid-chain configuration that does no inbound work.
     let hb_handle = if let Some(accept) = config.accept.as_ref() {
-        let (hb, _outbound) = HeartbeatServer::bind(
+        let (hb, outbound) = HeartbeatServer::bind(
             accept.listen,
             local_keys.clone(),
             peer_state.clone(),
@@ -237,6 +254,13 @@ pub async fn run_relay(
         )
         .await
         .context("binding chain listener")?;
+        // Wire the downstream-facing outbound channel into the
+        // acceptor so it can emit `ChainHopReply` envelopes back to
+        // the querier.
+        if let Some(acc) = chain_acceptor.as_ref() {
+            acc.set_outbound(outbound.sender())
+                .map_err(|_| anyhow::anyhow!("outbound set twice on acceptor"))?;
+        }
 
         Some(tokio::spawn(async move {
             if let Err(e) = hb.run().await {
@@ -247,21 +271,27 @@ pub async fn run_relay(
         None
     };
 
-    // 6b. Outbound chain client — only when [dial] is set.
-    //     Phase 3B does not push predicates from relays; the handle is
-    //     therefore unused on this path. We still keep the chain client
-    //     spawned so mid-chain relays maintain their upstream session.
-    let chain_client_join = match build_chain_client(&config, &local_keys, shutdown.clone()) {
-        Some(built) => {
+    // 6b. Spawn the outbound chain client now that the acceptor is
+    //     wired. The client's body handler routes inbound
+    //     `ChainHopReply` envelopes through the shared `QueryRouter`
+    //     so awaiting `query_upstream` callers resolve correctly.
+    let (chain_client_join, chain_client_handle) = match built_chain_client {
+        Some(mut built) => {
+            let router_handler = built
+                .client
+                .query_router()
+                .install_into_body_handler(None);
+            built.client.set_body_handler(router_handler);
+            let handle = built.handle.clone();
             let client = built.client;
             let join = tokio::spawn(async move {
                 if let Err(e) = client.run().await {
                     tracing::error!(error = %e, "chain client exited with error");
                 }
             });
-            Some(join)
+            (Some(join), Some(handle))
         }
-        None => None,
+        None => (None, None),
     };
     let has_chain_upstream = config.dial.is_some();
 
@@ -276,6 +306,7 @@ pub async fn run_relay(
         has_chain_upstream,
         prom_handle.clone(),
         Some(introspection_state.clone()),
+        chain_client_handle.clone(),
         shutdown.clone(),
     )
     .await
@@ -346,7 +377,12 @@ pub async fn run_terminal(
     //     proxy), so absence is not an error.
     let (chain_client_join, chain_client_handle) =
         match build_chain_client(&config, &local_keys, shutdown.clone()) {
-            Some(built) => {
+            Some(mut built) => {
+                let router_handler = built
+                    .client
+                    .query_router()
+                    .install_into_body_handler(None);
+                built.client.set_body_handler(router_handler);
                 let handle = built.handle.clone();
                 let client = built.client;
                 let join = tokio::spawn(async move {
@@ -403,6 +439,7 @@ pub async fn run_terminal(
         has_chain_upstream,
         prom_handle.clone(),
         Some(introspection_state.clone()),
+        chain_client_handle.clone(),
         shutdown.clone(),
     )
     .await

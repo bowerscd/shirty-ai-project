@@ -13,6 +13,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod auth;
+pub mod chain_query;
 pub mod control;
 pub mod control_frame;
 pub mod error;

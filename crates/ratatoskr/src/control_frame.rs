@@ -95,6 +95,20 @@ pub enum ControlBodyType {
     ///
     /// [`PredicateSet`]: crate::predicate::PredicateSet
     PredicateSetUpdate = 0x02,
+    /// Downstream→upstream `ChainHopQuery` for the recursive
+    /// `ChainSummary` RPC. Body is a postcard-encoded
+    /// [`crate::chain_query::ChainHopQuery`]. The receiver acks `Ok`
+    /// immediately, then asynchronously assembles its local hop (and
+    /// any upstream hops it can reach within the deadline) and emits a
+    /// reciprocal `ChainHopReply` envelope back to the querier on the
+    /// same chain session.
+    ChainHopQuery = 0x03,
+    /// Upstream→downstream `ChainHopReply` carrying one or more
+    /// [`crate::control::ChainHop`] entries. Body is a postcard-encoded
+    /// [`crate::chain_query::ChainHopReply`]. The `query_id` field
+    /// correlates the reply with the originating
+    /// [`ChainHopQuery`](Self::ChainHopQuery).
+    ChainHopReply = 0x04,
 }
 
 impl ControlBodyType {
@@ -105,6 +119,8 @@ impl ControlBodyType {
             0x00 => Self::Reserved,
             0x01 => Self::Noop,
             0x02 => Self::PredicateSetUpdate,
+            0x03 => Self::ChainHopQuery,
+            0x04 => Self::ChainHopReply,
             _ => return None,
         })
     }
@@ -182,6 +198,16 @@ mod tests {
         assert_eq!(
             ControlBodyType::from_byte(0x02),
             Some(ControlBodyType::PredicateSetUpdate),
+        );
+        assert_eq!(ControlBodyType::ChainHopQuery.as_byte(), 0x03);
+        assert_eq!(
+            ControlBodyType::from_byte(0x03),
+            Some(ControlBodyType::ChainHopQuery),
+        );
+        assert_eq!(ControlBodyType::ChainHopReply.as_byte(), 0x04);
+        assert_eq!(
+            ControlBodyType::from_byte(0x04),
+            Some(ControlBodyType::ChainHopReply),
         );
         assert!(ControlBodyType::from_byte(0xFF).is_none());
     }

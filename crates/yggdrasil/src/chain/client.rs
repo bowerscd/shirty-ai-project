@@ -34,9 +34,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::{Initiator, Session, StaticKeyPair, PUBLIC_KEY_LEN};
-use ratatoskr::control_frame::{AckStatus, ControlAck};
+use ratatoskr::chain_query::{ChainHopQuery, ChainHopReply};
+use ratatoskr::control_frame::{AckStatus, ControlAck, ControlBodyType};
 use ratatoskr::wire::{self, PacketType, SessionId};
 
+use super::query_router::QueryRouter;
 use super::reliability::{ControlChannel, InboundDisposition, SendError};
 
 /// Build-time defaults that callers can override.
@@ -100,6 +102,11 @@ pub struct ControlOp {
 #[derive(Debug, Clone)]
 pub struct ChainClientHandle {
     tx: mpsc::UnboundedSender<ControlOp>,
+    /// Shared per-session query/reply router used by
+    /// [`ChainClientHandle::query_upstream`]. The chain client's
+    /// body-handler closure resolves [`ChainHopReply`] envelopes
+    /// through this same router.
+    router: Arc<QueryRouter>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,8 +138,98 @@ impl ChainClientHandle {
     #[cfg(test)]
     #[doc(hidden)]
     pub(crate) fn __test_new(tx: mpsc::UnboundedSender<ControlOp>) -> Self {
-        Self { tx }
+        Self { tx, router: QueryRouter::new() }
     }
+
+    /// Shared per-session query router. The body handler installed on
+    /// the chain client must be wired to resolve [`ChainHopReply`]
+    /// envelopes through this same router (see
+    /// [`QueryRouter::install_into_body_handler`]).
+    pub fn query_router(&self) -> Arc<QueryRouter> {
+        Arc::clone(&self.router)
+    }
+
+    /// Issue a [`ChainHopQuery`] upstream and await the matching
+    /// [`ChainHopReply`]. The receiver acks the query immediately;
+    /// the reply arrives as a separate `ChainHopReply` envelope routed
+    /// through [`QueryRouter`].
+    ///
+    /// On timeout the router registration is cancelled so a late
+    /// reply doesn't leak the oneshot slot; the caller receives
+    /// [`QueryError::Timeout`]. On any underlying `send_control`
+    /// failure (channel closed, retransmits exhausted, peer rejected)
+    /// the error variant carries the underlying [`SendError`].
+    pub async fn query_upstream(
+        &self,
+        depth_budget: u32,
+        deadline: Duration,
+    ) -> Result<ChainHopReply, QueryError> {
+        let (query_id, rx) = self.router.register();
+        let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+        let query = ChainHopQuery {
+            query_id,
+            depth_budget,
+            deadline_ms,
+        };
+        let body = postcard::to_allocvec(&query).map_err(QueryError::Encode)?;
+        let ack_rx = self
+            .send_control(ControlBodyType::ChainHopQuery.as_byte(), body)
+            .map_err(|_| {
+                self.router.cancel(query_id);
+                QueryError::ClientDown
+            })?;
+
+        // First, await the ACK so we know the query was actually
+        // delivered. If the peer can't even ack we won't get a reply
+        // either, so propagate.
+        let ack_outcome = tokio::time::timeout(deadline, ack_rx).await;
+        match ack_outcome {
+            Err(_) => {
+                self.router.cancel(query_id);
+                return Err(QueryError::Timeout);
+            }
+            Ok(Err(_)) => {
+                self.router.cancel(query_id);
+                return Err(QueryError::ClientDown);
+            }
+            Ok(Ok(Err(e))) => {
+                self.router.cancel(query_id);
+                return Err(QueryError::Send(e));
+            }
+            Ok(Ok(Ok(()))) => {}
+        }
+
+        // Then await the actual reply.
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(QueryError::ClientDown),
+            Err(_) => {
+                self.router.cancel(query_id);
+                Err(QueryError::Timeout)
+            }
+        }
+    }
+}
+
+/// Failure modes for [`ChainClientHandle::query_upstream`].
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    /// The deadline expired before a reply arrived. The local hop is
+    /// still usable; the CLI surfaces this as `partial = true`.
+    #[error("chain hop query timed out")]
+    Timeout,
+    /// The chain client task is no longer running (cancellation or
+    /// fatal session error).
+    #[error("chain client is shut down")]
+    ClientDown,
+    /// The send layer reported a delivery failure (retransmits
+    /// exhausted, peer rejected the body type, etc.).
+    #[error("chain hop query send failed: {0}")]
+    Send(#[from] SendError),
+    /// Postcard refused to encode the query body. Pure internal bug;
+    /// surfaces here so tests catch it.
+    #[error("failed to encode ChainHopQuery body: {0}")]
+    Encode(postcard::Error),
 }
 
 /// Driver: owns the config, the cancel token, and the control-send queue;
@@ -142,6 +239,7 @@ pub struct ChainClient {
     cancel:     CancellationToken,
     control_tx: mpsc::UnboundedSender<ControlOp>,
     control_rx: mpsc::UnboundedReceiver<ControlOp>,
+    router:     Arc<QueryRouter>,
 }
 
 impl std::fmt::Debug for ChainClient {
@@ -156,14 +254,26 @@ impl std::fmt::Debug for ChainClient {
 impl ChainClient {
     pub fn new(config: ChainClientConfig, cancel: CancellationToken) -> Self {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        Self { config, cancel, control_tx, control_rx }
+        Self { config, cancel, control_tx, control_rx, router: QueryRouter::new() }
     }
 
     /// Clone the control-send handle. Multiple callers may hold handles
     /// concurrently; each enqueued op is processed in FIFO order by the
     /// client task.
     pub fn handle(&self) -> ChainClientHandle {
-        ChainClientHandle { tx: self.control_tx.clone() }
+        ChainClientHandle {
+            tx: self.control_tx.clone(),
+            router: Arc::clone(&self.router),
+        }
+    }
+
+    /// The query-router shared with [`ChainClientHandle`]s. Callers
+    /// constructing the body-handler must install a router-aware
+    /// dispatcher (see
+    /// [`QueryRouter::install_into_body_handler`]) so inbound
+    /// `ChainHopReply` envelopes reach their awaiting oneshots.
+    pub fn query_router(&self) -> Arc<QueryRouter> {
+        Arc::clone(&self.router)
     }
 
     /// Install (or replace) the per-envelope body handler.

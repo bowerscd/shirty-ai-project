@@ -35,14 +35,16 @@ pub mod derive;
 pub mod introspection;
 pub mod predicate_extractor;
 pub mod predicate_publisher;
+pub mod query_router;
 pub mod reliability;
 
 pub use acceptor::ChainAcceptor;
 pub use client::{
     BodyHandler, ChainClient, ChainClientConfig, ChainClientHandle, ChainClientShutDown,
-    ControlOp,
+    ControlOp, QueryError,
 };
 pub use derive::{derive, DeriveConfig, DeriveError};
 pub use introspection::IntrospectionState;
 pub use predicate_extractor::{extract, ExtractOutcome};
+pub use query_router::QueryRouter;
 pub use reliability::{ControlChannel, InboundDisposition, SendError};

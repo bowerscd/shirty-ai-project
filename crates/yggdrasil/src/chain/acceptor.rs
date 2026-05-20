@@ -35,14 +35,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ratatoskr::control_frame::{AckStatus, ControlBodyType};
+use ratatoskr::chain_query::{ChainHopQuery, ChainHopReply, CHAIN_HOP_REPLY_MAX_WIRE_BYTES};
+use ratatoskr::control::{ChainHop, Mode};
+use ratatoskr::control_frame::{AckStatus, ControlBodyType, ControlEnvelope};
 use ratatoskr::predicate::{predicate_reject, PredicateSet, PREDICATE_SET_MAX_WIRE_BYTES};
 use ratatoskr::pubkey::PubKey;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
+use crate::chain::client::{ChainClientHandle, QueryError};
 use crate::chain::derive::{derive, DeriveConfig};
 use crate::chain::introspection::IntrospectionState;
 use crate::proxy::supervisor::SupervisorHandle;
@@ -112,6 +116,27 @@ pub struct ChainAcceptor {
     ///
     /// See [`set_introspection`](ChainAcceptor::set_introspection).
     introspection: OnceLock<Arc<IntrospectionState>>,
+    /// Wall-clock process start (Instant). Used to compute the
+    /// `uptime_secs` field of the local [`ChainHop`] returned in
+    /// `ChainHopReply`.
+    started_at: Instant,
+    /// Daemon mode. Stamped onto the local [`ChainHop`] emitted in
+    /// `ChainHopReply`. Settable via
+    /// [`set_mode`](ChainAcceptor::set_mode); defaults to
+    /// [`Mode::Relay`] (the only mode that runs an acceptor on the
+    /// downstream-facing side).
+    mode: OnceLock<Mode>,
+    /// Downstream-facing outbound channel hand into the heartbeat
+    /// server. The acceptor uses this to push `ChainHopReply`
+    /// envelopes back down the chain after assembling them. Unset
+    /// for relays without a wired heartbeat server (tests); in that
+    /// case `ChainHopQuery` is acked `Ok` but no reply is emitted.
+    outbound: OnceLock<mpsc::UnboundedSender<ControlEnvelope>>,
+    /// Optional upstream chain-client handle used to recursively
+    /// forward `ChainHopQuery` further up the chain. Absent on
+    /// nodes without `[dial]` (gateways and top-of-chain relays); in
+    /// that case the reply contains only this hop's local view.
+    upstream: OnceLock<ChainClientHandle>,
 }
 
 impl ChainAcceptor {
@@ -140,7 +165,40 @@ impl ChainAcceptor {
             state_path,
             state: Mutex::new(state),
             introspection: OnceLock::new(),
+            started_at: Instant::now(),
+            mode: OnceLock::new(),
+            outbound: OnceLock::new(),
+            upstream: OnceLock::new(),
         }))
+    }
+
+    /// Set the daemon mode reported on the local [`ChainHop`] of
+    /// `ChainHopReply`. Must be called at most once. Idempotent
+    /// no-op for callers that don't need to override the default
+    /// [`Mode::Relay`].
+    pub fn set_mode(&self, mode: Mode) -> std::result::Result<(), Mode> {
+        self.mode.set(mode)
+    }
+
+    /// Install the downstream-facing outbound channel hand from the
+    /// heartbeat server. Must be called at most once. Acceptors
+    /// without a wired outbound silently drop `ChainHopReply`
+    /// emission (the local query times out).
+    pub fn set_outbound(
+        &self,
+        sender: mpsc::UnboundedSender<ControlEnvelope>,
+    ) -> std::result::Result<(), mpsc::UnboundedSender<ControlEnvelope>> {
+        self.outbound.set(sender)
+    }
+
+    /// Install the upstream chain-client handle so this acceptor can
+    /// forward `ChainHopQuery`s recursively. Optional: relays without
+    /// `[dial]` skip the call and the reply contains only this hop.
+    pub fn set_upstream(
+        &self,
+        handle: ChainClientHandle,
+    ) -> std::result::Result<(), ChainClientHandle> {
+        self.upstream.set(handle)
     }
 
     /// Attach the chain-introspection sink. Must be called at most
@@ -162,8 +220,12 @@ impl ChainAcceptor {
     /// `Unknown`; recognised bodies that fail validation ack
     /// `Reject(code)`.
     ///
+    /// `ChainHopQuery` is acked `Ok` synchronously; the reply walk
+    /// runs in a background task spawned on the current tokio runtime
+    /// (see [`spawn_chain_hop_query_handler`](Self::spawn_chain_hop_query_handler)).
+    ///
     /// [`ControlEnvelope`]: ratatoskr::control_frame::ControlEnvelope
-    pub async fn dispatch(&self, body_type: u8, body: &[u8]) -> AckStatus {
+    pub async fn dispatch(self: &Arc<Self>, body_type: u8, body: &[u8]) -> AckStatus {
         let kind = match ControlBodyType::from_byte(body_type) {
             Some(k) => k,
             None => {
@@ -189,6 +251,22 @@ impl ChainAcceptor {
             }
             ControlBodyType::PredicateSetUpdate => {
                 self.handle_predicate_set_update(body).await
+            }
+            ControlBodyType::ChainHopQuery => {
+                self.spawn_chain_hop_query_handler(body);
+                AckStatus::Ok
+            }
+            ControlBodyType::ChainHopReply => {
+                // Acceptors do not consume ChainHopReply — replies are
+                // received on the *upstream-facing* chain client side
+                // and routed through `QueryRouter`. A reply arriving
+                // at the acceptor means the downstream is using the
+                // body type backwards; ack Unknown so the operator
+                // sees the misuse in metrics/logs.
+                tracing::warn!(
+                    "drop ChainHopReply on relay-acceptor side (replies flow upstream-to-downstream)"
+                );
+                AckStatus::Unknown
             }
         }
     }
@@ -340,6 +418,195 @@ impl ChainAcceptor {
     #[cfg(test)]
     pub(crate) async fn last_accepted_version(&self, origin: &PubKey) -> Option<u64> {
         self.state.lock().await.versions.get(origin).copied()
+    }
+
+    /// Decode a `ChainHopQuery` body and spawn a background task to
+    /// assemble + send the matching `ChainHopReply`. The dispatch
+    /// caller has already returned `AckStatus::Ok` for the query
+    /// envelope; the reply is a separate `ChainHopReply` envelope
+    /// pushed back to the downstream via [`Self::outbound`].
+    ///
+    /// Decoding failure logs at `warn` and drops the query. Missing
+    /// `outbound` channel (acceptor wired without a heartbeat server)
+    /// is also a silent drop — the downstream's `query_upstream`
+    /// awaiter then times out and surfaces it as `partial = true`.
+    fn spawn_chain_hop_query_handler(self: &Arc<Self>, body: &[u8]) {
+        let query: ChainHopQuery = match postcard::from_bytes(body) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode inbound ChainHopQuery");
+                metrics::counter!(
+                    "yggdrasil_chain_hop_query_total",
+                    "outcome" => "decode_error",
+                )
+                .increment(1);
+                return;
+            }
+        };
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.handle_chain_hop_query(query).await;
+        });
+    }
+
+    async fn handle_chain_hop_query(self: Arc<Self>, query: ChainHopQuery) {
+        let query_id = query.query_id;
+        metrics::counter!(
+            "yggdrasil_chain_hop_query_total",
+            "outcome" => "received",
+        )
+        .increment(1);
+        let started = Instant::now();
+
+        // 1. Assemble the local hop. Without an introspection sink we
+        //    cannot produce a meaningful reply at all; bail with a
+        //    partial+error reply so the downstream still sees something.
+        let view = match self.introspection.get() {
+            Some(ix) => ix.snapshot(),
+            None => {
+                tracing::warn!(
+                    query_id,
+                    "ChainHopQuery received but no introspection sink wired; \
+                     replying partial",
+                );
+                self.send_reply(ChainHopReply {
+                    query_id,
+                    hops: vec![],
+                    partial: true,
+                    error: Some("local introspection unavailable".into()),
+                })
+                .await;
+                return;
+            }
+        };
+        let mode = self.mode.get().copied().unwrap_or(Mode::Relay);
+        let uptime_secs = self.started_at.elapsed().as_secs();
+        let local_hop = ChainHop {
+            hop_index: 0,
+            mode,
+            uptime_secs,
+            view,
+        };
+
+        // 2. If we have an upstream and budget remaining, forward
+        //    the query recursively. Reserve a small overhead for our
+        //    own assembly + send so the upstream doesn't deadline
+        //    exactly on the boundary.
+        const FORWARDING_OVERHEAD_MS: u32 = 250;
+        let depth_budget = query.depth_budget.saturating_sub(1);
+        let upstream_deadline_ms = query
+            .deadline_ms
+            .saturating_sub(FORWARDING_OVERHEAD_MS);
+        let mut hops = vec![local_hop];
+        let mut partial = false;
+        let mut error: Option<String> = None;
+
+        if let Some(upstream) = self.upstream.get() {
+            if depth_budget > 0 && upstream_deadline_ms > 0 {
+                let deadline = std::time::Duration::from_millis(upstream_deadline_ms as u64);
+                match upstream.query_upstream(depth_budget, deadline).await {
+                    Ok(reply) => {
+                        // Renumber upstream hops to extend the local
+                        // sequence (local = 0, upstream = 1, ...).
+                        for (offset, mut hop) in reply.hops.into_iter().enumerate() {
+                            hop.hop_index = (hops.len() + offset) as u32;
+                            hops.push(hop);
+                        }
+                        partial |= reply.partial;
+                        if reply.error.is_some() {
+                            error = reply.error;
+                        }
+                    }
+                    Err(QueryError::Timeout) => {
+                        partial = true;
+                        error = Some("upstream chain hop query timed out".into());
+                    }
+                    Err(e) => {
+                        partial = true;
+                        error = Some(format!("upstream chain hop query failed: {e}"));
+                    }
+                }
+            } else if depth_budget == 0 {
+                // Reached the depth budget; this is an expected truncation,
+                // not a failure.
+                partial = true;
+                error = Some("depth budget exhausted".into());
+            } else {
+                partial = true;
+                error = Some("deadline exhausted before upstream forward".into());
+            }
+        }
+
+        // 3. Encode + size-check the reply. If oversized, drop upstream
+        //    hops and flag partial.
+        let mut reply = ChainHopReply {
+            query_id,
+            hops,
+            partial,
+            error,
+        };
+        match postcard::to_allocvec(&reply) {
+            Ok(bytes) if bytes.len() > CHAIN_HOP_REPLY_MAX_WIRE_BYTES => {
+                tracing::warn!(
+                    query_id,
+                    bytes = bytes.len(),
+                    cap = CHAIN_HOP_REPLY_MAX_WIRE_BYTES,
+                    "ChainHopReply oversized; truncating to local hop only",
+                );
+                reply.hops.truncate(1);
+                reply.partial = true;
+                reply.error = Some(format!(
+                    "reply exceeded {CHAIN_HOP_REPLY_MAX_WIRE_BYTES} bytes; \
+                     truncated to local hop"
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(query_id, error = %e, "failed to encode ChainHopReply");
+                return;
+            }
+        }
+
+        metrics::counter!(
+            "yggdrasil_chain_hop_query_total",
+            "outcome" => if reply.partial { "replied_partial" } else { "replied_ok" },
+        )
+        .increment(1);
+        metrics::histogram!("yggdrasil_chain_hop_query_walk_seconds")
+            .record(started.elapsed().as_secs_f64());
+
+        self.send_reply(reply).await;
+    }
+
+    async fn send_reply(self: &Arc<Self>, reply: ChainHopReply) {
+        let bytes = match postcard::to_allocvec(&reply) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to encode ChainHopReply for send");
+                return;
+            }
+        };
+        let outbound = match self.outbound.get() {
+            Some(o) => o,
+            None => {
+                tracing::debug!(
+                    query_id = reply.query_id,
+                    "no downstream outbound wired; dropping ChainHopReply",
+                );
+                return;
+            }
+        };
+        let env = ControlEnvelope {
+            seq: 0, // heartbeat server assigns the per-session seq
+            body_type: ControlBodyType::ChainHopReply.as_byte(),
+            body: bytes,
+        };
+        if outbound.send(env).is_err() {
+            tracing::warn!(
+                query_id = reply.query_id,
+                "outbound channel closed; dropping ChainHopReply",
+            );
+        }
     }
 }
 

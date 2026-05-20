@@ -34,6 +34,7 @@ use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::{Rule, RuleSet};
 
 use crate::chain::predicate_extractor;
+use crate::chain::client::ChainClientHandle;
 use crate::heartbeat::PeerState;
 use crate::pending_peers::PendingPeerStore;
 use crate::proxy::supervisor::{ProxySupervisor, SupervisorHandle};
@@ -88,6 +89,12 @@ struct ControlState {
     /// [`Request::DerivedRules`]. `None` on pure-local terminals (no
     /// chain) or in tests that don't exercise predicate apply.
     introspection: Option<Arc<crate::chain::IntrospectionState>>,
+    /// Optional upstream chain-client handle used by
+    /// [`Request::ChainSummary`] to walk the chain. `None` on nodes
+    /// without a `[dial]` section (gateways, root relays, pure-local
+    /// terminals); the response then contains only the local hop with
+    /// `partial = false`.
+    chain_client_handle: Option<ChainClientHandle>,
 }
 
 impl ControlServer {
@@ -115,6 +122,7 @@ impl ControlServer {
         has_chain_upstream: bool,
         prom_handle: PrometheusHandle,
         introspection: Option<Arc<crate::chain::IntrospectionState>>,
+        chain_client_handle: Option<ChainClientHandle>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -165,6 +173,7 @@ impl ControlServer {
             supervisor_handle: supervisor.handle(),
             prom_handle,
             introspection,
+            chain_client_handle,
         });
 
         let main_cancel = cancel.clone();
@@ -251,6 +260,16 @@ async fn handle_connection(
                         // defensive arm in `dispatch` returns
                         // INTERNAL_ERROR if routing slips.
                         let response = dispatch_chain_apply(rules, &state).await;
+                        let mut buf =
+                            serde_json::to_vec(&response).context("encode response")?;
+                        buf.push(b'\n');
+                        writer.write_all(&buf).await.context("write response")?;
+                    }
+                    Ok(Request::ChainSummary { timeout_ms }) => {
+                        // ChainSummary may walk upstream via
+                        // `ChainClientHandle::query_upstream`, which
+                        // is async; route it like ChainApply.
+                        let response = dispatch_chain_summary(timeout_ms, &state).await;
                         let mut buf =
                             serde_json::to_vec(&response).context("encode response")?;
                         buf.push(b'\n');
@@ -397,24 +416,12 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                     .into(),
             },
         },
-        Request::ChainSummary { timeout_ms: _ } => match state.introspection.as_ref() {
-            // B3a-local: only the local hop. Upward fanout via the
-            // chain control plane is a follow-up increment; the wire
-            // shape already supports it via `Vec<ChainHop>` + `partial`.
-            Some(ix) => Response::ChainSummary(ChainSummaryResponse {
-                hops: vec![ChainHop {
-                    hop_index: 0,
-                    mode: state.mode,
-                    uptime_secs: state.started_at.elapsed().as_secs(),
-                    view: ix.snapshot(),
-                }],
-                partial: false,
-            }),
-            None => Response::Error {
-                code: error_codes::INTERNAL_ERROR.into(),
-                message: "introspection state not configured for this daemon"
-                    .into(),
-            },
+        Request::ChainSummary { timeout_ms: _ } => Response::Error {
+            code: error_codes::INTERNAL_ERROR.into(),
+            message: "internal routing error: ChainSummary reached \
+                      the synchronous dispatcher (should have been \
+                      hoisted by handle_connection)"
+                .to_string(),
         },
         // `ChainApply` is handled by [`dispatch_chain_apply`] in
         // [`handle_connection`]: the apply path is async because
@@ -536,6 +543,74 @@ async fn dispatch_chain_apply(rules: Vec<Rule>, state: &ControlState) -> Respons
         predicate_count,
         skipped_https,
     })
+}
+
+/// Async dispatch for [`Request::ChainSummary`]. Always returns at
+/// least the local hop. When a chain-client handle is wired
+/// (i.e. this node has `[dial]`), forwards a `ChainHopQuery`
+/// upstream and aggregates the upstream hops into the response.
+///
+/// Caller-supplied `timeout_ms` caps the wait on the upstream walk.
+/// Falls back to `5_000` ms when zero/absent. On any upstream error
+/// (timeout, encode failure, client-down) the local hop is still
+/// returned with `partial = true`.
+async fn dispatch_chain_summary(timeout_ms: Option<u64>, state: &ControlState) -> Response {
+    let ix = match state.introspection.as_ref() {
+        Some(ix) => ix,
+        None => {
+            return Response::Error {
+                code: error_codes::INTERNAL_ERROR.into(),
+                message: "introspection state not configured for this daemon".into(),
+            };
+        }
+    };
+    let local = ChainHop {
+        hop_index: 0,
+        mode: state.mode,
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        view: ix.snapshot(),
+    };
+
+    let upstream = match state.chain_client_handle.as_ref() {
+        Some(h) => h,
+        None => {
+            return Response::ChainSummary(ChainSummaryResponse {
+                hops: vec![local],
+                partial: false,
+            });
+        }
+    };
+
+    let deadline_ms = timeout_ms
+        .filter(|m| *m > 0)
+        .unwrap_or(ratatoskr::chain_query::CHAIN_HOP_DEFAULT_DEADLINE_MS as u64);
+    let deadline = std::time::Duration::from_millis(deadline_ms);
+    match upstream
+        .query_upstream(
+            ratatoskr::chain_query::CHAIN_HOP_DEFAULT_DEPTH_BUDGET,
+            deadline,
+        )
+        .await
+    {
+        Ok(reply) => {
+            let mut hops = vec![local];
+            for (offset, mut hop) in reply.hops.into_iter().enumerate() {
+                hop.hop_index = (hops.len() + offset) as u32;
+                hops.push(hop);
+            }
+            Response::ChainSummary(ChainSummaryResponse {
+                hops,
+                partial: reply.partial,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "chain summary upstream walk failed; returning local only");
+            Response::ChainSummary(ChainSummaryResponse {
+                hops: vec![local],
+                partial: true,
+            })
+        }
+    }
 }
 
 /// Build the canonical "not supported in terminal mode" error response.
@@ -710,6 +785,7 @@ mod tests {
             cfg,
             false,
             crate::metrics::detached_handle_for_tests(),
+            None,
             None,
             shutdown,
         )
