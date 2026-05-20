@@ -98,7 +98,6 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
         supervisor.handle(),
         derive_cfg,
         state_dir.path(),
-        ratatoskr::pubkey::PubKey::x25519(*server_keys.public_key()),
     )
     .expect("load acceptor");
 
@@ -243,7 +242,6 @@ async fn unknown_body_type_acks_unknown_over_wire() {
         supervisor.handle(),
         derive_cfg,
         state_dir.path(),
-        ratatoskr::pubkey::PubKey::x25519(*server_keys.public_key()),
     )
     .unwrap();
     let (hb, _outbound) = HeartbeatServer::bind(

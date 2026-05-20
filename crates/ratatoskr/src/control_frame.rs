@@ -71,20 +71,10 @@ pub enum AckStatus {
 /// [`PredicateSet`]; reject reason codes live in
 /// [`predicate_reject`](crate::predicate::predicate_reject).
 ///
-/// Phase 4 introduces the tunnel triplet ([`TunnelOpen`], [`TunnelData`],
-/// [`TunnelClose`]) used by `yggdrasilctl chain` commands to reach
-/// chain-internal introspection endpoints. Wire bodies are postcard
-/// encodings of the matching [`tunnel`] types; reject reason codes live
-/// in [`tunnel_reject`](crate::tunnel::tunnel_reject).
-///
 /// [`Reserved`]: ControlBodyType::Reserved
 /// [`Noop`]: ControlBodyType::Noop
 /// [`PredicateSetUpdate`]: ControlBodyType::PredicateSetUpdate
-/// [`TunnelOpen`]: ControlBodyType::TunnelOpen
-/// [`TunnelData`]: ControlBodyType::TunnelData
-/// [`TunnelClose`]: ControlBodyType::TunnelClose
 /// [`PredicateSet`]: crate::predicate::PredicateSet
-/// [`tunnel`]: crate::tunnel
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ControlBodyType {
@@ -105,15 +95,6 @@ pub enum ControlBodyType {
     ///
     /// [`PredicateSet`]: crate::predicate::PredicateSet
     PredicateSetUpdate = 0x02,
-    /// Open a new tunnel stream. Body is the postcard-encoded
-    /// [`TunnelOpen`](crate::tunnel::TunnelOpen).
-    TunnelOpen = 0x03,
-    /// One chunk of bytes on an open tunnel stream. Body is the postcard-
-    /// encoded [`TunnelData`](crate::tunnel::TunnelData).
-    TunnelData = 0x04,
-    /// Close a tunnel stream (clean or with reason). Body is the postcard-
-    /// encoded [`TunnelClose`](crate::tunnel::TunnelClose).
-    TunnelClose = 0x05,
 }
 
 impl ControlBodyType {
@@ -124,9 +105,6 @@ impl ControlBodyType {
             0x00 => Self::Reserved,
             0x01 => Self::Noop,
             0x02 => Self::PredicateSetUpdate,
-            0x03 => Self::TunnelOpen,
-            0x04 => Self::TunnelData,
-            0x05 => Self::TunnelClose,
             _ => return None,
         })
     }
@@ -204,21 +182,6 @@ mod tests {
         assert_eq!(
             ControlBodyType::from_byte(0x02),
             Some(ControlBodyType::PredicateSetUpdate),
-        );
-        assert_eq!(ControlBodyType::TunnelOpen.as_byte(), 0x03);
-        assert_eq!(
-            ControlBodyType::from_byte(0x03),
-            Some(ControlBodyType::TunnelOpen),
-        );
-        assert_eq!(ControlBodyType::TunnelData.as_byte(), 0x04);
-        assert_eq!(
-            ControlBodyType::from_byte(0x04),
-            Some(ControlBodyType::TunnelData),
-        );
-        assert_eq!(ControlBodyType::TunnelClose.as_byte(), 0x05);
-        assert_eq!(
-            ControlBodyType::from_byte(0x05),
-            Some(ControlBodyType::TunnelClose),
         );
         assert!(ControlBodyType::from_byte(0xFF).is_none());
     }

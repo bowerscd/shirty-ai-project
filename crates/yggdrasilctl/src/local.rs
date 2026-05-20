@@ -241,17 +241,6 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             eprintln!("(request was {request:?})");
             bail!("server returned error");
         }
-        Response::ChainTunnelOpened { .. } => {
-            // `ChainTunnelOpened` belongs to the `chain tunnel open`
-            // connection-hijack path and is never produced for any
-            // request issued from the `local` scope. Treat reaching
-            // this arm as a server misbehaviour rather than a panic so
-            // the operator sees a useful message.
-            bail!(
-                "server returned unexpected ChainTunnelOpened response \
-                 to local request {request:?}"
-            );
-        }
         Response::ChainApplied(_) => {
             // `ChainApplied` belongs to the `chain apply` path and is
             // never produced for any request issued from the `local`

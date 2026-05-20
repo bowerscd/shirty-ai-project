@@ -1,29 +1,14 @@
 //! `chain` scope — chain-control plane operations.
 //!
-//! Phase 4C added `chain tunnel open`: a one-shot bidirectional stdio
-//! splice through the daemon's UDS. Internally it asks the daemon to
-//! open a tunnel toward `dest` at `pubkey`, then hands the socket
-//! halves to two `tokio::io::copy` tasks against stdin / stdout.
-//! Suitable for scripting `(echo PAYLOAD; cat) | yggdrasilctl chain
-//! tunnel open` pipelines and for ssh ProxyCommand wiring.
+//! `chain apply`: push a candidate `rules.toml` into the running
+//! terminal daemon without touching its on-disk rules directory.
 //!
-//! Phase 5 added multi-hop forwarding: `pubkey` may be any node on
-//! the chain (direct upstream, two hops up, etc.). The local daemon's
-//! upstream relay forwards to the next hop on `pubkey` mismatch.
-//!
-//! Phase 5C added `chain apply`: push a candidate `rules.toml` into
-//! the running terminal daemon without touching its on-disk rules
-//! directory.
-//!
-//! Phase 5D added `chain diff`: walk the chain upward through the
-//! daemon's tunnel pipeline, fetching each hop's
-//! `/internal/derived-rules` snapshot, and surface drift between the
-//! local terminal's published predicate set and the upstream node's
-//! accepted predicate set.
+//! `chain diff`: compare the local terminal's published predicate
+//! set with what each upstream node believes it accepted. Currently
+//! served from a single-RPC `ChainSummary` reply over UDS; multi-hop
+//! fanout is a follow-up increment.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -39,43 +24,15 @@ use ratatoskr::rule::{RuleFile, RuleSet};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
-    /// Open or inspect chain tunnels (Phase 4C).
-    Tunnel {
-        #[command(subcommand)]
-        action: TunnelAction,
-    },
     /// Push a candidate rule set from a TOML file into the running
     /// terminal daemon without touching its rules directory on disk.
     /// The daemon validates the candidate, projects its predicate set,
     /// and (if a chain upstream is configured) publishes the projection
     /// on its next push tick.
     Apply(ApplyArgs),
-    /// Walk the chain upward and surface drift between the local
-    /// terminal's published predicate set and what each upstream node
-    /// believes it accepted. Each hop is reached over a chain tunnel
-    /// to its `/internal/derived-rules` HTTP endpoint.
+    /// Compare the local terminal's published predicate set with what
+    /// each upstream node believes it accepted.
     Diff(DiffArgs),
-}
-
-#[derive(Debug, Subcommand)]
-pub enum TunnelAction {
-    /// Open a one-shot bidirectional tunnel to `dest` at `pubkey` and
-    /// splice it against this process's stdin/stdout. Exits when either
-    /// stdin closes or the peer closes the tunnel.
-    Open(OpenArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct OpenArgs {
-    /// Tagged target pubkey, e.g. `x25519:0123…ef`. May be any node on
-    /// this chain — the local daemon's upstream relay forwards the
-    /// open envelope onward until it reaches the target (Phase 5).
-    #[arg(long)]
-    pub pubkey: String,
-    /// Destination `host:port` the target relay should dial. Both
-    /// IPv4 and IPv6 (`[::1]:443`) are accepted.
-    #[arg(long)]
-    pub dest: SocketAddr,
 }
 
 #[derive(Debug, Args)]
@@ -106,113 +63,9 @@ pub struct DiffArgs {
 
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     match cmd {
-        Cmd::Tunnel {
-            action: TunnelAction::Open(args),
-        } => open_tunnel(socket, &args).await,
         Cmd::Apply(args) => apply(socket, &args).await,
         Cmd::Diff(args) => diff(socket, &args, json).await,
     }
-}
-
-/// Connect to the daemon's UDS, send `OpenChainTunnel`, await the single
-/// JSON response line, and on success splice the socket against
-/// stdin/stdout until either side closes.
-///
-/// Wire discipline matches the daemon's `run_chain_tunnel_bridge`:
-///
-/// 1. Write `Request::OpenChainTunnel { ... }\n` once.
-/// 2. Read exactly one JSON line back via [`BufReader::read_line`].
-///    On `Response::ChainTunnelOpened { stream_id }` the daemon flips
-///    the socket into raw-bytes mode; on `Response::Error { ... }` we
-///    print and exit. We do *not* read further JSON lines.
-/// 3. From the `BufReader`'s underlying socket: any bytes the BufReader
-///    pre-buffered past the `\n` of the response remain in its buffer
-///    and are surfaced by `read()` first, so they aren't lost. (In
-///    practice the daemon never writes raw bytes ahead of receiving
-///    operator data, so the buffer is empty here — but the splice
-///    code is correct either way.)
-/// 4. Splice stdin -> socket and socket -> stdout concurrently.
-async fn open_tunnel(socket: &Path, args: &OpenArgs) -> Result<()> {
-    let target_pubkey = PubKey::from_str(&args.pubkey)
-        .with_context(|| format!("parsing --pubkey {:?}", args.pubkey))?;
-    let socket_path: PathBuf = socket.to_path_buf();
-    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path))
-        .await
-        .with_context(|| format!("connect timeout to {}", socket_path.display()))?
-        .with_context(|| format!("connecting to {}", socket_path.display()))?;
-
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    // 1. Send the request line.
-    let request = Request::OpenChainTunnel {
-        target_pubkey,
-        dest: args.dest,
-    };
-    let mut buf = serde_json::to_vec(&request).context("encode OpenChainTunnel")?;
-    buf.push(b'\n');
-    writer
-        .write_all(&buf)
-        .await
-        .context("writing OpenChainTunnel request")?;
-
-    // 2. Read exactly one response line.
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .await
-        .context("reading OpenChainTunnel response")?;
-    if n == 0 {
-        bail!("daemon closed the socket without responding to OpenChainTunnel");
-    }
-    let response: Response = serde_json::from_str(line.trim())
-        .with_context(|| format!("parsing daemon response as JSON: {line:?}"))?;
-
-    let stream_id = match response {
-        Response::ChainTunnelOpened { stream_id } => stream_id,
-        Response::Error { code, message } => {
-            bail!("daemon refused to open tunnel: code={code} message={message}");
-        }
-        other => bail!(
-            "daemon returned an unexpected response to OpenChainTunnel: {other:?}"
-        ),
-    };
-    tracing::debug!(stream_id, "chain tunnel opened; splicing stdio");
-
-    // 3 + 4. Splice. We hand-roll the two `tokio::io::copy` halves
-    // (rather than `copy_bidirectional`) because the read side is a
-    // `BufReader<OwnedReadHalf>` — that lets any leftover buffered
-    // bytes drain first. Either side closing terminates the whole call.
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-
-    let upload = async {
-        let n = tokio::io::copy(&mut stdin, &mut writer).await;
-        // After stdin EOF, shutdown the UDS write half so the daemon
-        // sees EOF on its reader and emits `TunnelClose` to the peer.
-        let _ = writer.shutdown().await;
-        n
-    };
-    let download = async {
-        let n = tokio::io::copy(&mut reader, &mut stdout).await;
-        let _ = stdout.flush().await;
-        n
-    };
-
-    tokio::select! {
-        res = upload => {
-            res.map_err(|e| anyhow!("upload (stdin -> tunnel) failed: {e}"))?;
-            // Wait briefly for any in-flight download bytes to flush.
-            // The download future is dropped on select-exit, which is
-            // fine: any remaining bytes are lost only if the operator
-            // closes stdin while the peer is still writing, which is
-            // the operator's choice.
-        }
-        res = download => {
-            res.map_err(|e| anyhow!("download (tunnel -> stdout) failed: {e}"))?;
-        }
-    }
-    Ok(())
 }
 
 /// Push a candidate rule set from `args.file` to the running daemon.

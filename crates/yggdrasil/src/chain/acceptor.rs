@@ -40,14 +40,11 @@ use anyhow::{Context, Result};
 use ratatoskr::control_frame::{AckStatus, ControlBodyType};
 use ratatoskr::predicate::{predicate_reject, PredicateSet, PREDICATE_SET_MAX_WIRE_BYTES};
 use ratatoskr::pubkey::PubKey;
-use ratatoskr::tunnel::{tunnel_reject, TunnelOpen, TUNNEL_OPEN_MAX_WIRE_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::chain::derive::{derive, DeriveConfig};
 use crate::chain::introspection::IntrospectionState;
-use crate::chain::tunnel_forwarder::TunnelForwarder;
-use crate::chain::tunnel_terminator::TunnelManager;
 use crate::proxy::supervisor::SupervisorHandle;
 
 /// State file name under `state_dir`. Single file regardless of how many
@@ -107,30 +104,6 @@ pub struct ChainAcceptor {
     derive_cfg: DeriveConfig,
     state_path: PathBuf,
     state: Mutex<InMemoryState>,
-    /// This relay's own x25519 pubkey. Recorded so the acceptor can
-    /// route inbound `TunnelOpen` envelopes by comparing their
-    /// `target_pubkey` against ours: matches go to the terminator,
-    /// non-matches to the forwarder (if attached). Mid-chain relays
-    /// that omit a forwarder reject non-self targets with
-    /// `TUNNEL_NOT_PERMITTED`.
-    local_pubkey: PubKey,
-    /// Late-bound tunnel terminator. Construction order in
-    /// [`crate::run_relay`] is: build acceptor → bind heartbeat server
-    /// (returning the outbound channel handle) → build [`TunnelManager`]
-    /// with that handle → attach via [`set_tunnel_manager`]. When unset,
-    /// inbound `Tunnel*` body types are acked `Unknown`.
-    ///
-    /// [`set_tunnel_manager`]: ChainAcceptor::set_tunnel_manager
-    tunnel: OnceLock<Arc<TunnelManager>>,
-    /// Late-bound mid-chain forwarder. Only attached on relays that
-    /// also have an outbound chain upstream (a forwarder needs both a
-    /// downstream session, owned by the heartbeat server, and an
-    /// upstream chain client to relay through). When unset, inbound
-    /// `TunnelOpen` with `target_pubkey != local_pubkey` is rejected
-    /// with `TUNNEL_NOT_PERMITTED`.
-    ///
-    /// See [`set_tunnel_forwarder`](ChainAcceptor::set_tunnel_forwarder).
-    tunnel_forwarder: OnceLock<Arc<TunnelForwarder>>,
     /// Late-bound chain-introspection sink. Phase 5B's
     /// `/internal/derived-rules` HTTP endpoint reads from this. When
     /// unset (e.g. tests, or relays where the introspection endpoint
@@ -150,7 +123,6 @@ impl ChainAcceptor {
         supervisor: SupervisorHandle,
         derive_cfg: DeriveConfig,
         state_dir: impl AsRef<Path>,
-        local_pubkey: PubKey,
     ) -> Result<Arc<Self>> {
         let state_path = state_dir.as_ref().join(STATE_FILE);
         let persisted = if state_path.exists() {
@@ -167,32 +139,8 @@ impl ChainAcceptor {
             derive_cfg,
             state_path,
             state: Mutex::new(state),
-            local_pubkey,
-            tunnel: OnceLock::new(),
-            tunnel_forwarder: OnceLock::new(),
             introspection: OnceLock::new(),
         }))
-    }
-
-    /// Attach a tunnel terminator. Must be called at most once; further
-    /// calls return the manager back to the caller. Idempotent on the
-    /// happy path.
-    pub fn set_tunnel_manager(
-        &self,
-        mgr: Arc<TunnelManager>,
-    ) -> std::result::Result<(), Arc<TunnelManager>> {
-        self.tunnel.set(mgr)
-    }
-
-    /// Attach a mid-chain tunnel forwarder. Must be called at most
-    /// once; further calls return the forwarder back to the caller. A
-    /// relay without an upstream chain client has nothing to forward
-    /// through and should leave this unset.
-    pub fn set_tunnel_forwarder(
-        &self,
-        fwd: Arc<TunnelForwarder>,
-    ) -> std::result::Result<(), Arc<TunnelForwarder>> {
-        self.tunnel_forwarder.set(fwd)
     }
 
     /// Attach the chain-introspection sink. Must be called at most
@@ -241,137 +189,6 @@ impl ChainAcceptor {
             }
             ControlBodyType::PredicateSetUpdate => {
                 self.handle_predicate_set_update(body).await
-            }
-            ControlBodyType::TunnelOpen => self.dispatch_tunnel_open(body).await,
-            ControlBodyType::TunnelData | ControlBodyType::TunnelClose => {
-                self.dispatch_tunnel_data_or_close(kind, body).await
-            }
-        }
-    }
-
-    /// Route a `TunnelOpen` by peeking at `target_pubkey`. The
-    /// terminator handles `target_pubkey == local`; the forwarder
-    /// handles everything else (when attached). A relay with neither
-    /// half attached rejects with `TUNNEL_NOT_PERMITTED`.
-    async fn dispatch_tunnel_open(&self, body: &[u8]) -> AckStatus {
-        // Cheap pre-decode: postcard `TunnelOpen` is fixed-size enough
-        // that a second decode in the terminator / forwarder is
-        // negligible. We need the `target_pubkey` to route.
-        if body.len() > TUNNEL_OPEN_MAX_WIRE_BYTES {
-            metrics::counter!(
-                "yggdrasil_chain_predicate_recv_total",
-                "outcome" => "tunnel_open_too_large",
-            )
-            .increment(1);
-            return AckStatus::Reject(tunnel_reject::TUNNEL_NOT_PERMITTED);
-        }
-        let preview: TunnelOpen = match postcard::from_bytes(body) {
-            Ok(o) => o,
-            Err(_) => {
-                metrics::counter!(
-                    "yggdrasil_chain_predicate_recv_total",
-                    "outcome" => "tunnel_open_decode_error",
-                )
-                .increment(1);
-                return AckStatus::Reject(tunnel_reject::TUNNEL_NOT_PERMITTED);
-            }
-        };
-        if preview.target_pubkey == self.local_pubkey {
-            match self.tunnel.get() {
-                Some(tm) => tm.handle_open(body).await,
-                None => {
-                    tracing::debug!(
-                        "tunnel open: no terminator attached on this node"
-                    );
-                    metrics::counter!(
-                        "yggdrasil_chain_predicate_recv_total",
-                        "outcome" => "unknown_body",
-                    )
-                    .increment(1);
-                    AckStatus::Unknown
-                }
-            }
-        } else {
-            match self.tunnel_forwarder.get() {
-                Some(fwd) => fwd.handle_open_from_downstream(body).await,
-                None => {
-                    tracing::debug!(
-                        target = %preview.target_pubkey,
-                        local = %self.local_pubkey,
-                        "tunnel open: target is not us and no forwarder attached"
-                    );
-                    metrics::counter!(
-                        "yggdrasil_chain_predicate_recv_total",
-                        "outcome" => "tunnel_forward_unavailable",
-                    )
-                    .increment(1);
-                    AckStatus::Reject(tunnel_reject::TUNNEL_NOT_PERMITTED)
-                }
-            }
-        }
-    }
-
-    /// Route a `TunnelData` / `TunnelClose` from the downstream peer.
-    /// The terminator's registry is the source of truth for
-    /// locally-terminated streams; on `Reject(STREAM_NOT_FOUND)` we
-    /// fall through to the forwarder (if attached) which owns the
-    /// proxied-stream registry. Other reject reasons are propagated
-    /// verbatim — they describe a payload-level or stream-state error
-    /// that the forwarder cannot rescue.
-    async fn dispatch_tunnel_data_or_close(
-        &self,
-        kind: ControlBodyType,
-        body: &[u8],
-    ) -> AckStatus {
-        let terminator_outcome = match self.tunnel.get() {
-            Some(tm) => match kind {
-                ControlBodyType::TunnelData => Some(tm.handle_data(body).await),
-                ControlBodyType::TunnelClose => Some(tm.handle_close(body).await),
-                _ => unreachable!("caller restricts kind to TunnelData/TunnelClose"),
-            },
-            None => None,
-        };
-        match terminator_outcome {
-            Some(AckStatus::Reject(reason))
-                if reason == tunnel_reject::STREAM_NOT_FOUND =>
-            {
-                // Fall through to the forwarder for the proxied half.
-                match self.tunnel_forwarder.get() {
-                    Some(fwd) => match kind {
-                        ControlBodyType::TunnelData => {
-                            fwd.handle_data_from_downstream(body).await
-                        }
-                        ControlBodyType::TunnelClose => {
-                            fwd.handle_close_from_downstream(body).await
-                        }
-                        _ => unreachable!(),
-                    },
-                    None => AckStatus::Reject(tunnel_reject::STREAM_NOT_FOUND),
-                }
-            }
-            Some(ack) => ack,
-            None => {
-                // No terminator at all — try forwarder, otherwise
-                // surface as `Unknown` (legacy behaviour preserved).
-                match self.tunnel_forwarder.get() {
-                    Some(fwd) => match kind {
-                        ControlBodyType::TunnelData => {
-                            fwd.handle_data_from_downstream(body).await
-                        }
-                        ControlBodyType::TunnelClose => {
-                            fwd.handle_close_from_downstream(body).await
-                        }
-                        _ => unreachable!(),
-                    },
-                    None => {
-                        metrics::counter!(
-                            "yggdrasil_chain_predicate_recv_total",
-                            "outcome" => "unknown_body",
-                        )
-                        .increment(1);
-                        AckStatus::Unknown
-                    }
-                }
             }
         }
     }
@@ -560,13 +377,6 @@ mod tests {
         PubKey::x25519([0xAAu8; PUBLIC_KEY_LEN])
     }
 
-    fn fake_local_pubkey() -> PubKey {
-        // Sentinel local pubkey for the unit tests. Distinct from
-        // `origin_a()` so no test accidentally exercises the
-        // self-target tunnel routing path.
-        PubKey::x25519([0xBBu8; PUBLIC_KEY_LEN])
-    }
-
     fn predicate_set(origin: PubKey, version: u64, ports: &[u16]) -> PredicateSet {
         let mut predicates: Vec<Predicate> = ports
             .iter()
@@ -640,7 +450,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
         let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
 
         let set = predicate_set(origin_a(), 1, &[free_port(), free_port()]);
         let bytes = encode(&set);
@@ -666,7 +476,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
         let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
 
         let p = free_port();
         let v2 = encode(&predicate_set(origin_a(), 2, &[p]));
@@ -701,7 +511,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
         let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
 
         let big = vec![0u8; PREDICATE_SET_MAX_WIRE_BYTES + 1];
         assert_eq!(
@@ -719,7 +529,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
         let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
 
         // 0x7F is unassigned in the registry.
         let status = acc.dispatch(0x7F, &[]).await;
@@ -734,7 +544,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
         let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
 
         // Random bytes that aren't a valid postcard PredicateSet.
         let junk = b"this is not a predicate set";
@@ -754,7 +564,7 @@ mod tests {
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
         let state_dir = tempfile::tempdir().unwrap();
 
-        let acc1 = ChainAcceptor::load(handle.clone(), derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc1 = ChainAcceptor::load(handle.clone(), derive_cfg(), state_dir.path()).unwrap();
         let bytes = encode(&predicate_set(origin_a(), 7, &[free_port()]));
         assert_eq!(
             acc1.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &bytes)
@@ -763,7 +573,7 @@ mod tests {
         );
         drop(acc1);
 
-        let acc2 = ChainAcceptor::load(handle, derive_cfg(), state_dir.path(), fake_local_pubkey()).unwrap();
+        let acc2 = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
         assert_eq!(acc2.last_accepted_version(&origin_a()).await, Some(7));
 
         cancel.cancel();

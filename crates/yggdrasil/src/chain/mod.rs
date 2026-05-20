@@ -36,9 +36,6 @@ pub mod introspection;
 pub mod predicate_extractor;
 pub mod predicate_publisher;
 pub mod reliability;
-pub mod tunnel_forwarder;
-pub mod tunnel_initiator;
-pub mod tunnel_terminator;
 
 pub use acceptor::ChainAcceptor;
 pub use client::{
@@ -49,8 +46,3 @@ pub use derive::{derive, DeriveConfig, DeriveError};
 pub use introspection::IntrospectionState;
 pub use predicate_extractor::{extract, ExtractOutcome};
 pub use reliability::{ControlChannel, InboundDisposition, SendError};
-pub use tunnel_forwarder::{combined_tunnel_body_handler, TunnelForwarder};
-pub use tunnel_initiator::{
-    InitiatorStream, OpenError, SendDataError, TunnelInitiator,
-};
-pub use tunnel_terminator::{TunnelAllowList, TunnelManager};

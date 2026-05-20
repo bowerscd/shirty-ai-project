@@ -18,8 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use metrics_exporter_prometheus::PrometheusHandle;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -33,10 +32,8 @@ use ratatoskr::control::{
 use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::{Rule, RuleSet};
-use ratatoskr::tunnel::TUNNEL_DATA_MAX_PAYLOAD;
 
 use crate::chain::predicate_extractor;
-use crate::chain::tunnel_initiator::{OpenError, TunnelInitiator};
 use crate::heartbeat::PeerState;
 use crate::pending_peers::PendingPeerStore;
 use crate::proxy::supervisor::{ProxySupervisor, SupervisorHandle};
@@ -71,12 +68,11 @@ struct ControlState {
     /// `[accept].pubkey` atomically (tmp + rename). Held even in
     /// terminal mode (unused; cheap to carry).
     config_path: PathBuf,
-    /// Initiator-side of the chain tunnel. `Some` only when this node
-    /// has a chain upstream configured (`[dial]`); without an
-    /// upstream we have nowhere to forward `TunnelOpen` envelopes, so
-    /// the `OpenChainTunnel` UDS request returns
-    /// [`error_codes::NO_CHAIN_UPSTREAM`].
-    tunnel_initiator: Option<Arc<TunnelInitiator>>,
+    /// True when this node has a chain upstream configured (`[dial]`).
+    /// Gates the predicate-projection pre-check in
+    /// [`dispatch_chain_apply`]: pure-local terminals skip projection
+    /// (no upstream to push to) and report `predicate_count = 0`.
+    has_chain_upstream: bool,
     /// Handle to the proxy supervisor. Owned here so the
     /// `Request::ChainApply` path can call
     /// [`SupervisorHandle::apply_ruleset`] directly without going
@@ -105,11 +101,9 @@ impl ControlServer {
     /// `peer_state` and `pending_store` are `None` in terminal mode. All
     /// `downstream ...` requests then return `not_supported_in_terminal_mode`.
     ///
-    /// `tunnel_initiator` is `Some` only when the daemon has a chain
-    /// upstream configured (predicate publisher / chain tunnel both
-    /// depend on it). Pure-local terminals leave it `None`; the
-    /// `OpenChainTunnel` UDS request then returns
-    /// [`error_codes::NO_CHAIN_UPSTREAM`].
+    /// `has_chain_upstream` is `true` when the daemon has a `[dial]`
+    /// section (and the chain client/publisher have been wired). It
+    /// gates the predicate-projection pre-check in `chain apply`.
     #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         socket_path: impl Into<PathBuf>,
@@ -118,7 +112,7 @@ impl ControlServer {
         supervisor: &ProxySupervisor,
         pending_store: Option<Arc<PendingPeerStore>>,
         config_path: PathBuf,
-        tunnel_initiator: Option<Arc<TunnelInitiator>>,
+        has_chain_upstream: bool,
         prom_handle: PrometheusHandle,
         introspection: Option<Arc<crate::chain::IntrospectionState>>,
         shutdown: CancellationToken,
@@ -167,7 +161,7 @@ impl ControlServer {
             cert_store: supervisor.cert_store(),
             pending_store,
             config_path,
-            tunnel_initiator,
+            has_chain_upstream,
             supervisor_handle: supervisor.handle(),
             prom_handle,
             introspection,
@@ -250,29 +244,12 @@ async fn handle_connection(
                 let parsed: std::result::Result<Request, _> =
                     serde_json::from_str(line.trim());
                 match parsed {
-                    Ok(Request::OpenChainTunnel { target_pubkey, dest }) => {
-                        // Hand the connection off to the tunnel bridge:
-                        // after this call returns the UDS half is dead
-                        // either way (success → splice consumed it;
-                        // failure → an `Error` response was written and
-                        // we close).
-                        return run_chain_tunnel_bridge(
-                            target_pubkey,
-                            dest,
-                            reader,
-                            writer,
-                            state,
-                            cancel,
-                        )
-                        .await;
-                    }
                     Ok(Request::ChainApply { rules }) => {
                         // ChainApply needs `supervisor_handle.apply_ruleset`
                         // which is async; the synchronous `dispatch`
-                        // table can't await. Route it here, mirroring
-                        // how `OpenChainTunnel` is hoisted out for the
-                        // same reason. The defensive arm in `dispatch`
-                        // returns INTERNAL_ERROR if routing slips.
+                        // table can't await. Route it here. The
+                        // defensive arm in `dispatch` returns
+                        // INTERNAL_ERROR if routing slips.
                         let response = dispatch_chain_apply(rules, &state).await;
                         let mut buf =
                             serde_json::to_vec(&response).context("encode response")?;
@@ -302,20 +279,7 @@ async fn handle_connection(
     }
 }
 
-/// Single-line response writer used by the connection-hijack path. The
-/// non-hijack path inlines the equivalent two lines because keeping the
-/// error-flow ergonomics close to the surrounding loop matters more
-/// than the line count.
-async fn write_response(
-    writer: &mut OwnedWriteHalf,
-    response: &Response,
-) -> Result<()> {
-    let mut buf = serde_json::to_vec(response).context("encode response")?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await.context("write response")?;
-    Ok(())
-}
-
+/// Dispatcher for synchronous control requests.
 fn dispatch(req: Request, state: &ControlState) -> Response {
     match req {
         Request::Status => {
@@ -452,18 +416,6 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                     .into(),
             },
         },
-        // `OpenChainTunnel` is handled by [`run_chain_tunnel_bridge`] in
-        // [`handle_connection`] before reaching this synchronous
-        // dispatch table: the bridge owns the socket halves and pumps
-        // raw bytes between the operator and the chain. If we ever
-        // reach this arm it means the connection-loop routing slipped.
-        Request::OpenChainTunnel { .. } => Response::Error {
-            code: error_codes::INTERNAL_ERROR.into(),
-            message: "internal routing error: OpenChainTunnel reached \
-                      the synchronous dispatcher (should have been \
-                      hijacked by handle_connection)"
-                .to_string(),
-        },
         // `ChainApply` is handled by [`dispatch_chain_apply`] in
         // [`handle_connection`]: the apply path is async because
         // [`SupervisorHandle::apply_ruleset`] awaits a channel send,
@@ -528,7 +480,7 @@ async fn dispatch_chain_apply(rules: Vec<Rule>, state: &ControlState) -> Respons
     // Predicate projection + wire-size pre-check are only meaningful
     // when this terminal actually pushes upstream. Pure-local terminals
     // skip the projection and report `predicate_count = 0`.
-    let (predicate_count, skipped_https) = if state.tunnel_initiator.is_some() {
+    let (predicate_count, skipped_https) = if state.has_chain_upstream {
         // The pre-check is sizing-only; the origin and version don't
         // affect whether the body fits under the cap (origin is 32B,
         // version is 8B; both are constant-sized regardless of value).
@@ -595,244 +547,6 @@ fn terminal_mode_unsupported(verb: &str) -> Response {
              (terminal daemons have no downstream identity)"
         ),
     }
-}
-
-/// Hijack the UDS connection for a chain tunnel.
-///
-/// Wire shape:
-/// 1. Caller has already written `Request::OpenChainTunnel { ... }\n` to
-///    the socket and is awaiting a single response line.
-/// 2. On success we write `Response::ChainTunnelOpened { stream_id }\n`
-///    once, then enter raw-bytes mode: bytes from the UDS reader are
-///    chunked and fed to [`TunnelInitiator::send_data`]; bytes coming
-///    back through the [`crate::chain::tunnel_initiator::InitiatorStream::inbound_rx`]
-///    are written directly to the UDS writer.
-/// 3. The connection closes when the operator closes their write half
-///    (EOF on the UDS reader) or when the upstream sends `TunnelClose`
-///    (the `close_rx` oneshot fires and the inbox drains).
-///
-/// On failure (no upstream / target mismatch / open rejected / open
-/// failed) we write a single `Response::Error { code, message }\n` and
-/// return; the connection then drops. No partial response is ever
-/// emitted: callers can rely on "exactly one JSON response line then
-/// either raw bytes or EOF".
-async fn run_chain_tunnel_bridge(
-    target_pubkey: PubKey,
-    dest: std::net::SocketAddr,
-    mut reader: BufReader<OwnedReadHalf>,
-    mut writer: OwnedWriteHalf,
-    state: Arc<ControlState>,
-    cancel: CancellationToken,
-) -> Result<()> {
-    let initiator = match &state.tunnel_initiator {
-        Some(i) => i.clone(),
-        None => {
-            let err = Response::Error {
-                code: error_codes::NO_CHAIN_UPSTREAM.into(),
-                message: "this node has no chain upstream configured; \
-                          OpenChainTunnel is unavailable"
-                    .to_string(),
-            };
-            write_response(&mut writer, &err).await?;
-            return Ok(());
-        }
-    };
-
-    let stream = match initiator.open(target_pubkey, dest).await {
-        Ok(s) => s,
-        Err(OpenError::Rejected(reason)) => {
-            let err = Response::Error {
-                code: error_codes::TUNNEL_OPEN_REJECTED.into(),
-                message: format!(
-                    "upstream rejected the tunnel open with reason \
-                     code 0x{reason:04x}"
-                ),
-            };
-            write_response(&mut writer, &err).await?;
-            return Ok(());
-        }
-        Err(e) => {
-            let err = Response::Error {
-                code: error_codes::TUNNEL_OPEN_FAILED.into(),
-                message: format!("failed to open chain tunnel: {e}"),
-            };
-            write_response(&mut writer, &err).await?;
-            return Ok(());
-        }
-    };
-
-    let stream_id = stream.stream_id;
-    let ok = Response::ChainTunnelOpened { stream_id };
-    write_response(&mut writer, &ok).await?;
-    tracing::debug!(stream_id, target = %target_pubkey, dest = %dest, "chain tunnel opened; entering splice");
-
-    let crate::chain::tunnel_initiator::InitiatorStream {
-        mut inbound_rx,
-        close_rx,
-        ..
-    } = stream;
-
-    // Spawn the upload pump (operator stdin / UDS reader → tunnel).
-    // We hold the reader in the task because it's owned and we need
-    // raw `read()` semantics; the BufReader will drain its internal
-    // buffer first (any bytes the operator pipelined after the
-    // request line) before pulling from the underlying socket.
-    let upload_initiator = initiator.clone();
-    let upload_done = CancellationToken::new();
-    let upload_done_for_task = upload_done.clone();
-    let upload_join = tokio::spawn(async move {
-        let mut buf = vec![0u8; TUNNEL_DATA_MAX_PAYLOAD];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
-                    tracing::debug!(stream_id, "upload: UDS read EOF");
-                    break;
-                }
-                Ok(n) => {
-                    if let Err(e) = upload_initiator
-                        .send_data(stream_id, buf[..n].to_vec())
-                        .await
-                    {
-                        tracing::warn!(
-                            stream_id,
-                            error = %e,
-                            "upload: send_data failed; aborting splice"
-                        );
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(stream_id, error = %e, "upload: UDS read error");
-                    break;
-                }
-            }
-        }
-        upload_done_for_task.cancel();
-    });
-
-    // Main task: pump inbox → UDS writer, watching for the upload
-    // pump exiting (operator closed write half), an explicit
-    // `close_rx` from the peer, or daemon shutdown.
-    //
-    // TCP-style half-close: when the operator closes their UDS write
-    // half (`upload_done` fires), we send a wire `TunnelClose` to the
-    // peer via [`TunnelInitiator::signal_close`] but **keep the local
-    // registry entry alive** so any response bytes the peer is still
-    // flushing make it back to the operator. Without this, the
-    // [`TunnelInitiator::close`] path would also `remove_stream` and
-    // any subsequent `TunnelData` would be rejected with
-    // `STREAM_NOT_FOUND`. Matters for request/response patterns like
-    // `yggdrasilctl chain diff` over HTTP/1.1 with `Connection:
-    // close`, where the server emits its response *after* seeing FIN.
-    tokio::pin!(close_rx);
-    let mut peer_initiated_close = false;
-    let mut we_sent_close = false;
-    let mut upload_done_seen = false;
-    let mut bridge_bytes_written: usize = 0;
-    let mut bridge_chunks_written: usize = 0;
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                tracing::debug!(stream_id, "bridge: cancel arm");
-                break;
-            }
-            _ = upload_done.cancelled(), if !upload_done_seen => {
-                upload_done_seen = true;
-                tracing::debug!(
-                    stream_id,
-                    "bridge: upload_done arm; calling signal_close"
-                );
-                initiator.signal_close(stream_id, 0).await;
-                tracing::debug!(stream_id, "bridge: signal_close returned");
-                we_sent_close = true;
-            }
-            res = &mut close_rx => {
-                tracing::debug!(
-                    stream_id,
-                    close_rx_ok = res.is_ok(),
-                    "bridge: close_rx arm fired; draining inbound_rx"
-                );
-                peer_initiated_close = res.is_ok();
-                let mut drained_chunks: usize = 0;
-                let mut drained_bytes: usize = 0;
-                while let Ok(payload) = inbound_rx.try_recv() {
-                    drained_chunks += 1;
-                    drained_bytes += payload.len();
-                    if let Err(e) = writer.write_all(&payload).await {
-                        tracing::warn!(
-                            stream_id,
-                            error = %e,
-                            "bridge: UDS write_all failed during close drain"
-                        );
-                        break;
-                    }
-                    bridge_bytes_written += payload.len();
-                    bridge_chunks_written += 1;
-                }
-                tracing::debug!(
-                    stream_id,
-                    drained_chunks,
-                    drained_bytes,
-                    "bridge: close_rx drain complete"
-                );
-                break;
-            }
-            res = inbound_rx.recv() => match res {
-                Some(payload) => {
-                    let len = payload.len();
-                    if let Err(e) = writer.write_all(&payload).await {
-                        tracing::warn!(stream_id, error = %e, "bridge: UDS write_all failed");
-                        break;
-                    }
-                    bridge_bytes_written += len;
-                    bridge_chunks_written += 1;
-                    tracing::trace!(
-                        stream_id,
-                        chunk_bytes = len,
-                        bridge_bytes_written,
-                        bridge_chunks_written,
-                        "bridge: inbound_rx arm wrote chunk to UDS"
-                    );
-                }
-                None => {
-                    tracing::debug!(
-                        stream_id,
-                        "bridge: inbound_rx arm hit None (registry entry removed)"
-                    );
-                    peer_initiated_close = true;
-                    break;
-                }
-            }
-        }
-    }
-    tracing::debug!(
-        stream_id,
-        bridge_bytes_written,
-        bridge_chunks_written,
-        peer_initiated_close,
-        we_sent_close,
-        upload_done_seen,
-        "bridge: main loop exit"
-    );
-
-    // Cleanup: if neither side has wire-closed yet (cancel path), do
-    // a full close. If we already half-closed, the peer's TunnelClose
-    // back removed the local entry (or will, idempotently); calling
-    // `close` here is a safe no-op via the `remove_stream` returns-
-    // `false` path.
-    if !we_sent_close && !peer_initiated_close {
-        initiator.close(stream_id, 0).await;
-    } else if we_sent_close && !peer_initiated_close {
-        // Peer never wire-closed (e.g. cancel midway through). Make
-        // sure we drop our local entry so the registry doesn't leak.
-        initiator.close(stream_id, 0).await;
-    }
-    let _ = writer.shutdown().await;
-    upload_join.abort();
-    let _ = upload_join.await;
-    tracing::debug!(stream_id, "chain tunnel bridge exited");
-    Ok(())
 }
 
 fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
@@ -994,7 +708,7 @@ mod tests {
             supervisor,
             Some(pending),
             cfg,
-            None,
+            false,
             crate::metrics::detached_handle_for_tests(),
             None,
             shutdown,

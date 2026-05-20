@@ -130,7 +130,6 @@ async fn predicate_set_update_surfaces_in_internal_derived_rules() {
         supervisor.handle(),
         derive_cfg,
         state_dir.path(),
-        local_pubkey,
     )
     .expect("load acceptor");
 

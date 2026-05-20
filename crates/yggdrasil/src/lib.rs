@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
 
-use crate::chain::{ChainAcceptor, ChainClient, ChainClientConfig, ChainClientHandle, TunnelAllowList, TunnelManager};
+use crate::chain::{ChainAcceptor, ChainClient, ChainClientConfig, ChainClientHandle};
 use crate::control::ControlServer;
 use crate::heartbeat::{HeartbeatServer, PeerState, UNENROLLED_PEER_KEY};
 use crate::pending_peers::PendingPeerStore;
@@ -227,7 +227,6 @@ pub async fn run_relay(
                 supervisor.handle(),
                 derive_cfg,
                 &config.server.state_dir,
-                ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
             )
             .context("loading chain acceptor state")?,
         )
@@ -249,19 +248,8 @@ pub async fn run_relay(
     // 6. Heartbeat (chain) listener — only when [accept] is set.
     //    A pure-proxy relay (no downstream/listener, only an upstream) is
     //    a legitimate mid-chain configuration that does no inbound work.
-    //
-    //    `downstream_outbound_sender` is a clone of the heartbeat
-    //    server's outbound channel, surfaced out of this block so the
-    //    Phase 5 [`TunnelForwarder`] (constructed below, after the
-    //    chain client is built) can push relayed envelopes back to the
-    //    downstream peer. `None` when there is no chain listener.
-    //
-    //    [`TunnelForwarder`]: crate::chain::TunnelForwarder
-    let mut downstream_outbound_sender: Option<
-        tokio::sync::mpsc::UnboundedSender<ratatoskr::control_frame::ControlEnvelope>,
-    > = None;
     let hb_handle = if let Some(accept) = config.accept.as_ref() {
-        let (hb, outbound) = HeartbeatServer::bind(
+        let (hb, _outbound) = HeartbeatServer::bind(
             accept.listen,
             local_keys.clone(),
             peer_state.clone(),
@@ -271,36 +259,6 @@ pub async fn run_relay(
         )
         .await
         .context("binding chain listener")?;
-
-        // Phase 4B tunnel terminator. Only meaningful alongside a
-        // chain listener (the inbound side decodes `TunnelOpen`); a
-        // pure-upstream relay has nothing to terminate.
-        if let Some(acc) = chain_acceptor.as_ref() {
-            // Tunnel destination policy is hardcoded for v1: loopback
-            // destinations only. The wider tunnel feature is scheduled
-            // for removal; until then, no operator-facing knob exists.
-            let allow = TunnelAllowList {
-                allow_loopback: true,
-                allowed_targets: Default::default(),
-            };
-            let mgr = TunnelManager::new(
-                allow,
-                ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
-                outbound.sender(),
-            );
-            // First call wins; if some future refactor sets it twice
-            // we surface that as a hard error so the operator notices.
-            acc.set_tunnel_manager(mgr)
-                .map_err(|_| anyhow::anyhow!("tunnel manager set twice"))?;
-            // Stash a second clone for the Phase 5 forwarder. Cheap:
-            // `mpsc::UnboundedSender` is just an `Arc`-wrapped chan.
-            downstream_outbound_sender = Some(outbound.sender());
-        } else {
-            // No acceptor means we'll never decode Tunnel* bodies; drop
-            // the outbound handle so the server's keepalive is the only
-            // sender (channel stays open, nobody writes to it).
-            drop(outbound);
-        }
 
         Some(tokio::spawn(async move {
             if let Err(e) = hb.run().await {
@@ -315,61 +273,19 @@ pub async fn run_relay(
     //     Phase 3B does not push predicates from relays; the handle is
     //     therefore unused on this path. We still keep the chain client
     //     spawned so mid-chain relays maintain their upstream session.
-    //
-    //     We build the client *without* spawning so the body handler
-    //     can be wired through the optional [`TunnelForwarder`] (Phase 5)
-    //     before the run loop begins consuming inbound envelopes. The
-    //     forwarder requires the upstream chain handle, the downstream
-    //     outbound channel, and the initiator's shared `stream_id`
-    //     allocator — none of which exist until *after* both the
-    //     heartbeat server and the chain client are constructed.
-    //
-    //     [`TunnelForwarder`]: crate::chain::TunnelForwarder
-    let (chain_client_join, chain_initiator) =
-        match build_chain_client(&config, &local_keys, shutdown.clone()) {
-            Some(mut built) => {
-                // Optionally attach a forwarder. Requires: (a) an
-                // acceptor (we need to register the forwarder with it),
-                // (b) a chain upstream (we just built the client), and
-                // (c) a downstream outbound channel (heartbeat server
-                // present). Pure leaves (terminal mode) and root relays
-                // skip this path.
-                let forwarder = match (chain_acceptor.as_ref(), downstream_outbound_sender) {
-                    (Some(acc), Some(ds_outbound)) => {
-                        let fwd = crate::chain::TunnelForwarder::new(
-                            built.handle.clone(),
-                            ds_outbound,
-                            ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
-                            built.initiator.stream_id_allocator(),
-                        );
-                        acc.set_tunnel_forwarder(fwd.clone())
-                            .map_err(|_| anyhow::anyhow!("tunnel forwarder set twice"))?;
-                        Some(fwd)
-                    }
-                    _ => None,
-                };
-                // Install the combined body handler: initiator →
-                // forwarder (`STREAM_NOT_FOUND` fall-through). With
-                // `forwarder = None` this degenerates to the
-                // initiator-only handler (terminal nodes, no
-                // downstream session → no forwarder).
-                built.client.set_body_handler(
-                    crate::chain::combined_tunnel_body_handler(
-                        built.initiator.clone(),
-                        forwarder,
-                    ),
-                );
-                let initiator = built.initiator.clone();
-                let client = built.client;
-                let join = tokio::spawn(async move {
-                    if let Err(e) = client.run().await {
-                        tracing::error!(error = %e, "chain client exited with error");
-                    }
-                });
-                (Some(join), Some(initiator))
-            }
-            None => (None, None),
-        };
+    let chain_client_join = match build_chain_client(&config, &local_keys, shutdown.clone()) {
+        Some(built) => {
+            let client = built.client;
+            let join = tokio::spawn(async move {
+                if let Err(e) = client.run().await {
+                    tracing::error!(error = %e, "chain client exited with error");
+                }
+            });
+            Some(join)
+        }
+        None => None,
+    };
+    let has_chain_upstream = config.dial.is_some();
 
     // 7. UDS control surface for `yggdrasilctl`.
     let control = ControlServer::bind(
@@ -379,7 +295,7 @@ pub async fn run_relay(
         &supervisor,
         Some(pending_store.clone()),
         args.config.clone(),
-        chain_initiator,
+        has_chain_upstream,
         prom_handle.clone(),
         Some(introspection_state.clone()),
         shutdown.clone(),
@@ -461,32 +377,21 @@ pub async fn run_terminal(
     // 3b. Outbound chain client — only when [dial] is set.
     //     A terminal node without an upstream is still useful (pure local
     //     proxy), so absence is not an error.
-    //
-    //     Terminal mode never forwards tunnels (no downstream chain
-    //     session, nothing to relay), so the combined body handler is
-    //     built with `forwarder = None` and degenerates to the
-    //     initiator-only path.
-    let (chain_client_join, chain_client_handle, chain_initiator) =
+    let (chain_client_join, chain_client_handle) =
         match build_chain_client(&config, &local_keys, shutdown.clone()) {
-            Some(mut built) => {
-                built.client.set_body_handler(
-                    crate::chain::combined_tunnel_body_handler(
-                        built.initiator.clone(),
-                        None,
-                    ),
-                );
+            Some(built) => {
                 let handle = built.handle.clone();
-                let initiator = built.initiator.clone();
                 let client = built.client;
                 let join = tokio::spawn(async move {
                     if let Err(e) = client.run().await {
                         tracing::error!(error = %e, "chain client exited with error");
                     }
                 });
-                (Some(join), Some(handle), Some(initiator))
+                (Some(join), Some(handle))
             }
-            None => (None, None, None),
+            None => (None, None),
         };
+    let has_chain_upstream = config.dial.is_some();
 
     // 4. Rule-driven proxy supervisor with a terminal-mode factory: every
     //    rule must carry `target_addr`; `target_port` rules are
@@ -531,7 +436,7 @@ pub async fn run_terminal(
         &supervisor,
         None,
         args.config.clone(),
-        chain_initiator,
+        has_chain_upstream,
         prom_handle.clone(),
         Some(introspection_state.clone()),
         shutdown.clone(),
@@ -619,30 +524,16 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<StaticKeyPair> {
     }
 }
 
-/// Built but un-spawned chain client. Returned by
-/// [`build_chain_client`] so the caller can attach an optional
-/// [`TunnelForwarder`] body handler before the run loop begins.
-///
-/// The handle is kept alongside the client for convenience even though
-/// callers normally re-derive it via [`ChainClient::handle`] after the
-/// move into a spawn.
-///
-/// [`TunnelForwarder`]: crate::chain::TunnelForwarder
+/// Built but un-spawned chain client. Returned by [`build_chain_client`]
+/// so the caller can drive it with [`tokio::spawn`] on `client.run()`.
 struct BuiltChainClient {
     client: ChainClient,
     handle: ChainClientHandle,
-    initiator: Arc<crate::chain::TunnelInitiator>,
 }
 
 /// Build the outbound chain client when `[dial]` is configured,
 /// *without* spawning. Returns `None` when no `[dial]` section is set
 /// (a legitimate configuration for pure-proxy nodes and root relays).
-///
-/// The caller is responsible for installing a body handler via
-/// [`ChainClient::set_body_handler`] (typically the combined
-/// initiator + forwarder handler from
-/// [`crate::chain::combined_tunnel_body_handler`]) and then driving
-/// the client with [`tokio::spawn`] on `client.run()`.
 fn build_chain_client(
     config: &config::ServerConfig,
     local_keys: &StaticKeyPair,
@@ -671,11 +562,7 @@ fn build_chain_client(
     );
     let client = ChainClient::new(cfg, shutdown);
     let handle = client.handle();
-    let initiator = crate::chain::TunnelInitiator::new(
-        handle.clone(),
-        ratatoskr::pubkey::PubKey::x25519(upstream_pubkey),
-    );
-    Some(BuiltChainClient { client, handle, initiator })
+    Some(BuiltChainClient { client, handle })
 }
 
 async fn wait_for_shutdown() {
