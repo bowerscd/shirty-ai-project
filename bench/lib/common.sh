@@ -212,9 +212,6 @@ rules_dir = "$tmp/rules"
 state_dir = "$tmp/state"
 identity_file = "$tmp/yggdrasil/identity.key"
 
-[metrics]
-listen = "127.0.0.1:$metrics_port"
-
 [control]
 socket = "$tmp/run/control.sock"
 

@@ -3,7 +3,6 @@
 //! The config is organised into a small number of named tables:
 //!
 //! * `[server]` — paths and defaults.
-//! * `[metrics]` — Prometheus exporter listen address.
 //! * `[control]` — `yggdrasilctl` Unix-domain socket path.
 //! * `[dial]` (optional) — this node's outbound chain client: who to
 //!   dial, what to pin, how often to heartbeat. Drives both relay- and
@@ -16,6 +15,7 @@
 //! rejected.
 
 use std::net::{IpAddr, SocketAddr};
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -29,8 +29,6 @@ use ratatoskr::Error as ProtoError;
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub server:  ServerSection,
-    #[serde(default)]
-    pub metrics: MetricsSection,
     #[serde(default)]
     pub control: ControlSection,
     /// Outbound chain client. When set, this node dials the configured
@@ -111,22 +109,6 @@ pub struct ServerSection {
     /// Default TLS private key (PEM) paired with `default_cert`.
     #[serde(default)]
     pub default_key:  Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MetricsSection {
-    /// Address to expose Prometheus `/metrics` on. Leave at the default
-    /// `127.0.0.1:9090` and front it with whatever scraper you trust.
-    pub listen: SocketAddr,
-}
-
-impl Default for MetricsSection {
-    fn default() -> Self {
-        Self {
-            listen: "127.0.0.1:9090".parse().expect("static addr"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

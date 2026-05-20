@@ -53,9 +53,6 @@ cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
 
-[metrics]
-listen = "0.0.0.0:9090"
-
 [control]
 socket = "/run/yggdrasil/control.sock"
 
@@ -79,9 +76,6 @@ rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
-
-[metrics]
-listen = "0.0.0.0:9090"
 
 [control]
 socket = "/run/yggdrasil/control.sock"
@@ -109,9 +103,6 @@ identity_file = "/etc/yggdrasil/identity.key"
 
 [control]
 socket = "/run/yggdrasil/control.sock"
-
-[metrics]
-listen = "0.0.0.0:9090"
 EOF
 
 echo "[init-chain] generating home-chain identity"

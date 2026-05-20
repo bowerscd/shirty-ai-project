@@ -141,24 +141,13 @@ pub async fn run_relay(
     // 3. One shutdown token rules them all.
     let shutdown = CancellationToken::new();
 
-    // 4. Metrics exporter. Set up before anything emits metrics so the
+    // 4. Metrics recorder. Set up before anything emits metrics so the
     //    global recorder is the prometheus one and not the no-op fallback.
-    //    The [`IntrospectionSlot`] is created up front and populated in
-    //    step 5b once the supervisor exists — see [`crate::chain::introspection`]
-    //    for the ordering rationale.
-    let introspection_slot = metrics::new_introspection_slot();
+    //    Text exposition is served exclusively over the UDS via
+    //    [`ratatoskr::control::Request::Metrics`]; there is no HTTP
+    //    listener.
     let prom_handle = metrics::install_recorder(wire_mode)
         .context("installing prometheus recorder")?;
-    if let Err(e) = metrics::spawn_http(
-        config.metrics.listen,
-        wire_mode,
-        prom_handle.clone(),
-        Some(introspection_slot.clone()),
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "metrics http listener failed to bind; continuing without it");
-    }
 
     // 5. Rule-driven proxy supervisor. Built *before* the heartbeat
     //    listener so the chain acceptor can hold a handle to it.
@@ -183,26 +172,15 @@ pub async fn run_relay(
     .context("spawning proxy supervisor")?;
 
     // 5a. Phase 5B introspection state. Constructed now that the
-    //     supervisor exists. The `/internal/derived-rules` endpoint
-    //     reads this lazily through `introspection_slot`.
-    //
-    //     `record_apply` writers:
-    //     * the chain acceptor (on a relay) — attached below.
-    //     * the predicate publisher (on a terminal) — does not apply
-    //       in `run_relay`; terminals install their own state in
-    //       [`crate::run_terminal`].
+    //     supervisor exists. Passed by reference into the UDS control
+    //     server (for `Request::DerivedRules`) and into the chain
+    //     acceptor (`record_apply` writer on a relay).
     let introspection_state = crate::chain::IntrospectionState::new(
         ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
         config.dial.as_ref().map(|d| d.pubkey),
         config.accept.as_ref().map(|a| a.pubkey),
         supervisor.handle(),
     );
-    if introspection_slot.set(introspection_state.clone()).is_err() {
-        // Slot was constructed fresh above; nobody else can have set
-        // it. If this ever fires, the orchestration layer has been
-        // reordered incorrectly.
-        anyhow::bail!("introspection slot set twice; orchestration ordering bug");
-    }
 
     // 5b. Chain acceptor — receive-side dispatcher for inbound
     //     `PredicateSetUpdate` envelopes. Built only when a listener is
@@ -358,21 +336,10 @@ pub async fn run_terminal(
     //    the control server.
     let shutdown = CancellationToken::new();
 
-    // 3. Metrics exporter. The [`IntrospectionSlot`] is created up
-    //    front and populated in step 4a once the supervisor exists.
-    let introspection_slot = metrics::new_introspection_slot();
+    // 3. Metrics recorder. The introspection state is constructed in
+    //    step 4a and passed directly into the UDS control server.
     let prom_handle = metrics::install_recorder(wire_mode)
         .context("installing prometheus recorder")?;
-    if let Err(e) = metrics::spawn_http(
-        config.metrics.listen,
-        wire_mode,
-        prom_handle.clone(),
-        Some(introspection_slot.clone()),
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "metrics http listener failed to bind; continuing without it");
-    }
 
     // 3b. Outbound chain client — only when [dial] is set.
     //     A terminal node without an upstream is still useful (pure local
@@ -423,9 +390,6 @@ pub async fn run_terminal(
         None,
         supervisor.handle(),
     );
-    if introspection_slot.set(introspection_state.clone()).is_err() {
-        anyhow::bail!("introspection slot set twice; orchestration ordering bug");
-    }
 
     // 5. UDS control surface. Terminal mode has no downstream identity, so
     //    peer-related endpoints return `not_supported_in_terminal_mode`.

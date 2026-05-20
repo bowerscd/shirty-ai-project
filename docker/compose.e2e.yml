@@ -8,7 +8,6 @@
 #   └────────────┘                                │   :7000/tcp         │
 #                                                 │   :7001/udp         │
 #                                                 │   :51820/udp chain  │
-#                                                 │   :9090/tcp metrics │
 #                                                 └──────────┬──────────┘
 #                                                            │ proxied
 #                                                            ▼
@@ -99,7 +98,6 @@ services:
       - "7001/udp"
       - "8443/tcp"
       - "51820/udp"
-      - "9090/tcp"
 
   home:
     <<: *yggdrasil-image

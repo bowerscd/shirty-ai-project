@@ -1,32 +1,14 @@
-//! Prometheus metrics registration & HTTP surface.
+//! Prometheus metrics registration.
 //!
 //! The `metrics` crate gives us a global recorder; we install
-//! `metrics_exporter_prometheus`'s recorder once at startup and stand up a
-//! tiny hyper server on the configured `[metrics] listen` address. Hot-path
+//! `metrics_exporter_prometheus`'s recorder once at startup. Hot-path
 //! call sites use the [`metrics::counter!`] / [`metrics::gauge!`] macros
 //! directly — no per-call lookup, just a recorder dispatch.
 //!
-//! ## HTTP endpoints
-//!
-//! The listener serves five routes — Prometheus exposition, standard
-//! liveness / readiness probes, and a loopback-only chain-introspection
-//! endpoint — over a single port:
-//!
-//! | Path                       | Status               | Body                            |
-//! |----------------------------|----------------------|---------------------------------|
-//! | `/metrics`                 | 200                  | Prometheus text exposition      |
-//! | `/healthz`                 | 200                  | `ok\n` — liveness (process up)  |
-//! | `/readyz`                  | 200 or 503           | `ready\n` once [`crate::health::mark_ready`] has been called; `not ready\n` otherwise |
-//! | `/`                        | 200                  | Plain-text index of the above   |
-//! | `/internal/derived-rules`  | 200 / 403 / 404      | JSON snapshot of the local node's chain-applied predicates + derived rules + chain identity. Loopback-only; non-loopback peers get 403. Returns 404 when [`init`] was called without an [`IntrospectionState`]. See [`crate::chain::introspection`]. |
-//! | (other)                    | 404                  | `not found\n`                   |
-//!
-//! Bundling all routes behind one listener keeps the operator-facing
-//! surface to a single port. Kubernetes `readinessProbe.httpGet.path:
-//! /readyz`, load-balancer pool members, `docker run --health-cmd="curl
-//! -fs .../readyz"`, etc. all work without any extra wiring. The
-//! `/internal/*` prefix is reserved for operator-facing introspection
-//! that must never be reachable from outside the host.
+//! The text exposition format is served exclusively over the
+//! `yggdrasilctl` UDS via [`ratatoskr::control::Request::Metrics`].
+//! There is no HTTP listener; operators that scrape via Prometheus run
+//! a thin UDS→HTTP adapter sidecar.
 //!
 //! ## Metric catalogue
 //!
@@ -61,54 +43,17 @@
 //!   Alert primitive: `time() - yggdrasil_last_heartbeat_timestamp_seconds
 //!   > N`.
 
-use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
-
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use tokio::net::TcpListener;
 
 use ratatoskr::control::Mode;
-
-use crate::chain::introspection::IntrospectionState;
-use crate::health;
-
-/// Late-bound holder for the chain-introspection state. The metrics
-/// listener has to come up *before* the proxy supervisor so the
-/// supervisor's startup-time gauges hit the real recorder; the
-/// [`IntrospectionState`], by contrast, needs the supervisor's handle
-/// to read `derived_rules`. We resolve the ordering tension by passing
-/// this empty slot into [`init`] and filling it in the orchestration
-/// layer ([`crate::run_relay`] / [`crate::run_terminal`]) once the
-/// supervisor exists.
-///
-/// HTTP requests to `/internal/derived-rules` that race the fill
-/// observe `None` and receive `503 Service Unavailable` until the slot
-/// is populated. In practice this window is a few milliseconds at
-/// startup.
-pub type IntrospectionSlot = Arc<OnceLock<Arc<IntrospectionState>>>;
-
-/// Construct a fresh [`IntrospectionSlot`]. The caller passes the slot
-/// to [`init`] *and* fills it later with [`OnceLock::set`].
-pub fn new_introspection_slot() -> IntrospectionSlot {
-    Arc::new(OnceLock::new())
-}
 
 /// Install the prometheus recorder and emit the startup gauges.
 ///
 /// Must be called exactly once per process before any metric is emitted
 /// (otherwise that metric goes to the no-op recorder). Returns the
 /// [`PrometheusHandle`] so callers can render the text exposition format
-/// directly (e.g. for the UDS-served `local metrics` command) and pass
-/// it on to [`spawn_http`] if they want the HTTP exposition surface as
-/// well.
+/// directly (e.g. for the UDS-served `local metrics` command).
 pub fn install_recorder(mode: Mode) -> Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
@@ -132,59 +77,6 @@ pub fn install_recorder(mode: Mode) -> Result<PrometheusHandle> {
     Ok(handle)
 }
 
-/// Spawn the HTTP listener that serves `/metrics`, `/healthz`,
-/// `/readyz`, `/`, and — when `introspection` resolves — the
-/// loopback-gated `/internal/derived-rules` chain-introspection
-/// endpoint.
-///
-/// Returns the actual bound address; primarily useful for tests that
-/// pass `127.0.0.1:0`. The Prometheus recorder must already be
-/// installed via [`install_recorder`]; pass the returned handle here
-/// (or any clone of it) to share the same metrics universe.
-pub async fn spawn_http(
-    listen: SocketAddr,
-    mode: Mode,
-    handle: PrometheusHandle,
-    introspection: Option<IntrospectionSlot>,
-) -> Result<SocketAddr> {
-    // TcpListener::bind is what gives us EADDRINUSE if the port is taken.
-    // Use std then convert so that we get the synchronous error directly.
-    let std_listener = std::net::TcpListener::bind(listen)
-        .with_context(|| format!("binding metrics listener on {listen}"))?;
-    std_listener
-        .set_nonblocking(true)
-        .context("set_nonblocking on metrics listener")?;
-    let bound = std_listener
-        .local_addr()
-        .context("local_addr on metrics listener")?;
-    let listener = TcpListener::from_std(std_listener)
-        .context("converting metrics listener to tokio")?;
-
-    tokio::spawn(accept_loop(listener, handle, introspection));
-
-    tracing::info!(
-        listen = %bound,
-        mode = mode.as_str(),
-        "metrics + health listener up (/metrics /healthz /readyz)"
-    );
-    Ok(bound)
-}
-
-/// Convenience wrapper that calls [`install_recorder`] followed by
-/// [`spawn_http`]. Returns the bound HTTP address and the handle.
-/// Tests that exercise the HTTP endpoints use this; the daemon does
-/// the two steps separately so the recorder is installed even when the
-/// HTTP listener fails to bind.
-pub async fn init(
-    listen: SocketAddr,
-    mode: Mode,
-    introspection: Option<IntrospectionSlot>,
-) -> Result<(SocketAddr, PrometheusHandle)> {
-    let handle = install_recorder(mode)?;
-    let bound = spawn_http(listen, mode, handle.clone(), introspection).await?;
-    Ok((bound, handle))
-}
-
 /// Build a fresh, unattached [`PrometheusHandle`] for tests that need
 /// to construct a [`crate::control::ControlServer`] without installing
 /// a global recorder. The returned handle renders an empty exposition
@@ -194,134 +86,3 @@ pub async fn init(
 pub fn detached_handle_for_tests() -> PrometheusHandle {
     PrometheusBuilder::new().build_recorder().handle()
 }
-
-async fn accept_loop(
-    listener: TcpListener,
-    handle: PrometheusHandle,
-    introspection: Option<IntrospectionSlot>,
-) {
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "metrics accept error; retrying");
-                continue;
-            }
-        };
-        let handle = handle.clone();
-        let introspection = introspection.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let handle = handle.clone();
-                let introspection = introspection.clone();
-                async move {
-                    Ok::<_, std::convert::Infallible>(route(
-                        req,
-                        &handle,
-                        introspection.as_ref(),
-                        peer,
-                    ))
-                }
-            });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                tracing::debug!(peer = %peer, error = %e, "metrics connection error");
-            }
-        });
-    }
-}
-
-fn route(
-    req: Request<Incoming>,
-    handle: &PrometheusHandle,
-    introspection: Option<&IntrospectionSlot>,
-    peer: SocketAddr,
-) -> Response<Full<Bytes>> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/metrics") => text_response(StatusCode::OK, handle.render()),
-        (&Method::GET, "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
-        (&Method::GET, "/readyz") => {
-            if health::is_ready() {
-                text_response(StatusCode::OK, "ready\n".to_string())
-            } else {
-                text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n".to_string())
-            }
-        }
-        (&Method::GET, "/") => text_response(
-            StatusCode::OK,
-            INDEX_BODY.to_string(),
-        ),
-        (&Method::GET, "/internal/derived-rules") => {
-            internal_derived_rules(introspection, peer)
-        }
-        _ => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
-    }
-}
-
-/// `/internal/derived-rules` handler. Gated to loopback peers — the
-/// endpoint exposes the operator's effective rule set (hostnames + ports)
-/// and must not leak across the trust boundary. Non-loopback peers see
-/// `403 Forbidden`. A 404 is returned when [`init`] was called without an
-/// introspection slot (e.g. an operator path that disables the
-/// endpoint). `503` is returned when the slot was passed but the
-/// orchestration layer has not yet filled it (brief startup window
-/// between `metrics::init` and supervisor construction).
-fn internal_derived_rules(
-    introspection: Option<&IntrospectionSlot>,
-    peer: SocketAddr,
-) -> Response<Full<Bytes>> {
-    if !peer.ip().is_loopback() {
-        tracing::warn!(
-            peer = %peer,
-            "non-loopback peer requested /internal/derived-rules; refusing"
-        );
-        return text_response(
-            StatusCode::FORBIDDEN,
-            "forbidden: /internal/* is loopback-only\n".to_string(),
-        );
-    }
-    let Some(slot) = introspection else {
-        return text_response(
-            StatusCode::NOT_FOUND,
-            "not found\n".to_string(),
-        );
-    };
-    let Some(ix) = slot.get() else {
-        return text_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "introspection state not yet initialised\n".to_string(),
-        );
-    };
-    match ix.render_json() {
-        Ok(body) => Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .expect("static response build never fails"),
-        Err(e) => {
-            tracing::error!(error = %e, "render_json failed");
-            text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error\n".to_string(),
-            )
-        }
-    }
-}
-
-fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
-        .expect("static response build never fails")
-}
-
-const INDEX_BODY: &str = "\
-yggdrasil
-
-/metrics                  Prometheus text exposition
-/healthz                  Liveness probe — 200 while the process is responding
-/readyz                   Readiness probe — 200 once all subsystems are bound, else 503
-/internal/derived-rules   Chain introspection JSON (loopback only)
-";
-

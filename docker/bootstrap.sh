@@ -51,9 +51,6 @@ cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
 identity_file = "$VPS_KEY"
 
-[metrics]
-listen = "0.0.0.0:9090"
-
 [control]
 socket = "/run/yggdrasil/control.sock"
 

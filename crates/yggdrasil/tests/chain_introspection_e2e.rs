@@ -1,5 +1,6 @@
 //! Phase 5B end-to-end test: a `PredicateSetUpdate` accepted by the
-//! relay surfaces in the `/internal/derived-rules` HTTP snapshot.
+//! relay surfaces in the introspection snapshot read by
+//! `Request::DerivedRules` over UDS.
 //!
 //! Wire path exercised:
 //!
@@ -8,16 +9,8 @@
 //! 2. Driver sends a `PredicateSetUpdate` envelope; server acks `Ok`.
 //! 3. The introspection sink wired into the acceptor records the
 //!    apply (predicates, origin, version, last_apply_unix).
-//! 4. Test opens an HTTP/1.1 connection to the metrics listener and
-//!    `GET`s `/internal/derived-rules`. The response body parses as
-//!    JSON and contains the just-applied predicate set, the relay's
-//!    chain identity, and a derived rule from the proxy supervisor.
-//!
-//! Also covers the non-loopback gate: a non-loopback-source request
-//! cannot reach `127.0.0.1`-bound listeners in tests, so the gate is
-//! exercised indirectly by the absence of a non-loopback path. The
-//! gate's unit behaviour is asserted in the metrics-module tests via
-//! `route(...)` with a synthetic peer.
+//! 4. Test calls `IntrospectionState::snapshot()` directly — same
+//!    `DerivedRulesResponse` shape the UDS handler serves.
 
 mod common;
 
@@ -25,14 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ratatoskr::auth::StaticKeyPair;
-use ratatoskr::control::Mode;
 use ratatoskr::control_frame::{AckStatus, ControlBodyType, ControlEnvelope};
 use ratatoskr::predicate::{Predicate, PredicateSet};
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::Protocol;
 use ratatoskr::wire;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -65,35 +56,8 @@ async fn send_control_and_await_ack(
         .expect("decode ControlAck")
 }
 
-/// Open a fresh HTTP/1.1 connection, send `GET path`, return the raw
-/// response bytes as a String. Mirrors the pattern in `tests/health.rs`.
-async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
-    let mut tcp = TcpStream::connect(addr)
-        .await
-        .unwrap_or_else(|e| panic!("connect {addr}: {e}"));
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    );
-    tcp.write_all(req.as_bytes()).await.expect("write request");
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut buf))
-        .await
-        .expect("read timeout");
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// Split an HTTP/1.1 response into (status_line, body). Crude but
-/// sufficient — we only need the status line and the body for JSON
-/// parsing.
-fn split_http_response(resp: &str) -> (&str, &str) {
-    let status_end = resp.find("\r\n").expect("no CRLF in response");
-    let status_line = &resp[..status_end];
-    let body_start = resp.find("\r\n\r\n").expect("no body separator") + 4;
-    (status_line, &resp[body_start..])
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn predicate_set_update_surfaces_in_internal_derived_rules() {
+async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     // 1. Crypto identities + downstream enrollment.
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
@@ -133,8 +97,7 @@ async fn predicate_set_update_surfaces_in_internal_derived_rules() {
     )
     .expect("load acceptor");
 
-    // 4. Introspection state + slot. Attach to the acceptor and to the
-    //    metrics listener.
+    // 4. Introspection state wired into the acceptor.
     let introspection = IntrospectionState::new(
         local_pubkey,
         Some(upstream_pubkey),
@@ -144,17 +107,6 @@ async fn predicate_set_update_surfaces_in_internal_derived_rules() {
     acceptor
         .set_introspection(introspection.clone())
         .expect("set_introspection");
-    let slot = yggdrasil::metrics::new_introspection_slot();
-    if slot.set(introspection.clone()).is_err() {
-        panic!("slot set twice");
-    }
-    let (metrics_addr, _handle) = yggdrasil::metrics::init(
-        "127.0.0.1:0".parse().unwrap(),
-        Mode::Relay,
-        Some(slot.clone()),
-    )
-    .await
-    .expect("metrics init");
 
     // 5. HeartbeatServer bound to a random loopback port with the acceptor.
     let hb_cancel = cancel.clone();
@@ -195,10 +147,9 @@ async fn predicate_set_update_surfaces_in_internal_derived_rules() {
     let ack = send_control_and_await_ack(&mut session, &sock, &envelope).await;
     assert_eq!(ack.status, AckStatus::Ok);
 
-    // 7. Wait until the supervisor has applied the derived rule. This is
-    //    the same wait point as `chain_predicate_e2e.rs`; once that
-    //    completes, the supervisor's `current_set` watch has fired and
-    //    a future snapshot will see the new rule.
+    // 7. Wait until the supervisor has applied the derived rule. Once
+    //    that completes, the introspection snapshot must reflect v=1
+    //    and the predicate list.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if supervisor
@@ -214,64 +165,34 @@ async fn predicate_set_update_surfaces_in_internal_derived_rules() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // 8. Fire the HTTP GET. With record_apply wired on the success
-    //    branch in the acceptor, the snapshot must already reflect v=1
-    //    and the predicate list.
-    let raw = http_get(metrics_addr, "/internal/derived-rules").await;
-    let (status, body) = split_http_response(&raw);
-    assert!(
-        status.starts_with("HTTP/1.1 200"),
-        "expected 200, got status line {status:?} body {body:?}"
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).expect("snapshot body parses as JSON");
+    // 8. Read the introspection snapshot directly — same
+    //    `DerivedRulesResponse` shape the UDS `Request::DerivedRules`
+    //    handler serves.
+    let snap = introspection.snapshot();
 
     // Predicate list shape.
-    let predicates = parsed["predicates"]
-        .as_array()
-        .expect("predicates is array");
-    assert_eq!(predicates.len(), 1, "exactly one predicate applied");
-    assert_eq!(predicates[0]["name"], "alpha");
-    assert_eq!(predicates[0]["listen_port"], listen_port);
-    assert_eq!(predicates[0]["protocol"], "tcp");
+    assert_eq!(snap.predicates.len(), 1, "exactly one predicate applied");
+    assert_eq!(snap.predicates[0].name, "alpha");
+    assert_eq!(snap.predicates[0].listen_port, listen_port);
+    assert_eq!(snap.predicates[0].protocol, Protocol::Tcp);
 
     // Derived rules surface the supervisor's current_set.
-    let derived = parsed["derived_rules"]
-        .as_array()
-        .expect("derived_rules is array");
     assert!(
-        derived.iter().any(|r| r["name"] == "alpha"),
-        "derived_rules should contain the alpha rule, got: {derived:?}"
+        snap.derived_rules.iter().any(|r| r.name == "alpha"),
+        "derived_rules should contain the alpha rule, got: {:?}",
+        snap.derived_rules
     );
 
     // Chain identity surfaces the configured pubkeys + applied version.
-    let chain = &parsed["chain"];
-    assert_eq!(chain["local"], local_pubkey.to_string());
-    assert_eq!(chain["upstream"], upstream_pubkey.to_string());
-    assert_eq!(chain["downstream"], downstream_pubkey.to_string());
-    assert_eq!(chain["predicate_origin"], origin.to_string());
-    assert_eq!(chain["predicate_version"], 1);
+    assert_eq!(snap.chain.local, local_pubkey);
+    assert_eq!(snap.chain.upstream, Some(upstream_pubkey));
+    assert_eq!(snap.chain.downstream, Some(downstream_pubkey));
+    assert_eq!(snap.chain.predicate_origin, Some(origin));
+    assert_eq!(snap.chain.predicate_version, Some(1));
     assert!(
-        chain["last_apply_unix"].as_i64().unwrap_or(0) > 0,
+        snap.chain.last_apply_unix.unwrap_or(0) > 0,
         "last_apply_unix should be a wall-clock value, got {:?}",
-        chain["last_apply_unix"]
-    );
-
-    // 9. Content-Type sanity.
-    assert!(
-        raw.to_lowercase().contains("content-type: application/json"),
-        "expected application/json content-type, got headers in: {raw}"
-    );
-
-    // 10. The index endpoint advertises the route.
-    let index = http_get(metrics_addr, "/").await;
-    assert!(
-        index.starts_with("HTTP/1.1 200"),
-        "expected 200 on /, got:\n{index}"
-    );
-    assert!(
-        index.contains("/internal/derived-rules"),
-        "index missing /internal/derived-rules listing:\n{index}"
+        snap.chain.last_apply_unix
     );
 
     cancel.cancel();
