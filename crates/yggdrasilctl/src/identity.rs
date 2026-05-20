@@ -95,10 +95,11 @@ pub struct ExportIntroArgs {
     #[arg(long)]
     identity_file: Option<PathBuf>,
 
-    /// Where to write the intro file. Defaults to `intro.txt` in the current
-    /// working directory.
-    #[arg(short = 'o', long = "out", default_value = "intro.txt")]
-    out: PathBuf,
+    /// Where to write the intro file. When omitted, the intro TOML is
+    /// printed to stdout (operators can pipe it directly or redirect
+    /// to a file). When supplied, the file is written with 0600 perms.
+    #[arg(short = 'o', long = "out")]
+    out: Option<PathBuf>,
 
     /// Free-form note included in the intro file (operator hint).
     #[arg(long, default_value = "")]
@@ -307,20 +308,44 @@ fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result
     let pubkey = PubKey::X25519(*kp.public_key());
     let intro = IntroFile::new(pubkey, now_unix_secs(), args.note.clone());
     let toml_str = intro.to_toml().context("serialise intro file")?;
-    write_file_secret(&args.out, toml_str.as_bytes())
-        .with_context(|| format!("write {}", args.out.display()))?;
-    let out_str = args.out.display().to_string();
+
     let fingerprint = kp.fingerprint();
     let pubkey_str = intro.intro.pubkey.to_string();
-    print_kv(
-        json,
-        &[
-            ("intro_file:", out_str.as_str()),
-            ("pubkey:", pubkey_str.as_str()),
-            ("fingerprint:", fingerprint.as_str()),
-            ("note:", intro.intro.note.as_str()),
-        ],
-    )
+
+    match args.out.as_ref() {
+        Some(path) => {
+            write_file_secret(path, toml_str.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
+            let out_str = path.display().to_string();
+            print_kv(
+                json,
+                &[
+                    ("intro_file:", out_str.as_str()),
+                    ("pubkey:", pubkey_str.as_str()),
+                    ("fingerprint:", fingerprint.as_str()),
+                    ("note:", intro.intro.note.as_str()),
+                ],
+            )
+        }
+        None => {
+            // Stdout default: emit only the intro TOML body so the
+            // output can be piped directly into the upstream's
+            // `identity add-downstream --from -` workflow without
+            // any text-mode chrome to strip first. Diagnostic
+            // metadata (pubkey/fingerprint/note) goes to stderr so
+            // pipelines stay clean while the operator still sees
+            // what was emitted.
+            print!("{toml_str}");
+            if !json {
+                eprintln!("pubkey:      {pubkey_str}");
+                eprintln!("fingerprint: {fingerprint}");
+                if !intro.intro.note.is_empty() {
+                    eprintln!("note:        {}", intro.intro.note);
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 // ---------- add-upstream ----------
