@@ -1,20 +1,21 @@
 //! Phase 5D integration tests: `yggdrasilctl chain diff` end-to-end.
 //!
 //! The CLI binary is exercised verbatim via `CARGO_BIN_EXE_yggdrasilctl`.
-//! On the daemon side we stand up:
+//! On the daemon side we stand up a one-shot Unix domain socket that
+//! impersonates the daemon's control surface:
 //!
-//! * A **fake metrics listener** — a one-shot TCP server that responds
-//!   to a single `GET /internal/derived-rules` with a canned JSON
-//!   body. The CLI's `fetch_local_introspection` connects to this on
-//!   `127.0.0.1:<picked_port>`.
-//!
-//! * For multi-hop tests, a **fake UDS daemon** — a one-shot Unix
-//!   socket server that (a) reads a single `Request::OpenChainTunnel`
-//!   line, (b) replies with `Response::ChainTunnelOpened`, then (c)
-//!   acts as the tunnel terminator: reads the CLI's HTTP GET and
-//!   writes a canned HTTP response. This is enough to drive the
-//!   CLI's tunnel-splice path without spinning up a real two-process
-//!   chain.
+//! 1. **Local hop** (always served): the CLI sends
+//!    `Request::DerivedRules` and we reply with a canned
+//!    `Response::DerivedRules` carrying the snapshot.
+//! 2. **Upstream hop** (when the local snapshot's `chain.upstream`
+//!    is `Some`): the CLI opens a fresh UDS connection and sends
+//!    `Request::OpenChainTunnel`. We reply with
+//!    `Response::ChainTunnelOpened`, then act as the tunnel
+//!    terminator: read the CLI's HTTP `GET /internal/derived-rules`
+//!    and write a canned HTTP/1.1 200 response carrying the
+//!    upstream snapshot. (Stage B3 will collapse this onto the same
+//!    `Request::DerivedRules` shape; until then the tunnel still
+//!    speaks HTTP.)
 //!
 //! Tests in this file:
 //!
@@ -31,127 +32,53 @@
 //!    rendering.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::Shutdown;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
-/// Pick a free loopback TCP port by binding, querying, dropping.
-fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("local_addr").port()
-}
-
-/// Spawn a one-shot TCP server on `addr` that accepts exactly one
-/// connection, drains its HTTP request, and writes `body` framed in
-/// a minimal HTTP/1.1 200 response. Returns a `JoinHandle` so the
-/// caller can ensure the thread joined before tearing down.
-fn spawn_oneshot_http(addr: SocketAddr, body: String) -> thread::JoinHandle<()> {
-    let listener = TcpListener::bind(addr).expect("bind metrics listener");
-    thread::spawn(move || {
-        let (mut stream, _peer) = listener.accept().expect("accept");
-        // Drain the request — read until we see the CRLF/CRLF sentinel.
-        let mut buf = [0u8; 4096];
-        let mut acc = Vec::new();
-        loop {
-            let n = stream.read(&mut buf).expect("read request");
-            if n == 0 {
-                break;
-            }
-            acc.extend_from_slice(&buf[..n]);
-            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(resp.as_bytes())
-            .expect("write HTTP response");
-        // Half-close write so the client sees EOF and proceeds.
-        let _ = stream.shutdown(Shutdown::Write);
-        // Optionally read until peer closes so we don't drop the socket
-        // prematurely under TCP RST semantics.
-        let _ = stream.read_to_end(&mut Vec::new());
-    })
-}
-
-/// Spawn a one-shot UDS server at `socket_path` that:
-/// 1. accepts one connection,
-/// 2. reads exactly one newline-delimited JSON request (expected to
-///    be `Request::OpenChainTunnel`),
-/// 3. writes back a `Response::ChainTunnelOpened { stream_id: 1 }`
-///    JSON line,
-/// 4. then acts as the tunnel terminator: drains the CLI's HTTP GET
-///    and writes the canned `body` framed as HTTP/1.1 200.
-fn spawn_oneshot_uds_tunnel(
-    socket_path: PathBuf,
-    body: String,
-) -> (thread::JoinHandle<()>, mpsc::Receiver<String>) {
-    let (tx, rx) = mpsc::channel::<String>();
-    let listener =
-        UnixListener::bind(&socket_path).expect("bind UDS listener");
-    let handle = thread::spawn(move || {
-        let (mut stream, _peer) = listener.accept().expect("accept UDS");
-        // Read the OpenChainTunnel line.
-        let mut req_line = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let n = stream.read(&mut byte).expect("read request byte");
-            if n == 0 {
-                panic!("UDS client closed without sending a request");
-            }
-            if byte[0] == b'\n' {
-                break;
-            }
-            req_line.push(byte[0] as char);
-        }
-        tx.send(req_line.clone()).ok();
-
-        // Write ChainTunnelOpened.
-        let resp = r#"{"kind":"chain_tunnel_opened","stream_id":1}"#;
-        stream
-            .write_all(resp.as_bytes())
-            .expect("write tunnel opened response");
-        stream.write_all(b"\n").expect("newline");
-
-        // Now act as tunnel terminator — drain HTTP GET, write canned
-        // HTTP response.
-        let mut http_req = Vec::new();
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = stream
-                .read(&mut buf)
-                .expect("read HTTP request through tunnel");
-            if n == 0 {
-                break;
-            }
-            http_req.extend_from_slice(&buf[..n]);
-            if http_req.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(resp.as_bytes())
-            .expect("write HTTP/200 through tunnel");
-        let _ = stream.shutdown(Shutdown::Write);
-        // Allow the CLI to read the response before we drop.
-        let _ = stream.read_to_end(&mut Vec::new());
+/// Construct the JSON body for `Response::DerivedRules { ... }`.
+/// Adds the `kind` discriminant the wire enum uses.
+fn derived_rules_response_json(
+    local: &str,
+    upstream: Option<&str>,
+    predicates: &[(&str, u16, &str)],
+    version: Option<u64>,
+    origin: Option<&str>,
+) -> String {
+    let preds: Vec<serde_json::Value> = predicates
+        .iter()
+        .map(|(name, port, proto)| {
+            serde_json::json!({
+                "name": name,
+                "listen_port": port,
+                "protocol": proto,
+                "idle_timeout_ms": null,
+            })
+        })
+        .collect();
+    let chain = serde_json::json!({
+        "local": local,
+        "upstream": upstream,
+        "downstream": null,
+        "predicate_origin": origin,
+        "predicate_version": version,
+        "last_apply_unix": null,
     });
-    (handle, rx)
+    serde_json::json!({
+        "kind": "derived_rules",
+        "predicates": preds,
+        "derived_rules": [],
+        "chain": chain,
+    })
+    .to_string()
 }
 
-/// Construct a minimal `/internal/derived-rules` JSON snapshot.
-fn snapshot_json(
+/// Snapshot body without the wire discriminant — used as the HTTP
+/// payload for the upstream-hop fetch (which still goes over the
+/// chain tunnel as HTTP until stage B3).
+fn snapshot_body_json(
     local: &str,
     upstream: Option<&str>,
     predicates: &[(&str, u16, &str)],
@@ -185,16 +112,102 @@ fn snapshot_json(
     .to_string()
 }
 
+/// Read one newline-delimited line from a UDS connection. Panics on
+/// EOF before newline (the test binary should never see a half-open).
+fn read_uds_line<R: Read>(stream: &mut R) -> String {
+    let mut line = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).expect("read uds byte");
+        if n == 0 {
+            panic!("UDS client closed without sending a request line");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0] as char);
+    }
+    line
+}
+
+/// Spawn a one-shot UDS server that impersonates the daemon for
+/// `chain diff`. Always serves a `Request::DerivedRules` on the first
+/// connection. When `upstream_http_body` is `Some`, additionally
+/// serves a second connection carrying `Request::OpenChainTunnel` ->
+/// `Response::ChainTunnelOpened` -> tunneled HTTP response with the
+/// given body.
+fn spawn_oneshot_uds_diff(
+    socket_path: PathBuf,
+    local_response_json: String,
+    upstream_http_body: Option<String>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(&socket_path).expect("bind UDS listener");
+    thread::spawn(move || {
+        // ---- Connection 1: DerivedRules ----
+        let (mut stream, _peer) = listener.accept().expect("accept #1");
+        let req_line = read_uds_line(&mut stream);
+        assert!(
+            req_line.contains("\"kind\":\"derived_rules\""),
+            "expected derived_rules request on conn #1, got {req_line:?}"
+        );
+        let mut payload = local_response_json.into_bytes();
+        payload.push(b'\n');
+        stream
+            .write_all(&payload)
+            .expect("write DerivedRules response");
+        let _ = stream.shutdown(Shutdown::Write);
+        // Drain anything else the client might have sent before close.
+        let _ = stream.read_to_end(&mut Vec::new());
+
+        // ---- Connection 2: OpenChainTunnel + tunneled HTTP (if requested) ----
+        if let Some(body) = upstream_http_body {
+            let (mut stream, _peer) = listener.accept().expect("accept #2");
+            let req_line = read_uds_line(&mut stream);
+            assert!(
+                req_line.contains("\"kind\":\"open_chain_tunnel\""),
+                "expected open_chain_tunnel on conn #2, got {req_line:?}"
+            );
+            let opened = r#"{"kind":"chain_tunnel_opened","stream_id":1}"#;
+            stream.write_all(opened.as_bytes()).expect("write opened");
+            stream.write_all(b"\n").expect("opened newline");
+
+            // Drain the CLI's HTTP GET sent through the tunnel.
+            let mut http_req = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).expect("read tunneled HTTP");
+                if n == 0 {
+                    break;
+                }
+                http_req.extend_from_slice(&buf[..n]);
+                if http_req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(resp.as_bytes())
+                .expect("write HTTP response through tunnel");
+            let _ = stream.shutdown(Shutdown::Write);
+            let _ = stream.read_to_end(&mut Vec::new());
+        }
+    })
+}
+
 /// Run the yggdrasilctl binary with the given args. Captures stdout
-/// + stderr. Caller asserts on the result.
-fn run_cli(socket: &PathBuf, args: &[&str]) -> Output {
+/// + stderr.
+fn run_cli(socket: &PathBuf, extra_args: &[&str]) -> Output {
     let bin = env!("CARGO_BIN_EXE_yggdrasilctl");
     let mut cmd = Command::new(bin);
     cmd.arg("--socket")
         .arg(socket)
         .arg("chain")
         .arg("diff");
-    for a in args {
+    for a in extra_args {
         cmd.arg(a);
     }
     cmd.output().expect("spawn yggdrasilctl")
@@ -205,26 +218,18 @@ const PK_UPSTREAM: &str = "x25519:0202020202020202020202020202020202020202020202
 
 #[test]
 fn diff_single_hop_local_only_in_sync() {
-    let metrics_port = pick_free_port();
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
-    let body = snapshot_json(
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_path = tmp.path().join("control.sock");
+    let local_resp = derived_rules_response_json(
         PK_LOCAL,
         None, // no upstream → walk stops at hop 0
         &[("alpha", 9001, "tcp")],
         Some(7),
         Some(PK_LOCAL),
     );
-    let metrics_join = spawn_oneshot_http(metrics_addr, body);
+    let join = spawn_oneshot_uds_diff(socket_path.clone(), local_resp, None);
 
-    // socket is unused for a single-hop diff because there's no
-    // upstream to tunnel to, but the CLI still needs a path arg.
-    let tmp = tempfile::tempdir().unwrap();
-    let socket_path = tmp.path().join("unused.sock");
-    let out = run_cli(
-        &socket_path,
-        &["--metrics-port", &metrics_port.to_string()],
-    );
-
+    let out = run_cli(&socket_path, &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -245,38 +250,38 @@ fn diff_single_hop_local_only_in_sync() {
         "expected 'in sync across 1 hop(s).', got:\n{stdout}"
     );
 
-    metrics_join.join().expect("metrics thread joined");
+    join.join().expect("uds thread joined");
 }
 
 #[test]
 fn diff_two_hops_in_sync() {
-    let metrics_port = pick_free_port();
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
-    let local_body = snapshot_json(
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_path = tmp.path().join("control.sock");
+
+    let local_resp = derived_rules_response_json(
         PK_LOCAL,
         Some(PK_UPSTREAM),
         &[("alpha", 9001, "tcp"), ("beta", 9002, "udp")],
         Some(7),
         Some(PK_LOCAL),
     );
-    let metrics_join = spawn_oneshot_http(metrics_addr, local_body);
-
-    let tmp = tempfile::tempdir().unwrap();
-    let socket_path = tmp.path().join("control.sock");
     // Upstream hop carries the SAME predicates / version / origin.
-    let upstream_body = snapshot_json(
+    let upstream_body = snapshot_body_json(
         PK_UPSTREAM,
         None,
         &[("alpha", 9001, "tcp"), ("beta", 9002, "udp")],
         Some(7),
         Some(PK_LOCAL),
     );
-    let (uds_join, _req_rx) = spawn_oneshot_uds_tunnel(socket_path.clone(), upstream_body);
-
-    let out = run_cli(
-        &socket_path,
-        &["--metrics-port", &metrics_port.to_string()],
+    let join = spawn_oneshot_uds_diff(
+        socket_path.clone(),
+        local_resp,
+        Some(upstream_body),
     );
+
+    // metrics_port is still required (used for upstream tunnel dest);
+    // any port works because the test UDS forwards verbatim.
+    let out = run_cli(&socket_path, &["--metrics-port", "9090"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -302,39 +307,36 @@ fn diff_two_hops_in_sync() {
         "expected 'in sync across 2 hop(s).' in:\n{stdout}"
     );
 
-    metrics_join.join().expect("metrics thread joined");
-    uds_join.join().expect("uds thread joined");
+    join.join().expect("uds thread joined");
 }
 
 #[test]
 fn diff_two_hops_drift_detected() {
-    let metrics_port = pick_free_port();
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
-    let local_body = snapshot_json(
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_path = tmp.path().join("control.sock");
+
+    let local_resp = derived_rules_response_json(
         PK_LOCAL,
         Some(PK_UPSTREAM),
         &[("alpha", 9001, "tcp"), ("beta", 9002, "udp")],
         Some(7),
         Some(PK_LOCAL),
     );
-    let metrics_join = spawn_oneshot_http(metrics_addr, local_body);
-
-    let tmp = tempfile::tempdir().unwrap();
-    let socket_path = tmp.path().join("control.sock");
     // Upstream is MISSING "beta" — drift!
-    let upstream_body = snapshot_json(
+    let upstream_body = snapshot_body_json(
         PK_UPSTREAM,
         None,
         &[("alpha", 9001, "tcp")],
         Some(7),
         Some(PK_LOCAL),
     );
-    let (uds_join, _req_rx) = spawn_oneshot_uds_tunnel(socket_path.clone(), upstream_body);
-
-    let out = run_cli(
-        &socket_path,
-        &["--metrics-port", &metrics_port.to_string()],
+    let join = spawn_oneshot_uds_diff(
+        socket_path.clone(),
+        local_resp,
+        Some(upstream_body),
     );
+
+    let out = run_cli(&socket_path, &["--metrics-port", "9090"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -357,25 +359,22 @@ fn diff_two_hops_drift_detected() {
         "expected closing 'DRIFT detected' summary in:\n{stdout}"
     );
 
-    metrics_join.join().expect("metrics thread joined");
-    uds_join.join().expect("uds thread joined");
+    join.join().expect("uds thread joined");
 }
 
 #[test]
 fn diff_json_output_round_trips() {
-    let metrics_port = pick_free_port();
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
-    let body = snapshot_json(
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_path = tmp.path().join("control.sock");
+    let local_resp = derived_rules_response_json(
         PK_LOCAL,
         None,
         &[("alpha", 9001, "tcp")],
         Some(7),
         Some(PK_LOCAL),
     );
-    let metrics_join = spawn_oneshot_http(metrics_addr, body);
+    let join = spawn_oneshot_uds_diff(socket_path.clone(), local_resp, None);
 
-    let tmp = tempfile::tempdir().unwrap();
-    let socket_path = tmp.path().join("unused.sock");
     // `--json` is a global flag; it must come before the `chain` subcommand
     // in clap argument order.
     let bin = env!("CARGO_BIN_EXE_yggdrasilctl");
@@ -385,8 +384,6 @@ fn diff_json_output_round_trips() {
         .arg("--json")
         .arg("chain")
         .arg("diff")
-        .arg("--metrics-port")
-        .arg(metrics_port.to_string())
         .output()
         .expect("spawn yggdrasilctl");
 
@@ -407,11 +404,5 @@ fn diff_json_output_round_trips() {
     assert_eq!(hops[0]["index"], 0);
     assert_eq!(hops[0]["view"]["chain"]["local"], PK_LOCAL);
 
-    metrics_join.join().expect("metrics thread joined");
+    join.join().expect("uds thread joined");
 }
-
-// `_` to mark TcpStream / UnixStream unused so the file still compiles
-// with these imports when a test below references neither. Suppresses
-// an unused-import warning if someone refactors later.
-#[allow(dead_code)]
-fn _unused_imports(_: TcpStream, _: UnixStream, _: Duration) {}

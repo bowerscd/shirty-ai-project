@@ -28,14 +28,14 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 
 use ratatoskr::control::{Request, Response};
 use ratatoskr::predicate::Predicate;
 use ratatoskr::pubkey::PubKey;
-use ratatoskr::rule::{Rule, RuleFile, RuleSet};
+use ratatoskr::rule::{RuleFile, RuleSet};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -90,11 +90,13 @@ pub struct ApplyArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffArgs {
-    /// TCP port on each node's loopback that exposes the metrics
-    /// listener (the `[metrics] listen` setting in `config.toml`). The
-    /// local node is queried directly on this port; upstream nodes are
-    /// reached through chain tunnels with the same port assumed on
-    /// each hop's loopback.
+    /// TCP port on each upstream hop's loopback that exposes the
+    /// metrics listener (the `[metrics] listen` setting in
+    /// `config.toml`). Used only for upstream hops, which are still
+    /// reached via HTTP-over-tunnel; the local hop now uses
+    /// [`Request::DerivedRules`] over UDS and ignores this field.
+    /// Stage B3 will collapse the upstream path onto UDS too and
+    /// remove this argument.
     #[arg(long, value_name = "PORT", default_value_t = 9090)]
     pub metrics_port: u16,
     /// Maximum number of upstream hops to walk before stopping. Each
@@ -103,9 +105,9 @@ pub struct DiffArgs {
     /// is unusual; tune up only if you've explicitly designed one.
     #[arg(long, value_name = "N", default_value_t = 8)]
     pub max_hops: usize,
-    /// Per-fetch deadline. Applies to each individual hop's HTTP GET
-    /// (over TCP for the local hop, over a chain tunnel for upstream
-    /// hops). The overall walk time is bounded by `max_hops *
+    /// Per-fetch deadline. Applies to each individual hop's request
+    /// (UDS for the local hop, HTTP-over-tunnel for upstream hops).
+    /// The overall walk time is bounded by `max_hops *
     /// per_hop_timeout`.
     #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration, default_value = "5s")]
     pub per_hop_timeout: Duration,
@@ -319,52 +321,13 @@ async fn send_chain_apply(
 // Phase 5D: `chain diff`
 // =============================================================================
 
-/// CLI-side mirror of [`yggdrasil::chain::introspection::IntrospectionSnapshot`].
-/// The daemon serialises via `IntrospectionSnapshot`; we deserialise into
-/// this shape. Field names + JSON shape must stay in lock-step with the
-/// daemon side — `tests/chain_introspection_e2e.rs` exercises the
-/// daemon's emit, and `introspection_view_round_trips_through_serde`
-/// below exercises this deserialise.
-///
-/// We keep the mirror local (rather than importing
-/// `yggdrasil::chain::introspection`) because `yggdrasilctl` deliberately
-/// does not depend on `yggdrasil` — the daemon crate is large and
-/// pulling it in would balloon the CLI binary.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct IntrospectionView {
-    /// Predicates the hop is currently driven by. On a terminal these
-    /// are the *projection* of `derived_rules`; on a relay these are
-    /// the set last *received and accepted* from its downstream.
-    predicates: Vec<Predicate>,
-    /// The hop's currently-active rule set, as the proxy supervisor
-    /// reports it. Mostly informational in the diff; the comparison is
-    /// driven by `predicates`.
-    derived_rules: Vec<Rule>,
-    chain: ChainView,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ChainView {
-    /// This hop's own static x25519 pubkey. Used to detect mis-routing
-    /// (the tunnel forwarder should have delivered us to the pubkey we
-    /// requested).
-    local: PubKey,
-    /// Next hop upward, if any. The walker uses this to decide whether
-    /// to continue past this hop.
-    upstream: Option<PubKey>,
-    /// Hop's downstream pubkey (purely informational at this layer).
-    downstream: Option<PubKey>,
-    /// Pubkey of the terminal that authored the predicates currently
-    /// driving this hop. When `predicate_origin == previous_hop.local`,
-    /// it confirms the predicate set arrived from the hop we expect.
-    predicate_origin: Option<PubKey>,
-    /// Monotonic predicate-set version recorded on the last apply.
-    predicate_version: Option<u64>,
-    /// Wall-clock seconds since UNIX epoch at the last apply. Lets the
-    /// operator tell whether an upstream is *stale* or *was never
-    /// pushed*.
-    last_apply_unix: Option<i64>,
-}
+// CLI-side aliases for the wire types defined in
+// [`ratatoskr::control`]. The daemon emits a `Response::DerivedRules`
+// over UDS for the local hop, and (in stage B3, once the chain tunnel
+// learns to forward UDS-style ndjson) for upstream hops too. Using the
+// wire types directly removes the parallel-mirror divergence risk that
+// existed when we defined our own `IntrospectionView` shape.
+use ratatoskr::control::DerivedRulesResponse as IntrospectionView;
 
 /// A single hop's contribution to the report. Hop 0 is the local node;
 /// hops 1..N are reached over chain tunnels.
@@ -447,28 +410,22 @@ struct DiffReport {
 }
 
 /// Walk the chain upward from the local node, fetch each hop's
-/// `/internal/derived-rules`, and emit a structured diff. See module
+/// derived-rules snapshot, and emit a structured diff. See module
 /// docstring for the operator-facing semantics.
 ///
 /// The walk:
-/// 1. Fetches hop 0 (local) over `127.0.0.1:metrics_port`.
+/// 1. Fetches hop 0 (local) over the UDS control socket via
+///    [`Request::DerivedRules`].
 /// 2. For each `chain.upstream` it finds, opens a chain tunnel via
 ///    the daemon's UDS and fetches that hop's `/internal/derived-rules`
-///    through the tunnel.
+///    through the tunnel. (The tunneled path is still HTTP today;
+///    stage B3 will collapse it onto the same UDS request shape.)
 /// 3. Bounds total work at `args.max_hops` to keep a misconfigured
 ///    chain (or a forwarding loop) from running forever.
 async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
-    let local_addr: SocketAddr = format!("127.0.0.1:{}", args.metrics_port)
-        .parse()
-        .with_context(|| format!("constructing local metrics addr for port {}", args.metrics_port))?;
-
-    let local_view = fetch_local_introspection(local_addr, args.per_hop_timeout)
+    let local_view = fetch_local_introspection(socket, args.per_hop_timeout)
         .await
-        .with_context(|| {
-            format!(
-                "fetching local /internal/derived-rules from {local_addr}"
-            )
-        })?;
+        .context("fetching local derived-rules snapshot over UDS")?;
 
     let mut hops: Vec<HopReport> = Vec::new();
     let local_pubkey = local_view.chain.local;
@@ -724,25 +681,49 @@ fn render_human(report: &DiffReport) {
     }
 }
 
-/// Fetch the local node's `/internal/derived-rules` snapshot via a
-/// direct TCP connection to its metrics listener. The endpoint is
-/// loopback-gated on the daemon side; this path is the only one that
-/// works without involving a chain tunnel.
+/// Fetch the local node's derived-rules snapshot via the daemon's
+/// UDS control socket using [`Request::DerivedRules`]. Replaces the
+/// previous loopback-gated `GET /internal/derived-rules` HTTP path:
+/// the operator already has UDS access (every other `yggdrasilctl`
+/// command uses it), and the UDS gate is filesystem-permission-based
+/// rather than a runtime loopback check, which is strictly stronger.
 async fn fetch_local_introspection(
-    addr: SocketAddr,
+    socket: &Path,
     timeout: Duration,
 ) -> Result<IntrospectionView> {
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    let socket_path: PathBuf = socket.to_path_buf();
+    let stream = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
         .await
-        .with_context(|| format!("connect timeout to {addr}"))?
-        .with_context(|| format!("connecting to {addr}"))?;
-    let raw = tokio::time::timeout(
-        timeout,
-        http_get_collect(&mut stream, "127.0.0.1", "/internal/derived-rules"),
-    )
-    .await
-    .context("HTTP GET timed out")??;
-    parse_introspection_response(&raw)
+        .with_context(|| format!("UDS connect timeout to {}", socket_path.display()))?
+        .with_context(|| format!("connecting to {}", socket_path.display()))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let mut buf = serde_json::to_vec(&Request::DerivedRules)
+        .context("encode DerivedRules request")?;
+    buf.push(b'\n');
+    tokio::time::timeout(timeout, writer.write_all(&buf))
+        .await
+        .context("write timeout sending DerivedRules")?
+        .context("writing DerivedRules request")?;
+
+    let mut line = String::new();
+    let n = tokio::time::timeout(timeout, reader.read_line(&mut line))
+        .await
+        .context("read timeout awaiting DerivedRules response")?
+        .context("reading DerivedRules response")?;
+    if n == 0 {
+        bail!("daemon closed UDS without responding to DerivedRules");
+    }
+    let response: Response = serde_json::from_str(line.trim())
+        .with_context(|| format!("parsing daemon response: {line:?}"))?;
+    match response {
+        Response::DerivedRules(snap) => Ok(snap),
+        Response::Error { code, message } => {
+            bail!("daemon returned error for DerivedRules: code={code} message={message}");
+        }
+        other => bail!("unexpected response to DerivedRules: {other:?}"),
+    }
 }
 
 /// Fetch an upstream hop's `/internal/derived-rules` over a chain
@@ -813,32 +794,10 @@ async fn fetch_upstream_introspection(
     parse_introspection_response(&raw)
 }
 
-/// Write an HTTP/1.1 GET to `stream` and read until EOF. Returns the
-/// raw response bytes. Caller is responsible for parsing.
-async fn http_get_collect(
-    stream: &mut TcpStream,
-    host: &str,
-    path: &str,
-) -> Result<Vec<u8>> {
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .context("writing HTTP GET request")?;
-    let mut buf = Vec::with_capacity(8192);
-    stream
-        .read_to_end(&mut buf)
-        .await
-        .context("reading HTTP response")?;
-    Ok(buf)
-}
-
-/// Same as [`http_get_collect`] but for a tunnel stream whose halves
-/// have been split. Used by [`fetch_upstream_introspection`] because
-/// the read half is wrapped in a `BufReader` for the prior
-/// `read_line`.
+/// Write an HTTP/1.1 GET to a split tunnel stream and read until EOF.
+/// Used by [`fetch_upstream_introspection`]; the local hop now goes
+/// through UDS via [`Request::DerivedRules`] and no longer needs an
+/// HTTP helper.
 async fn http_get_through_split<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -905,6 +864,7 @@ fn parse_introspection_response(raw: &[u8]) -> Result<IntrospectionView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatoskr::control::ChainIdentity as ChainView;
     use ratatoskr::rule::Protocol;
 
     fn pk(seed: u8) -> PubKey {
