@@ -26,7 +26,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent, Debouncer};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use ratatoskr::rule::{RuleDiff, RuleSet};
 
@@ -45,6 +45,12 @@ pub struct RuleUpdate {
 pub struct RuleWatcher {
     updates_rx: mpsc::Receiver<RuleUpdate>,
     reload_tx: mpsc::Sender<()>,
+    /// Monotonic counter ticking on every reload-attempt completion
+    /// regardless of outcome (successful reload, no-op reload, parse
+    /// error). Lets `RulesReload` over UDS block until the worker has
+    /// drained the trigger and either applied a new set or established
+    /// that none was needed.
+    reload_completion_rx: watch::Receiver<u64>,
     dir: PathBuf,
     // Order matters: the debouncer holds the notify watcher which feeds the
     // std::sync::mpsc bridge; dropping it closes the bridge, which closes the
@@ -70,6 +76,11 @@ impl RuleWatcher {
         // Bounded so multiple rapid events collapse to a single pending reload.
         let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
         let (updates_tx, updates_rx) = mpsc::channel::<RuleUpdate>(8);
+        // Bumps after each reload-attempt iteration regardless of
+        // outcome. Consumers that need to block until a reload
+        // request has been processed (e.g. `RulesReload` over UDS)
+        // borrow_and_update + force_reload + .changed() this watch.
+        let (reload_completion_tx, reload_completion_rx) = watch::channel::<u64>(0);
 
         // notify → std mpsc → tokio mpsc bridge.
         let (notify_tx, notify_rx) = std::sync::mpsc::channel::<NotifyResult>();
@@ -101,6 +112,7 @@ impl RuleWatcher {
             }
 
             let mut current = initial;
+            let mut completion_gen: u64 = 0;
             while let Some(()) = reload_rx.recv().await {
                 match load_dir(&worker_dir) {
                     Ok(next) => {
@@ -110,6 +122,10 @@ impl RuleWatcher {
                                 dir = %worker_dir.display(),
                                 "rule reload: no semantic change"
                             );
+                            // Still bump the completion counter so
+                            // RPC waiters unblock on no-op reloads.
+                            completion_gen = completion_gen.wrapping_add(1);
+                            let _ = reload_completion_tx.send(completion_gen);
                             continue;
                         }
                         tracing::info!(
@@ -138,12 +154,17 @@ impl RuleWatcher {
                         );
                     }
                 }
+                // Bump after every attempt (success or failure) so
+                // RPC waiters unblock on validation errors too.
+                completion_gen = completion_gen.wrapping_add(1);
+                let _ = reload_completion_tx.send(completion_gen);
             }
         });
 
         Ok(Self {
             updates_rx,
             reload_tx,
+            reload_completion_rx,
             dir,
             _debouncer: debouncer,
             _bridge: bridge,
@@ -168,6 +189,7 @@ impl RuleWatcher {
     pub fn reload_trigger(&self) -> ReloadTrigger {
         ReloadTrigger {
             tx: self.reload_tx.clone(),
+            completion_rx: self.reload_completion_rx.clone(),
         }
     }
 
@@ -181,11 +203,39 @@ impl RuleWatcher {
 #[derive(Debug, Clone)]
 pub struct ReloadTrigger {
     tx: mpsc::Sender<()>,
+    /// Receiver for the watcher's reload-completion counter. Bumps once
+    /// per drained reload attempt regardless of outcome (successful
+    /// apply, no-op, parse error). Lets callers `block_on_reload` to
+    /// wait for the worker to drain a triggered reload before returning
+    /// to the operator.
+    completion_rx: watch::Receiver<u64>,
 }
 
 impl ReloadTrigger {
     pub fn force_reload(&self) {
         let _ = self.tx.try_send(());
+    }
+
+    /// Trigger a reload and block until the worker drains it (success,
+    /// no-op, or load error). Returns the post-reload completion
+    /// counter, or `Err` on timeout.
+    ///
+    /// The wait is bounded so a stuck worker (e.g. blocked on a
+    /// pathological `load_dir`) cannot hang the control socket. The
+    /// caller is responsible for any subsequent supervisor-swap wait
+    /// — this only confirms the watcher itself processed the trigger.
+    pub async fn force_reload_and_wait(
+        &self,
+        timeout: Duration,
+    ) -> Result<u64, tokio::time::error::Elapsed> {
+        let mut rx = self.completion_rx.clone();
+        // Mark the current value as already seen so .changed() fires on
+        // the next bump, not on a stale value.
+        rx.borrow_and_update();
+        self.force_reload();
+        tokio::time::timeout(timeout, rx.changed())
+            .await
+            .map(|_changed| *rx.borrow())
     }
 }
 
