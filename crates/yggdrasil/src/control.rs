@@ -88,6 +88,10 @@ struct ControlState {
     /// render the text exposition format directly over the UDS,
     /// without going through the HTTP listener.
     prom_handle: PrometheusHandle,
+    /// Optional chain-introspection state used by
+    /// [`Request::DerivedRules`]. `None` on pure-local terminals (no
+    /// chain) or in tests that don't exercise predicate apply.
+    introspection: Option<Arc<crate::chain::IntrospectionState>>,
 }
 
 impl ControlServer {
@@ -116,6 +120,7 @@ impl ControlServer {
         config_path: PathBuf,
         tunnel_initiator: Option<Arc<TunnelInitiator>>,
         prom_handle: PrometheusHandle,
+        introspection: Option<Arc<crate::chain::IntrospectionState>>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -165,6 +170,7 @@ impl ControlServer {
             tunnel_initiator,
             supervisor_handle: supervisor.handle(),
             prom_handle,
+            introspection,
         });
 
         let main_cancel = cancel.clone();
@@ -419,6 +425,14 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
                 uptime_secs,
             })
         }
+        Request::DerivedRules => match state.introspection.as_ref() {
+            Some(ix) => Response::DerivedRules(ix.snapshot()),
+            None => Response::Error {
+                code: error_codes::INTERNAL_ERROR.into(),
+                message: "introspection state not configured for this daemon"
+                    .into(),
+            },
+        },
         // `OpenChainTunnel` is handled by [`run_chain_tunnel_bridge`] in
         // [`handle_connection`] before reaching this synchronous
         // dispatch table: the bridge owns the socket halves and pumps
@@ -963,6 +977,7 @@ mod tests {
             cfg,
             None,
             crate::metrics::detached_handle_for_tests(),
+            None,
             shutdown,
         )
         .await

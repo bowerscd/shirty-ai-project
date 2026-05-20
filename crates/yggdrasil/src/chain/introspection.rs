@@ -66,10 +66,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
-use ratatoskr::predicate::{Predicate, PredicateSet};
+use ratatoskr::control::{ChainIdentity, DerivedRulesResponse};
+use ratatoskr::predicate::PredicateSet;
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::Rule;
-use serde::Serialize;
 
 use crate::proxy::supervisor::SupervisorHandle;
 
@@ -132,7 +132,7 @@ impl IntrospectionState {
     /// short read-lock acquire on `latest_predicates` and one cheap
     /// `watch::Receiver::borrow` clone on the supervisor's current
     /// rule set.
-    pub fn snapshot(&self) -> IntrospectionSnapshot {
+    pub fn snapshot(&self) -> DerivedRulesResponse {
         let predicates_holder = self.latest_predicates.read();
         let (predicates, predicate_origin, predicate_version) =
             match predicates_holder.as_ref() {
@@ -156,10 +156,10 @@ impl IntrospectionState {
             .borrow()
             .rules()
             .to_vec();
-        IntrospectionSnapshot {
+        DerivedRulesResponse {
             predicates,
             derived_rules,
-            chain: ChainSnapshot {
+            chain: ChainIdentity {
                 local: self.local_pubkey,
                 upstream: self.upstream_pubkey,
                 downstream: self.downstream_pubkey,
@@ -181,43 +181,6 @@ impl IntrospectionState {
     pub fn render_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&self.snapshot())
     }
-}
-
-/// Wire shape returned by the `/internal/derived-rules` endpoint.
-/// See the module docstring for the canonical JSON shape.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct IntrospectionSnapshot {
-    /// Predicate list this node is currently driven by. Terminal: the
-    /// projection from the local rule set last pushed upstream. Relay:
-    /// the set last received from downstream and used to derive
-    /// `derived_rules`.
-    pub predicates: Vec<Predicate>,
-    /// Active rule set on this node. Always reflects the
-    /// proxy supervisor's `current_set` watch at snapshot time.
-    pub derived_rules: Vec<Rule>,
-    pub chain: ChainSnapshot,
-}
-
-/// Chain-identity facts and predicate-set metadata.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct ChainSnapshot {
-    /// This node's static x25519 pubkey, tagged. Lets the operator's
-    /// `chain diff` tooling confirm which node it actually reached
-    /// through the tunnel.
-    pub local: PubKey,
-    /// Upstream node pubkey when `[dial]` is configured.
-    pub upstream: Option<PubKey>,
-    /// Downstream node pubkey when `[accept]` is configured.
-    pub downstream: Option<PubKey>,
-    /// `PredicateSet.origin` of the most recently applied push. On a
-    /// terminal this equals `local`; on a relay it equals the terminal
-    /// further down the chain that authored the predicate.
-    pub predicate_origin: Option<PubKey>,
-    /// `PredicateSet.version` of the most recently applied push.
-    pub predicate_version: Option<u64>,
-    /// Wall-clock seconds since UNIX epoch of the most recent
-    /// `record_apply`. Null until the first push has been applied.
-    pub last_apply_unix: Option<i64>,
 }
 
 // =============================================================================

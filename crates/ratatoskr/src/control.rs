@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::predicate::Predicate;
 use crate::pubkey::PubKey;
 use crate::rule::Rule;
 
@@ -95,6 +96,12 @@ pub enum Request {
     /// Liveness/readiness probe served over the control socket. Backs
     /// `yggdrasilctl local health`.
     Health,
+    /// Snapshot of this node's chain-applied predicates, derived rule
+    /// set, and chain identity. Replaces the previous loopback-gated
+    /// `GET /internal/derived-rules` HTTP endpoint. Backs both
+    /// `yggdrasilctl local derived-rules` and the local-hop fetch in
+    /// `yggdrasilctl chain diff`.
+    DerivedRules,
     /// Open a chain tunnel from this node toward `target_pubkey`, which
     /// must terminate the tunnel at `dest` (a TCP `host:port`). This
     /// request **hijacks the UDS connection**: once the server responds
@@ -165,6 +172,9 @@ pub enum Response {
     /// Successful response to [`Request::Health`]. See
     /// [`HealthResponse`] for the field semantics.
     Health(HealthResponse),
+    /// Successful response to [`Request::DerivedRules`]. See
+    /// [`DerivedRulesResponse`] for the field semantics.
+    DerivedRules(DerivedRulesResponse),
     /// Successful response to [`Request::ChainApply`]. Reports the
     /// number of rules that were handed to the supervisor and, for
     /// terminal daemons with a chain upstream, what the projected
@@ -282,6 +292,49 @@ pub struct HealthResponse {
     pub ready: bool,
     /// Process uptime in whole seconds.
     pub uptime_secs: u64,
+}
+
+/// Response body for [`Request::DerivedRules`]. Snapshot of this node's
+/// chain-applied predicates, derived rule set, and chain identity.
+///
+/// Wire-stable: `yggdrasilctl chain diff` parses this from older daemons
+/// over UDS and (when the multi-hop tunneled path lands) over chain
+/// tunnels. Field names + JSON shape must not change without a wire
+/// version bump.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DerivedRulesResponse {
+    /// Predicates this node is currently driven by. On a terminal these
+    /// are the projection of `derived_rules`; on a relay these are the
+    /// set last *received and accepted* from its downstream.
+    pub predicates: Vec<Predicate>,
+    /// Active rule set on this node, as the proxy supervisor reports
+    /// it. Always reflects the supervisor's `current_set` watch at
+    /// snapshot time.
+    pub derived_rules: Vec<Rule>,
+    /// Chain identity facts and predicate-set metadata for the hop.
+    pub chain: ChainIdentity,
+}
+
+/// Chain-identity facts and predicate-set metadata. Carried inside
+/// [`DerivedRulesResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainIdentity {
+    /// This node's static x25519 pubkey, tagged. Lets `chain diff`
+    /// confirm which node it actually reached.
+    pub local: PubKey,
+    /// Upstream node pubkey when `[dial]` is configured.
+    pub upstream: Option<PubKey>,
+    /// Downstream node pubkey when `[accept]` is configured.
+    pub downstream: Option<PubKey>,
+    /// `PredicateSet.origin` of the most recently applied push. On a
+    /// terminal this equals `local`; on a relay it equals the terminal
+    /// further down the chain that authored the predicates.
+    pub predicate_origin: Option<PubKey>,
+    /// `PredicateSet.version` of the most recently applied push.
+    pub predicate_version: Option<u64>,
+    /// Wall-clock seconds since UNIX epoch of the most recent
+    /// `record_apply`. `None` until the first push has been applied.
+    pub last_apply_unix: Option<i64>,
 }
 
 /// Metadata for a single (hostname, cert) pair loaded into the cert store.

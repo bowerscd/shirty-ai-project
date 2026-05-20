@@ -37,6 +37,11 @@ pub enum Cmd {
     /// Liveness/readiness probe served over the control socket. Exit
     /// status: 0 if ready, 1 if not yet ready, 2 on RPC error.
     Health,
+    /// Snapshot of this node's chain-applied predicates, derived rule
+    /// set, and chain identity. Pretty-printed JSON to stdout. Same
+    /// data the previous loopback-gated `GET /internal/derived-rules`
+    /// HTTP endpoint served, now retrieved over UDS.
+    DerivedRules,
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,6 +103,7 @@ fn build_request(cmd: &Cmd) -> Request {
         },
         Cmd::Metrics => Request::Metrics,
         Cmd::Health => Request::Health,
+        Cmd::DerivedRules => Request::DerivedRules,
     }
 }
 
@@ -267,6 +273,13 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             if !h.ready {
                 std::process::exit(1);
             }
+        }
+        Response::DerivedRules(d) => {
+            // Pretty-print the snapshot; matches the body the
+            // previous `/internal/derived-rules` HTTP endpoint emitted.
+            let s = serde_json::to_string_pretty(d)
+                .context("serialise DerivedRulesResponse")?;
+            println!("{s}");
         }
     }
     Ok(())

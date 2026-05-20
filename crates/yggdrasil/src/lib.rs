@@ -381,6 +381,7 @@ pub async fn run_relay(
         args.config.clone(),
         chain_initiator,
         prom_handle.clone(),
+        Some(introspection_state.clone()),
         shutdown.clone(),
     )
     .await
@@ -532,6 +533,7 @@ pub async fn run_terminal(
         args.config.clone(),
         chain_initiator,
         prom_handle.clone(),
+        Some(introspection_state.clone()),
         shutdown.clone(),
     )
     .await
