@@ -1285,4 +1285,220 @@ mod tests {
         server.stop().await;
         supervisor.stop().await;
     }
+
+    /// `Request::Metrics` renders the Prometheus text exposition from the
+    /// installed handle. `detached_handle_for_tests` produces an empty
+    /// body (no recorder installed in tests); we're verifying the
+    /// dispatch path renders without panicking and the response shape
+    /// is well-formed.
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+        let socket = tmp.path().join("control.sock");
+        let (pending, cfg) = aux_state(tmp.path());
+        let server = bind_relay_control(
+            socket.clone(),
+            peer_state.clone(),
+            &supervisor,
+            pending,
+            cfg,
+            shutdown.clone(),
+        )
+        .await;
+
+        let resp = send_request(&socket, &Request::Metrics).await;
+        match resp {
+            Response::Metrics(m) => {
+                assert!(
+                    m.body.is_empty() || m.body.ends_with('\n'),
+                    "expected empty or newline-terminated body, got: {:?}",
+                    m.body
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        shutdown.cancel();
+        server.stop().await;
+        supervisor.stop().await;
+    }
+
+    /// `Request::Health` reports `ready = true` after `mark_ready` has
+    /// been called. The flag is process-global and one-way; previous
+    /// tests in this binary may already have flipped it, but after our
+    /// `mark_ready` call the contract holds unconditionally.
+    #[tokio::test]
+    async fn health_endpoint_reports_ready_after_mark_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+        let socket = tmp.path().join("control.sock");
+        let (pending, cfg) = aux_state(tmp.path());
+        let server = bind_relay_control(
+            socket.clone(),
+            peer_state.clone(),
+            &supervisor,
+            pending,
+            cfg,
+            shutdown.clone(),
+        )
+        .await;
+
+        crate::health::mark_ready();
+
+        let resp = send_request(&socket, &Request::Health).await;
+        match resp {
+            Response::Health(h) => {
+                assert!(h.ready, "health endpoint should report ready=true");
+                // Sanity: uptime should be small; we just bound the server.
+                assert!(h.uptime_secs < 3600);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        shutdown.cancel();
+        server.stop().await;
+        supervisor.stop().await;
+    }
+
+    /// `Request::DerivedRules` returns the introspection snapshot when
+    /// the control server has one wired. The wire path here is the
+    /// counterpart to `chain_introspection_e2e.rs`, which exercises
+    /// `IntrospectionState::snapshot()` directly without going through
+    /// the UDS dispatcher.
+    #[tokio::test]
+    async fn derived_rules_endpoint_returns_snapshot_when_introspection_wired() {
+        use ratatoskr::pubkey::PubKey;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+        let socket = tmp.path().join("control.sock");
+        let (pending, cfg) = aux_state(tmp.path());
+
+        let local = PubKey::x25519([0x11; 32]);
+        let introspection = crate::chain::IntrospectionState::new(
+            local,
+            Some(PubKey::x25519([0x22; 32])),
+            None,
+            supervisor.handle(),
+        );
+
+        let server = ControlServer::bind(
+            socket.clone(),
+            Mode::Relay,
+            Some(peer_state.clone()),
+            &supervisor,
+            Some(pending),
+            cfg,
+            false,
+            crate::metrics::detached_handle_for_tests(),
+            Some(introspection),
+            None,
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resp = send_request(&socket, &Request::DerivedRules).await;
+        match resp {
+            Response::DerivedRules(d) => {
+                assert!(d.predicates.is_empty(), "no apply yet");
+                assert!(d.derived_rules.is_empty(), "no rules loaded");
+                assert_eq!(d.chain.local, local);
+                assert!(d.chain.predicate_origin.is_none());
+                assert!(d.chain.predicate_version.is_none());
+                assert!(d.chain.last_apply_unix.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        shutdown.cancel();
+        server.stop().await;
+        supervisor.stop().await;
+    }
+
+    /// `Request::DerivedRules` on a server with no introspection state
+    /// reports `INTERNAL_ERROR` via the dispatcher's defensive arm.
+    /// `bind_relay_control` passes `None` for introspection, which is
+    /// the configuration tests want here.
+    #[tokio::test]
+    async fn derived_rules_endpoint_errors_when_introspection_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+        let socket = tmp.path().join("control.sock");
+        let (pending, cfg) = aux_state(tmp.path());
+        let server = bind_relay_control(
+            socket.clone(),
+            peer_state.clone(),
+            &supervisor,
+            pending,
+            cfg,
+            shutdown.clone(),
+        )
+        .await;
+
+        let resp = send_request(&socket, &Request::DerivedRules).await;
+        match resp {
+            Response::Error { code, .. } => {
+                assert_eq!(code, error_codes::INTERNAL_ERROR);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        shutdown.cancel();
+        server.stop().await;
+        supervisor.stop().await;
+    }
+
+    /// `Request::TraceSet` with an invalid directive returns
+    /// `INVALID_REQUEST`. The dispatcher's two failure modes
+    /// (`EnvFilter::try_new` parse error and "tracing not initialised")
+    /// both land on the same error code, so this test is robust to
+    /// whether a sibling test has already installed the global
+    /// subscriber.
+    #[tokio::test]
+    async fn trace_set_with_invalid_directive_returns_invalid_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules");
+        let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+        let socket = tmp.path().join("control.sock");
+        let (pending, cfg) = aux_state(tmp.path());
+        let server = bind_relay_control(
+            socket.clone(),
+            peer_state.clone(),
+            &supervisor,
+            pending,
+            cfg,
+            shutdown.clone(),
+        )
+        .await;
+
+        // Best-effort init so `EnvFilter::try_new` is the error source.
+        // If a sibling test already installed a subscriber, this call
+        // returns Err but `TRACE_CONTROLLER` is already set by that
+        // test — the dispatcher lands on the same INVALID_REQUEST code
+        // either way.
+        let _ = crate::log::init_tracing(crate::cli::LogFormat::Pretty);
+
+        let resp = send_request(
+            &socket,
+            &Request::TraceSet {
+                directive: Some("= not a valid filter =".to_string()),
+            },
+        )
+        .await;
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, error_codes::INVALID_REQUEST);
+                assert!(
+                    message.contains("tracing directive"),
+                    "expected directive error message, got: {message}"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        shutdown.cancel();
+        server.stop().await;
+        supervisor.stop().await;
+    }
 }

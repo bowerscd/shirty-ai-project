@@ -283,3 +283,65 @@ async fn send_request(socket_path: &Path, req: &Request) -> Response {
     let line = lines.next_line().await.unwrap().unwrap();
     serde_json::from_str(&line).unwrap()
 }
+
+/// `chain apply` against a terminal with a configured chain upstream
+/// rejects a candidate set whose projected `PredicateSet` would exceed
+/// `PREDICATE_SET_MAX_WIRE_BYTES`. Without this synchronous pre-check
+/// the apply would "succeed" here but the publisher would silently
+/// drop the upstream push (the encode would fail past the 8 KiB cap).
+#[tokio::test]
+async fn terminal_chain_apply_rejects_oversize_predicate_set() {
+    let shutdown = CancellationToken::new();
+    let rules_tmp = tempfile::tempdir().unwrap();
+    let rules_dir = rules_tmp.path().join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    let supervisor =
+        spawn_terminal_supervisor(rules_dir, Duration::from_millis(50), shutdown.clone()).await;
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("control.sock");
+    let config_path = socket_dir.path().join("yggdrasil.toml");
+    std::fs::write(&config_path, "[server]\nmode = \"terminal\"\n").unwrap();
+
+    // `has_chain_upstream = true` engages the oversize pre-check.
+    let server = ControlServer::bind(
+        socket_path.clone(),
+        Mode::Terminal,
+        None,
+        &supervisor,
+        None,
+        config_path,
+        true,
+        yggdrasil::metrics::detached_handle_for_tests(),
+        None,
+        None,
+        shutdown.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Build ~500 TCP rules with long unique names so the projected
+    // PredicateSet wire-encodes well past the 8 KiB cap.
+    let mut rules = Vec::with_capacity(500);
+    for i in 0..500u16 {
+        let name = format!("very-long-rule-name-to-push-wire-bytes-over-cap-{i:04}");
+        rules.push(terminal_rule(&name, 10_000 + i, "127.0.0.1:9000"));
+    }
+
+    let resp = send_request(&socket_path, &Request::ChainApply { rules }).await;
+
+    match resp {
+        Response::Error { code, message } => {
+            assert_eq!(code, error_codes::PREDICATE_SET_OVERSIZE);
+            assert!(
+                message.contains("wire cap"),
+                "expected oversize message, got: {message}",
+            );
+        }
+        other => panic!("expected Error response, got {other:?}"),
+    }
+
+    shutdown.cancel();
+    server.stop().await;
+    supervisor.stop().await;
+}
