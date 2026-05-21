@@ -305,6 +305,43 @@ EOF
 # Renders an nginx.conf with a single `stream {}` block proxying to the echo
 # backend, starts nginx with `-p $tmp -c nginx.conf`, and waits for the
 # listener to come up.
+#
+# On distros that ship the stream module dynamically (Arch, RHEL/Fedora),
+# we emit a `load_module` directive at the top of the rendered conf so
+# the harness's self-contained file doesn't rely on `/etc/nginx/...`
+# include paths. Distros where stream is statically built in (Debian's
+# `libnginx-mod-stream` package wires it via `modules-enabled/`, but
+# also vendor builds that bake stream in) don't need the directive; we
+# detect that case by parsing `nginx -V`.
+
+bench_nginx_stream_loader() {
+    # Echo a `load_module ...;` directive (with trailing newline) if the
+    # nginx binary has stream as a *dynamic* module AND we can locate the
+    # .so on disk. Otherwise echo nothing. Exits non-zero with a useful
+    # message on stderr if stream is dynamic but the .so is missing.
+    local nginx_bin="$1"
+    local vline
+    vline="$("$nginx_bin" -V 2>&1 | tr ' ' '\n')"
+
+    # Stream built statically (no `=dynamic` qualifier) — nothing to load.
+    if grep -qx -- '--with-stream' <<<"$vline"; then
+        return 0
+    fi
+    # Stream not configured at all — fatal: nginx can't proxy L4.
+    if ! grep -qx -- '--with-stream=dynamic' <<<"$vline"; then
+        die "nginx at $nginx_bin was built without the stream module; install a build that has --with-stream or --with-stream=dynamic"
+    fi
+
+    # Stream dynamic — locate the .so.
+    local modules_path
+    modules_path="$(grep -E '^--modules-path=' <<<"$vline" | head -1 | sed 's/^--modules-path=//')"
+    [[ -n "$modules_path" ]] || modules_path="/usr/lib/nginx/modules"
+    local so="$modules_path/ngx_stream_module.so"
+    if [[ ! -f "$so" ]]; then
+        die "nginx at $nginx_bin has stream as a dynamic module but $so is missing; install the distro's nginx-mod-stream / libnginx-mod-stream package"
+    fi
+    printf 'load_module "%s";\n' "$so"
+}
 
 bench_spin_nginx() {
     local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
@@ -312,11 +349,14 @@ bench_spin_nginx() {
     nginx_bin="${BENCH_NGINX:-$(command -v nginx || true)}"
     [[ -x "$nginx_bin" ]] || die "nginx binary not found; set BENCH_NGINX=/path/to/nginx or install nginx"
 
+    local stream_loader
+    stream_loader="$(bench_nginx_stream_loader "$nginx_bin")"
+
     mkdir -p "$tmp/nginx/logs"
     local udp_kw=""
     [[ "$proto" == "udp" ]] && udp_kw="udp"
     cat > "$tmp/nginx/nginx.conf" <<EOF
-worker_processes auto;
+${stream_loader}worker_processes auto;
 pid $tmp/nginx/nginx.pid;
 error_log $tmp/nginx/error.log warn;
 events { worker_connections 4096; }
