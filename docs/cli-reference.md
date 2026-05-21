@@ -332,9 +332,9 @@ Exit codes:
 
 ## `loadgen`
 
-Workspace-internal benchmark tool. See [bench/README.md](../bench/README.md)
-for end-to-end usage; the per-subcommand surface is documented inline via
-`loadgen --help`.
+Workspace-internal benchmark tool (shipped in the `bench-tools` crate).
+See [bench/README.md](../bench/README.md) for end-to-end usage; the
+per-subcommand surface is documented inline via `loadgen --help`.
 
 Subcommands:
 
@@ -349,3 +349,25 @@ Subcommands:
   `--duration`).
 
 All modes emit a stable JSON report to stdout, or to `--report-json <path>`.
+
+---
+
+## `bench-echo`
+
+Workspace-internal echo backend (shipped in the `bench-tools` crate). The
+bench harness spawns it on a loopback port as the upstream for direct /
+yggdrasil / nginx legs. A native tokio implementation with `SO_REUSEPORT`
+fan-out, so the echo backend never becomes the bottleneck above the
+proxy under test.
+
+Subcommands:
+
+* `tcp <port>` — accept TCP connections and echo bytes back.
+* `udp <port>` — echo each datagram to its sender.
+
+Shared flags:
+
+* `--bind <host>` (default `127.0.0.1`).
+* `--workers <N>` — number of independent listener sockets bound via
+  `SO_REUSEPORT`. Defaults to available_parallelism so the kernel can
+  spread load across cores.

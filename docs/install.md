@@ -30,10 +30,11 @@ You'll get three release binaries under `target/release/`:
 | --------------- | --------------------- | -------------------------------------------------------- |
 | `yggdrasil`     | every chain node      | The chain daemon. Same binary in relay or terminal mode.  |
 | `yggdrasilctl`  | every chain node      | Admin CLI: `local`, `chain`, and `identity` scopes.       |
-| `loadgen`       | (only on bench hosts) | UDP/TCP load generator used by [bench/](../bench/).      |
+| `loadgen`       | (only on bench hosts) | UDP/TCP load generator used by [bench/](../bench/). Built by `cargo build -p bench-tools`. |
+| `bench-echo`    | (only on bench hosts) | Native TCP/UDP echo backend used by [bench/](../bench/). Built by `cargo build -p bench-tools`. |
 
-`loadgen` is build-time-only for the benchmark harness; you don't need
-to install it on production hosts.
+`loadgen` and `bench-echo` are build-time-only for the benchmark harness;
+you don't need to install them on production hosts.
 
 ## Filesystem layout
 

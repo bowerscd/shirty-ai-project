@@ -145,26 +145,34 @@ bench_mktempdir() {
 
 # ---------- echo servers ----------
 #
-# We use minimal Python echo servers because they're trivial to write and the
-# bench is bottlenecked by the proxy under test, not the echo backend.
-# For pure throughput (where the echo CAN become the bottleneck) the per-
-# scenario script can swap to a Rust echo via `bench/_helpers/echo`.
+# We use the native `bench-echo` Rust binary so the backend is never the
+# scenario's bottleneck. It binds N listener sockets via SO_REUSEPORT
+# (defaults to available_parallelism()) so the kernel can spread the
+# load across cores — matching what a "real" upstream service would do.
+
+bench_echo_binary() {
+    local root
+    root="$(bench_workspace_root)"
+    local bin="$root/target/release/bench-echo"
+    [[ -x "$bin" ]] || die "missing $bin — run: cargo build --release -p bench-tools"
+    printf '%s' "$bin"
+}
 
 # Spawn a UDP echo on 127.0.0.1:$port. Writes PID into named var.
 bench_spawn_udp_echo() {
     local __pidvar="$1" port="$2" logfile="$3"
-    local script
-    script="$(bench_workspace_root)/bench/lib/echo_udp.py"
-    bench_spawn "$__pidvar" "$logfile" -- python3 "$script" "$port"
+    local bin
+    bin="$(bench_echo_binary)"
+    bench_spawn "$__pidvar" "$logfile" -- "$bin" udp "$port"
     bench_wait_listen_udp 127.0.0.1 "$port" 3
 }
 
 # Spawn a TCP echo on 127.0.0.1:$port. Writes PID into named var.
 bench_spawn_tcp_echo() {
     local __pidvar="$1" port="$2" logfile="$3"
-    local script
-    script="$(bench_workspace_root)/bench/lib/echo_tcp.py"
-    bench_spawn "$__pidvar" "$logfile" -- python3 "$script" "$port"
+    local bin
+    bin="$(bench_echo_binary)"
+    bench_spawn "$__pidvar" "$logfile" -- "$bin" tcp "$port"
     bench_wait_listen_tcp 127.0.0.1 "$port" 3
 }
 
@@ -388,7 +396,7 @@ bench_run_loadgen() {
     local root
     root="$(bench_workspace_root)"
     local lg="$root/target/release/loadgen"
-    [[ -x "$lg" ]] || die "missing $lg — run: cargo build --release -p loadgen"
+    [[ -x "$lg" ]] || die "missing $lg — run: cargo build --release -p bench-tools"
     log "loadgen subject=$subject out=$(basename "$out") args: $*"
     "$lg" --subject "$subject" --report-json "$out" "$@"
 }

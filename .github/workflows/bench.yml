@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: build release artifacts
-        run: cargo build --release -p yggdrasil -p yggdrasilctl -p loadgen
+        run: cargo build --release -p yggdrasil -p yggdrasilctl -p bench-tools
 
       - name: run full bench matrix
         run: bench/run-all.sh

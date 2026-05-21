@@ -10,6 +10,7 @@ nginx is the only widely-deployed L4 reverse proxy with comparable feature surfa
 | ----------------- | ---------------- | ------------------------ |
 | `tcp-throughput`  | bytes/sec        | **−10 %**                |
 | `tcp-connrate`    | conns/sec        | **−25 %**                |
+| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× nginx**          |
 | `udp-pps`         | pkts/sec         | **−20 %**                |
 | `udp-flows`       | pkts/sec         | **−20 %**                |
 | `udp-flowchurn`   | new-flows/sec    | **−20 %**                |
@@ -52,7 +53,7 @@ sudo sysctl -w net.ipv4.tcp_tw_reuse=1
 
 ```bash
 # Build once, then run the full matrix.
-cargo build --release -p yggdrasil -p yggdrasilctl -p loadgen
+cargo build --release -p yggdrasil -p yggdrasilctl -p bench-tools
 bench/run-all.sh
 ```
 
@@ -98,6 +99,7 @@ Exit codes:
 | `tcp-latency.sh`     | direct, yggdrasil, nginx  | TCP ping-pong p50/p99/p99.9                                     |
 | `tcp-throughput.sh`  | direct, yggdrasil, nginx  | bulk TCP MB/s with a handful of streams                         |
 | `tcp-connrate.sh`    | direct, yggdrasil, nginx  | TCP handshake rate (connect + close)                            |
+| `tcp-idle-conns.sh`  | direct, yggdrasil, nginx  | proxy PSS while holding N idle TCP conns (per-conn memory cost) |
 | `reload-latency.sh`  | yggdrasil, nginx          | time from "config dropped" to "new listener serves a request"   |
 
 A future `heartbeat-roundtrip.sh` (yggdrasil-only — nginx has no analogous heartbeat) is tracked under Phase 12.
@@ -106,7 +108,10 @@ A future `heartbeat-roundtrip.sh` (yggdrasil-only — nginx has no analogous hea
 
 For each non-direct subject, the harness:
 
-1. Spawns a Python echo (`bench/lib/echo_{udp,tcp}.py`) on `127.0.0.1:<echo_port>`.
+1. Spawns the native `bench-echo` Rust binary on `127.0.0.1:<echo_port>`.
+   By default it binds one listener per core via `SO_REUSEPORT`, so the
+   backend has plenty of headroom and never bottlenecks the proxy under
+   test.
 2. Renders a fresh config + identity into a `mktemp -d` workspace:
    - **yggdrasil**: spins two `yggdrasil` daemons on loopback — a
      gateway (accept-mode) and a terminal (dial-mode). Identities are
@@ -124,7 +129,6 @@ For each non-direct subject, the harness:
 
 ## Known caveats
 
-- The Python echo is single-threaded — it can become the bottleneck above ~150 k pps. For absolute-ceiling testing, swap in a Rust echo and re-run; the harness will still produce comparable yggdrasil-vs-nginx numbers because both go through the same backend.
 - 127.0.0.1 loopback bypasses the NIC entirely, so we are measuring per-packet overhead, scheduling, and userspace cost — *not* anything network-stack-bound. To exercise the NIC, replace `127.0.0.1` targets with a host on a separate kernel and rerun.
 - nginx's per-config-reload cost includes a full worker fork; yggdrasil's includes filesystem inotify debounce. Both are realistic for their respective hot-reload models, but the absolute numbers are not directly comparable beyond an order-of-magnitude.
 - `bench/collect-env.sh` records governor + sysctls but does **not** refuse to run on a misconfigured host. Check `env.json` before trusting the numbers.

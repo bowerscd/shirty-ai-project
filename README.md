@@ -148,7 +148,7 @@ ssh -p 2222 user@vps.example.net
 | `yggdrasil`     | bin `yggdrasil` (daemon)            | The proxy / chain node. Same binary in relay or terminal. |
 | `yggdrasilctl`  | bin `yggdrasilctl`                  | Admin CLI. Three scopes: `local`, `chain`, `identity`.    |
 | `ratatoskr`     | (lib only)                          | Shared protocol types, wire format, Noise_IK auth.        |
-| `loadgen`       | bin `loadgen` (workspace-internal)  | UDP/TCP load generator used by [bench/](bench/README.md). |
+| `bench-tools`   | bins `loadgen`, `bench-echo` (workspace-internal) | Helpers used by [bench/](bench/README.md): UDP/TCP load generator and a native echo backend. |
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 

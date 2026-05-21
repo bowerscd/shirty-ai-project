@@ -33,7 +33,7 @@ The auxiliary binaries are:
   `validate`.
 * **ratatoskr** — shared library. Wire format, Noise_IK auth, control-plane
   message types, rule schema, predicate schema, chain query envelopes.
-* **loadgen** — benchmark generator under [bench/](../bench/).
+* **bench-tools** — benchmark helper binaries (`loadgen`, `bench-echo`) used by the harness under [bench/](../bench/).
 
 The metaphor is a navigation aid, not load-bearing: yggdrasil is the tree,
 ratatoskr is the squirrel who runs messages up and down it.
@@ -461,7 +461,7 @@ plus `yggdrasilctl chain {apply,summary,health,ping,diff}` and offline
 | `ratatoskr`     | (lib only)                          | shared types + crypto  |
 | `yggdrasil`     | bin `yggdrasil` + lib               | depends on `ratatoskr` |
 | `yggdrasilctl`  | bin `yggdrasilctl`                  | depends on `ratatoskr` |
-| `loadgen`       | bin `loadgen` (workspace-internal)  | depends on nothing     |
+| `bench-tools`   | bins `loadgen`, `bench-echo` (workspace-internal) | depends on nothing     |
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency. The
 `snow` crate uses pure-Rust X25519/ChaCha20-Poly1305/BLAKE2s

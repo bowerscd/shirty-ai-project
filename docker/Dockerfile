@@ -23,7 +23,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ratatoskr/Cargo.toml       crates/ratatoskr/Cargo.toml
 COPY crates/yggdrasil/Cargo.toml       crates/yggdrasil/Cargo.toml
 COPY crates/yggdrasilctl/Cargo.toml    crates/yggdrasilctl/Cargo.toml
-COPY crates/loadgen/Cargo.toml         crates/loadgen/Cargo.toml
+COPY crates/bench-tools/Cargo.toml     crates/bench-tools/Cargo.toml
 
 # Stub sources for the dep-cache layer. cargo builds and caches all deps
 # against these placeholders; the next stage replaces the sources and
@@ -32,7 +32,7 @@ COPY crates/loadgen/Cargo.toml         crates/loadgen/Cargo.toml
 # Crates declaring `[[bench]]` (harness=false) also need a stub bench
 # source file or cargo refuses to parse the manifest.
 RUN set -eux; \
-    for crate in ratatoskr loadgen; do \
+    for crate in ratatoskr bench-tools; do \
         mkdir -p crates/$crate/src; \
         echo "pub fn _stub() {}" > crates/$crate/src/lib.rs; \
     done; \

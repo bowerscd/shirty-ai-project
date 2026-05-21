@@ -1,6 +1,6 @@
 [package]
-name        = "loadgen"
-description = "TCP/UDP load generator for yggdrasil end-to-end benchmarks"
+name        = "bench-tools"
+description = "Workspace-internal binaries used by the yggdrasil benchmark harness (loadgen, bench-echo)"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -10,6 +10,10 @@ repository.workspace   = true
 [[bin]]
 name = "loadgen"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench-echo"
+path = "src/bin/echo.rs"
 
 [dependencies]
 tokio        = { workspace = true }
@@ -21,3 +25,4 @@ serde_json   = { workspace = true }
 hdrhistogram = { workspace = true }
 humantime-serde = { workspace = true }
 humantime    = { workspace = true }
+socket2      = { workspace = true }

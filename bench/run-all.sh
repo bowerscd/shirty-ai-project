@@ -12,8 +12,8 @@ source "$HERE/lib/common.sh"
 ensure_results_dir
 
 root="$(bench_workspace_root)"
-log "building release artifacts (yggdrasil, yggdrasilctl, loadgen)…"
-( cd "$root" && cargo build --release -p yggdrasil -p yggdrasilctl -p loadgen ) >&2
+log "building release artifacts (yggdrasil, yggdrasilctl, bench-tools)…"
+( cd "$root" && cargo build --release -p yggdrasil -p yggdrasilctl -p bench-tools ) >&2
 
 log "capturing host env"
 "$HERE/collect-env.sh"
@@ -25,6 +25,7 @@ declare -a SCENARIOS=(
     tcp-latency
     tcp-throughput
     tcp-connrate
+    tcp-idle-conns
     reload-latency
 )
 
