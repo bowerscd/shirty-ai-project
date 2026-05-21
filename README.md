@@ -99,7 +99,7 @@ sudo tee /etc/yggdrasil/conf.d/ssh.toml >/dev/null <<'EOF'
 name          = "ssh"
 listen        = "0.0.0.0:2222"
 protocol      = "tcp"
-upstream_addr = "127.0.0.1:22"
+target_addr = "127.0.0.1:22"
 EOF
 ```
 

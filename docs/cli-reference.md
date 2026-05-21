@@ -84,7 +84,7 @@ mode the heartbeat- and downstream-related fields are suppressed.
 
 ### `local rules list`
 
-Print loaded rules with their listen sockets and resolved upstream
+Print loaded rules with their listen sockets and resolved target
 targets.
 
 ### `local rules reload`
@@ -92,12 +92,38 @@ targets.
 Force a re-scan of `[server].rules_dir`. The inotify watcher already
 handles most cases — use this when the filesystem stack doesn't deliver
 events (NFS, some FUSE filesystems, container bind mounts on macOS).
+Blocks until the rule supervisor has swapped in the new set and returns
+the post-swap rule count; subsequent `local rules list` / `local status`
+calls observe the new ruleset without a follow-up RTT.
 
-### `local certs list`
+### `local metrics`
 
-Removed. Cert-store summary is now folded into `local status`: when at
-least one HTTPS rule is loaded, `status` prints a single
-`cert: <path> (loaded Xs ago); ephemeral certs: N` line.
+Emit the Prometheus text-format scrape body (`# HELP … / # TYPE … / …`)
+over the UDS. Operators who scrape over TCP run a thin UDS→HTTP scrape
+adapter sidecar.
+
+### `local health`
+
+Three-tier liveness/readiness summary (`healthy` / `degraded` /
+`down` / `starting`). With `--json`, returns the structured report; without,
+a one-line summary. Exit codes: `0` healthy/starting, `1` degraded,
+`2` down, `3` RPC error. Suitable for `systemd` HEALTHCHECK / k8s exec
+probes.
+
+### `local derived-rules`
+
+JSON snapshot of the daemon's current derived rule set plus the chain
+identity / predicate version that produced it. Equivalent to the data
+that backs `chain diff` per hop. Loopback-only by virtue of running over
+the UDS.
+
+### `local trace <DIRECTIVE> | --reset`
+
+Hot-reload the daemon's `tracing` filter directive (the same syntax
+accepted by `RUST_LOG`). Exactly one of `<DIRECTIVE>` or `--reset`
+must be supplied; clap enforces XOR. The daemon stores its boot-time
+default and `--reset` restores it. The active and default directives
+are echoed in the response so scripts can confirm what's now in force.
 
 ### `local accept show`
 
@@ -116,26 +142,18 @@ accepted.
 
 | Positional        | Notes                                                                                |
 | ----------------- | ------------------------------------------------------------------------------------ |
-| `<fingerprint>`   | Full BLAKE2s-128 fingerprint (32 hex chars) shown by `downstream pending`, or any unique 8+-hex-char prefix. The daemon disambiguates against the staged queue; ambiguous prefixes return `error_codes::AMBIGUOUS_FINGERPRINT` listing every match. |
+| `<fingerprint>`   | Full BLAKE2s-128 fingerprint (32 hex chars) shown by `accept pending`, or any unique 8+-hex-char prefix. The daemon disambiguates against the staged queue; ambiguous prefixes return `error_codes::AMBIGUOUS_FINGERPRINT` listing every match. |
 
 ---
 
 ## `yggdrasilctl chain <cmd>` — chain-control plane commands
 
-### `chain tunnel open --pubkey <PK> --dest <HOST:PORT>`
-
-Open a one-shot bidirectional chain tunnel to `dest` at `pubkey`, then
-splice it against this process's stdin/stdout. Exits when either stdin
-closes or the peer closes the tunnel.
-
-| Flag        | Type           | Notes                                                                                                       |
-| ----------- | -------------- | ----------------------------------------------------------------------------------------------------------- |
-| `--pubkey`  | tagged pubkey  | Target node where the tunnel terminates. May be any node along the chain — the daemon's tunnel forwarder routes onward until the pubkey matches. |
-| `--dest`    | `host:port`    | Destination socket the terminator should dial after the tunnel arrives. In v1, tunnel destination policy is loopback-only. |
-
-Useful for `ssh -o ProxyCommand='yggdrasilctl chain tunnel open --pubkey
-… --dest …'` style wiring, or for one-shot pipelines like `echo PAYLOAD
-| yggdrasilctl chain tunnel open …`.
+Every `chain` subcommand walks the chain via a single
+`Request::ChainSummary` RPC over the control UDS; the daemon fans out
+upstream via the chain control plane, aggregates per-hop replies, and
+returns them in one response. All commands accept `--timeout <DURATION>`
+(default `5s`) as the end-to-end deadline for the walk; local-only
+replies (no `[dial]`) return synchronously and effectively ignore it.
 
 ### `chain apply --file <PATH>`
 
@@ -155,18 +173,49 @@ Terminal mode only. Relay-mode daemons return
 On success, the predicate publisher emits a fresh `PredicateSetUpdate`
 on its next tick (if `[dial]` is set).
 
+### `chain summary`
+
+One-line-per-hop overview of the chain (index, role, pubkey, uptime,
+rule count, predicate count, predicate version). "What's my chain?"
+
+| Flag        | Type        | Default | Notes                                                                                            |
+| ----------- | ----------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `--timeout` | `humantime` | `5s`    | End-to-end deadline for the upstream walk. Partial replies are flagged with a trailing `note:`. |
+
+With `--json`, the same data is emitted as a structured `SummaryReport`.
+
+### `chain health`
+
+Per-hop health tier (`healthy` / `degraded` / `down` / `starting`),
+aggregated to a chain-wide worst-of-hops verdict. Exit code reflects the
+worst hop: `0` healthy/starting, `1` degraded, `2` down, `3` RPC error.
+
+| Flag        | Type        | Default | Notes                                              |
+| ----------- | ----------- | ------- | -------------------------------------------------- |
+| `--timeout` | `humantime` | `5s`    | End-to-end deadline for the upstream walk.        |
+
+### `chain ping [--hop <PUBKEY>]`
+
+Per-hop control-plane round-trip time. Re-uses the `ChainSummary` RPC
+and projects each hop's `query_rtt_ms`. The local hop reports `rtt=-`
+(no RTT applies — it's the responder itself); every upstream hop is
+RTT-stamped by its parent as the recursive query bubbles back. Useful
+for isolating "slow link" vs. "unreachable hop" during a chain incident.
+
+| Flag        | Type           | Default | Notes                                                                                |
+| ----------- | -------------- | ------- | ------------------------------------------------------------------------------------ |
+| `--timeout` | `humantime`    | `5s`    | End-to-end deadline for the upstream walk.                                          |
+| `--hop`     | tagged pubkey  | unset   | If set, restrict rendered output to the single hop matching this `x25519:<hex>`. The whole chain is still walked. |
+
 ### `chain diff`
 
 Walk the chain upward from the local node and surface drift between
 each terminal's published predicate set and what each upstream hop
-actually accepted. Each hop is reached over a chain tunnel to its
-loopback `/internal/derived-rules` HTTP endpoint.
+actually accepted.
 
-| Flag                | Type        | Default | Notes                                                                                                                   |
-| ------------------- | ----------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `--metrics-port`    | u16         | `9090`  | Port on each node's loopback where the metrics listener is bound. Assumed identical on every hop.                       |
-| `--max-hops`        | usize       | `8`     | Walk depth cap. A chain deeper than 8 is unusual; tune up only if you've explicitly designed one.                       |
-| `--per-hop-timeout` | `humantime` | `5s`    | Per-fetch deadline. Overall walk time is bounded by `max_hops * per_hop_timeout`.                                       |
+| Flag        | Type        | Default | Notes                                              |
+| ----------- | ----------- | ------- | -------------------------------------------------- |
+| `--timeout` | `humantime` | `5s`    | End-to-end deadline for the upstream walk.        |
 
 Exit codes: `0` if every hop is in sync (or all `Predicates::None` /
 origin-mismatch sentinels are documented expected drift), `1` if drift
@@ -226,21 +275,23 @@ mode 0600.
 
 ### `identity export-request [--identity-file <PATH>] [--out PATH] [--note STR]`
 
-Emit an request file (this node advertising itself as a downstream
-candidate). Defaults to `./request.txt`. The request contains the local
+Emit a request file (this node advertising itself as a downstream
+candidate). When `--out` is supplied, writes there; when omitted, the
+TOML body is written to stdout and the metadata header to stderr
+(metadata is silenced under `--json`). The request contains the local
 pubkey + fingerprint + operator note. Not a secret.
 
 ### `identity add-accept --from <REQUEST> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
 
-Apply an request file received from a prospective downstream. Writes
+Apply a request file received from a prospective downstream. Writes
 `[accept].pubkey = <downstream-pubkey>` into the daemon
-config and emits an grant file (default `./grant.txt`) containing
+config and emits a grant file (default `./grant.txt`) containing
 both pubkeys plus `my_endpoint`. Hand-deliver the grant back to the
 downstream.
 
 ### `identity add-dial --from <GRANT> [--identity-file <PATH>]`
 
-Apply an grant file received from an upstream. Verifies the grant's
+Apply a grant file received from an upstream. Verifies the grant's
 `dial_pubkey` matches the local identity (catches "wrong grant
 file" mistakes), then writes `[dial]` into the daemon config:
 the upstream's pubkey + endpoint.
@@ -254,6 +305,28 @@ against a new upstream.
 
 Remove `[accept]` from the daemon config. The next downstream
 that handshakes lands in the pending-peer TOFU store.
+
+---
+
+## `yggdrasilctl validate` — offline config + rule validation
+
+Parse `--config` and load every `*.toml` under `--rules-dir` (overrides
+`[server].rules_dir` from the config), running the daemon's own loaders
+and validators. Does not contact a running daemon. Suitable for CI
+pipelines and pre-deploy smoke checks.
+
+| Flag           | Default                      | Notes                                                                                  |
+| -------------- | ---------------------------- | -------------------------------------------------------------------------------------- |
+| `--config`     | `/etc/yggdrasil/config.toml` | (global flag) Path to the server config to parse.                                      |
+| `--rules-dir`  | (value from config)          | Override `[server].rules_dir` for the validation pass. Useful when validating a candidate rules tree without touching the deployed config. |
+
+Exit codes:
+
+| Exit | Meaning                                                                          |
+| ---- | -------------------------------------------------------------------------------- |
+| 0    | Config + rules both parse and validate cleanly.                                  |
+| 2    | Config parse or validation error. Path + line context written to stderr.        |
+| 3    | One or more rule files failed to parse or validate. Each error names the file. |
 
 ---
 

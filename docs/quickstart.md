@@ -44,12 +44,6 @@ Both pubkeys are public — copy them around freely. The secrets stay in
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
 
-[metrics]
-listen = "127.0.0.1:9090"
-
-[control]
-socket = "/run/yggdrasil/control.sock"
-
 [accept]
 listen = "0.0.0.0:51820"
 EOF
@@ -65,12 +59,6 @@ the next step.
 ```bash
 sudo tee /etc/yggdrasil/config.toml >/dev/null <<'EOF'
 [server]
-
-[metrics]
-listen = "127.0.0.1:9090"
-
-[control]
-socket = "/run/yggdrasil/control.sock"
 EOF
 ```
 
@@ -109,9 +97,9 @@ sudo yggdrasilctl identity add-accept \
     --out /tmp/home.grant
 # updated /etc/yggdrasil/config.toml: [accept].pubkey
 # wrote grant file
-#   upstream_pubkey:   x25519:6c5a30bb...0ff1
-#   dial_pubkey: x25519:9d2f04a3...4b7c
-#   endpoint:          vps.example.net:51820
+#   dial_pubkey:       x25519:6c5a30bb...0ff1
+#   dial_fingerprint:  9d2f04a34b7c...
+#   accept_endpoint:   vps.example.net:51820
 ```
 
 Copy the grant back to the home box:
@@ -153,7 +141,7 @@ sudo tee /etc/yggdrasil/conf.d/ssh.toml >/dev/null <<'EOF'
 name          = "ssh"
 listen        = "0.0.0.0:2222"
 protocol      = "tcp"
-upstream_addr = "127.0.0.1:22"
+target_addr = "127.0.0.1:22"
 EOF
 ```
 
@@ -233,13 +221,13 @@ sudo tee /etc/yggdrasil/conf.d/minecraft.toml >/dev/null <<'EOF'
 name          = "minecraft-java"
 listen        = "0.0.0.0:25565"
 protocol      = "tcp"
-upstream_addr = "127.0.0.1:25565"
+target_addr = "127.0.0.1:25565"
 
 [[rule]]
 name          = "minecraft-bedrock"
 listen        = "0.0.0.0:19132"
 protocol      = "udp"
-upstream_addr = "127.0.0.1:19132"
+target_addr = "127.0.0.1:19132"
 idle_timeout  = "120s"
 EOF
 ```

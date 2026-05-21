@@ -40,11 +40,12 @@ Mode is derived from section presence:
 * `[dial]` + `[accept]` => `relay` (mid-chain relay)
 * neither => invalid config
 
-### `[metrics]` — optional
-
-| Key      | Type        | Default            | Notes                                                                                              |
-| -------- | ----------- | ------------------ | -------------------------------------------------------------------------------------------------- |
-| `listen` | `host:port` | `127.0.0.1:9090`   | Prometheus `/metrics` + `/healthz` + `/readyz` + (loopback-only) `/internal/derived-rules`.        |
+There is no `[metrics]` section. Prometheus text, `/healthz`-equivalent
+status, and derived-rule snapshots are served on the control UDS via
+`yggdrasilctl local metrics` / `local health` / `local derived-rules`.
+Operators who scrape Prometheus over TCP run a thin UDS→HTTP scrape
+adapter sidecar (`socat UNIX-CONNECT:/run/yggdrasil/control.sock …` is
+enough).
 
 ### `[control]` — optional
 
@@ -83,12 +84,6 @@ session. Presence of `[accept]` makes the effective mode `relay`.
 ```toml
 [server]
 
-[metrics]
-listen = "127.0.0.1:9090"
-
-[control]
-socket = "/run/yggdrasil/control.sock"
-
 [accept]
 listen = "0.0.0.0:51820"
 pubkey = "x25519:9d2f04a3...4b7c"
@@ -98,12 +93,6 @@ pubkey = "x25519:9d2f04a3...4b7c"
 
 ```toml
 [server]
-
-[metrics]
-listen = "127.0.0.1:9090"
-
-[control]
-socket = "/run/yggdrasil/control.sock"
 
 [dial]
 pubkey   = "x25519:6c5a30bb...0ff1"
@@ -152,11 +141,11 @@ one unified rule set with global uniqueness checks.
 | `name`           | string                     | ✓   | ✓   | ✓     | **required**  | Globally unique across all rule files. No whitespace or control characters.                                        |
 | `listen`         | `host:port`                | ✓   | ✓   | ✓     | **required**  | Listen socket. `port` must be non-zero. Globally unique by `(ip, port, protocol)`.                                 |
 | `protocol`       | `"tcp"`/`"udp"`/`"https"`  | ✓   | ✓   | ✓     | **required**  | Determines whether this is a TCP listener, a UDP receiver, or the HTTPS L7 frontend.                                |
-| `upstream_port`  | u16                        | ✓   | ✓   | —     | one of these  | Relay mode. Port on the residential host. The IP comes from the heartbeat. Mutually exclusive with `upstream_addr` and `upstream_host`. |
-| `upstream_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. Literal upstream socket address. Mutually exclusive with `upstream_port` and `upstream_host`.       |
-| `upstream_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. DNS-resolved upstream. Re-resolves periodically; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `upstream_port` and `upstream_addr`. |
+| `target_port`  | u16                        | ✓   | ✓   | —     | one of these  | Relay mode. Port on the residential host. The IP comes from the heartbeat. Mutually exclusive with `target_addr` and `target_host`. |
+| `target_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. Literal upstream socket address. Mutually exclusive with `target_port` and `target_host`.       |
+| `target_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. DNS-resolved upstream. Re-resolves periodically; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `target_port` and `target_addr`. |
 | `idle_timeout`   | `humantime`                | —   | ✓   | —     | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP / HTTPS rules.            |
-| `proxy_protocol` | `"v1"`/`"v2"`              | ✓   | —   | —     | absent        | TCP relay rules only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and on terminal-mode rules (`upstream_addr` / `upstream_host`). |
+| `proxy_protocol` | `"v1"`/`"v2"`              | ✓   | —   | —     | absent        | TCP relay rules only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and on terminal-mode rules (`target_addr` / `target_host`). |
 | `cert_dir`       | path                       | —   | —   | ✓     | inherits from `[server]` | HTTPS only. Per-rule override of the convention cert directory.                                          |
 | `[[rule.route]]` | table                      | —   | —   | ✓     | **required**  | HTTPS only. One entry per virtual host — see the HTTPS section below.                                              |
 
@@ -172,7 +161,7 @@ applying a broken update.
 name          = "ssh"
 listen        = "0.0.0.0:2222"
 protocol      = "tcp"
-upstream_addr = "127.0.0.1:22"
+target_addr = "127.0.0.1:22"
 ```
 
 ```toml
@@ -181,20 +170,20 @@ upstream_addr = "127.0.0.1:22"
 name          = "minecraft-java"
 listen        = "0.0.0.0:25565"
 protocol      = "tcp"
-upstream_host = "minecraft.lan:25565"
+target_host = "minecraft.lan:25565"
 
 [[rule]]
 name          = "minecraft-bedrock"
 listen        = "0.0.0.0:19132"
 protocol      = "udp"
-upstream_addr = "192.168.1.20:19132"
+target_addr = "192.168.1.20:19132"
 idle_timeout  = "120s"
 
 [[rule]]
 name          = "wireguard"
 listen        = "0.0.0.0:51821"
 protocol      = "udp"
-upstream_addr = "127.0.0.1:51820"
+target_addr = "127.0.0.1:51820"
 idle_timeout  = "300s"
 ```
 
@@ -207,7 +196,7 @@ idle_timeout  = "300s"
 name          = "printer"
 listen        = "0.0.0.0:9100"
 protocol      = "tcp"
-upstream_host = "printer.lan:9100"
+target_host = "printer.lan:9100"
 ```
 
 ### Relay-mode rules
@@ -215,7 +204,7 @@ upstream_host = "printer.lan:9100"
 Relay-mode rules are normally produced by the predicate publisher on the
 downstream terminal and applied to the relay's supervisor via the chain
 plane — operators do not hand-author them. They look the same in
-TOML, with `upstream_port` (no host; the IP is filled in at runtime from
+TOML, with `target_port` (no host; the IP is filled in at runtime from
 the heartbeat):
 
 ```toml
@@ -224,7 +213,7 @@ the heartbeat):
 name          = "ssh"
 listen        = "0.0.0.0:2222"
 protocol      = "tcp"
-upstream_port = 22
+target_port = 22
 ```
 
 ### HTTPS rules
@@ -255,14 +244,14 @@ protocol = "https"
 
   [[rule.route]]
   hostname = "api.example.com"
-  upstream = "http://10.0.0.10:8080"
+  target   = "http://10.0.0.10:8080"
   cert     = "/etc/yggdrasil/certs/api.example.com.crt"
   key      = "/etc/yggdrasil/certs/api.example.com.key"
   hsts     = true
 
   [[rule.route]]
   hostname = "app.example.com"
-  upstream = "http://10.0.0.11:3000"
+  target   = "http://10.0.0.11:3000"
   # No explicit cert — falls through to the cert_dir convention or the default cert.
 ```
 

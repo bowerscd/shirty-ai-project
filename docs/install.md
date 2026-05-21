@@ -83,8 +83,8 @@ Wants=network-online.target
 
 [Service]
 # `notify` (paired with sd_notify(READY=1) in yggdrasil) means `is-active`
-# reports `active` only after the metrics exporter, chain listener (if any),
-# proxy supervisor, and control socket have all bound — not just after the
+# reports `active` only after the chain listener (if any), proxy
+# supervisor, and control socket have all bound — not just after the
 # process forked. Dependent units therefore order correctly.
 Type=notify
 NotifyAccess=main
@@ -139,12 +139,12 @@ Inbound:
 * UDP for `[accept].listen` from the open internet — downstreams
   can roam, so you can't tighten this to a single IP.
 * TCP / UDP for every derived `listen` port from the chain.
-* Nothing for the control socket — it's `AF_UNIX`, not a TCP port.
-* Metrics listener should bind loopback (default) and be reached either
-  via `127.0.0.1:9090` directly or through a chain tunnel from a peer.
+* Nothing for the control socket — it's `AF_UNIX`, not a TCP port. The
+  daemon does not bind an HTTP metrics listener; Prometheus is served
+  over the same UDS via `yggdrasilctl local metrics`.
 
 Outbound: yggdrasil needs to reach the downstream's current IP for each
-derived rule's `upstream_port`. Most cloud firewalls allow all outbound
+derived rule's `target_port`. Most cloud firewalls allow all outbound
 by default.
 
 ### Mid-chain relay

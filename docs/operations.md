@@ -20,24 +20,28 @@ Pipe through `jq` for human-friendly inspection:
 sudo journalctl -u yggdrasil --output=cat | jq -r 'select(.level=="warn" or .level=="error")'
 ```
 
-### Liveness / readiness HTTP
+### Liveness / readiness
 
-The metrics listener serves three plain-HTTP endpoints alongside
-`/metrics`:
+The daemon does not expose an HTTP listener of its own; everything is
+served over the control UDS at `[control].socket`. The CLI surfaces
+three convenience commands on top of it:
 
-| Path                       | Returns                                                      | Use case                              |
-| -------------------------- | ------------------------------------------------------------ | ------------------------------------- |
-| `/`                        | Plain-text landing with endpoint list.                       | Discovery from a browser.             |
-| `/healthz`                 | `200 OK` if the daemon's main task hasn't aborted.           | Container liveness probe.             |
-| `/readyz`                  | `200 OK` once the proxy supervisor + chain client have come up. | Container readiness probe.         |
-| `/internal/derived-rules`  | JSON snapshot of the current derived rule set.               | Used by `yggdrasilctl chain diff`. Loopback-only. |
+| Command                              | Returns                                                              | Use case                                 |
+| ------------------------------------ | -------------------------------------------------------------------- | ---------------------------------------- |
+| `yggdrasilctl local health`          | Tiered verdict (`healthy` / `degraded` / `down` / `starting`). Exit code 0/1/2/3. | Container liveness/readiness probes.    |
+| `yggdrasilctl local metrics`         | Prometheus text exposition, identical to the legacy `/metrics`.       | Scrape via a UDS→HTTP adapter sidecar.   |
+| `yggdrasilctl local derived-rules`   | JSON snapshot of the current derived rule set + applied predicates.  | Used internally by `chain diff`; useful for ad-hoc inspection. |
 
-Example probe wired into systemd:
+Example systemd probe wired through the UDS:
 
 ```ini
 [Service]
-ExecStartPre=/bin/sh -c 'curl -fsS http://127.0.0.1:9090/healthz >/dev/null'
+ExecStartPre=/usr/bin/yggdrasilctl local health --quiet
 ```
+
+Operators who need TCP-reachable Prometheus front the UDS with a small
+adapter (`socat TCP-LISTEN:9090,fork EXEC:'yggdrasilctl local metrics'`,
+or a dedicated sidecar). There is no in-daemon HTTP listener to attack.
 
 ### Daemon-local quick checks
 
@@ -53,8 +57,8 @@ because terminals don't accept inbound chain traffic.
 
 ## Metrics inventory
 
-Every metric exposed by `/metrics`. Useful columns: type, labels,
-meaning.
+Every metric exposed by `yggdrasilctl local metrics`. Useful columns:
+type, labels, meaning.
 
 ### Daemon-wide
 
@@ -63,58 +67,43 @@ meaning.
 | `yggdrasil_build_info`                            | gauge   | `version`                       | Constant `1`. Used to join other metrics with the deployed build.       |
 | `yggdrasil_mode`                                  | gauge   | `mode` (`relay`/`terminal`)     | Constant `1`. Lets dashboards branch on mode.                          |
 | `yggdrasil_rules_loaded`                          | gauge   | (none)                          | Number of rules currently in the live rule set.                         |
+| `yggdrasil_https_routes`                          | gauge   | (none)                          | Number of `[[rule.route]]` entries currently loaded.                    |
 
 ### Chain heartbeat & enrollment
 
-| Metric                                            | Type    | Labels             | Notes                                                                       |
-| ------------------------------------------------- | ------- | ------------------ | --------------------------------------------------------------------------- |
-| `yggdrasil_handshakes_completed_total`            | counter | `role`             | Noise_IK handshakes completed. `role` is `initiator` or `responder`.        |
-| `yggdrasil_heartbeats_received_total`             | counter | (none)             | Inbound heartbeats accepted (replay-checked, replayed counters rejected).   |
-| `yggdrasil_last_heartbeat_timestamp_seconds`      | gauge   | (none)             | UNIX timestamp of the last accepted heartbeat. Inactive heartbeats freeze this value. |
-| `yggdrasil_peer_ip_changes_total`                 | counter | (none)             | Number of times the relay's view of the downstream IP changed.              |
-
-### Chain control plane (predicates & tunnels)
-
-| Metric                                            | Type    | Labels                                                              | Notes                                                       |
-| ------------------------------------------------- | ------- | ------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `yggdrasil_chain_predicate_push_total`            | counter | `outcome` (`ok`, `reject`, `timeout`, `skip_dedup`, `skip_oversize`, `encode_error`, `persist_error`, `unknown_body`, `channel_closed`, `client_down`, `publisher_timeout`) | Terminal-side: predicate publisher attempts. |
-| `yggdrasil_chain_predicate_recv_total`            | counter | `outcome`                                                           | Upstream-side: predicate accept-side outcomes.              |
-| `yggdrasil_chain_predicate_set_size_bytes`        | gauge   | (none)                                                              | Size of the most recently encoded `PredicateSetUpdate`.     |
-| `yggdrasil_chain_predicate_version`               | gauge   | (none)                                                              | Terminal-side: monotonically-increasing local set version.  |
-| `yggdrasil_chain_predicate_accepted_version`      | gauge   | (none)                                                              | Upstream-side: version of the last accepted update.          |
-| `yggdrasil_chain_tunnel_initiator_total`          | counter | `outcome`                                                           | `chain tunnel open` initiator-side outcomes.                 |
-| `yggdrasil_chain_tunnel_forwarder_total`          | counter | `outcome`                                                           | Mid-hop forwarder outcomes.                                  |
-| `yggdrasil_chain_tunnel_terminator_total`         | counter | `outcome`                                                           | Terminator-side outcomes (allow-list rejections live here). |
+| Metric                                            | Type    | Labels                              | Notes                                                                       |
+| ------------------------------------------------- | ------- | ----------------------------------- | --------------------------------------------------------------------------- |
+| `yggdrasil_handshakes_completed_total`            | counter | (none)                              | Noise_IK responder-side handshake completions.                              |
+| `yggdrasil_heartbeats_received_total`             | counter | `result` (`accepted`/`rejected`)    | Inbound heartbeats classified by replay/auth verdict.                       |
+| `yggdrasil_last_heartbeat_timestamp_seconds`      | gauge   | (none)                              | UNIX timestamp of the last accepted heartbeat. Inactive heartbeats freeze this value. |
+| `yggdrasil_peer_ip_changes_total`                 | counter | (none)                              | Number of times the relay's view of the downstream IP changed.              |
 
 ### Proxy
 
 | Metric                                            | Type      | Labels                          | Notes                                                                 |
 | ------------------------------------------------- | --------- | ------------------------------- | --------------------------------------------------------------------- |
-| `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | (none)                          | UDP flows torn down because the downstream IP changed under them.      |
-| `yggdrasil_udp_flows_rejected_total`              | counter   | `reason`                        | UDP flows rejected before insertion (capacity, malformed, etc.).      |
-| `yggdrasil_https_routes`                          | gauge     | (none)                          | Number of `[[rule.route]]` entries currently loaded.                    |
-| `yggdrasil_https_tls_handshakes_total`            | counter   | `outcome`                       | TLS handshake outcomes for HTTPS rules.                                |
-| `yggdrasil_https_cert_reload_total`               | counter   | `outcome`                       | Cert source rung reload outcomes (path / convention / default).        |
-
-### Metrics HTTP
-
-| Metric                                            | Type      | Labels                          | Notes                                                                 |
-| ------------------------------------------------- | --------- | ------------------------------- | --------------------------------------------------------------------- |
-| `yggdrasil_http_requests_total`                   | counter   | `endpoint`, `status`            | Requests against the metrics listener itself.                          |
-| `yggdrasil_http_request_duration_seconds`         | histogram | `endpoint`                      | Per-endpoint latency histogram.                                        |
+| `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | `rule`                          | UDP flows torn down because the downstream IP changed under them.      |
+| `yggdrasil_udp_flows_rejected_total`              | counter   | `rule`, `reason`                | UDP flows rejected before insertion (`cap`, etc.).                    |
+| `yggdrasil_https_tls_handshakes_total`            | counter   | `rule`, `result`                | TLS handshake outcomes for HTTPS rules.                                |
+| `yggdrasil_https_cert_reload_total`               | counter   | `route`, `result`               | Per-route cert source reload outcomes.                                 |
+| `yggdrasil_http_requests_total`                   | counter   | `rule`, `route`, …              | Requests routed by the HTTPS frontend.                                |
+| `yggdrasil_http_request_duration_seconds`         | histogram | `rule`, `route`                 | Per-route HTTPS request latency.                                       |
 
 ### Suggested alerts
 
-* `yggdrasil_handshakes_completed_total{role="responder"}` should not be
-  flat for more than `rekey_interval + 2 × heartbeat_interval` once a
-  downstream is enrolled.
+* `yggdrasil_handshakes_completed_total` should not be flat for more
+  than `rekey_interval + 2 × heartbeat_interval` once a downstream is
+  enrolled.
 * `time() - yggdrasil_last_heartbeat_timestamp_seconds > 30` on a relay
   means the downstream is offline.
-* `rate(yggdrasil_chain_predicate_push_total{outcome="ok"}[15m]) == 0`
-  combined with `rate(...{outcome!="ok"}[15m]) > 0` means the publisher
-  is failing — check tunnel reliability metrics next.
+* `rate(yggdrasil_heartbeats_received_total{result="rejected"}[5m]) > 0`
+  on a relay means inbound traffic is failing auth/replay checks —
+  investigate the journal.
 * `rate(yggdrasil_udp_flows_rejected_total[5m]) > 0` indicates capacity
   pressure or malformed inbound — investigate before it becomes user-visible.
+* `yggdrasilctl chain health` returning a non-zero exit code (run from
+  any hop) means at least one hop is `degraded` or `down`; pair with
+  `chain ping` to localise the slow/unreachable hop.
 
 ## Common runbook tasks
 
@@ -150,6 +139,11 @@ docker-desktop, FUSE filesystems with cached metadata):
 ```bash
 sudo yggdrasilctl local rules reload
 ```
+
+The reload command blocks until the supervisor has swapped to the new
+rule set and returns the post-swap rule count; a non-zero exit code
+means the new set failed validation and the daemon kept the previous
+one.
 
 To push a rule file **without** writing it to disk (e.g. dry runs from
 a deploy box), use `chain apply`:
@@ -275,6 +269,22 @@ immediate upstream and immediate downstream.
 
 ## Troubleshooting
 
+### Turning up verbose logging on a live daemon
+
+The daemon's `tracing` env-filter is hot-swappable via the control UDS;
+you don't need to restart it to chase a transient issue:
+
+```bash
+# Crank the proxy supervisor + chain client to debug for one investigation.
+sudo yggdrasilctl local trace 'yggdrasil::proxy=debug,yggdrasil::chain=debug'
+# When you're done, reset to the daemon's startup filter.
+sudo yggdrasilctl local trace --reset
+```
+
+Filter syntax matches `tracing-subscriber::EnvFilter`. The reset path
+restores whatever the daemon was originally launched with (typically
+the value of `YGGDRASIL_LOG`).
+
 ### "chain client handshake failed"
 
 The terminal can't complete Noise_IK against the configured upstream.
@@ -303,17 +313,18 @@ The relay shows a pending candidate but no `accept` is wired.
 * Confirm the file landed under `[server].rules_dir`, not elsewhere.
   `yggdrasilctl local rules list` on the terminal should show the new
   rules within ~250 ms.
-* Check the publisher push metric on the terminal — if the latest
-  outcome is `skip_oversize`, your rule set is too big for a single
-  `PredicateSetUpdate` (>16 KiB encoded). Split it across multiple
-  files isn't enough — they're merged before publishing. Reduce rule
-  count, shorten names, or drop unused rules.
-* Run `yggdrasilctl chain diff` to surface any drift.
+* Run `yggdrasilctl chain summary` to see each hop's rule + predicate
+  counts in one shot. Mismatches between adjacent hops are usually
+  predicate-push failures.
+* Run `yggdrasilctl chain diff` to surface any drift between
+  published and accepted predicate sets.
+* If a hop is unreachable, `yggdrasilctl chain ping` will isolate which
+  link is slow or down.
 
 ### "PROXY-protocol upstream sees the wrong client IP"
 
 `proxy_protocol = "v1"` / `"v2"` is **TCP relay-mode only**. On a
-terminal-mode rule (`upstream_addr` / `upstream_host`), the config
+terminal-mode rule (`target_addr` / `target_host`), the config
 validator rejects `proxy_protocol`. On a UDP or HTTPS rule, same — the
 validator rejects it.
 

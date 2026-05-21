@@ -96,7 +96,7 @@ you don't trust the transport.
 | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
 | Internet ↔ relay's public port      | Cleartext from the original client. The relay forwards it like any reverse proxy.                  |
 | Relay ↔ next hop ↔ … ↔ terminal     | Encrypted under Noise_IK + ChaCha20-Poly1305. Strict-monotonic replay window.                       |
-| Terminal ↔ application backend       | Cleartext from the terminal to `127.0.0.1` (or whatever `upstream_addr` / `upstream_host` resolves to). |
+| Terminal ↔ application backend       | Cleartext from the terminal to `127.0.0.1` (or whatever `target_addr` / `target_host` resolves to). |
 | `yggdrasilctl` ↔ daemon              | Unix domain socket, no encryption. Restrict via filesystem permissions.                              |
 
 The chain plane gives you confidentiality and integrity **only between
@@ -122,10 +122,6 @@ inside the relay is still part of your attack surface).
   handshake from a wrong static key is rejected.
 * **Pending-peer takeover.** Until an operator approves, a candidate's
   traffic is not forwarded — the boundary is your operator process.
-* **Rogue tunnel destinations.** In v1, tunnel destination policy is
-  loopback-only, which bounds what an upstream can ask the terminator to
-  dial. A `TunnelOpen` for `192.168.1.1:80` is rejected even if the
-  chain neighbour is legitimate.
 
 ## What yggdrasil does NOT protect against
 

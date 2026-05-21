@@ -4,9 +4,7 @@
 # home-chain, client-chain) and exercises:
 #
 #   1. predicate flow:  home publishes -> midbox derives -> traffic flows
-#   2. chain tunnel:    home -> midbox (forward) -> vps-chain (terminate)
-#                       through `yggdrasilctl chain tunnel open`
-#   3. chain diff:      `yggdrasilctl chain diff` from home, no drift
+#   2. chain diff:      `yggdrasilctl chain diff` from home, no drift
 #
 # Usage:
 #   ./tests/e2e/run-chain.sh                # build + run + verify + teardown

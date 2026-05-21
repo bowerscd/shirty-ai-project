@@ -27,11 +27,12 @@ derived from the `[dial]` / `[accept]` tables:
 
 The auxiliary binaries are:
 
-* **yggdrasilctl** — admin CLI. Three scopes: `local` (UDS, daemon-local
+* **yggdrasilctl** — admin CLI. Four scopes: `local` (UDS, daemon-local
   operations), `chain` (introspection across the chain), `identity`
-  (file-based identity + request/grant handshake).
+  (file-based identity + request/grant handshake), and offline
+  `validate`.
 * **ratatoskr** — shared library. Wire format, Noise_IK auth, control-plane
-  message types, rule schema, predicate schema, tunnel envelopes.
+  message types, rule schema, predicate schema, chain query envelopes.
 * **loadgen** — benchmark generator under [bench/](../bench/).
 
 The metaphor is a navigation aid, not load-bearing: yggdrasil is the tree,
@@ -50,22 +51,25 @@ clients |   yggdrasil     |   forwarded TCP / UDP             |   yggdrasil     
         +-----------------+                                   +-----------------+
             ^      ^
             |      |
-            |      +-- Prometheus /metrics + /readyz + /healthz +
-            |          loopback-only /internal/derived-rules
-            +-- yggdrasilctl over UDS
+            |      +-- yggdrasilctl over UDS:
+            |          status, rules, accept, metrics, health,
+            |          derived-rules, trace, chain {summary,health,ping,diff}
+            +-- (no separate metrics listener — UDS only)
 ```
 
 Both nodes bind:
 
 1. **Chain listener** (relay only, when `[accept]` is set). UDP.
    Carries Noise_IK-protected control frames — heartbeats, predicate pushes,
-   tunnel envelopes. No application bytes.
+   and recursive chain-summary queries. No application bytes.
 2. **Per-rule data-plane sockets**. Each rule (on the terminal: from
    `conf.d/*.toml`; on the relay: derived from the terminal's published
    predicate set) creates exactly one TCP listener or one UDP listener.
 3. **Unix control socket** (`[control].socket`). Talks to `yggdrasilctl`.
-4. **Metrics HTTP listener** (`[metrics].listen`). Prometheus + health +
-   `/internal/derived-rules`.
+   Also serves Prometheus text (`local metrics`), health summaries
+   (`local health`), and derived-rule snapshots (`local derived-rules`).
+   There is no separate HTTP listener; operators who scrape Prometheus
+   over TCP front the UDS with a small UDS→HTTP adapter.
 
 The terminal additionally maintains an outbound UDP connection (the **chain
 client**) to its `[dial]` endpoint, performs the Noise_IK
@@ -122,10 +126,12 @@ datagram; every ack is decoded with the matching `Session::decode_*`.
 
 Plaintext frame budget per datagram is
 `ratatoskr::wire::MAX_CONTROL_PLAINTEXT_LEN` (17 KiB), which accommodates
-the largest TunnelData payload (16 KiB) plus envelope overhead. The total
-UDP packet size, including preamble, counter, ciphertext, and AEAD tag,
-is `ratatoskr::wire::MAX_PACKET_LEN`. Buffers on production receive paths
-(heartbeat server, chain client) are sized to that constant.
+the largest control body (currently the recursive `ChainSummary` reply
+capped at 16 KiB by `chain_query::CHAIN_HOP_REPLY_MAX_WIRE_BYTES`) plus
+envelope overhead. The total UDP packet size, including preamble,
+counter, ciphertext, and AEAD tag, is `ratatoskr::wire::MAX_PACKET_LEN`.
+Buffers on production receive paths (heartbeat server, chain client) are
+sized to that constant.
 
 ### Replay protection
 
@@ -258,8 +264,8 @@ Plain async accept loop. On each new client connection:
 
 1. Resolve the dial target. Relay mode: snapshot
    `peer_state.current_ip()` (drop the socket immediately if `None`),
-   combine with `rule.upstream_port`. Terminal mode: read the rule's
-   `upstream_addr` or DNS-resolved `upstream_host` directly.
+   combine with `rule.target_port`. Terminal mode: read the rule's
+   `target_addr` or DNS-resolved `target_host` directly.
 2. Dial the target. Connection failures close the client without sending
    bytes (no leaked half-open).
 3. Optionally write a PROXY-protocol v1/v2 header so the upstream service
@@ -337,14 +343,13 @@ The chain plane is a Noise_IK-protected UDP control channel between
 adjacent nodes. It carries five frame body types defined as
 `ratatoskr::control_frame::ControlBodyType`:
 
-| Code | Body                | Direction          | Purpose                                                 |
-| ---- | ------------------- | ------------------ | ------------------------------------------------------- |
-| 0    | `Reserved`          | —                  | Wire reservation; never sent.                            |
-| 1    | `Noop`              | bi-directional     | Keep-alive / handshake test frame.                      |
-| 2    | `PredicateSetUpdate`| downstream → upstream | Terminal pushes a new `PredicateSet` to its upstream. |
-| 3    | `TunnelOpen`        | originator → terminator | Open a chain tunnel to `dest` at `target_pubkey`.   |
-| 4    | `TunnelData`        | bi-directional     | Forward bytes within an open tunnel stream.             |
-| 5    | `TunnelClose`       | bi-directional     | Half-close one direction of a tunnel stream.            |
+| Code | Body                 | Direction               | Purpose                                                       |
+| ---- | -------------------- | ----------------------- | ------------------------------------------------------------- |
+| 0    | `Reserved`           | —                       | Wire reservation; never sent.                                  |
+| 1    | `Noop`               | bi-directional          | Keep-alive / handshake test frame.                            |
+| 2    | `PredicateSetUpdate` | downstream → upstream   | Terminal pushes a new `PredicateSet` to its upstream.         |
+| 3    | `ChainHopQuery`      | downstream → upstream   | Recursive chain query (summary / health / derived-rules).     |
+| 4    | `ChainHopReply`      | upstream   → downstream | One reply per query, with a slice of `ChainHop` records.      |
 
 Each frame is acknowledged by the receiver. The reliability layer
 (`crates/yggdrasil/src/chain/reliability.rs`) sits between the Noise
@@ -372,90 +377,40 @@ ordered byte-channel above the per-datagram Noise layer.
     +-----------------+                                 |  RuleSet)       |
                                                         +-----------------+
 
-    +-----------------+    TunnelOpen / Data / Close    +-----------------+
-    | tunnel_         | -----------------------------> | tunnel_         |
-    | initiator       |                                 | forwarder       | (mid-chain)
-    | (originating    |                                 |   ||            |
-    |  yggdrasilctl)  |                                 |   v             |
-    +-----------------+                                 | tunnel_         |
-                                                        | terminator      | (target node)
-                                                        +-----------------+
+    +-----------------+        ChainHopQuery            +-----------------+
+    | control::       | ------------------------------> | chain/acceptor: |
+    | dispatch_chain_ |                                 | handle_chain_   |
+    | summary         | <------------------------------ | hop_query       |
+    +-----------------+        ChainHopReply            +-----------------+
 ```
 
 * **`acceptor`** — relay-side dispatcher. Receives `PredicateSetUpdate`,
-  validates the version-monotonicity, runs `derive::derive` to project
-  it back into a local `RuleSet`, hands the result to the proxy
-  supervisor. Exposes the resulting derived rules through
-  `/internal/derived-rules` for `chain diff`.
+  validates version monotonicity, runs `derive::derive` to project it
+  back into a local `RuleSet`, hands the result to the proxy
+  supervisor. Also handles `ChainHopQuery`: appends a local `ChainHop`
+  record, optionally forwards the query one hop further upstream, and
+  returns the aggregated `ChainHopReply` with `query_rtt_ms` stamped on
+  the next-hop record.
 * **`predicate_publisher`** — terminal-side task. Subscribes to the
   supervisor's `current_set` channel and emits `PredicateSetUpdate` on
   the next tick after a real change.
-* **`tunnel_initiator`** — originator-side stream registry. Allocates a
-  `stream_id`, sends `TunnelOpen`, splices the UDS half against the
-  in-flight tunnel.
-* **`tunnel_forwarder`** — mid-chain. For tunnel frames whose
-  `target_pubkey` is not us, look up the (downstream, upstream) stream
-  binding and forward the body on the other side. Used at every hop
-  along a multi-hop tunnel.
-* **`tunnel_terminator`** — destination-side. For tunnel frames whose
-  `target_pubkey` is us, splice against a freshly-dialled TCP socket to
-  the `dest` address (subject to the v1 loopback-only tunnel destination policy).
 * **`client`** — chain-client state machine. Owns the Noise handshake,
-  the heartbeat tick, and the dispatch of inbound body types to the
+  the heartbeat tick, and dispatch of inbound body types to the
   combined handler stack.
 
-### TCP-style half-close
+### Chain queries
 
-Tunnel streams behave like TCP: each direction is independently
-closeable; entries persist in the registry until **both** sides have
-closed. This shows up at every layer:
+`yggdrasilctl chain {summary,health,ping,diff}` all ride the same UDS
+RPC (`Request::ChainSummary`) and the same upstream `ChainHopQuery`
+frame; subcommands differ only in how they render the aggregated
+`ChainHop` slice returned by the daemon. The recursive walk is bounded
+end-to-end by the `--timeout` flag (default `5s`); each hop times its
+own upstream call with `Instant::now()` and stamps the next hop's
+`query_rtt_ms` on the offset-0 record before returning.
 
-* `tunnel_initiator::signal_close` only marks the local half closed; it
-  does not remove the registry entry. The entry is removed when the
-  reciprocal `TunnelClose` from the peer arrives.
-* `tunnel_forwarder::handle_close_from_downstream` is lookup-only — the
-  upstream-side `TunnelClose` still has to land before both halves of
-  the binding are released.
-* `tunnel_terminator::run_stream` joins reader + writer with
-  `tokio::join!` (not `select! + abort`) so a one-shot
-  request/response pattern doesn't get its response truncated when one
-  half completes ahead of the other.
-* On unknown stream ids, both the terminator and the initiator return
-  `Reject(STREAM_NOT_FOUND)` from `handle_close`. This is load-bearing:
-  the acceptor's combined dispatch and the
-  `combined_tunnel_body_handler` chain use `STREAM_NOT_FOUND` as the
-  fall-through signal between the terminator/initiator leg and the
-  forwarder leg. Returning an idempotent `Ok` here would silently
-  swallow upstream-initiated closes for forwarded streams.
-
-The half-close semantics are exercised end-to-end by
-[`tests/e2e/run-chain.sh`](../tests/e2e/run-chain.sh) milestone 5 (chain
-tunnel echo across 3 hops) and milestones 6/7 (`chain diff` walking
-upstream through forwarded tunnels).
-
-### Multi-hop tunnels
-
-`yggdrasilctl chain tunnel open --pubkey x25519:… --dest host:port` may
-target any node along the chain — direct upstream, two hops up, etc.
-The local daemon's `tunnel_initiator` sends the `TunnelOpen` envelope
-upstream; each intermediate `tunnel_forwarder` rewrites stream ids and
-forwards to the next hop until a node whose own pubkey matches
-`target_pubkey` terminates the tunnel via `tunnel_terminator`. Inbound
-data and closes flow back along the same path in reverse.
-
-Forwarders maintain a (downstream\_stream\_id, upstream\_stream\_id) map
-keyed by the local stream's allocation; the binding is removed only
-after both sides have observed a close. Stream-id allocation is local
-to each hop — there is no end-to-end stream namespace.
-
-### `/internal/derived-rules`
-
-A loopback-only HTTP endpoint exposed on the metrics listener. Returns a
-JSON snapshot of the node's chain-applied predicate set + derived rules
-+ chain identity. Non-loopback peers receive 403. `chain diff` opens a
-chain tunnel to each upstream hop's loopback metrics port and queries
-this endpoint to surface drift between the local terminal's published
-predicates and what each upstream actually accepted.
+Derived rules — what each upstream hop actually accepted — are carried
+inline in each `ChainHop` record, so `chain diff` no longer needs a
+side-channel HTTP fetch.
 
 ## Control plane: yggdrasilctl over UDS
 
@@ -467,12 +422,6 @@ debugging — no length-prefixed framing.
 Request/response definitions live in
 [`crates/ratatoskr/src/control.rs`](../crates/ratatoskr/src/control.rs) so
 both sides of the wire share the type surface verbatim.
-
-`OpenChainTunnel` is special: after the daemon responds with
-`ChainTunnelOpened { stream_id }`, the UDS connection switches from
-newline-JSON mode into bidirectional raw-bytes mode. The CLI splices
-stdin/stdout against the socket; closing either half emits `TunnelClose`
-on the chain side.
 
 Filesystem permissions are the access boundary. Run yggdrasil as a
 dedicated user, drop the socket directory's group to your admin group,
@@ -495,11 +444,14 @@ privileged child, no helper subprocess. Capabilities-wise:
 Logs: `tracing` JSON to stdout. Configure verbosity per `tracing-subscriber`
 env-filter via `YGGDRASIL_LOG`.
 
-Metrics: Prometheus on `[metrics].listen`, default `127.0.0.1:9090/metrics`.
-Full list in [operations.md → Prometheus metrics](operations.md#prometheus-metrics).
+Metrics: Prometheus text served over the control UDS via
+`yggdrasilctl local metrics`. Full list in
+[operations.md → Prometheus metrics](operations.md#prometheus-metrics).
+Scraping over TCP requires fronting the UDS with a small adapter.
 
-Admin: `yggdrasilctl local {status,rules,downstream,certs}` plus
-`yggdrasilctl chain {tunnel open,apply,diff}`. Reference in
+Admin: `yggdrasilctl local {status,rules,accept,metrics,health,derived-rules,trace}`
+plus `yggdrasilctl chain {apply,summary,health,ping,diff}` and offline
+`yggdrasilctl validate`. Reference in
 [cli-reference.md](cli-reference.md).
 
 ## Build artefacts
