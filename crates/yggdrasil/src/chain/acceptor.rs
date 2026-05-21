@@ -529,6 +529,7 @@ impl ChainAcceptor {
             mode,
             uptime_secs,
             view,
+            query_rtt_ms: None,
         };
 
         // 2. If we have an upstream and budget remaining, forward
@@ -547,12 +548,24 @@ impl ChainAcceptor {
         if let Some(upstream) = self.upstream.get() {
             if depth_budget > 0 && upstream_deadline_ms > 0 {
                 let deadline = std::time::Duration::from_millis(upstream_deadline_ms as u64);
+                let upstream_started = Instant::now();
                 match upstream.query_upstream(depth_budget, deadline).await {
                     Ok(reply) => {
+                        let rtt_ms = upstream_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64;
                         // Renumber upstream hops to extend the local
                         // sequence (local = 0, upstream = 1, ...).
+                        // Stamp the RTT we measured on the immediately
+                        // adjacent upstream hop (offset == 0); hops
+                        // further up the chain were timed by their
+                        // respective parents.
                         for (offset, mut hop) in reply.hops.into_iter().enumerate() {
                             hop.hop_index = (hops.len() + offset) as u32;
+                            if offset == 0 {
+                                hop.query_rtt_ms = Some(rtt_ms);
+                            }
                             hops.push(hop);
                         }
                         partial |= reply.partial;

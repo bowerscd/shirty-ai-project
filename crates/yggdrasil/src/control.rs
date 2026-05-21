@@ -620,6 +620,7 @@ async fn dispatch_chain_summary(timeout_ms: Option<u64>, state: &ControlState) -
         mode: state.mode,
         uptime_secs: state.started_at.elapsed().as_secs(),
         view: ix.snapshot(),
+        query_rtt_ms: None,
     };
 
     let upstream = match state.chain_client_handle.as_ref() {
@@ -636,6 +637,7 @@ async fn dispatch_chain_summary(timeout_ms: Option<u64>, state: &ControlState) -
         .filter(|m| *m > 0)
         .unwrap_or(ratatoskr::chain_query::CHAIN_HOP_DEFAULT_DEADLINE_MS as u64);
     let deadline = std::time::Duration::from_millis(deadline_ms);
+    let started = std::time::Instant::now();
     match upstream
         .query_upstream(
             ratatoskr::chain_query::CHAIN_HOP_DEFAULT_DEPTH_BUDGET,
@@ -644,9 +646,17 @@ async fn dispatch_chain_summary(timeout_ms: Option<u64>, state: &ControlState) -
         .await
     {
         Ok(reply) => {
+            let rtt_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let mut hops = vec![local];
             for (offset, mut hop) in reply.hops.into_iter().enumerate() {
                 hop.hop_index = (hops.len() + offset) as u32;
+                // Stamp the RTT we just measured on the immediately
+                // adjacent upstream hop (offset == 0). Hops further
+                // upstream were already RTT-stamped by the relay that
+                // queried them recursively.
+                if offset == 0 {
+                    hop.query_rtt_ms = Some(rtt_ms);
+                }
                 hops.push(hop);
             }
             Response::ChainSummary(ChainSummaryResponse {

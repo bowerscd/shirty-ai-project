@@ -42,6 +42,12 @@ pub enum Cmd {
     /// to a chain-wide worst-of-hops verdict. Exit code reflects the
     /// worst hop: 0=healthy/starting, 1=degraded, 2=down, 3=RPC error.
     Health(HealthArgs),
+    /// Per-hop control-plane round-trip time. Walks the chain via the
+    /// same `Request::ChainSummary` RPC and prints each hop's measured
+    /// query→reply RTT (or `-` for the local hop, which has no RTT to
+    /// report). Useful for isolating "slow link" vs. "unreachable hop"
+    /// during a chain incident.
+    Ping(PingArgs),
 }
 
 #[derive(Debug, Args)]
@@ -96,12 +102,33 @@ pub struct HealthArgs {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Args)]
+pub struct PingArgs {
+    /// Overall budget for assembling the chain summary across all
+    /// hops. Local-only replies effectively ignore this.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = humantime::parse_duration,
+        default_value = "5s",
+    )]
+    pub timeout: Duration,
+    /// If set, restrict the rendered output to a single hop matching
+    /// this tagged x25519 pubkey (`x25519:<hex>`). The whole chain is
+    /// still walked — only the rendering is filtered. Useful in
+    /// scripts that probe a specific hop without needing to compute
+    /// its index.
+    #[arg(long, value_name = "PUBKEY")]
+    pub hop: Option<PubKey>,
+}
+
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     match cmd {
         Cmd::Apply(args) => apply(socket, &args).await,
         Cmd::Diff(args) => diff(socket, &args, json).await,
         Cmd::Summary(args) => summary(socket, &args, json).await,
         Cmd::Health(args) => health(socket, &args, json).await,
+        Cmd::Ping(args) => ping(socket, &args, json).await,
     }
 }
 
@@ -877,6 +904,108 @@ fn render_health_human(report: &HealthReport) {
 }
 
 // =============================================================================
+// CP22: `chain ping`
+// =============================================================================
+
+/// One hop's RTT measurement in the structured ping report.
+#[derive(Debug, Clone, Serialize)]
+struct PingHop {
+    /// `0 = local`, `1 = local's upstream`, …
+    index: u32,
+    /// Hop's tagged x25519 pubkey (used for `--hop` filtering).
+    pubkey: PubKey,
+    /// Wall-clock RTT measured by this hop's parent for the
+    /// `ChainHopQuery` that produced it. `None` on the local hop and
+    /// (legacy daemons) on hops whose parent didn't stamp an RTT.
+    query_rtt_ms: Option<u64>,
+}
+
+/// Structured top-level ping report. The `--json` rendering serialises
+/// this directly; the human renderer projects it onto one line per hop.
+#[derive(Debug, Clone, Serialize)]
+struct PingReport {
+    hops: Vec<PingHop>,
+    /// Mirrors [`ChainSummaryResponse::partial`] so JSON consumers and
+    /// the human renderer can both surface the truncation note.
+    partial: bool,
+}
+
+/// Render per-hop control-plane RTT. Walks the chain via the same
+/// `Request::ChainSummary` RPC as `chain summary`/`chain diff`/`chain
+/// health`; the RTT field on each [`ratatoskr::control::ChainHop`]
+/// carries the wall-clock time that the hop's parent measured for its
+/// upstream query.
+async fn ping(socket: &Path, args: &PingArgs, json_output: bool) -> Result<()> {
+    let resp = fetch_chain_summary(socket, args.timeout)
+        .await
+        .context("fetching chain summary over UDS")?;
+
+    if resp.hops.is_empty() {
+        bail!("daemon returned an empty chain summary; no hops to ping");
+    }
+
+    let mut hops: Vec<PingHop> = resp
+        .hops
+        .iter()
+        .map(|h| PingHop {
+            index: h.hop_index,
+            pubkey: h.view.chain.local,
+            query_rtt_ms: h.query_rtt_ms,
+        })
+        .collect();
+
+    if let Some(filter) = args.hop.as_ref() {
+        hops.retain(|h| &h.pubkey == filter);
+        if hops.is_empty() {
+            bail!(
+                "--hop {filter} did not match any pubkey in the chain summary"
+            );
+        }
+    }
+
+    let report = PingReport {
+        hops,
+        partial: resp.partial,
+    };
+
+    if json_output {
+        let s = serde_json::to_string_pretty(&report)
+            .context("serialise chain ping report")?;
+        println!("{s}");
+    } else {
+        render_ping_human(&report);
+    }
+    Ok(())
+}
+
+/// Render the report in the default human-readable form. Format:
+///
+/// ```text
+/// hop 0  x25519:abc…  rtt=-
+/// hop 1  x25519:def…  rtt=12ms
+/// hop 2  x25519:fff…  rtt=37ms
+/// ```
+fn render_ping_human(report: &PingReport) {
+    for hop in &report.hops {
+        let rtt = match hop.query_rtt_ms {
+            Some(ms) => format!("{ms}ms"),
+            None => "-".to_string(),
+        };
+        println!(
+            "hop {idx}  {pk}  rtt={rtt}",
+            idx = hop.index,
+            pk = hop.pubkey,
+        );
+    }
+    if report.partial {
+        println!(
+            "note: chain summary is partial — some upstream hops could \
+             not be reached within the timeout."
+        );
+    }
+}
+
+// =============================================================================
 // Tests — diff comparison + serde round-trip
 // =============================================================================
 
@@ -1076,6 +1205,7 @@ mod tests {
             hop_index: 0,
             mode: ratatoskr::control::Mode::Terminal,
             uptime_secs,
+            query_rtt_ms: None,
             view: view(Vec::new(), pk(1), None, None, None).pipe(|mut v| {
                 v.chain.last_apply_unix = last_apply_unix;
                 v

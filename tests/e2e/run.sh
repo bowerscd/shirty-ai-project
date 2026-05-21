@@ -248,6 +248,28 @@ print(f"[chain-summary] 2 hops; both see tcp-echo; drift_detected=False")
 ' || fail "chain diff --json output did not match 2-hop expectations"
 echo "    [ok] chain diff --json reports 2 hops in sync"
 
+# -------- test 6c: chain ping per-hop RTT (home -> vps) ---------------------
+
+echo "==> [chain-ping] yggdrasilctl chain ping --json from home (2 hops)"
+
+# `chain ping` reuses the same Request::ChainSummary RPC and projects
+# the per-hop query_rtt_ms field. Hop 0 (local) has rtt=null; hop 1
+# (vps) is RTT-stamped by home as it forwards upstream.
+chain_ping_2hop=$("${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T home \
+    yggdrasilctl --json chain --socket /run/yggdrasil/control.sock ping) \
+    || fail "chain ping --json from home failed"
+echo "$chain_ping_2hop" | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+hops = report["hops"]
+assert len(hops) == 2, f"expected 2 hops (home + vps), got {len(hops)}: {hops}"
+assert hops[0]["query_rtt_ms"] is None, f"local hop must have null rtt: {hops[0]}"
+rtt = hops[1]["query_rtt_ms"]
+assert isinstance(rtt, int) and rtt >= 0, f"upstream rtt missing or invalid: {hops[1]}"
+print(f"[chain-ping] hop1 rtt={rtt}ms")
+' || fail "chain ping --json output did not match 2-hop expectations"
+echo "    [ok] chain ping --json stamps RTT on the upstream hop"
+
 # -------- test 7: metrics scrape over UDS -----------------------------------
 
 echo "==> [metrics] yggdrasilctl local metrics exposes build_info + last_heartbeat gauge"

@@ -400,6 +400,18 @@ pub struct ChainHop {
     /// Predicates, derived rule set, and chain identity facts. Every
     /// field of [`DerivedRulesResponse`] is wire-stable across hops.
     pub view: DerivedRulesResponse,
+    /// Wall-clock round-trip time, in milliseconds, that the *parent*
+    /// hop measured for the upstream `ChainHopQuery` that produced
+    /// this entry. `None` on the local hop (index 0 in any reply, no
+    /// RTT applies — it's the responder itself) and on hops further
+    /// upstream that were already known to the responder via cached
+    /// state. Carried as `#[serde(default)]` so older daemons sending
+    /// replies without this field continue to deserialise.
+    ///
+    /// Backs `chain ping` and lets `chain summary --json` expose
+    /// per-hop RTT for monitoring.
+    #[serde(default)]
+    pub query_rtt_ms: Option<u64>,
 }
 
 /// Response body for a successful [`Request::ChainApply`].
@@ -612,6 +624,7 @@ mod tests {
                 mode: Mode::Terminal,
                 uptime_secs: 42,
                 view,
+                query_rtt_ms: None,
             }],
             partial: false,
         });
