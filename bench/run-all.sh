@@ -12,8 +12,8 @@ source "$HERE/lib/common.sh"
 ensure_results_dir
 
 root="$(bench_workspace_root)"
-log "building release artifacts (yggdrasil, huginn, loadgen)…"
-( cd "$root" && cargo build --release -p yggdrasil -p huginn -p loadgen ) >&2
+log "building release artifacts (yggdrasil, yggdrasilctl, loadgen)…"
+( cd "$root" && cargo build --release -p yggdrasil -p yggdrasilctl -p loadgen ) >&2
 
 log "capturing host env"
 "$HERE/collect-env.sh"

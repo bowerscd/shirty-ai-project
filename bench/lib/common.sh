@@ -172,15 +172,35 @@ bench_spawn_tcp_echo() {
 #
 # bench_spin_yggdrasil <tmpdir> <listen_port> <upstream_port> <protocol> [extra_rule_toml]
 #
-# Builds and runs the full yggdrasil + huginn stack:
-#   1. keygen both
-#   2. enroll-token + enroll
-#   3. write configs and branch
-#   4. start yggdrasil + huginn in background
-#   5. wait until the proxy listener is up AND huginn has heartbeat'd through
+# Spins a two-daemon yggdrasil topology on loopback:
+#
+#   * gateway (accept-mode): binds the proxy listener on
+#     127.0.0.1:$listen_port that the load generator hits. Owns no rules
+#     of its own; the listener is derived from the chain predicate
+#     published over the dial session.
+#   * terminal (dial-mode):  owns the rule set under $tmp/rules and dials
+#     the gateway's accept listener on 127.0.0.1:$accept_port. The local
+#     echo backend on 127.0.0.1:$upstream_port runs in the same netns,
+#     so target_addr resolves there.
+#
+# Steps:
+#   1. write seed configs for gateway + terminal
+#   2. mint identity keys for both
+#   3. offline request/grant: terminal exports request, gateway mints
+#      grant (writes [accept] to gateway config), terminal applies grant
+#      (writes [dial] to terminal config)
+#   4. write the bench rule under the terminal's rules dir
+#   5. start both daemons; wait for the gateway-side proxy listener
+#      AND give the heartbeat + chain predicate a moment to settle
 #
 # Exports:
-#   YGG_LISTEN_PORT, YGG_HB_PORT, YGG_CTRL_SOCK, YGG_CONFIG, RAT_CONFIG
+#   YGG_LISTEN_PORT       — the gateway-side proxy port (loadgen target)
+#   YGG_HB_PORT           — the gateway's accept (heartbeat) UDP port
+#   YGG_CTRL_SOCK         — the TERMINAL's control socket (rules live here,
+#                           so reload/predicate-add scenarios drive it)
+#   YGG_CONFIG            — terminal config path
+#   YGG_GATEWAY_CONFIG    — gateway config path
+#   YGG_GATEWAY_CTRL_SOCK — gateway control socket
 
 bench_spin_yggdrasil() {
     local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
@@ -189,78 +209,93 @@ bench_spin_yggdrasil() {
     root="$(bench_workspace_root)"
 
     local ygg_bin="$root/target/release/yggdrasil"
-    local rat_bin="$root/target/release/huginn"
+    local ctl_bin="$root/target/release/yggdrasilctl"
     [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
-    [[ -x "$rat_bin" ]] || die "missing $rat_bin — run: cargo build --release -p huginn"
+    [[ -x "$ctl_bin" ]] || die "missing $ctl_bin — run: cargo build --release -p yggdrasilctl"
 
-    mkdir -p "$tmp"/{yggdrasil,huginn,rules,state,run,logs}
-    local hb_port; hb_port="$(pick_free_udp_port)"
-    local metrics_port; metrics_port="$(pick_free_tcp_port)"
+    mkdir -p "$tmp"/{gateway,terminal,rules,gw-rules,gw-state,tm-state,gw-run,tm-run,logs}
+    local accept_port; accept_port="$(pick_free_udp_port)"
 
-    # Keys.
-    "$ygg_bin" keygen --identity-file "$tmp/yggdrasil/identity.key" >/dev/null
-    "$rat_bin" keygen --identity-file "$tmp/huginn/identity.key" >/dev/null
-
-    local rat_pub
-    rat_pub="$("$rat_bin" pubkey --identity-file "$tmp/huginn/identity.key" | tr -d '\r\n[:space:]')"
-
-    # Write yggdrasil config FIRST (peer.public_key_hex empty for now).
-    cat > "$tmp/yggdrasil/config.toml" <<EOF
+    # ---- gateway (accept-mode) ----
+    local gw_cfg="$tmp/gateway/config.toml"
+    local gw_key="$tmp/gateway/identity.key"
+    cat > "$gw_cfg" <<EOF
 [server]
-heartbeat_listen = "127.0.0.1:$hb_port"
-rules_dir = "$tmp/rules"
-state_dir = "$tmp/state"
-identity_file = "$tmp/yggdrasil/identity.key"
+rules_dir     = "$tmp/gw-rules"
+state_dir     = "$tmp/gw-state"
+identity_file = "$gw_key"
 
 [control]
-socket = "$tmp/run/control.sock"
+socket = "$tmp/gw-run/control.sock"
 
-[peer]
-public_key_hex = ""
-rekey_interval = "1h"
+[accept]
+listen = "127.0.0.1:$accept_port"
 EOF
 
-    # Mint enrollment token. This stamps peer.public_key_hex into the config.
-    "$ygg_bin" enroll-token \
-        --peer-pubkey "$rat_pub" \
-        --endpoint "127.0.0.1:$hb_port" \
-        --config "$tmp/yggdrasil/config.toml" \
-        -o "$tmp/enroll.token" --force >/dev/null
+    # ---- terminal (dial-mode) ----
+    local tm_cfg="$tmp/terminal/config.toml"
+    local tm_key="$tmp/terminal/identity.key"
+    cat > "$tm_cfg" <<EOF
+[server]
+rules_dir     = "$tmp/rules"
+state_dir     = "$tmp/tm-state"
+identity_file = "$tm_key"
 
-    # Huginn config skeleton + enroll applies the server pubkey + endpoint.
-    cat > "$tmp/huginn/config.toml" <<EOF
-[client]
-yggdrasil_endpoint = "placeholder:1"
-yggdrasil_pubkey_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-identity_file = "$tmp/huginn/identity.key"
-heartbeat_interval = "200ms"
-rekey_interval = "1h"
+[control]
+socket = "$tmp/tm-run/control.sock"
 EOF
-    "$rat_bin" enroll "$tmp/enroll.token" --config "$tmp/huginn/config.toml" >/dev/null
 
-    # Branch file.
+    # Mint identities (yggdrasilctl `identity rotate` writes the key file).
+    "$ctl_bin" --config "$gw_cfg" identity rotate \
+        --identity-file "$gw_key" --force >/dev/null
+    "$ctl_bin" --config "$tm_cfg" identity rotate \
+        --identity-file "$tm_key" --force >/dev/null
+
+    # Offline request/grant handshake. Terminal asks; gateway grants.
+    "$ctl_bin" --config "$tm_cfg" identity export-request \
+        --identity-file "$tm_key" \
+        --out "$tmp/request.txt" \
+        --note "bench terminal" >/dev/null
+    "$ctl_bin" --config "$gw_cfg" identity add-accept \
+        --identity-file "$gw_key" \
+        --from "$tmp/request.txt" \
+        --my-endpoint "127.0.0.1:$accept_port" \
+        --out "$tmp/grant.txt" \
+        --note "bench gw->tm" >/dev/null
+    "$ctl_bin" --config "$tm_cfg" identity add-dial \
+        --identity-file "$tm_key" \
+        --from "$tmp/grant.txt" >/dev/null
+    rm -f "$tmp/request.txt" "$tmp/grant.txt"
+
+    # Bench rule on the terminal. Gateway derives a matching listener via
+    # the chain predicate pushed over the dial session.
     cat > "$tmp/rules/scenario.toml" <<EOF
 [[rule]]
-name = "bench"
-listen = "127.0.0.1:$listen_port"
-protocol = "$proto"
-upstream_port = $upstream_port
+name        = "bench"
+listen      = "127.0.0.1:$listen_port"
+protocol    = "$proto"
+target_addr = "127.0.0.1:$upstream_port"
 $extra
 EOF
 
-    bench_spawn YGG_PID  "$tmp/logs/yggdrasil.log" -- "$ygg_bin"  --log-format pretty run --config "$tmp/yggdrasil/config.toml"
-    bench_spawn RAT_PID  "$tmp/logs/huginn.log" -- "$rat_bin" --log-format pretty run --config "$tmp/huginn/config.toml"
+    bench_spawn YGG_GW_PID "$tmp/logs/gateway.log"  -- "$ygg_bin" --log-format pretty run --config "$gw_cfg"
+    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format pretty run --config "$tm_cfg"
 
     if [[ "$proto" == "tcp" ]]; then
         bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
     else
         bench_wait_listen_udp 127.0.0.1 "$listen_port" 5
     fi
-    # Give huginn a couple of heartbeats so the proxy has the peer IP.
+    # Give the chain predicate a beat to land + the gateway to record the
+    # terminal's source IP from the first heartbeat.
     sleep 0.6
 
-    export YGG_LISTEN_PORT="$listen_port" YGG_HB_PORT="$hb_port" YGG_CTRL_SOCK="$tmp/run/control.sock"
-    export YGG_CONFIG="$tmp/yggdrasil/config.toml" RAT_CONFIG="$tmp/huginn/config.toml"
+    export YGG_LISTEN_PORT="$listen_port"
+    export YGG_HB_PORT="$accept_port"
+    export YGG_CTRL_SOCK="$tmp/tm-run/control.sock"
+    export YGG_CONFIG="$tm_cfg"
+    export YGG_GATEWAY_CONFIG="$gw_cfg"
+    export YGG_GATEWAY_CTRL_SOCK="$tmp/gw-run/control.sock"
 }
 
 # ---------- nginx orchestration ----------

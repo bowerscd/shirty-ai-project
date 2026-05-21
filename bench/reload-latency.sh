@@ -126,7 +126,7 @@ run_yggdrasil() {
 name = "iter-$i"
 listen = "127.0.0.1:$p"
 protocol = "tcp"
-upstream_port = $echo_port_b
+target_addr = "127.0.0.1:$echo_port_b"
 EOF
         if ! probe_tcp_until_serving 127.0.0.1 "$p" 3; then
             die "yggdrasil iter $i: listener never came up"
