@@ -166,8 +166,10 @@ inside the relay is still part of your attack surface).
 * **Outbound** to the downstream's current heartbeat-observed IP. Cloud
   firewalls typically allow all outbound; if yours doesn't, you'll need
   to whitelist the home ISP's allocation.
-* **Nothing inbound** for the control socket (it's `AF_UNIX`) or the
-  metrics listener (loopback by default).
+* **Nothing inbound** for the control socket (it's `AF_UNIX`).
+  There is no separate metrics listener — metrics, health, and
+  derived-rules snapshots are served over the same control socket
+  via `yggdrasilctl local`.
 
 ### Mid-chain relay
 
@@ -175,7 +177,7 @@ inside the relay is still part of your attack surface).
   downstream's known IP only. Pin it — your mid-relay is not exposed
   to the open internet.
 * **Outbound UDP** to the next-hop upstream's `[accept].listen`.
-* Same proxy-rule and control-socket / metrics-listener rules as the
+* Same proxy-rule and control-socket rules as the
   root relay.
 
 ### Terminal (home)

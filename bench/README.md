@@ -52,7 +52,7 @@ sudo sysctl -w net.ipv4.tcp_tw_reuse=1
 
 ```bash
 # Build once, then run the full matrix.
-cargo build --release -p yggdrasil -p huginn -p loadgen
+cargo build --release -p yggdrasil -p yggdrasilctl -p loadgen
 bench/run-all.sh
 ```
 
@@ -108,7 +108,14 @@ For each non-direct subject, the harness:
 
 1. Spawns a Python echo (`bench/lib/echo_{udp,tcp}.py`) on `127.0.0.1:<echo_port>`.
 2. Renders a fresh config + identity into a `mktemp -d` workspace:
-   - **yggdrasil**: full keygen → enroll-token → huginn enroll → spawns both daemons and waits one heartbeat interval. The branch TOML uses `target_port = <echo_port>`.
+   - **yggdrasil**: spins two `yggdrasil` daemons on loopback — a
+     gateway (accept-mode) and a terminal (dial-mode). Identities are
+     minted with `yggdrasilctl identity rotate` and wired together via
+     the offline `identity export-request` → `identity add-accept`
+     → `identity add-dial` handshake. The terminal owns the rule
+     set; the gateway derives a matching listener from the chain
+     predicate published over the dial session. The bench rule uses
+     the current `target_addr = "127.0.0.1:<echo_port>"` schema.
    - **nginx**: a minimal `stream { server { listen <listen>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }` config, started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
 3. Runs `loadgen` against `127.0.0.1:<listen_port>` (or `<echo_port>` for the direct leg).
 4. SIGTERMs everything, removes the tmpdir, and pauses briefly to let TIME_WAIT clear before the next leg.

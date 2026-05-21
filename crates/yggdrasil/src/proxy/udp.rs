@@ -22,7 +22,7 @@
 //! existing IP do not fire the watch and therefore do not disturb the
 //! table — every existing flow keeps its upstream socket pair, preserving
 //! stateful UDP sessions like Factorio dedicated servers across the
-//! huginn heartbeat cadence.
+//! dial-side heartbeat cadence.
 //!
 //! The IP-change watcher uses `watch::Receiver::changed().await`, so it is
 //! literally impossible for unchanged values to wake it up.

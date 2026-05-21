@@ -1,4 +1,4 @@
-//! Shared error types for the yggdrasil/huginn crates.
+//! Shared error types for the yggdrasil heartbeat protocol crate.
 
 use std::io;
 use std::path::PathBuf;
