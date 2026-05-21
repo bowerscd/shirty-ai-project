@@ -152,10 +152,17 @@ run_nginx() {
     mkdir -p "$tmp/nginx/logs"
     local listen_a; listen_a="$(pick_free_tcp_port)"
 
+    # On distros that ship the stream module dynamically (Arch, RHEL/Fedora),
+    # the rendered conf needs a load_module directive — same logic as
+    # bench_spin_nginx in common.sh. We compute it once here and prepend
+    # to every write_conf result.
+    local stream_loader
+    stream_loader="$(bench_nginx_stream_loader "$nginx_bin")"
+
     write_conf() {
         local extra="$1"
         cat > "$tmp/nginx/nginx.conf" <<EOF
-worker_processes auto;
+${stream_loader}worker_processes auto;
 pid $tmp/nginx/nginx.pid;
 error_log $tmp/nginx/error.log warn;
 events { worker_connections 4096; }
