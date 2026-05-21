@@ -88,7 +88,7 @@ fail() {
 
 # -------- gating: wait for first authenticated heartbeat --------------------
 
-echo "==> waiting for huginn to enrol and heartbeat"
+echo "==> waiting for home daemon to enrol and heartbeat"
 peer_enrolled() {
     local out; out=$(ctl --json status 2>/dev/null || true)
     echo "$out" | grep -q '"peer_enrolled": true' && \
@@ -97,7 +97,7 @@ peer_enrolled() {
 WAIT_TIMEOUT=60 wait_for "peer enrolled + heartbeat seen from 172.30.0.20" peer_enrolled
 
 # Wait for the home box's HTTP backend to come up too — it's a sidecar in
-# home-entrypoint.sh and races with huginn's first heartbeat.
+# home-entrypoint.sh and races with the home daemon's first heartbeat.
 echo "==> waiting for home HTTP backend on 172.30.0.20:7180"
 http_backend_up() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T client python3 -c '

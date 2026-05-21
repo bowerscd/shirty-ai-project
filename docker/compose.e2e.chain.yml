@@ -13,7 +13,7 @@
 #   │  ┌──────────────┐    chain ctrl     ┌──────────────┐        │
 #   │  │   home-chain │ ────heartbeat──►  │    midbox    │        │
 #   │  │   172.30.1.30│  predicate push   │   172.30.1.20│        │
-#   │  │   terminal   │  + tunnel open    │ relay+forward│        │
+#   │  │   terminal   │                   │ relay+forward│        │
 #   │  │  upstream=mb │                   │ upstream=vps │        │
 #   │  │  rules dir:  │                   │ downstream=hm│        │
 #   │  │  home-tcp-   │                   │  listener    │        │
@@ -23,8 +23,8 @@
 #   │  └──────────────┘                   └──────┬───────┘        │
 #   │                                            │ chain ctrl     │
 #   │                                            │ heartbeat      │
-#   │                                            │ + tunnel       │
-#   │                                            │ forward        │
+#   │                                            │                │
+#   │                                            │                │
 #   │                                            ▼                │
 #   │                                     ┌──────────────┐        │
 #   │                                     │  vps-chain   │        │
@@ -34,8 +34,9 @@
 #   │                                     │   midbox     │        │
 #   │                                     │  listener    │        │
 #   │                                     │   :51820     │        │
-#   │                                     │  +loopback   │        │
-#   │                                     │  echo:7100   │        │
+#   │                                     │  (residual   │        │
+#   │                                     │  loopback    │        │
+#   │                                     │  echo:7100)  │        │
 #   │                                     └──────────────┘        │
 #   └─────────────────────────────────────────────────────────────┘
 #
@@ -47,15 +48,15 @@
 #     127.0.0.1:7100 on home (the loopback echo). vps stays unaware —
 #     v1 relays do not re-project predicates upward.
 #
-#   * Chain tunnel forwarding: the smoke driver issues
-#     `yggdrasilctl chain tunnel open --pubkey x25519:<vps_pk> --dest
-#     127.0.0.1:7100` from inside the home-chain container. The tunnel
-#     traverses home → midbox (forwarder, target != midbox) → vps-chain
-#     (terminator, target == vps), which dials its own loopback echo.
-#
 #   * `yggdrasilctl chain diff`: the smoke driver runs the diff from
 #     home and asserts exit 0 (predicates published from home match what
 #     midbox accepted; vps is end-of-chain and has nothing to compare).
+#
+# Note: the chain wire no longer carries tunnel frames, so vps-chain's
+# loopback echo on :7100 is unused by the current smoke driver. It is
+# kept only because vps-chain shares chain-loopback-echo-entrypoint.sh
+# with home-chain, where the loopback echo is still the predicate-flow
+# target.
 
 x-yggdrasil-image: &yggdrasil-image
   build:
@@ -105,7 +106,8 @@ services:
     environment:
       YGGDRASIL_LOG: info
       YGGDRASIL_LOG_FORMAT: pretty
-      # vps's loopback echo is the destination of the chain-tunnel test.
+      # vps-chain runs a residual loopback echo on :7100; the chain
+      # wire no longer carries tunnel frames, so it is currently unused.
       ECHO_TCP_PORT: "7100"
     volumes:
       - vps_chain_etc:/etc/yggdrasil

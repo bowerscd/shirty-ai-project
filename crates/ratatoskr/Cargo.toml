@@ -1,6 +1,6 @@
 [package]
 name        = "ratatoskr"
-description = "Shared protocol types, wire format and Noise-based auth for yggdrasil/huginn"
+description = "Shared protocol types, wire format and Noise-based auth for yggdrasil"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

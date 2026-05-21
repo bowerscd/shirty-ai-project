@@ -8,13 +8,15 @@
 #     7100). Without it, traffic that arrives at home via midbox's derived
 #     listener would have nothing to forward to.
 #
-#   * vps-chain: the echo on 127.0.0.1:$ECHO_TCP_PORT is the destination of
-#     the chain-tunnel test. The tunnel terminator on vps dials this
-#     loopback address; the smoke driver sends bytes through the tunnel
-#     from home and asserts they echo back.
+#   * vps-chain: the echo on 127.0.0.1:$ECHO_TCP_PORT is a residual
+#     loopback backend kept alongside the daemon. The chain wire no
+#     longer carries tunnel frames, so nothing currently dials it; it
+#     remains as a harmless sidecar to keep the entrypoint shared with
+#     home-chain. The chain stack now exercises only predicate-flow and
+#     `chain diff` (see tests/e2e/run-chain.sh).
 #
-# Loopback-only bind keeps the echo off the wan interface — only yggdrasil
-# (proxy or tunnel terminator) on the same netns can reach it.
+# Loopback-only bind keeps the echo off the wan interface — only the
+# yggdrasil proxy on the same netns can reach it.
 set -euo pipefail
 
 ECHO_TCP_PORT="${ECHO_TCP_PORT:-7100}"
