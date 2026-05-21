@@ -307,3 +307,81 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `Cmd` variant must map to the expected `Request` so the CLI
+    /// surface stays in sync with the wire surface. A regression in
+    /// `build_request` is otherwise only observable end-to-end.
+    #[test]
+    fn build_request_maps_status() {
+        assert_eq!(build_request(&Cmd::Status), Request::Status);
+    }
+
+    #[test]
+    fn build_request_maps_rules_list_and_reload() {
+        let list = build_request(&Cmd::Rules {
+            action: RuleAction::List,
+        });
+        assert_eq!(list, Request::RulesList);
+        let reload = build_request(&Cmd::Rules {
+            action: RuleAction::Reload,
+        });
+        assert_eq!(reload, Request::RulesReload);
+    }
+
+    #[test]
+    fn build_request_maps_accept_subcommands() {
+        let show = build_request(&Cmd::Accept {
+            action: AcceptAction::Show,
+        });
+        assert_eq!(show, Request::DownstreamShow);
+        let pending = build_request(&Cmd::Accept {
+            action: AcceptAction::Pending,
+        });
+        assert_eq!(pending, Request::DownstreamPending);
+        let approve = build_request(&Cmd::Accept {
+            action: AcceptAction::Approve(ApproveArgs {
+                fingerprint: "abcdef0123456789".into(),
+            }),
+        });
+        assert_eq!(
+            approve,
+            Request::DownstreamApprove {
+                fingerprint: "abcdef0123456789".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_request_maps_metrics_health_derived_rules() {
+        assert_eq!(build_request(&Cmd::Metrics), Request::Metrics);
+        assert_eq!(build_request(&Cmd::Health), Request::Health);
+        assert_eq!(build_request(&Cmd::DerivedRules), Request::DerivedRules);
+    }
+
+    #[test]
+    fn build_request_trace_with_directive_carries_some() {
+        let req = build_request(&Cmd::Trace(TraceArgs {
+            directive: Some("debug".into()),
+            reset: false,
+        }));
+        assert_eq!(
+            req,
+            Request::TraceSet {
+                directive: Some("debug".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn build_request_trace_reset_yields_none_directive() {
+        let req = build_request(&Cmd::Trace(TraceArgs {
+            directive: None,
+            reset: true,
+        }));
+        assert_eq!(req, Request::TraceSet { directive: None });
+    }
+}

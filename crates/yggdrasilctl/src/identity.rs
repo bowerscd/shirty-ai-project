@@ -707,3 +707,216 @@ fn write_file_secret(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `resolve_identity_file` honours an explicit `--identity-file` flag
+    /// above all other sources, including a config that sets a different path.
+    #[test]
+    fn resolve_identity_explicit_flag_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(&cfg, "[server]\nidentity_file = \"/from/config.key\"\n").unwrap();
+        let p = PathBuf::from("/explicit/path");
+        let resolved = resolve_identity_file(Some(p.clone()), &cfg).unwrap();
+        assert_eq!(resolved, p);
+    }
+
+    /// With no explicit flag and a config that sets `[server].identity_file`,
+    /// the resolver picks that path up.
+    #[test]
+    fn resolve_identity_reads_server_identity_file_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(&cfg, "[server]\nidentity_file = \"/from/config.key\"\n").unwrap();
+        let resolved = resolve_identity_file(None, &cfg).unwrap();
+        assert_eq!(resolved, PathBuf::from("/from/config.key"));
+    }
+
+    /// No explicit flag, missing config → fall back to the default
+    /// `/etc/yggdrasil/identity.key`.
+    #[test]
+    fn resolve_identity_falls_back_to_default_when_config_missing() {
+        let resolved =
+            resolve_identity_file(None, Path::new("/definitely/not/a/file.toml")).unwrap();
+        assert_eq!(resolved, PathBuf::from(DEFAULT_IDENTITY_FILE));
+    }
+
+    /// A config that parses but has no `[server].identity_file` falls back
+    /// to the default.
+    #[test]
+    fn resolve_identity_falls_back_when_config_omits_identity_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(&cfg, "[server]\n").unwrap();
+        let resolved = resolve_identity_file(None, &cfg).unwrap();
+        assert_eq!(resolved, PathBuf::from(DEFAULT_IDENTITY_FILE));
+    }
+
+    /// `load_config_doc` on a missing file returns an empty table so
+    /// `add-dial` / `add-accept` can bootstrap a new config.
+    #[test]
+    fn load_config_doc_missing_file_returns_empty_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("absent.toml");
+        let doc = load_config_doc(&cfg).unwrap();
+        match doc {
+            toml::Value::Table(t) => assert!(t.is_empty()),
+            other => panic!("expected empty table, got {other:?}"),
+        }
+    }
+
+    /// `save_config_doc` writes via tmp+rename and preserves unrelated
+    /// keys when we round-trip through it.
+    #[test]
+    fn save_config_doc_preserves_unrelated_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[server]\nidentity_file = \"/etc/y/id.key\"\n\n[control]\nsocket = \"/run/y.sock\"\n",
+        )
+        .unwrap();
+
+        let mut doc = load_config_doc(&cfg).unwrap();
+        let table = top_table_mut(&mut doc).unwrap();
+        let mut dial = toml::value::Table::new();
+        dial.insert("pubkey".into(), toml::Value::String("x25519:aa".into()));
+        dial.insert("endpoint".into(), toml::Value::String("host:443".into()));
+        table.insert("dial".into(), toml::Value::Table(dial));
+
+        save_config_doc(&cfg, &doc).unwrap();
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after.contains("identity_file"));
+        assert!(after.contains("[control]"));
+        assert!(after.contains("[dial]"));
+        assert!(after.contains("x25519:aa"));
+        // tmp file should not remain after atomic rename.
+        assert!(!cfg.with_extension("toml.tmp").exists());
+    }
+
+    /// `list_chain_enrollments` tolerates a missing config (returns an
+    /// empty list — best-effort enumeration only).
+    #[test]
+    fn list_chain_enrollments_missing_config_is_empty() {
+        let v = list_chain_enrollments(Path::new("/definitely/not/here.toml"));
+        assert!(v.is_empty());
+    }
+
+    /// `list_chain_enrollments` tolerates a malformed config (returns
+    /// an empty list — the operator gets no breakage hints but the
+    /// rotate flow proceeds rather than crashing).
+    #[test]
+    fn list_chain_enrollments_malformed_config_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("broken.toml");
+        std::fs::write(&cfg, "this is = not valid = toml = at = all").unwrap();
+        let v = list_chain_enrollments(&cfg);
+        assert!(v.is_empty());
+    }
+
+    /// `list_chain_enrollments` extracts both `[dial]` and `[accept]`
+    /// when present.
+    #[test]
+    fn list_chain_enrollments_lists_both_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            r#"
+[dial]
+pubkey = "x25519:11"
+endpoint = "vps.example.com:443"
+
+[accept]
+pubkey = "x25519:22"
+listen = "0.0.0.0:443"
+"#,
+        )
+        .unwrap();
+        let v = list_chain_enrollments(&cfg);
+        assert_eq!(v.len(), 2);
+        let sections: Vec<_> = v.iter().map(|e| e.section).collect();
+        assert!(sections.contains(&"dial"));
+        assert!(sections.contains(&"accept"));
+        assert!(v
+            .iter()
+            .any(|e| e.endpoint_label.contains("vps.example.com:443")));
+        assert!(v.iter().any(|e| e.endpoint_label.contains("0.0.0.0:443")));
+    }
+
+    /// `write_file_secret` writes mode 0600 on Unix and refuses to
+    /// overwrite an existing file (`create_new(true)` is the guard).
+    #[cfg(unix)]
+    #[test]
+    fn write_file_secret_creates_with_0600_and_refuses_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secret.bin");
+        write_file_secret(&path, b"hello").unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+        // Second write must fail (create_new prevents clobber).
+        let err = write_file_secret(&path, b"world").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error should mention path: {msg}"
+        );
+    }
+
+    /// `remove_top_section` errors when the file is missing rather than
+    /// silently creating one.
+    #[test]
+    fn remove_top_section_missing_file_errors() {
+        let err = remove_top_section(Path::new("/no/such/config.toml"), "dial", false).unwrap_err();
+        assert!(format!("{err:#}").contains("nothing to remove"));
+    }
+
+    /// `remove_top_section` errors when the section is absent (no-op
+    /// removes would mask operator typos).
+    #[test]
+    fn remove_top_section_absent_section_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(&cfg, "[server]\n").unwrap();
+        let err = remove_top_section(&cfg, "dial", false).unwrap_err();
+        assert!(format!("{err:#}").contains("no `[dial]`"));
+    }
+
+    /// `remove_top_section` strips the target section and leaves the
+    /// rest of the file intact.
+    #[test]
+    fn remove_top_section_strips_target_and_preserves_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            r#"
+[server]
+identity_file = "/etc/y/id.key"
+
+[dial]
+pubkey = "x25519:11"
+endpoint = "host:443"
+"#,
+        )
+        .unwrap();
+        remove_top_section(&cfg, "dial", true).unwrap();
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after.contains("[server]"));
+        assert!(after.contains("identity_file"));
+        assert!(!after.contains("[dial]"));
+    }
+
+    /// `now_unix_secs` returns a positive wall-clock value (assumes the
+    /// test box clock is set; the function falls back to `0` only on
+    /// catastrophic clock skew).
+    #[test]
+    fn now_unix_secs_is_positive() {
+        assert!(now_unix_secs() > 1_577_836_800, "{}", now_unix_secs());
+    }
+}
