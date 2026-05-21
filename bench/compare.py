@@ -40,6 +40,7 @@ HIGHER_BETTER = {
 }
 LOWER_BETTER = {
     "loss_pct",
+    "proxy_rss_kib",
     "latency.min",
     "latency.p50",
     "latency.p90",
@@ -52,11 +53,14 @@ LOWER_BETTER = {
 # Plan §11.5 acceptable deltas vs nginx (yggdrasil should be within these).
 NGINX_DELTA_BUDGET = {
     # scenario : (metric, max_pct_worse)
-    ("tcp-throughput", "bytes_per_sec_rx"): 10,
-    ("tcp-connrate",   "pps_rx"):           25,
-    ("udp-pps",        "pps_rx"):           20,
-    ("udp-flows",      "pps_rx"):           20,
-    ("udp-flowchurn",  "pps_rx"):           20,
+    ("tcp-throughput",  "bytes_per_sec_rx"): 10,
+    ("tcp-connrate",    "pps_rx"):           25,
+    ("udp-pps",         "pps_rx"):           20,
+    ("udp-flows",       "pps_rx"):           20,
+    ("udp-flowchurn",   "pps_rx"):           20,
+    # Per-connection memory: nginx's event-loop model is hard to beat, so
+    # we budget at most a 2× (100% above) absolute PSS footprint.
+    ("tcp-idle-conns",  "proxy_rss_kib"):    100,
 }
 # p99 must be ≤ 2× nginx for these (i.e. up to 100% worse is allowed)
 NGINX_P99_BUDGET_PCT = 100
@@ -127,7 +131,7 @@ def diff_runs(base: Dict[Tuple[str, str], Report],
     regressions: List[str] = []
 
     metrics: Iterable[str] = (
-        "pps_rx", "bytes_per_sec_rx", "loss_pct",
+        "pps_rx", "bytes_per_sec_rx", "loss_pct", "proxy_rss_kib",
         "latency.p50", "latency.p99", "latency.p999", "latency.mean",
     )
 
@@ -180,12 +184,24 @@ def check_nginx_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
             ngx_v = ngx.metric(metric)
             if ygg_v is None or ngx_v is None or ngx_v == 0:
                 continue
-            delta = (ygg_v - ngx_v) / ngx_v * 100.0
-            if delta < -budget_pct:
-                failures.append(
-                    f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {-delta:.1f}% "
-                    f"below nginx ({ngx_v:.2f}); budget allows {budget_pct}%"
-                )
+            if metric in LOWER_BETTER:
+                # Lower-is-better metric: "worse" means yggdrasil's value is
+                # ABOVE nginx's by more than budget%.
+                delta = (ygg_v - ngx_v) / ngx_v * 100.0
+                if delta > budget_pct:
+                    failures.append(
+                        f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {delta:.1f}% "
+                        f"above nginx ({ngx_v:.2f}); budget allows {budget_pct}%"
+                    )
+            else:
+                # Higher-is-better metric: "worse" means yggdrasil's value
+                # is BELOW nginx's by more than budget%.
+                delta = (ygg_v - ngx_v) / ngx_v * 100.0
+                if delta < -budget_pct:
+                    failures.append(
+                        f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {-delta:.1f}% "
+                        f"below nginx ({ngx_v:.2f}); budget allows {budget_pct}%"
+                    )
         # p99 latency budget.
         if ygg.latency and ngx.latency:
             ygg_p99 = ygg.latency.get("p99")

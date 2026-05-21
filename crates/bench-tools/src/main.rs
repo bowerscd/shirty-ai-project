@@ -14,6 +14,11 @@
 //!   Used by `bench/tcp-throughput.sh`.
 //! * `tcp-connrate` — repeatedly open + close short-lived TCP connections,
 //!   measure connections/sec. Used by `bench/tcp-connrate.sh`.
+//! * `tcp-idle` — open N TCP connections at bounded ramp-up parallelism,
+//!   hold every one idle for a fixed duration, then close. Captures the
+//!   per-connect latency histogram; the established count is reported as
+//!   `stats.tx_packets` / `stats.rx_packets`. Used by
+//!   `bench/tcp-idle-conns.sh` to drive a memory-footprint scenario.
 //!
 //! Each mode emits a single JSON document on stdout (or via
 //! `--report-json <path>`) describing what it did, what it measured, and a
@@ -57,6 +62,9 @@ enum Mode {
     TcpThroughput(TcpThroughputArgs),
     /// Repeatedly open + close TCP connections; measure connect/sec.
     TcpConnrate(TcpConnrateArgs),
+    /// Open N idle TCP connections, hold them, then close. Used to
+    /// characterise per-connection memory cost of the subject.
+    TcpIdle(TcpIdleArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -142,6 +150,24 @@ struct TcpConnrateArgs {
     duration: Duration,
 }
 
+#[derive(Debug, clap::Args)]
+struct TcpIdleArgs {
+    /// Target address (host:port).
+    #[arg(long)]
+    target: String,
+    /// Total number of TCP connections to open and hold idle.
+    #[arg(long, default_value_t = 1_000)]
+    connections: u32,
+    /// Maximum in-flight `connect()` attempts during ramp-up. The permit
+    /// is released as soon as a socket is established, so the steady-state
+    /// simultaneously-open count converges to `connections`.
+    #[arg(long, default_value_t = 256)]
+    concurrency: u32,
+    /// How long each established connection is held idle before closing.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "15s")]
+    hold: Duration,
+}
+
 fn main() -> Result<()> {
     // Dedicated tokio runtime so we can keep loadgen single-threaded for
     // single-core SLO measurements; switchable via env var if desired.
@@ -164,6 +190,7 @@ async fn run(cli: Cli) -> Result<()> {
         Mode::Tcp(args) => tcp::run_tcp(&cli.subject, args).await?,
         Mode::TcpThroughput(args) => tcp::run_tcp_throughput(&cli.subject, args).await?,
         Mode::TcpConnrate(args) => tcp::run_tcp_connrate(&cli.subject, args).await?,
+        Mode::TcpIdle(args) => tcp::run_tcp_idle(&cli.subject, args).await?,
     };
     let text = serde_json::to_string_pretty(&report).context("serialise report")?;
     match cli.report_json {

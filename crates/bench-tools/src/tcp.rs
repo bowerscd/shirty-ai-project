@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::report::{build_report, finalize_stats, unix_ms_now, LatencySummary, Report, Stats};
-use crate::{TcpArgs, TcpConnrateArgs, TcpThroughputArgs};
+use crate::{TcpArgs, TcpConnrateArgs, TcpIdleArgs, TcpThroughputArgs};
 
 /// Ping-pong fixed-size messages on N TCP connections, capture RTT.
 pub async fn run_tcp(subject: &str, args: TcpArgs) -> Result<Report> {
@@ -295,4 +295,93 @@ fn now_ns() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Open `connections` TCP connections at bounded ramp-up parallelism,
+/// hold every one idle for `hold`, then close. The semaphore bounds
+/// only the connect phase — each task drops its permit as soon as the
+/// socket is established, so the steady-state simultaneously-open
+/// count converges to `connections` (modulo connect errors). Records
+/// the per-connect latency histogram. `tx_packets` and `rx_packets`
+/// report the established count (one successful TCP handshake = one
+/// of each).
+pub async fn run_tcp_idle(subject: &str, args: TcpIdleArgs) -> Result<Report> {
+    let target: SocketAddr = args
+        .target
+        .parse()
+        .with_context(|| format!("parse target {}", args.target))?;
+    let TcpIdleArgs {
+        target: _,
+        connections,
+        concurrency,
+        hold,
+    } = args;
+
+    let sem = Arc::new(Semaphore::new(concurrency.max(1) as usize));
+    let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
+    ));
+    let established = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(AtomicU64::new(0));
+
+    let ts_start = unix_ms_now();
+    let started = Instant::now();
+
+    let mut handles = Vec::with_capacity(connections as usize);
+    for _ in 0..connections {
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let hist = hist.clone();
+        let established = established.clone();
+        let errors = errors.clone();
+        handles.push(tokio::spawn(async move {
+            let connect_start = Instant::now();
+            let stream = match TcpStream::connect(target).await {
+                Ok(s) => s,
+                Err(_) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    drop(permit);
+                    return;
+                }
+            };
+            let connect_us = connect_start.elapsed().as_micros() as u64;
+            hist.lock().await.saturating_record(connect_us.max(1));
+            established.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+            tokio::time::sleep(hold).await;
+            drop(stream);
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let elapsed = started.elapsed();
+    let ts_end = unix_ms_now();
+
+    let conns = established.load(Ordering::Relaxed);
+    let mut stats = Stats {
+        tx_packets: conns,
+        rx_packets: conns,
+        errors: errors.load(Ordering::Relaxed),
+        ..Stats::default()
+    };
+    finalize_stats(&mut stats, elapsed);
+    stats.latency_us = Some(LatencySummary::from_hist(&*hist.lock().await));
+
+    let mut params = serde_json::Map::new();
+    params.insert("connections".into(), json!(connections));
+    params.insert("concurrency".into(), json!(concurrency));
+    params.insert("hold_s".into(), json!(hold.as_secs_f64()));
+    Ok(build_report(
+        "tcp-idle",
+        subject,
+        &target.to_string(),
+        params,
+        stats,
+        ts_start,
+        ts_end,
+    ))
 }
