@@ -224,24 +224,24 @@ mode 0600.
   `--yes-i-understand-this-breaks-existing-chains` to skip the prompt
   for scripted use; without it, a non-interactive stdin is rejected.
 
-### `identity export-intro [--identity-file <PATH>] [--out PATH] [--note STR]`
+### `identity export-request [--identity-file <PATH>] [--out PATH] [--note STR]`
 
-Emit an intro file (this node advertising itself as a downstream
-candidate). Defaults to `./intro.txt`. The intro contains the local
+Emit an request file (this node advertising itself as a downstream
+candidate). Defaults to `./request.txt`. The request contains the local
 pubkey + fingerprint + operator note. Not a secret.
 
-### `identity add-accept --from <INTRO> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
+### `identity add-accept --from <REQUEST> --my-endpoint <HOST:PORT> [--out PATH] [--note STR] [--identity-file <PATH>]`
 
-Apply an intro file received from a prospective downstream. Writes
+Apply an request file received from a prospective downstream. Writes
 `[accept].pubkey = <downstream-pubkey>` into the daemon
-config and emits an invite file (default `./invite.txt`) containing
-both pubkeys plus `my_endpoint`. Hand-deliver the invite back to the
+config and emits an grant file (default `./grant.txt`) containing
+both pubkeys plus `my_endpoint`. Hand-deliver the grant back to the
 downstream.
 
-### `identity add-dial --from <INVITE> [--identity-file <PATH>]`
+### `identity add-dial --from <GRANT> [--identity-file <PATH>]`
 
-Apply an invite file received from an upstream. Verifies the invite's
-`downstream_pubkey` matches the local identity (catches "wrong invite
+Apply an grant file received from an upstream. Verifies the grant's
+`dial_pubkey` matches the local identity (catches "wrong grant
 file" mistakes), then writes `[dial]` into the daemon config:
 the upstream's pubkey + endpoint.
 

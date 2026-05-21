@@ -63,7 +63,7 @@ sudo chmod 0755 /etc/yggdrasil /etc/yggdrasil/conf.d /var/lib/yggdrasil
 
 The identity file at `/etc/yggdrasil/identity.key` is auto-generated on
 first daemon start. If you'd rather pre-generate it (e.g. to copy the
-pubkey into the upstream's invite ceremony before starting the
+pubkey into the upstream's grant ceremony before starting the
 daemon), run `yggdrasilctl identity rotate`.
 
 ## Service files

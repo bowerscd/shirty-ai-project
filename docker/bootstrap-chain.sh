@@ -5,7 +5,7 @@
 # Runs in the `init-chain` service. Mounts the state volumes for vps_chain
 # (the chain root relay), midbox (mid-chain forwarder), and home_chain
 # (the publishing terminal); provisions three identities, writes configs,
-# and runs the offline intro/invite handshake via `yggdrasilctl identity`
+# and runs the offline request/grant handshake via `yggdrasilctl identity`
 # twice (home<->midbox, midbox<->vps).
 #
 # Idempotent: re-running after a partial failure is a no-op.
@@ -28,10 +28,10 @@ MIDBOX_KEY=/etc/yggdrasil-midbox/identity.key
 HOME_CFG=/etc/yggdrasil-home/config.toml
 HOME_KEY=/etc/yggdrasil-home/identity.key
 
-HOME_INTRO=/tmp/home-intro.txt
-HOME_INVITE=/tmp/home-invite.txt
-MIDBOX_INTRO=/tmp/midbox-intro.txt
-MIDBOX_INVITE=/tmp/midbox-invite.txt
+HOME_REQUEST=/tmp/home-request.txt
+HOME_GRANT=/tmp/home-grant.txt
+MIDBOX_REQUEST=/tmp/midbox-request.txt
+MIDBOX_GRANT=/tmp/midbox-grant.txt
 
 if [[ -f "$VPS_KEY"     && -f "$VPS_CFG"    \
    && -f "$MIDBOX_KEY"  && -f "$MIDBOX_CFG" \
@@ -126,46 +126,46 @@ EOF
 
 # ---- handshake 1: home-chain <-> midbox -----------------------------------
 
-echo "[init-chain] home-chain exports intro"
-yggdrasilctl --config "$HOME_CFG" identity export-intro \
+echo "[init-chain] home-chain exports request"
+yggdrasilctl --config "$HOME_CFG" identity export-request \
     --identity-file "$HOME_KEY" \
-    --out "$HOME_INTRO" \
+    --out "$HOME_REQUEST" \
     --note "chain e2e home" >/dev/null
 
 echo "[init-chain] midbox add-accept from home-chain (writes midbox's [accept])"
 yggdrasilctl --config "$MIDBOX_CFG" identity add-accept \
     --identity-file "$MIDBOX_KEY" \
-    --from "$HOME_INTRO" \
+    --from "$HOME_REQUEST" \
     --my-endpoint midbox:51820 \
-    --out "$HOME_INVITE" \
+    --out "$HOME_GRANT" \
     --note "chain e2e midbox->home" >/dev/null
 
-echo "[init-chain] home-chain add-dial from midbox invite"
+echo "[init-chain] home-chain add-dial from midbox grant"
 yggdrasilctl --config "$HOME_CFG" identity add-dial \
     --identity-file "$HOME_KEY" \
-    --from "$HOME_INVITE" >/dev/null
+    --from "$HOME_GRANT" >/dev/null
 
 # ---- handshake 2: midbox <-> vps-chain -------------------------------------
 
-echo "[init-chain] midbox exports intro"
-yggdrasilctl --config "$MIDBOX_CFG" identity export-intro \
+echo "[init-chain] midbox exports request"
+yggdrasilctl --config "$MIDBOX_CFG" identity export-request \
     --identity-file "$MIDBOX_KEY" \
-    --out "$MIDBOX_INTRO" \
+    --out "$MIDBOX_REQUEST" \
     --note "chain e2e midbox" >/dev/null
 
 echo "[init-chain] vps-chain add-accept from midbox (writes vps's [accept])"
 yggdrasilctl --config "$VPS_CFG" identity add-accept \
     --identity-file "$VPS_KEY" \
-    --from "$MIDBOX_INTRO" \
+    --from "$MIDBOX_REQUEST" \
     --my-endpoint vps-chain:51820 \
-    --out "$MIDBOX_INVITE" \
+    --out "$MIDBOX_GRANT" \
     --note "chain e2e vps->midbox" >/dev/null
 
-echo "[init-chain] midbox add-dial from vps-chain invite"
+echo "[init-chain] midbox add-dial from vps-chain grant"
 yggdrasilctl --config "$MIDBOX_CFG" identity add-dial \
     --identity-file "$MIDBOX_KEY" \
-    --from "$MIDBOX_INVITE" >/dev/null
+    --from "$MIDBOX_GRANT" >/dev/null
 
-rm -f "$HOME_INTRO" "$HOME_INVITE" "$MIDBOX_INTRO" "$MIDBOX_INVITE"
+rm -f "$HOME_REQUEST" "$HOME_GRANT" "$MIDBOX_REQUEST" "$MIDBOX_GRANT"
 
 echo "[init-chain] done"

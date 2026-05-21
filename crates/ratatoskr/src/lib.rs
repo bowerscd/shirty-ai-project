@@ -17,7 +17,7 @@ pub mod chain_query;
 pub mod control;
 pub mod control_frame;
 pub mod error;
-pub mod intro;
+pub mod enrollment;
 pub mod predicate;
 pub mod pubkey;
 pub mod rule;

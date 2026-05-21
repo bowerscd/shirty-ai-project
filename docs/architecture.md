@@ -29,7 +29,7 @@ The auxiliary binaries are:
 
 * **yggdrasilctl** — admin CLI. Three scopes: `local` (UDS, daemon-local
   operations), `chain` (introspection across the chain), `identity`
-  (file-based identity + intro/invite handshake).
+  (file-based identity + request/grant handshake).
 * **ratatoskr** — shared library. Wire format, Noise_IK auth, control-plane
   message types, rule schema, predicate schema, tunnel envelopes.
 * **loadgen** — benchmark generator under [bench/](../bench/).
@@ -160,33 +160,33 @@ algorithms (`ed25519:…`, `pq:…`) can be added without breaking parsing.
 `fingerprint = BLAKE2s-128(pubkey)` rendered as 32 hex chars (no `x25519:`
 tag). Used for downstream TOFU approval and out-of-band confirmation.
 
-### Intro / invite handshake
+### Request / grant handshake
 
 Enrolment is a two-file out-of-band ceremony driven by the `identity`
 scope of `yggdrasilctl`:
 
-1. **Downstream emits an intro.** On the would-be downstream:
-   `yggdrasilctl identity export-intro --out intro.txt`
+1. **Downstream emits a request.** On the would-be downstream:
+   `yggdrasilctl identity export-request --out request.txt`
    writes the local pubkey + fingerprint + optional operator note.
 
-2. **Upstream issues an invite.** On the would-be upstream:
-   `yggdrasilctl identity add-accept --from intro.txt
-   --my-endpoint vps.example.net:51820 --out invite.txt`
+2. **Upstream issues a grant.** On the would-be upstream:
+   `yggdrasilctl identity add-accept --from request.txt
+   --my-endpoint vps.example.net:51820 --out grant.txt`
    writes `[accept]` into the upstream's config (pinning the
-   downstream's pubkey) and emits an invite file containing both pubkeys
+   downstream's pubkey) and emits an grant file containing both pubkeys
    plus the upstream's reachable endpoint.
 
-3. **Downstream applies the invite.** Back on the downstream:
-   `yggdrasilctl identity add-dial --from invite.txt`
-   verifies that the invite's `downstream_pubkey` matches the local
-   identity (catches "wrong invite file" mistakes) and writes
+3. **Downstream applies the grant.** Back on the downstream:
+   `yggdrasilctl identity add-dial --from grant.txt`
+   verifies that the grant's `dial_pubkey` matches the local
+   identity (catches "wrong grant file" mistakes) and writes
    `[dial]` into the downstream's config (pinning the upstream's
    pubkey + endpoint).
 
-The intro and invite files are not secrets. Both contain only public
+The request and grant files are not secrets. Both contain only public
 material; leaking them lets an attacker learn pubkeys and the upstream
 endpoint, neither of which lets them impersonate either side. The
-out-of-band fingerprint check after applying the invite is the security
+out-of-band fingerprint check after applying the grant is the security
 boundary; if you skip it, you trust whoever transported the files.
 
 ### TOFU fallback

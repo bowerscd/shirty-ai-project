@@ -62,25 +62,25 @@ EOF
 
 ### Enrol the terminal at the relay
 
-The enrolment handshake is two files exchanged out-of-band: an **intro** file
-the terminal emits (advertising its pubkey to the relay) and an **invite**
+The enrolment handshake is two files exchanged out-of-band: a **request** file
+the terminal emits (advertising its pubkey to the relay) and a **grant**
 file the relay emits in reply (committing both pubkeys plus the relay's
-reachable endpoint). The terminal applies the invite to populate
+reachable endpoint). The terminal applies the grant to populate
 `[dial]`; the relay's `identity add-accept` step has already
 written `[accept]` locally.
 
 ```bash
-# Terminal: export an intro file.
-sudo yggdrasilctl identity export-intro --out /tmp/home.intro
+# Terminal: export an request file.
+sudo yggdrasilctl identity export-request --out /tmp/home.request
 
-# Relay: accept the intro, mint an invite.
+# Relay: accept the request, mint a grant.
 sudo yggdrasilctl identity add-accept \
-    --from /tmp/home.intro \
+    --from /tmp/home.request \
     --my-endpoint vps.example.net:51820 \
-    --out /tmp/home.invite
+    --out /tmp/home.grant
 
-# Terminal: apply the invite (writes [dial]).
-sudo yggdrasilctl identity add-dial --from /tmp/home.invite
+# Terminal: apply the grant (writes [dial]).
+sudo yggdrasilctl identity add-dial --from /tmp/home.grant
 ```
 
 Verify the printed fingerprints match what `identity show` reports on the
@@ -137,7 +137,7 @@ ssh -p 2222 user@vps.example.net
   reload, metrics, `chain diff`, troubleshooting)
 * [docs/architecture.md](docs/architecture.md) — why the design looks the
   way it does (chain plane, predicate projection, half-close)
-* [docs/security.md](docs/security.md) — threat model, crypto, intro/invite
+* [docs/security.md](docs/security.md) — threat model, crypto, request/grant
 * [tests/e2e/run.sh](tests/e2e/run.sh) — 2-node podman-compose smoke
 * [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain smoke
 

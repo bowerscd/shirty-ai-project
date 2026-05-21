@@ -15,13 +15,14 @@
 //! * Config file: standard yggdrasil TOML. We mutate the `[dial]`
 //!   and `[accept]` sections atomically (tmp + rename); other
 //!   sections are preserved.
-//! * Intro file (`intro.txt` by convention): emitted by a node that wants to
-//!   advertise itself as a downstream candidate. Contains this node's
+//! * Request file (`request.txt` by convention): emitted by a node that
+//!   wants to be enrolled as a `dial`-side peer. Contains this node's
 //!   tagged pubkey and a self-fingerprint.
-//! * Invite file (`invite.txt` by convention): emitted by an upstream after
-//!   accepting an intro. Contains both pubkeys + the upstream's reachable
-//!   endpoint. Hand-delivered back to the downstream (the issuer of the
-//!   original intro), which feeds it to `identity add-dial`.
+//! * Grant file (`grant.txt` by convention): emitted by an accept-side
+//!   peer after consuming a request. Contains both pubkeys + the
+//!   accept-side's reachable endpoint. Hand-delivered back to the
+//!   requester (the issuer of the original request), which feeds it to
+//!   `identity add-dial`.
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,7 +30,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 
 use ratatoskr::auth::StaticKeyPair;
-use ratatoskr::intro::{IntroFile, InviteFile};
+use ratatoskr::enrollment::{GrantFile, RequestFile};
 use ratatoskr::pubkey::PubKey;
 
 /// Fallback identity-file path when neither `--identity-file` nor the
@@ -45,17 +46,17 @@ pub enum Cmd {
     /// unless `--force` is given.
     Rotate(RotateArgs),
 
-    /// Write an intro file (this node advertising itself as a downstream
-    /// candidate).
-    #[command(name = "export-intro")]
-    ExportIntro(ExportIntroArgs),
+    /// Write a request file (this node asking to be enrolled as a
+    /// `dial`-side peer).
+    #[command(name = "export-request")]
+    ExportRequest(ExportRequestArgs),
 
-    /// Apply an invite file: verify it targets this node and write
+    /// Apply a grant file: verify it targets this node and write
     /// `[dial]` into the daemon config.
     #[command(name = "add-dial")]
     AddDial(AddDialArgs),
 
-    /// Apply an intro file: mint an invite for the introducer, and write
+    /// Apply a request file: mint a grant for the requester, and write
     /// `[accept]` into the daemon config.
     #[command(name = "add-accept")]
     AddAccept(AddAcceptArgs),
@@ -99,55 +100,55 @@ pub struct RotateArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ExportIntroArgs {
+pub struct ExportRequestArgs {
     /// Override the identity file path.
     #[arg(long)]
     identity_file: Option<PathBuf>,
 
-    /// Where to write the intro file. When omitted, the intro TOML is
-    /// printed to stdout (operators can pipe it directly or redirect
+    /// Where to write the request file. When omitted, the request TOML
+    /// is printed to stdout (operators can pipe it directly or redirect
     /// to a file). When supplied, the file is written with 0600 perms.
     #[arg(short = 'o', long = "out")]
     out: Option<PathBuf>,
 
-    /// Free-form note included in the intro file (operator hint).
+    /// Free-form note included in the request file (operator hint).
     #[arg(long, default_value = "")]
     note: String,
 }
 
 #[derive(Debug, Args)]
 pub struct AddDialArgs {
-    /// Path to the invite file emitted by the upstream.
+    /// Path to the grant file emitted by the accept-side.
     #[arg(long = "from")]
     from: PathBuf,
 
-    /// Override the identity file path (used to verify the invite targets us).
+    /// Override the identity file path (used to verify the grant targets us).
     #[arg(long)]
     identity_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct AddAcceptArgs {
-    /// Path to the intro file received from the prospective downstream.
+    /// Path to the request file received from the prospective dial-side peer.
     #[arg(long = "from")]
     from: PathBuf,
 
     /// The endpoint string (`host:port`) this node advertises as its
-    /// upstream-facing address. Written into both the invite file and the
-    /// `[dial].endpoint` field that the downstream will paste in.
+    /// accept-side reachable address. Written into both the grant file
+    /// and the `[dial].endpoint` field that the requester will paste in.
     #[arg(long = "my-endpoint")]
     my_endpoint: String,
 
-    /// Where to write the resulting invite file. Defaults to `invite.txt`.
-    #[arg(short = 'o', long = "out", default_value = "invite.txt")]
+    /// Where to write the resulting grant file. Defaults to `grant.txt`.
+    #[arg(short = 'o', long = "out", default_value = "grant.txt")]
     out: PathBuf,
 
-    /// Override the identity file path (used to populate the invite's
-    /// `upstream_pubkey`).
+    /// Override the identity file path (used to populate the grant's
+    /// `accept_pubkey`).
     #[arg(long)]
     identity_file: Option<PathBuf>,
 
-    /// Free-form note included in the invite file.
+    /// Free-form note included in the grant file.
     #[arg(long, default_value = "")]
     note: String,
 }
@@ -156,7 +157,7 @@ pub async fn run(cmd: Cmd, config_path: &Path, json: bool) -> Result<()> {
     match cmd {
         Cmd::Show(a) => show(a, config_path, json),
         Cmd::Rotate(a) => rotate(a, config_path, json),
-        Cmd::ExportIntro(a) => export_intro(a, config_path, json),
+        Cmd::ExportRequest(a) => export_request(a, config_path, json),
         Cmd::AddDial(a) => add_dial(a, config_path, json),
         Cmd::AddAccept(a) => add_accept(a, config_path, json),
         Cmd::RemoveDial => remove_dial(config_path, json),
@@ -435,9 +436,9 @@ fn list_chain_enrollments(config_path: &Path) -> Vec<EnrollmentEntry> {
     out
 }
 
-// ---------- export-intro ----------
+// ---------- export-request ----------
 
-fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result<()> {
+fn export_request(args: ExportRequestArgs, config_path: &Path, json: bool) -> Result<()> {
     let identity_file = resolve_identity_file(args.identity_file, config_path)?;
     if !identity_file.exists() {
         bail!(
@@ -448,11 +449,11 @@ fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result
     let kp = StaticKeyPair::load_from_file(&identity_file)
         .with_context(|| format!("load {}", identity_file.display()))?;
     let pubkey = PubKey::X25519(*kp.public_key());
-    let intro = IntroFile::new(pubkey, now_unix_secs(), args.note.clone());
-    let toml_str = intro.to_toml().context("serialise intro file")?;
+    let req = RequestFile::new(pubkey, now_unix_secs(), args.note.clone());
+    let toml_str = req.to_toml().context("serialise request file")?;
 
     let fingerprint = kp.fingerprint();
-    let pubkey_str = intro.intro.pubkey.to_string();
+    let pubkey_str = req.request.pubkey.to_string();
 
     match args.out.as_ref() {
         Some(path) => {
@@ -462,16 +463,16 @@ fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result
             print_kv(
                 json,
                 &[
-                    ("intro_file:", out_str.as_str()),
+                    ("request_file:", out_str.as_str()),
                     ("pubkey:", pubkey_str.as_str()),
                     ("fingerprint:", fingerprint.as_str()),
-                    ("note:", intro.intro.note.as_str()),
+                    ("note:", req.request.note.as_str()),
                 ],
             )
         }
         None => {
-            // Stdout default: emit only the intro TOML body so the
-            // output can be piped directly into the upstream's
+            // Stdout default: emit only the request TOML body so the
+            // output can be piped directly into the accept-side's
             // `identity add-accept --from -` workflow without
             // any text-mode chrome to strip first. Diagnostic
             // metadata (pubkey/fingerprint/note) goes to stderr so
@@ -481,8 +482,8 @@ fn export_intro(args: ExportIntroArgs, config_path: &Path, json: bool) -> Result
             if !json {
                 eprintln!("pubkey:      {pubkey_str}");
                 eprintln!("fingerprint: {fingerprint}");
-                if !intro.intro.note.is_empty() {
-                    eprintln!("note:        {}", intro.intro.note);
+                if !req.request.note.is_empty() {
+                    eprintln!("note:        {}", req.request.note);
                 }
             }
             Ok(())
@@ -504,16 +505,16 @@ fn add_dial(args: AddDialArgs, config_path: &Path, json: bool) -> Result<()> {
         .with_context(|| format!("load {}", identity_file.display()))?;
     let local_pubkey = PubKey::X25519(*kp.public_key());
 
-    let invite = InviteFile::read(&args.from)
-        .with_context(|| format!("read invite {}", args.from.display()))?;
+    let grant = GrantFile::read(&args.from)
+        .with_context(|| format!("read grant {}", args.from.display()))?;
 
-    if invite.invite.downstream_pubkey != local_pubkey {
+    if grant.grant.dial_pubkey != local_pubkey {
         bail!(
-            "invite at {} targets pubkey {} (fp {}), but our identity is \
+            "grant at {} targets pubkey {} (fp {}), but our identity is \
              {} (fp {}). Refusing to apply.",
             args.from.display(),
-            invite.invite.downstream_pubkey,
-            invite.invite.downstream_fingerprint,
+            grant.grant.dial_pubkey,
+            grant.grant.dial_fingerprint,
             local_pubkey,
             kp.fingerprint(),
         );
@@ -528,23 +529,23 @@ fn add_dial(args: AddDialArgs, config_path: &Path, json: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("`dial` is not a table"))?;
     dial_table.insert(
         "pubkey".to_string(),
-        toml::Value::String(invite.invite.upstream_pubkey.to_string()),
+        toml::Value::String(grant.grant.accept_pubkey.to_string()),
     );
     dial_table.insert(
         "endpoint".to_string(),
-        toml::Value::String(invite.invite.upstream_endpoint.clone()),
+        toml::Value::String(grant.grant.accept_endpoint.clone()),
     );
     save_config_doc(config_path, &doc)?;
 
     let cfg_str = config_path.display().to_string();
-    let upstream_pubkey_str = invite.invite.upstream_pubkey.to_string();
+    let accept_pubkey_str = grant.grant.accept_pubkey.to_string();
     print_kv(
         json,
         &[
             ("config:", cfg_str.as_str()),
-            ("upstream_pubkey:", upstream_pubkey_str.as_str()),
-            ("upstream_fingerprint:", invite.invite.upstream_fingerprint.as_str()),
-            ("upstream_endpoint:", invite.invite.upstream_endpoint.as_str()),
+            ("accept_pubkey:", accept_pubkey_str.as_str()),
+            ("accept_fingerprint:", grant.grant.accept_fingerprint.as_str()),
+            ("accept_endpoint:", grant.grant.accept_endpoint.as_str()),
             ("action:", "wrote_[dial]"),
         ],
     )?;
@@ -567,7 +568,7 @@ fn add_accept(args: AddAcceptArgs, config_path: &Path, json: bool) -> Result<()>
     }
     let kp = StaticKeyPair::load_from_file(&identity_file)
         .with_context(|| format!("load {}", identity_file.display()))?;
-    let upstream_pubkey = PubKey::X25519(*kp.public_key());
+    let accept_pubkey = PubKey::X25519(*kp.public_key());
 
     // Validate endpoint shape: must contain a ':' (host:port). We don't
     // resolve DNS or check reachability here — that's the daemon's job at
@@ -579,20 +580,20 @@ fn add_accept(args: AddAcceptArgs, config_path: &Path, json: bool) -> Result<()>
         );
     }
 
-    let intro = IntroFile::read(&args.from)
-        .with_context(|| format!("read intro {}", args.from.display()))?;
-    let downstream_pubkey = intro.intro.pubkey;
+    let req = RequestFile::read(&args.from)
+        .with_context(|| format!("read request {}", args.from.display()))?;
+    let dial_pubkey = req.request.pubkey;
 
-    // Mint the invite.
-    let invite = InviteFile::new(
-        &intro,
-        upstream_pubkey,
+    // Mint the grant.
+    let grant = GrantFile::new(
+        &req,
+        accept_pubkey,
         args.my_endpoint.clone(),
         now_unix_secs(),
         args.note.clone(),
     );
-    let invite_toml = invite.to_toml().context("serialise invite file")?;
-    write_file_secret(&args.out, invite_toml.as_bytes())
+    let grant_toml = grant.to_toml().context("serialise grant file")?;
+    write_file_secret(&args.out, grant_toml.as_bytes())
         .with_context(|| format!("write {}", args.out.display()))?;
 
     // Mutate config: write `[accept].pubkey`. `listen` is left for the
@@ -607,22 +608,22 @@ fn add_accept(args: AddAcceptArgs, config_path: &Path, json: bool) -> Result<()>
         .ok_or_else(|| anyhow!("`accept` is not a table"))?;
     accept_table.insert(
         "pubkey".to_string(),
-        toml::Value::String(downstream_pubkey.to_string()),
+        toml::Value::String(dial_pubkey.to_string()),
     );
     save_config_doc(config_path, &doc)?;
 
     let cfg_str = config_path.display().to_string();
     let out_str = args.out.display().to_string();
-    let downstream_pubkey_str = downstream_pubkey.to_string();
+    let dial_pubkey_str = dial_pubkey.to_string();
     print_kv(
         json,
         &[
             ("config:", cfg_str.as_str()),
-            ("invite_file:", out_str.as_str()),
-            ("downstream_pubkey:", downstream_pubkey_str.as_str()),
-            ("downstream_fingerprint:", invite.invite.downstream_fingerprint.as_str()),
-            ("upstream_endpoint:", args.my_endpoint.as_str()),
-            ("action:", "wrote_[accept]_and_invite"),
+            ("grant_file:", out_str.as_str()),
+            ("dial_pubkey:", dial_pubkey_str.as_str()),
+            ("dial_fingerprint:", grant.grant.dial_fingerprint.as_str()),
+            ("accept_endpoint:", args.my_endpoint.as_str()),
+            ("action:", "wrote_[accept]_and_grant"),
         ],
     )?;
     eprintln!(

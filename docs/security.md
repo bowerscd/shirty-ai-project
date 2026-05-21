@@ -13,7 +13,7 @@ matters.
 | Handshake               | Noise_IK_25519_ChaChaPoly_BLAKE2s (`snow` crate)    | Authenticated key agreement per session.          |
 | Symmetric AEAD          | ChaCha20-Poly1305 (16-byte tag)                     | Payload confidentiality + integrity.              |
 | Strict-monotonic replay | 8-byte counter, rejected on `<= last_accepted`      | Replay prevention.                                |
-| Fingerprint             | BLAKE2s-128 over pubkey, 32 hex chars               | Human-checkable identifier for intro/invite.      |
+| Fingerprint             | BLAKE2s-128 over pubkey, 32 hex chars               | Human-checkable identifier for request/grant.      |
 
 The Noise pattern is **IK**: the initiator already knows the responder's
 static public key. This is the right primitive for a chain where every
@@ -53,38 +53,38 @@ A persistent attacker who watches you boot a relay for the first time
 running `approve` — never approve a fingerprint you haven't cross-checked
 against the downstream node directly.
 
-### Intro / invite handshake
+### Request / grant handshake
 
 The recommended flow is **offline** rather than TOFU. Two files move
 out-of-band:
 
-* **intro.txt** — emitted by the downstream node via `yggdrasilctl
-  identity export-intro`. Contents:
-    * `downstream_pubkey` (tagged `x25519:<hex>`)
+* **request.txt** — emitted by the downstream node via `yggdrasilctl
+  identity export-request`. Contents:
+    * `dial_pubkey` (tagged `x25519:<hex>`)
     * `downstream_fingerprint` (32-hex BLAKE2s-128)
     * optional operator `note`
   Encoded as base64-url-no-pad with a magic prefix; not a secret.
-* **invite.txt** — emitted by the upstream via `yggdrasilctl identity
-  add-accept --from intro.txt --my-endpoint host:port`. Contents:
+* **grant.txt** — emitted by the upstream via `yggdrasilctl identity
+  add-accept --from request.txt --my-endpoint host:port`. Contents:
     * `upstream_pubkey`
     * `upstream_fingerprint`
-    * `downstream_pubkey` (echoed from the intro)
+    * `dial_pubkey` (echoed from the request)
     * `endpoint` (the upstream's reachable `host:port`)
     * optional `note`
 
-`yggdrasilctl identity add-dial --from invite.txt` verifies that
-`downstream_pubkey` in the invite matches the local identity (catches
-"wrong invite file" mistakes) before writing `[dial]`.
+`yggdrasilctl identity add-dial --from grant.txt` verifies that
+`dial_pubkey` in the grant matches the local identity (catches
+"wrong grant file" mistakes) before writing `[dial]`.
 
 This buys you **two** things over TOFU:
 
 1. The pubkeys cross the air-gap before any network traffic flows, so
    a passive attacker cannot land in the pending-peer store.
-2. The downstream's `add-dial` rejects an invite that targets a
-   different node, preventing a misrouted invite from compromising a
+2. The downstream's `add-dial` rejects a grant that targets a
+   different node, preventing a misrouted grant from compromising a
    sibling terminal.
 
-**It does not** authenticate the intro / invite files cryptographically.
+**It does not** authenticate the request / grant files cryptographically.
 You are trusting the transport you use to hand-deliver them (Signal,
 encrypted email, USB stick). The fingerprint check on each end is the
 boundary; print and read the 32-hex fingerprint over a voice call if
@@ -203,7 +203,7 @@ inside the relay is still part of your attack surface).
   file). Add operators to the group; revoke when they leave.
 * Back up `/etc/yggdrasil/identity.key` to a place that's at least as
   secure as your password vault. Lose it and your chain neighbours
-  will need to re-run the intro/invite ceremony.
+  will need to re-run the request/grant ceremony.
 * Rotate identity keys at the cadence your policy demands — there's no
   technical requirement to do so on any particular schedule, but
   shorter rotation windows shrink the blast radius of a key compromise.

@@ -4,7 +4,7 @@
 # Runs in the `init` service (entrypoint = this script). Mounts the state
 # volumes for vps (gateway-mode acceptor) and home (terminal-mode dialer);
 # provisions identities, writes configs, and runs the offline
-# intro/invite handshake via `yggdrasilctl identity`. vps/home
+# request/grant handshake via `yggdrasilctl identity`. vps/home
 # `depends_on: { init: ... }` so they don't start until this completes.
 #
 # Note: in three-mode design, proxy rules are owned by the terminal and
@@ -25,8 +25,8 @@ VPS_KEY=/etc/yggdrasil/identity.key
 HOME_CFG=/etc/yggdrasil-home/config.toml
 HOME_KEY=/etc/yggdrasil-home/identity.key
 
-INTRO_PATH=/tmp/home-intro.txt
-INVITE_PATH=/tmp/home-invite.txt
+REQUEST_PATH=/tmp/home-request.txt
+GRANT_PATH=/tmp/home-grant.txt
 
 # Re-running the init service should be idempotent so `podman compose up`
 # after a partial failure works without manual cleanup.
@@ -89,28 +89,28 @@ echo "[init] generating home identity"
 yggdrasilctl --config "$HOME_CFG" identity rotate \
     --identity-file "$HOME_KEY" --force >/dev/null
 
-# ---- offline intro/invite handshake ---------------------------------------
+# ---- offline request/grant handshake ---------------------------------------
 
-echo "[init] home exports intro"
-yggdrasilctl --config "$HOME_CFG" identity export-intro \
+echo "[init] home exports request"
+yggdrasilctl --config "$HOME_CFG" identity export-request \
     --identity-file "$HOME_KEY" \
-    --out "$INTRO_PATH" \
+    --out "$REQUEST_PATH" \
     --note "e2e home downstream" >/dev/null
 
-echo "[init] vps mints invite for home (writes [accept])"
+echo "[init] vps mints grant for home (writes [accept])"
 yggdrasilctl --config "$VPS_CFG" identity add-accept \
     --identity-file "$VPS_KEY" \
-    --from "$INTRO_PATH" \
+    --from "$REQUEST_PATH" \
     --my-endpoint vps:51820 \
-    --out "$INVITE_PATH" \
+    --out "$GRANT_PATH" \
     --note "e2e vps→home" >/dev/null
 
-echo "[init] home applies invite (writes [dial])"
+echo "[init] home applies grant (writes [dial])"
 yggdrasilctl --config "$HOME_CFG" identity add-dial \
     --identity-file "$HOME_KEY" \
-    --from "$INVITE_PATH" >/dev/null
+    --from "$GRANT_PATH" >/dev/null
 
-rm -f "$INTRO_PATH" "$INVITE_PATH"
+rm -f "$REQUEST_PATH" "$GRANT_PATH"
 
 # ---- home rules ------------------------------------------------------------
 #

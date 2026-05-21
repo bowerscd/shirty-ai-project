@@ -135,7 +135,7 @@ sudo yggdrasilctl local accept approve 1234abcd5678efef...
 
 After approve, restart the daemon for `[accept]` to take effect.
 The same effect can also be produced offline via `yggdrasilctl identity
-add-accept` against an intro file — see [quickstart.md](quickstart.md).
+add-accept` against an request file — see [quickstart.md](quickstart.md).
 
 ### Hot-reloading rules
 
@@ -194,9 +194,9 @@ Identity keys are long-term. Rotate them when:
   rather than copying the old one.
 * Policy requires periodic rotation.
 
-The intro/invite handshake from [quickstart.md](quickstart.md) is the
+The request/grant handshake from [quickstart.md](quickstart.md) is the
 same ceremony you'll use to re-enroll across a rotation. The downstream
-always emits the intro; the upstream always emits the invite.
+always emits the request; the upstream always emits the grant.
 
 Workflow (upstream-side rotation — relay rotating its own key):
 
@@ -208,22 +208,22 @@ sudo yggdrasilctl identity rotate --force
 # pubkey:      x25519:NEW...
 # fingerprint: NEW...
 
-# The downstream emits a fresh intro carrying its already-enrolled pubkey.
-# (Or you can keep a cached copy of the original intro file if you saved
+# The downstream emits a fresh request carrying its already-enrolled pubkey.
+# (Or you can keep a cached copy of the original request file if you saved
 # it — the downstream pubkey is unchanged across an upstream-side rotation.)
-sudo yggdrasilctl identity export-intro --out /tmp/downstream.intro    # ON the downstream
+sudo yggdrasilctl identity export-request --out /tmp/downstream.request    # ON the downstream
 
-# Back on the relay, re-run add-accept against the intro. This rewrites
-# [accept].pubkey (no-op if unchanged) and emits a fresh invite
+# Back on the relay, re-run add-accept against the request. This rewrites
+# [accept].pubkey (no-op if unchanged) and emits a fresh grant
 # carrying the NEW relay pubkey + endpoint.
 sudo yggdrasilctl identity add-accept \
-    --from /tmp/downstream.intro \
+    --from /tmp/downstream.request \
     --my-endpoint relay.example.net:51820 \
-    --out /tmp/relay.invite
+    --out /tmp/relay.grant
 
-# Ship the invite to the downstream. There, apply it — it rewrites
+# Ship the grant to the downstream. There, apply it — it rewrites
 # [dial].pubkey to the relay's new key.
-sudo yggdrasilctl identity add-dial --from /tmp/relay.invite       # ON the downstream
+sudo yggdrasilctl identity add-dial --from /tmp/relay.grant       # ON the downstream
 
 # Restart both daemons.
 sudo systemctl restart yggdrasil
@@ -239,17 +239,17 @@ sudo yggdrasilctl identity rotate --force
 #  `--yes-i-understand-this-breaks-existing-chains` for scripted use)
 
 # The downstream's pubkey changed, so its upstream needs to re-pin it.
-sudo yggdrasilctl identity export-intro --out /tmp/downstream.intro
+sudo yggdrasilctl identity export-request --out /tmp/downstream.request
 
-# Ship intro to the upstream. There:
+# Ship request to the upstream. There:
 sudo yggdrasilctl identity remove-accept                            # ON the upstream
 sudo yggdrasilctl identity add-accept \
-    --from /tmp/downstream.intro \
+    --from /tmp/downstream.request \
     --my-endpoint <upstream-public>:<chain-listener-port> \
-    --out /tmp/upstream.invite
+    --out /tmp/upstream.grant
 
-# Ship the fresh invite back. On the downstream:
-sudo yggdrasilctl identity add-dial --from /tmp/upstream.invite
+# Ship the fresh grant back. On the downstream:
+sudo yggdrasilctl identity add-dial --from /tmp/upstream.grant
 
 # Restart both daemons.
 ```
@@ -264,9 +264,9 @@ upstream:
   start the daemon yet; enrollment will write `[accept]` and `[dial]`.
 2. On the terminal, `yggdrasilctl identity remove-dial`. Heartbeats
    to the old upstream stop.
-3. Mid-relay ↔ old-upstream enrollment: run the intro/invite ceremony
+3. Mid-relay ↔ old-upstream enrollment: run the request/grant ceremony
    so the mid-relay is the new downstream of the old upstream.
-4. Terminal ↔ mid-relay enrollment: run the intro/invite ceremony so
+4. Terminal ↔ mid-relay enrollment: run the request/grant ceremony so
    the terminal is the new downstream of the mid-relay.
 5. Restart all three daemons. `chain diff` should now report three hops.
 
@@ -330,7 +330,7 @@ non-error.
 You only need to back up two files per host:
 
 * `/etc/yggdrasil/identity.key` — the long-term key. Lose it and you'll
-  have to re-run the intro/invite ceremony with every neighbour.
+  have to re-run the request/grant ceremony with every neighbour.
 * `/etc/yggdrasil/config.toml` — the daemon config (which embeds the
   enrolled chain neighbour pubkeys).
 

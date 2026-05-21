@@ -78,53 +78,53 @@ EOF
 have `[accept]`; the daemon derives terminal mode from `[dial]`-only
 shape.
 
-## 4. Run the intro / invite handshake
+## 4. Run the request / grant handshake
 
 The enrolment ceremony is two files exchanged out-of-band. The home box
-emits an **intro** advertising its pubkey; the VPS replies with an
-**invite** committing both pubkeys plus the VPS's reachable endpoint;
-the home box applies the invite to populate `[dial]`.
+emits a **request** advertising its pubkey; the VPS replies with an
+**grant** committing both pubkeys plus the VPS's reachable endpoint;
+the home box applies the grant to populate `[dial]`.
 
 On the home box:
 
 ```bash
-sudo yggdrasilctl identity export-intro --out /tmp/home.intro
-# wrote intro file
+sudo yggdrasilctl identity export-request --out /tmp/home.request
+# wrote request file
 #   pubkey:      x25519:9d2f04a3...4b7c
 #   fingerprint: 1234abcd5678...
 ```
 
-Copy the intro to the VPS:
+Copy the request to the VPS:
 
 ```bash
-scp /tmp/home.intro vps.example.net:/tmp/
+scp /tmp/home.request vps.example.net:/tmp/
 ```
 
 On the VPS:
 
 ```bash
 sudo yggdrasilctl identity add-accept \
-    --from /tmp/home.intro \
+    --from /tmp/home.request \
     --my-endpoint vps.example.net:51820 \
-    --out /tmp/home.invite
+    --out /tmp/home.grant
 # updated /etc/yggdrasil/config.toml: [accept].pubkey
-# wrote invite file
+# wrote grant file
 #   upstream_pubkey:   x25519:6c5a30bb...0ff1
-#   downstream_pubkey: x25519:9d2f04a3...4b7c
+#   dial_pubkey: x25519:9d2f04a3...4b7c
 #   endpoint:          vps.example.net:51820
 ```
 
-Copy the invite back to the home box:
+Copy the grant back to the home box:
 
 ```bash
-scp /tmp/home.invite home.example.lan:/tmp/
+scp /tmp/home.grant home.example.lan:/tmp/
 ```
 
 On the home box:
 
 ```bash
-sudo yggdrasilctl identity add-dial --from /tmp/home.invite
-# verified invite targets this node (downstream_pubkey matches local identity)
+sudo yggdrasilctl identity add-dial --from /tmp/home.grant
+# verified grant targets this node (dial_pubkey matches local identity)
 # updated /etc/yggdrasil/config.toml: [dial]
 #   pubkey:   x25519:6c5a30bb...0ff1
 #   endpoint: vps.example.net:51820
@@ -132,13 +132,13 @@ sudo yggdrasilctl identity add-dial --from /tmp/home.invite
 
 Before continuing, sanity-check that the fingerprints match what
 `yggdrasilctl identity show` reports on the opposite host. If they
-don't match, somebody altered an intro or invite in transit — do not
+don't match, somebody altered a request or grant in transit — do not
 start the daemons.
 
 Wipe the transit files once enrolled; they're no longer needed:
 
 ```bash
-sudo rm /tmp/home.intro /tmp/home.invite
+sudo rm /tmp/home.request /tmp/home.grant
 ```
 
 ## 5. Add a forwarding rule (terminal side)
