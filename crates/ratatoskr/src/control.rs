@@ -96,17 +96,16 @@ pub enum Request {
     /// hostname, where the cert came from, and parsed metadata.
     // (`CertsList` was removed; cert summary now folded into `Status`.)
     /// Render the daemon's Prometheus metrics in text exposition format.
-    /// The daemon dispatches the request to its in-process recorder; no
-    /// HTTP listener is required. Backs `yggdrasilctl local metrics`.
+    /// The daemon dispatches the request to its in-process recorder.
+    /// Backs `yggdrasilctl local metrics`.
     Metrics,
     /// Liveness/readiness probe served over the control socket. Backs
     /// `yggdrasilctl local health`.
     Health,
     /// Snapshot of this node's chain-applied predicates, derived rule
-    /// set, and chain identity. Replaces the previous loopback-gated
-    /// `GET /internal/derived-rules` HTTP endpoint. Backs both
-    /// `yggdrasilctl local derived-rules` and the local-hop fetch in
-    /// `yggdrasilctl chain diff`.
+    /// set, and chain identity. Backs both `yggdrasilctl local
+    /// derived-rules` and the local-hop fetch in `yggdrasilctl chain
+    /// diff`.
     DerivedRules,
     /// Walk the chain from this node upward and collect a per-hop
     /// summary suitable for `yggdrasilctl chain summary` / `health` /
@@ -308,8 +307,7 @@ pub struct MetricsResponse {
     pub body: String,
 }
 
-/// Response body for [`Request::Health`]. Mirrors the previous
-/// `/healthz` + `/readyz` HTTP endpoints: `ready` flips to `true` once
+/// Response body for [`Request::Health`]. `ready` flips to `true` once
 /// every subsystem has signalled readiness via
 /// `yggdrasil::health::mark_ready`. `uptime_secs` is monotonic since
 /// process start and is convenient to gate "daemon is in `starting`

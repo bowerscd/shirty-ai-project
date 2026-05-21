@@ -108,11 +108,11 @@ pub struct ChainAcceptor {
     derive_cfg: DeriveConfig,
     state_path: PathBuf,
     state: Mutex<InMemoryState>,
-    /// Late-bound chain-introspection sink. Phase 5B's
-    /// `/internal/derived-rules` HTTP endpoint reads from this. When
-    /// unset (e.g. tests, or relays where the introspection endpoint
-    /// is intentionally disabled), `handle_predicate_set_update`
-    /// silently skips the `record_apply` notification.
+    /// Late-bound chain-introspection sink. The `Request::DerivedRules`
+    /// UDS handler reads from this. When unset (e.g. tests, or relays
+    /// where the introspection endpoint is intentionally disabled),
+    /// `handle_predicate_set_update` silently skips the `record_apply`
+    /// notification.
     ///
     /// See [`set_introspection`](ChainAcceptor::set_introspection).
     introspection: OnceLock<Arc<IntrospectionState>>,
@@ -403,10 +403,10 @@ impl ChainAcceptor {
         )
         .set(set.version as f64);
 
-        // Phase 5B: notify the introspection sink, if one is attached.
-        // This populates the `/internal/derived-rules` snapshot with the
-        // predicate set we just applied. Skipped silently when no sink
-        // is wired (tests, future opt-out).
+        // Notify the introspection sink, if one is attached. This
+        // populates the `Request::DerivedRules` snapshot with the
+        // predicate set we just applied. Skipped silently when no
+        // sink is wired (tests, future opt-out).
         if let Some(ix) = self.introspection.get() {
             ix.record_apply(&set);
         }

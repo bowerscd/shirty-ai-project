@@ -81,7 +81,7 @@ async fn terminal_chain_apply_enqueues_and_reports() {
     let config_path = socket_dir.path().join("yggdrasil.toml");
     std::fs::write(&config_path, "[server]\nmode = \"terminal\"\n").unwrap();
 
-    // No `tunnel_initiator`: pure-local terminal. The apply should
+    // No chain upstream: pure-local terminal. The apply should
     // succeed with `predicate_count = 0` (no projection performed when
     // there's no upstream to push to).
     let server = ControlServer::bind(

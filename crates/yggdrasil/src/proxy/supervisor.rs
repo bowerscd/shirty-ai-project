@@ -121,7 +121,8 @@ pub struct ProxySupervisor {
     rules_dir: PathBuf,
     reload_trigger: ReloadTrigger,
     /// Shared cert store: used by every HTTPS frontend as `ResolvesServerCert`
-    /// and read by the `yggdrasilctl certs list` control-plane verb.
+    /// and read by the `yggdrasilctl local status` control-plane verb
+    /// (cert summary section).
     cert_store: Arc<CertStore>,
     /// Filesystem watcher for the PEM files referenced by HTTPS routes.
     /// Re-resolves any host whose backing cert or key changes on disk and
@@ -322,7 +323,8 @@ impl ProxySupervisor {
     }
 
     /// Shared cert store: used by every HTTPS frontend as `ResolvesServerCert`
-    /// and read by the `yggdrasilctl certs list` control-plane verb.
+    /// and read by the `yggdrasilctl local status` control-plane verb
+    /// (cert summary section).
     pub fn cert_store(&self) -> Arc<CertStore> {
         Arc::clone(&self.cert_store)
     }

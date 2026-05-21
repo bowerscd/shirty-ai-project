@@ -27,17 +27,14 @@ pub enum Cmd {
         #[command(subcommand)]
         action: AcceptAction,
     },
-    /// Render the daemon's Prometheus metrics in text exposition format
-    /// (the same body the `/metrics` HTTP endpoint serves), retrieved
-    /// over the control socket.
+    /// Render the daemon's Prometheus metrics in text exposition
+    /// format, retrieved over the control socket.
     Metrics,
     /// Liveness/readiness probe served over the control socket. Exit
     /// status: 0 if ready, 1 if not yet ready, 2 on RPC error.
     Health,
     /// Snapshot of this node's chain-applied predicates, derived rule
-    /// set, and chain identity. Pretty-printed JSON to stdout. Same
-    /// data the previous loopback-gated `GET /internal/derived-rules`
-    /// HTTP endpoint served, now retrieved over UDS.
+    /// set, and chain identity. Pretty-printed JSON to stdout.
     DerivedRules,
     /// Adjust the daemon's tracing-subscriber filter at runtime.
     /// Pass a directive (`debug`, `yggdrasil::heartbeat=trace,info`,

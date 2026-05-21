@@ -70,11 +70,12 @@ const PUBLISH_ACK_DEADLINE: Duration = Duration::from_secs(30);
 /// file resets the counter to `0` and emits a warn-level log so the
 /// operator notices.
 ///
-/// `introspection` is the Phase 5B `/internal/derived-rules` sink: on
-/// every successful upstream-acked push the publisher calls
-/// [`IntrospectionState::record_apply`] with the predicate set we just
-/// shipped. Pass `None` when the terminal disables the introspection
-/// endpoint (the publisher then degenerates to its pre-5B behaviour).
+/// `introspection` is the chain-introspection sink backing
+/// `Request::DerivedRules`: on every successful upstream-acked push the
+/// publisher calls [`IntrospectionState::record_apply`] with the
+/// predicate set we just shipped. Pass `None` when the terminal
+/// disables introspection (the publisher then degenerates to its
+/// pre-introspection behaviour).
 pub fn spawn(
     rules_rx: watch::Receiver<RuleSet>,
     chain_handle: ChainClientHandle,

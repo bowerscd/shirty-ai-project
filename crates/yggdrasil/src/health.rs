@@ -1,19 +1,20 @@
-//! Readiness signaling for the `/readyz` endpoint exposed by
-//! [`crate::metrics`].
+//! Readiness signaling for the `Request::Health` UDS handler exposed by
+//! [`crate::control`].
 //!
 //! ## Why a separate flag from `sd_notify`?
 //!
 //! [`crate::systemd::notify_ready`] tells *systemd* the daemon is up, which
 //! it does by writing `READY=1` to a unix datagram socket. That works for
-//! init systems but doesn't help HTTP-based health probes (kubelet,
-//! load-balancer health checks, `wait_for_service.sh` scripts, etc.).
+//! init systems but doesn't help process-external probes (kubelet,
+//! load-balancer health checks, `wait_for_service.sh` scripts, etc.) that
+//! reach the daemon through `yggdrasilctl local health`.
 //!
 //! This module mirrors the same fact in a process-local
-//! [`AtomicBool`](std::sync::atomic::AtomicBool) so the metrics listener's
-//! `/readyz` handler can serve it. The flag flips to `true` at exactly the
+//! [`AtomicBool`](std::sync::atomic::AtomicBool) so the control-socket
+//! `Health` handler can serve it. The flag flips to `true` at exactly the
 //! same point [`crate::systemd::notify_ready`] is called — after the
-//! metrics exporter, heartbeat socket (relay only), proxy supervisor's
-//! initial rule load, and UDS control socket have all bound.
+//! heartbeat socket (relay only), proxy supervisor's initial rule load,
+//! and UDS control socket have all bound.
 //!
 //! Readiness is one-way: there is no `mark_unready`. If a critical
 //! subsystem fails *after* startup we crash and rely on the supervisor
@@ -25,8 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static READY: AtomicBool = AtomicBool::new(false);
 
-/// Mark the daemon as ready. Subsequent `/readyz` probes will return 200.
-/// Idempotent — calling more than once is harmless.
+/// Mark the daemon as ready. Subsequent `yggdrasilctl local health`
+/// probes will report `ready = true`. Idempotent — calling more than
+/// once is harmless.
 pub fn mark_ready() {
     READY.store(true, Ordering::Release);
 }

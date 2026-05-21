@@ -62,7 +62,7 @@ struct ControlState {
     peer_state: Option<Arc<PeerState>>,
     snapshot_rx: tokio::sync::watch::Receiver<Vec<crate::proxy::supervisor::ProxySnapshot>>,
     reload_trigger: ReloadTrigger,
-    /// Shared cert store handle; surfaces via `Request::CertsList`.
+    /// Shared cert store handle; surfaces via `Request::Status`.
     cert_store: Arc<crate::proxy::certs::CertStore>,
     pending_store: Option<Arc<PendingPeerStore>>,
     /// Path to the main server config; the approve flow rewrites
@@ -82,8 +82,7 @@ struct ControlState {
     /// cheap to clone and tied to the supervisor task's lifetime.
     supervisor_handle: SupervisorHandle,
     /// Prometheus recorder handle used by [`Request::Metrics`] to
-    /// render the text exposition format directly over the UDS,
-    /// without going through the HTTP listener.
+    /// render the text exposition format directly over the UDS.
     prom_handle: PrometheusHandle,
     /// Optional chain-introspection state used by
     /// [`Request::DerivedRules`]. `None` on pure-local terminals (no
@@ -500,8 +499,8 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
 /// 2. Validate the candidate vector by constructing a [`RuleSet`]; this
 ///    runs the same per-rule + cross-rule checks the file-watch reload
 ///    runs ([`error_codes::RULES_INVALID`]).
-/// 3. If the daemon has a chain upstream (presence of
-///    `tunnel_initiator`), project the rule set through
+/// 3. If the daemon has a chain upstream
+///    (`state.has_chain_upstream`), project the rule set through
 ///    [`predicate_extractor::extract`] and postcard-encode it. If the
 ///    encoded body would exceed
 ///    [`PREDICATE_SET_MAX_WIRE_BYTES`], refuse synchronously

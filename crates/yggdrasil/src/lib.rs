@@ -213,7 +213,7 @@ pub async fn run_relay(
     };
 
     // 5c. Attach the introspection sink to the chain acceptor so the
-    //     `/internal/derived-rules` snapshot updates on every inbound
+    //     `Request::DerivedRules` snapshot updates on every inbound
     //     `PredicateSetUpdate` the relay accepts. Relays without a
     //     chain listener never accept pushes, so they skip this wiring
     //     — the snapshot's `predicates` array stays empty for the
@@ -452,8 +452,8 @@ pub async fn run_terminal(
     //     this publisher is skipped.
     //
     //     The publisher carries the introspection state through so it
-    //     can update the `/internal/derived-rules` snapshot on each
-    //     successful upstream ack (Phase 5B).
+    //     can update the `Request::DerivedRules` snapshot on each
+    //     successful upstream ack.
     let predicate_publisher_join = chain_client_handle.as_ref().map(|handle| {
         let origin = ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key());
         let supervisor_handle = supervisor.handle();

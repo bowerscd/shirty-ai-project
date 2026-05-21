@@ -102,7 +102,8 @@ pub enum CertError {
 }
 
 /// Origin of a certificate currently loaded in the store. Mostly an
-/// observability aid: `yggdrasilctl certs list` (Phase 6g) renders this.
+/// observability aid: the cert summary surfaces in `yggdrasilctl local
+/// status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertOrigin {
     /// Operator-supplied PEM files on disk.
@@ -116,7 +117,7 @@ pub enum CertOrigin {
 }
 
 impl CertOrigin {
-    /// Short label suitable for tabular output (`yggdrasilctl certs list`).
+    /// Short label suitable for tabular output in `yggdrasilctl local status`.
     pub fn as_label(&self) -> String {
         match self {
             Self::Path { cert, .. } => format!("path:{}", cert.display()),
@@ -144,9 +145,9 @@ pub struct CertEntry {
     pub key:    Arc<CertifiedKey>,
     pub origin: CertOrigin,
     /// Unix epoch milliseconds at the time this entry was inserted.
-    /// Used by `yggdrasilctl certs list` for operator-facing freshness
-    /// hints. Updated on every reload — the value reflects the *last*
-    /// successful load, not the original.
+    /// Used by `yggdrasilctl local status` for operator-facing
+    /// freshness hints. Updated on every reload — the value reflects
+    /// the *last* successful load, not the original.
     pub loaded_at_unix_ms: u64,
 }
 
@@ -321,8 +322,9 @@ impl CertStore {
     }
 
     /// Snapshot every loaded entry's full operator-relevant metadata:
-    /// `(hostname, origin, loaded_at_unix_ms)`. Used by the control-plane
-    /// `Request::CertsList` handler to render `yggdrasilctl certs list`.
+    /// `(hostname, origin, loaded_at_unix_ms)`. Used by the
+    /// control-plane `Request::Status` handler to render the cert
+    /// summary in `yggdrasilctl local status`.
     pub fn list_full(&self) -> Vec<(String, CertOrigin, u64)> {
         let g = self.inner.read();
         let mut out: Vec<_> = g

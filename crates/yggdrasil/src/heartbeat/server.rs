@@ -50,12 +50,13 @@ pub struct HeartbeatServer {
     /// supervisor); when `Some`, inbound `Control` packets are decoded,
     /// dedup-classified, routed by body type, and acked.
     acceptor: Option<Arc<ChainAcceptor>>,
-    /// Relay-initiated `Control` envelopes (Phase 4B `TunnelData` /
-    /// `TunnelClose` produced by the tunnel terminator's splice tasks).
+    /// Relay-initiated `Control` envelopes (e.g. `ChainHopReply`
+    /// frames the acceptor pushes back down the chain in response to
+    /// recursive `ChainHopQuery` walks).
     /// Drained by the run loop, encoded on the active session, and
     /// emitted on the socket. The keepalive sender lives as long as the
     /// server so the receiver never short-circuits with `None` when no
-    /// tunnel manager is configured.
+    /// upstream-bound producer is configured.
     outbound_rx: mpsc::UnboundedReceiver<ControlEnvelope>,
     _outbound_keepalive: mpsc::UnboundedSender<ControlEnvelope>,
     session: Option<SessionState>,
@@ -85,10 +86,11 @@ impl HeartbeatServer {
     /// tests that do not exercise the relay-side dispatcher).
     ///
     /// The returned [`OutboundHandle`] is the **sender** side of the
-    /// relay-initiated `Control` envelope channel (Phase 4B tunnel
-    /// terminator pushes `TunnelData` / `TunnelClose` here). Drop it if
-    /// the daemon never originates control envelopes — the server holds
-    /// a keepalive sender internally so the channel won't close.
+    /// relay-initiated `Control` envelope channel (currently used by
+    /// the chain acceptor to push `ChainHopReply` frames downstream).
+    /// Drop it if the daemon never originates control envelopes — the
+    /// server holds a keepalive sender internally so the channel won't
+    /// close.
     pub async fn bind(
         listen: SocketAddr,
         local_keys: StaticKeyPair,
@@ -130,9 +132,9 @@ impl HeartbeatServer {
     /// Run the receive loop until the cancellation token fires.
     pub async fn run(mut self) -> Result<()> {
         // Sized to fit the largest single Noise packet we accept on the
-        // wire — currently a TunnelData chunk carrying up to
-        // `TUNNEL_DATA_MAX_PAYLOAD` (16 KiB) plus envelope and AEAD
-        // overhead. See `ratatoskr::wire::MAX_PACKET_LEN`.
+        // wire — currently a `ChainHopReply` body capped at
+        // `chain_query::CHAIN_HOP_REPLY_MAX_WIRE_BYTES` (16 KiB) plus
+        // envelope and AEAD overhead. See `ratatoskr::wire::MAX_PACKET_LEN`.
         let mut buf = [0u8; ratatoskr::wire::MAX_PACKET_LEN];
         loop {
             tokio::select! {
@@ -498,16 +500,16 @@ impl HeartbeatServer {
 }
 
 /// Sender side of the relay-initiated `Control` envelope channel. Hand
-/// this to subsystems that need to push frames upstream
-/// (Phase 4B: tunnel terminator splice tasks). Cloneable; the server
-/// holds a keepalive sender internally so droppers don't close the
-/// channel.
+/// this to subsystems that need to push frames upstream (the chain
+/// acceptor uses it to emit `ChainHopReply` frames). Cloneable; the
+/// server holds a keepalive sender internally so droppers don't close
+/// the channel.
 #[derive(Debug, Clone)]
 pub struct OutboundHandle(mpsc::UnboundedSender<ControlEnvelope>);
 
 impl OutboundHandle {
-    /// Underlying sender, suitable for passing into a
-    /// [`crate::chain::TunnelManager`].
+    /// Underlying sender, suitable for passing into the chain acceptor
+    /// (or any other subsystem that originates control envelopes).
     pub fn sender(&self) -> mpsc::UnboundedSender<ControlEnvelope> {
         self.0.clone()
     }
