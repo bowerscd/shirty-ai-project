@@ -65,21 +65,6 @@ NGINX_DELTA_BUDGET = {
 # p99 must be ≤ 2× nginx for these (i.e. up to 100% worse is allowed)
 NGINX_P99_BUDGET_PCT = 100
 
-# Scenarios whose results are reported but excluded from `--check-nginx`.
-# These are tracked for our own correctness/operational signal, but the
-# head-to-head comparison against nginx is not meaningful — see bench/README.md
-# for the rationale per scenario.
-#
-# - reload-latency: yggdrasil's hot-reload path includes a 250 ms filesystem
-#   inotify debounce by design (so half-written/streamed config drops don't
-#   trigger reload storms). nginx is triggered by an explicit `nginx -s
-#   reload` IPC with no debounce. The two paths measure fundamentally
-#   different things; keeping this in the gate just penalises a product
-#   choice. The scenario still produces JSON, just not a budget violation.
-NGINX_COMPARISON_SKIP = {
-    "reload-latency",
-}
-
 
 @dataclass
 class Report:
@@ -187,8 +172,6 @@ def check_nginx_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
     failures: List[str] = []
     scenarios = {scenario for (scenario, _subject) in cand}
     for scenario in sorted(scenarios):
-        if scenario in NGINX_COMPARISON_SKIP:
-            continue
         ygg = cand.get((scenario, "yggdrasil"))
         ngx = cand.get((scenario, "nginx"))
         if not ygg or not ngx:

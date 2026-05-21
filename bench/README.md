@@ -18,16 +18,15 @@ nginx is the only widely-deployed L4 reverse proxy with comparable feature surfa
 
 `compare.py --check-nginx` enforces these budgets and exits 1 on violation.
 
-> **Note — `reload-latency` is intentionally excluded from the nginx gate.**
+> **Note — `reload-latency` has no nginx leg.**
 > Yggdrasil's rule hot-reload is driven by inotify with a 250 ms debounce
-> window (so half-written/`cp`-streamed config drops don't trigger reload
-> storms); nginx reloads are an operator-explicit `nginx -s reload` IPC with
-> no debounce. The two paths measure fundamentally different things, and
-> rules in a yggdrasil deployment change on a human cadence (minutes-to-days),
-> not in the bench's hot loop. The scenario is still run on every `bench/run-all.sh`
-> invocation and the JSON is produced, so it remains a useful correctness
-> and regression signal against *previous yggdrasil runs* — it just doesn't
-> participate in `--check-nginx`. See `NGINX_COMPARISON_SKIP` in `compare.py`.
+> window (so half-written / `cp`-streamed config drops don't trigger reload
+> storms); `nginx -s reload` is an operator-explicit IPC with no debounce.
+> The two paths measure fundamentally different things and rules in a
+> yggdrasil deployment change on a human cadence (minutes-to-days), not in
+> the bench's hot loop. We still run the scenario on every `bench/run-all.sh`
+> invocation as a yggdrasil-only correctness and regression signal against
+> previous yggdrasil runs.
 
 The `direct` leg (loadgen → echo with no proxy in between) bounds what the kernel + echo backend can deliver in principle — useful for spotting cases where *both* proxies are bottlenecked on the harness, not the system under test.
 
@@ -111,7 +110,7 @@ Exit codes:
 | `tcp-throughput.sh`  | direct, yggdrasil, nginx  | bulk TCP MB/s with a handful of streams                         |
 | `tcp-connrate.sh`    | direct, yggdrasil, nginx  | TCP handshake rate (connect + close)                            |
 | `tcp-idle-conns.sh`  | direct, yggdrasil, nginx  | proxy PSS while holding N idle TCP conns (per-conn memory cost) |
-| `reload-latency.sh`  | yggdrasil, nginx          | time from "config dropped" to "new listener serves a request" (correctness signal; **not** part of the nginx gate — see Why nginx? above) |
+| `reload-latency.sh`  | yggdrasil only            | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why nginx? above for why there's no nginx leg) |
 
 A future `heartbeat-roundtrip.sh` (yggdrasil-only — nginx has no analogous heartbeat) is tracked under Phase 12.
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Config reload latency scenario.
+# Config reload latency scenario — yggdrasil-only.
 #
-# Measures the time from "I dropped a new config" to "the proxy serves traffic
-# under the new rule". For yggdrasil that's a new branch TOML appearing in the
-# rules dir (notify+debounce-driven hot reload). For nginx that's `nginx -s
-# reload` (SIGHUP / new worker fork). Direct has no equivalent and is skipped.
+# Measures the time from "I dropped a new rule fragment in conf.d/" to "the
+# new listener serves traffic", driven by the inotify+250ms debounce hot
+# reload path. This is a regression signal against previous yggdrasil runs
+# only — there is no nginx leg, because `nginx -s reload` is a different
+# trigger model (operator-explicit IPC, no debounce) and a head-to-head
+# comparison would only penalise a deliberate product choice. See bench/README.md.
 #
-# Reported per subject: mean/p95/p99 reload-to-serve latency across N iterations.
+# Reported: mean/p50/p99/p99.9 reload-to-serve latency across N iterations.
 # Output JSON shape matches loadgen reports (so compare.py treats it uniformly).
 
 set -euo pipefail
@@ -107,7 +109,6 @@ run_yggdrasil() {
     local echo_port_a; echo_port_a="$(pick_free_tcp_port)"
     local echo_port_b; echo_port_b="$(pick_free_tcp_port)"
     local listen_a;    listen_a="$(pick_free_tcp_port)"
-    local listen_b;    listen_b="$(pick_free_tcp_port)"
 
     bench_spawn_tcp_echo ECHO_A_PID "$echo_port_a" "$tmp/echo-a.log"
     bench_spawn_tcp_echo ECHO_B_PID "$echo_port_b" "$tmp/echo-b.log"
@@ -137,70 +138,9 @@ EOF
     record_iterations yggdrasil "$OUTDIR/$SCENARIO-yggdrasil.json" "$samples"
 }
 
-# ---------- nginx ----------
-
-run_nginx() {
-    local tmp; tmp="$(bench_mktempdir)"
-    local echo_port_a; echo_port_a="$(pick_free_tcp_port)"
-    local echo_port_b; echo_port_b="$(pick_free_tcp_port)"
-    bench_spawn_tcp_echo ECHO_A_PID "$echo_port_a" "$tmp/echo-a.log"
-    bench_spawn_tcp_echo ECHO_B_PID "$echo_port_b" "$tmp/echo-b.log"
-    local nginx_bin
-    nginx_bin="${BENCH_NGINX:-$(command -v nginx || true)}"
-    [[ -x "$nginx_bin" ]] || die "nginx binary not found; set BENCH_NGINX=/path/to/nginx"
-
-    mkdir -p "$tmp/nginx/logs"
-    local listen_a; listen_a="$(pick_free_tcp_port)"
-
-    # On distros that ship the stream module dynamically (Arch, RHEL/Fedora),
-    # the rendered conf needs a load_module directive — same logic as
-    # bench_spin_nginx in common.sh. We compute it once here and prepend
-    # to every write_conf result.
-    local stream_loader
-    stream_loader="$(bench_nginx_stream_loader "$nginx_bin")"
-
-    write_conf() {
-        local extra="$1"
-        cat > "$tmp/nginx/nginx.conf" <<EOF
-${stream_loader}worker_processes auto;
-pid $tmp/nginx/nginx.pid;
-error_log $tmp/nginx/error.log warn;
-events { worker_connections 4096; }
-stream {
-    server {
-        listen 127.0.0.1:$listen_a;
-        proxy_pass 127.0.0.1:$echo_port_a;
-    }
-$extra
-}
-EOF
-    }
-    write_conf ""
-
-    bench_spawn NGINX_PID "$tmp/nginx/spawn.log" -- "$nginx_bin" -p "$tmp/nginx" -c "$tmp/nginx/nginx.conf" -g "daemon off;"
-    bench_wait_listen_tcp 127.0.0.1 "$listen_a" 5
-
-    local samples=""
-    local i
-    for (( i = 1; i <= ITERATIONS; i++ )); do
-        local p; p="$(pick_free_tcp_port)"
-        local extra="    server { listen 127.0.0.1:$p; proxy_pass 127.0.0.1:$echo_port_b; }"
-        write_conf "$extra"
-        local t0_ns; t0_ns="$(date +%s%N)"
-        "$nginx_bin" -p "$tmp/nginx" -c "$tmp/nginx/nginx.conf" -s reload >/dev/null 2>&1
-        if ! probe_tcp_until_serving 127.0.0.1 "$p" 5; then
-            die "nginx iter $i: listener never came up"
-        fi
-        local t1_ns; t1_ns="$(date +%s%N)"
-        samples+="$(( t1_ns - t0_ns )),"
-    done
-    record_iterations nginx "$OUTDIR/$SCENARIO-nginx.json" "$samples"
-}
-
+# Only one leg — yggdrasil. There is no nginx comparison for this scenario;
+# see the file header for why.
 log "$SCENARIO/yggdrasil: starting"
 run_yggdrasil
-bench_leg_teardown
-log "$SCENARIO/nginx: starting"
-run_nginx
 bench_leg_teardown
 log "$SCENARIO: done. results in $OUTDIR/"
