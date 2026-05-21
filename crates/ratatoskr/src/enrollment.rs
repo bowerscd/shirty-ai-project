@@ -101,6 +101,24 @@ pub struct GrantBody {
 
 impl RequestFile {
     /// Build a new request file body from a pubkey, timestamp, and note.
+    ///
+    /// # Examples
+    ///
+    /// Round-trip through TOML (`to_toml` / `from_toml`):
+    ///
+    /// ```
+    /// use ratatoskr::enrollment::RequestFile;
+    /// use ratatoskr::pubkey::PubKey;
+    /// let req = RequestFile::new(
+    ///     PubKey::x25519([0x33; 32]),
+    ///     1_700_000_000,
+    ///     "home box",
+    /// );
+    /// let toml = req.to_toml().unwrap();
+    /// let parsed = RequestFile::from_toml(&toml).unwrap();
+    /// assert_eq!(parsed.request.pubkey, PubKey::x25519([0x33; 32]));
+    /// assert_eq!(parsed.request.note, "home box");
+    /// ```
     pub fn new(pubkey: PubKey, issued_at: i64, note: impl Into<String>) -> Self {
         let fingerprint = pubkey.fingerprint();
         Self {
@@ -156,6 +174,34 @@ impl RequestFile {
 impl GrantFile {
     /// Build a new grant from a request and the accept-side's own
     /// identity + endpoint.
+    ///
+    /// # Examples
+    ///
+    /// Mint a grant for a freshly-issued request, then round-trip the
+    /// grant through TOML:
+    ///
+    /// ```
+    /// use ratatoskr::enrollment::{GrantFile, RequestFile};
+    /// use ratatoskr::pubkey::PubKey;
+    ///
+    /// let request = RequestFile::new(
+    ///     PubKey::x25519([0x11; 32]),
+    ///     1_700_000_000,
+    ///     "home box",
+    /// );
+    /// let grant = GrantFile::new(
+    ///     &request,
+    ///     PubKey::x25519([0x22; 32]),
+    ///     "vps.example.com:443",
+    ///     1_700_000_100,
+    ///     "approved",
+    /// );
+    /// let toml = grant.to_toml().unwrap();
+    /// let parsed = GrantFile::from_toml(&toml).unwrap();
+    /// assert_eq!(parsed.grant.accept_endpoint, "vps.example.com:443");
+    /// // The grant carries the original requester's pubkey too.
+    /// assert_eq!(parsed.grant.dial_pubkey, PubKey::x25519([0x11; 32]));
+    /// ```
     pub fn new(
         request: &RequestFile,
         accept_pubkey: PubKey,

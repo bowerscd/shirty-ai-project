@@ -57,6 +57,31 @@ pub struct Predicate {
 
 /// A versioned bundle of predicates pushed from a downstream toward its
 /// upstream.
+///
+/// # Examples
+///
+/// Round-trip a [`PredicateSet`] through postcard (the on-the-wire
+/// encoding used by the chain control plane):
+///
+/// ```
+/// use ratatoskr::predicate::{Predicate, PredicateSet};
+/// use ratatoskr::pubkey::PubKey;
+/// use ratatoskr::rule::Protocol;
+///
+/// let set = PredicateSet {
+///     predicates: vec![Predicate {
+///         name: "minecraft".into(),
+///         listen_port: 25565,
+///         protocol: Protocol::Tcp,
+///         idle_timeout_ms: None,
+///     }],
+///     version: 1,
+///     origin: PubKey::x25519([0x44; 32]),
+/// };
+/// let bytes = postcard::to_allocvec(&set).unwrap();
+/// let decoded: PredicateSet = postcard::from_bytes(&bytes).unwrap();
+/// assert_eq!(decoded, set);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredicateSet {
     /// Predicates owned by [`origin`]. The list is ordered by `name` (the

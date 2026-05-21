@@ -28,6 +28,16 @@ pub enum PubKey {
 impl PubKey {
     /// Construct from raw X25519 bytes. Convenience constructor for the
     /// common case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatoskr::pubkey::PubKey;
+    /// let pk = PubKey::x25519([0x42; 32]);
+    /// assert_eq!(pk.algorithm(), "x25519");
+    /// assert_eq!(pk.raw_bytes().len(), 32);
+    /// assert_eq!(pk.as_x25519(), Some(&[0x42; 32]));
+    /// ```
     pub fn x25519(bytes: [u8; PUBLIC_KEY_LEN]) -> Self {
         Self::X25519(bytes)
     }
@@ -57,6 +67,16 @@ impl PubKey {
     /// Short BLAKE2s-128 fingerprint, hex-encoded. Suitable for voice/log
     /// display. Includes the algorithm tag prefix so fingerprints across
     /// algorithms cannot collide.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ratatoskr::pubkey::PubKey;
+    /// let fp = PubKey::x25519([0u8; 32]).fingerprint();
+    /// // tagged form is "<algo>:<32 hex chars>"
+    /// assert!(fp.starts_with("x25519:"));
+    /// assert_eq!(fp.len(), "x25519:".len() + 32);
+    /// ```
     pub fn fingerprint(&self) -> String {
         match self {
             Self::X25519(b) => format!("x25519:{}", public_key_fingerprint(b)),
@@ -75,6 +95,28 @@ impl fmt::Display for PubKey {
 impl FromStr for PubKey {
     type Err = Error;
 
+    /// Parse the tagged text form `<algo>:<hex>`. The only `<algo>`
+    /// recognised in v1 is `x25519`; bare hex is rejected so operators
+    /// cannot accidentally paste a key whose algorithm has changed.
+    ///
+    /// # Examples
+    ///
+    /// Roundtrip through `Display`:
+    ///
+    /// ```
+    /// use ratatoskr::pubkey::PubKey;
+    /// let original = PubKey::x25519([0xAB; 32]);
+    /// let parsed: PubKey = original.to_string().parse().unwrap();
+    /// assert_eq!(original, parsed);
+    /// ```
+    ///
+    /// Untagged hex is rejected:
+    ///
+    /// ```
+    /// use ratatoskr::pubkey::PubKey;
+    /// let bare = "ab".repeat(32);
+    /// assert!(bare.parse::<PubKey>().is_err());
+    /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         let (algo, hex_str) = s.split_once(':').ok_or_else(|| {

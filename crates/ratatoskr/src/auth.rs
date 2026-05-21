@@ -153,6 +153,23 @@ impl StaticKeyPair {
 
     /// Short fingerprint suitable for human display (BLAKE2s-128 of the public
     /// key, rendered as 32 hex characters).
+    ///
+    /// # Examples
+    ///
+    /// The fingerprint is deterministic and independent of how the
+    /// keypair was constructed:
+    ///
+    /// ```
+    /// use ratatoskr::auth::StaticKeyPair;
+    /// let kp = StaticKeyPair::from_raw([0u8; 32], [0u8; 32]);
+    /// let fp = kp.fingerprint();
+    /// assert_eq!(fp.len(), 32);
+    /// assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    ///
+    /// // Same public bytes → same fingerprint.
+    /// let kp2 = StaticKeyPair::from_raw([1u8; 32], [0u8; 32]);
+    /// assert_eq!(fp, kp2.fingerprint());
+    /// ```
     pub fn fingerprint(&self) -> String {
         public_key_fingerprint(&self.public)
     }
