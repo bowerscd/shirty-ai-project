@@ -15,3 +15,6 @@ identity.key
 
 # VS Code workspace settings
 .vscode/
+
+# Benchmark output trees (per-sha results dirs from bench/run-all.sh)
+/bench/results/
