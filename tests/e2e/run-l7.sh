@@ -53,7 +53,7 @@ echo "==> bringing daemons up"
 
 ctl() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T vps \
-        yggdrasilctl --socket /run/yggdrasil/control.sock "$@"
+        yggdrasilctl local --socket /run/yggdrasil/control.sock "$@"
 }
 
 vps_sh() {
@@ -89,12 +89,12 @@ fail() {
 # -------- gating: wait for first authenticated heartbeat --------------------
 
 echo "==> waiting for home daemon to enrol and heartbeat"
-peer_enrolled() {
+downstream_enrolled() {
     local out; out=$(ctl --json status 2>/dev/null || true)
-    echo "$out" | grep -q '"peer_enrolled": true' && \
-        echo "$out" | grep -q '"peer_ip": "172.30.0.20"'
+    echo "$out" | grep -q '"downstream_enrolled": true' && \
+        echo "$out" | grep -q '"downstream_ip": "172.30.0.20"'
 }
-WAIT_TIMEOUT=60 wait_for "peer enrolled + heartbeat seen from 172.30.0.20" peer_enrolled
+WAIT_TIMEOUT=60 wait_for "downstream enrolled + heartbeat seen from 172.30.0.20" downstream_enrolled
 
 # Wait for the home box's HTTP backend to come up too — it's a sidecar in
 # home-entrypoint.sh and races with the home daemon's first heartbeat.
@@ -142,7 +142,7 @@ protocol = "https"
 
 [[rule.route]]
 hostname = "${HOST}"
-upstream = "http://172.30.0.20:7180"
+target   = "http://172.30.0.20:7180"
 cert     = "${CERT_PATH}"
 key      = "${KEY_PATH}"
 EOF
