@@ -229,10 +229,7 @@ impl ChainAcceptor {
         let kind = match ControlBodyType::from_byte(body_type) {
             Some(k) => k,
             None => {
-                tracing::debug!(
-                    body_type = body_type,
-                    "control envelope: unknown body type"
-                );
+                tracing::debug!(body_type = body_type, "control envelope: unknown body type");
                 metrics::counter!(
                     "yggdrasil_chain_predicate_recv_total",
                     "outcome" => "unknown_body",
@@ -249,9 +246,7 @@ impl ChainAcceptor {
                 );
                 AckStatus::Ok
             }
-            ControlBodyType::PredicateSetUpdate => {
-                self.handle_predicate_set_update(body).await
-            }
+            ControlBodyType::PredicateSetUpdate => self.handle_predicate_set_update(body).await,
             ControlBodyType::ChainHopQuery => {
                 self.spawn_chain_hop_query_handler(body);
                 AckStatus::Ok
@@ -419,10 +414,9 @@ impl ChainAcceptor {
         // logged but do not fail the downstream ack — the downstream
         // has already done its job by getting the predicate to us.
         if let Some(upstream) = self.upstream.get() {
-            match upstream.send_control(
-                ControlBodyType::PredicateSetUpdate.as_byte(),
-                body.to_vec(),
-            ) {
+            match upstream
+                .send_control(ControlBodyType::PredicateSetUpdate.as_byte(), body.to_vec())
+            {
                 Ok(_completion) => {
                     // Fire-and-forget: drop the completion receiver. The
                     // chain client's ControlChannel handles retransmits
@@ -538,9 +532,7 @@ impl ChainAcceptor {
         //    exactly on the boundary.
         const FORWARDING_OVERHEAD_MS: u32 = 250;
         let depth_budget = query.depth_budget.saturating_sub(1);
-        let upstream_deadline_ms = query
-            .deadline_ms
-            .saturating_sub(FORWARDING_OVERHEAD_MS);
+        let upstream_deadline_ms = query.deadline_ms.saturating_sub(FORWARDING_OVERHEAD_MS);
         let mut hops = vec![local_hop];
         let mut partial = false;
         let mut error: Option<String> = None;
@@ -551,10 +543,8 @@ impl ChainAcceptor {
                 let upstream_started = Instant::now();
                 match upstream.query_upstream(depth_budget, deadline).await {
                     Ok(reply) => {
-                        let rtt_ms = upstream_started
-                            .elapsed()
-                            .as_millis()
-                            .min(u64::MAX as u128) as u64;
+                        let rtt_ms =
+                            upstream_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                         // Renumber upstream hops to extend the local
                         // sequence (local = 0, upstream = 1, ...).
                         // Stamp the RTT we measured on the immediately

@@ -117,9 +117,7 @@ fn build_request(cmd: &Cmd) -> Request {
                     .directive
                     .clone()
                     .expect("clap enforces directive XOR --reset");
-                Request::TraceSet {
-                    directive: Some(d),
-                }
+                Request::TraceSet { directive: Some(d) }
             }
         }
     }
@@ -202,13 +200,10 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             if s.default_cert_path.is_some() || s.ephemeral_cert_count > 0 {
                 let cert_part = match (&s.default_cert_path, s.default_cert_loaded_age_secs) {
                     (Some(p), Some(age)) => format!("cert: {p} (loaded {age}s ago)"),
-                    (Some(p), None)      => format!("cert: {p}"),
-                    (None, _)            => "cert: (none)".to_string(),
+                    (Some(p), None) => format!("cert: {p}"),
+                    (None, _) => "cert: (none)".to_string(),
                 };
-                println!(
-                    "{cert_part}; ephemeral certs: {}",
-                    s.ephemeral_cert_count
-                );
+                println!("{cert_part}; ephemeral certs: {}", s.ephemeral_cert_count);
             }
         }
         Response::Rules(b) => {
@@ -287,8 +282,7 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
         Response::DerivedRules(d) => {
             // Pretty-print the snapshot; matches the body the
             // previous `/internal/derived-rules` HTTP endpoint emitted.
-            let s = serde_json::to_string_pretty(d)
-                .context("serialise DerivedRulesResponse")?;
+            let s = serde_json::to_string_pretty(d).context("serialise DerivedRulesResponse")?;
             println!("{s}");
         }
         Response::ChainSummary(_) => {

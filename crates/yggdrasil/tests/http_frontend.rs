@@ -128,8 +128,12 @@ impl EchoBackend {
                                 ));
                             }
                             // Drain body
-                            let body_bytes =
-                                req.body_mut().collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+                            let body_bytes = req
+                                .body_mut()
+                                .collect()
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
                             captured.body = body_bytes.to_vec();
                             req_clone3.lock().await.push(captured);
                             let resp = HyperResp::builder()
@@ -409,9 +413,7 @@ impl TwoRouteFixture {
         )
         .await;
         assert!(
-            supervisor
-                .wait_for_nonempty(Duration::from_secs(2))
-                .await,
+            supervisor.wait_for_nonempty(Duration::from_secs(2)).await,
             "supervisor never spawned its HTTPS proxy"
         );
 
@@ -463,7 +465,10 @@ async fn sni_api_dispatches_and_xforwarded_headers_are_injected() {
     assert_eq!(captured.header("x-forwarded-for"), Some("127.0.0.1"));
     assert_eq!(captured.header("x-real-ip"), Some("127.0.0.1"));
     assert_eq!(captured.header("x-forwarded-proto"), Some("https"));
-    assert_eq!(captured.header("x-forwarded-host"), Some(fx.api_host.as_str()));
+    assert_eq!(
+        captured.header("x-forwarded-host"),
+        Some(fx.api_host.as_str())
+    );
     assert_eq!(captured.header("host"), Some(fx.api_host.as_str()));
     assert_eq!(fx.app.request_count().await, 0, "app backend got traffic");
     fx.stop().await;
@@ -544,14 +549,9 @@ async fn matched_sni_unknown_host_returns_404() {
     let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
-    let resp = http1_request(
-        &mut tls,
-        Some("nowhere.localhost"),
-        &[],
-        "/",
-    )
-    .await
-    .unwrap();
+    let resp = http1_request(&mut tls, Some("nowhere.localhost"), &[], "/")
+        .await
+        .unwrap();
     let body = String::from_utf8_lossy(&resp);
     assert!(
         body.starts_with("HTTP/1.1 404"),
@@ -606,11 +606,7 @@ cert = "ephemeral"
         shutdown.clone(),
     )
     .await;
-    assert!(
-        supervisor
-            .wait_for_nonempty(Duration::from_secs(2))
-            .await
-    );
+    assert!(supervisor.wait_for_nonempty(Duration::from_secs(2)).await);
     let mut tls = dial_tls(frontend_addr, &host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
@@ -687,11 +683,7 @@ async fn hsts_header_emitted_when_opted_in() {
         shutdown.clone(),
     )
     .await;
-    assert!(
-        supervisor
-            .wait_for_nonempty(Duration::from_secs(2))
-            .await
-    );
+    assert!(supervisor.wait_for_nonempty(Duration::from_secs(2)).await);
     let mut tls = dial_tls(frontend_addr, &host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
@@ -717,9 +709,7 @@ async fn missing_host_header_is_rejected() {
     let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
-    let resp = http1_request(&mut tls, None, &[], "/")
-        .await
-        .unwrap();
+    let resp = http1_request(&mut tls, None, &[], "/").await.unwrap();
     let body = String::from_utf8_lossy(&resp);
     // Acceptable: 400 Bad Request (hyper's default for missing Host on h1)
     // or any 4xx, or a connection drop (empty body).
@@ -869,11 +859,7 @@ async fn disk_backed_cert_reloads_on_change() {
         shutdown.clone(),
     )
     .await;
-    assert!(
-        supervisor
-            .wait_for_nonempty(Duration::from_secs(2))
-            .await
-    );
+    assert!(supervisor.wait_for_nonempty(Duration::from_secs(2)).await);
     let first_leaf_fp = leaf_fingerprint(frontend_addr, &host).await;
     // Replace the cert with a freshly-generated one. The dedicated cert
     // watcher in `certs.rs` will observe the file-write event in the
@@ -942,11 +928,7 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
         shutdown.clone(),
     )
     .await;
-    assert!(
-        supervisor
-            .wait_for_nonempty(Duration::from_secs(2))
-            .await
-    );
+    assert!(supervisor.wait_for_nonempty(Duration::from_secs(2)).await);
     let first_leaf_fp = leaf_fingerprint(frontend_addr, &host).await;
     // Trash the cert on disk. The cert watcher debounces the write event
     // and asks `CertStore::reload_host` to re-resolve — which fails

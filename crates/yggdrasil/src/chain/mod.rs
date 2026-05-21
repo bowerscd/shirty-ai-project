@@ -40,8 +40,8 @@ pub mod reliability;
 
 pub use acceptor::ChainAcceptor;
 pub use client::{
-    BodyHandler, ChainClient, ChainClientConfig, ChainClientHandle, ChainClientShutDown,
-    ControlOp, QueryError,
+    BodyHandler, ChainClient, ChainClientConfig, ChainClientHandle, ChainClientShutDown, ControlOp,
+    QueryError,
 };
 pub use derive::{derive, DeriveConfig, DeriveError};
 pub use introspection::IntrospectionState;

@@ -195,7 +195,9 @@ mod tests {
     fn first_heartbeat_is_classified_as_first() {
         let p = PeerState::new([0u8; 32]);
         let eff = p.record_heartbeat(addr("203.0.113.7:1234"));
-        assert!(matches!(eff, HeartbeatEffect::FirstHeartbeat(ip) if ip.to_string() == "203.0.113.7"));
+        assert!(
+            matches!(eff, HeartbeatEffect::FirstHeartbeat(ip) if ip.to_string() == "203.0.113.7")
+        );
         assert_eq!(p.current_ip().unwrap().to_string(), "203.0.113.7");
         assert!(p.last_heartbeat_ms().is_some());
         assert!(eff.is_data_plane_change());

@@ -73,15 +73,10 @@ impl IntrospectionState {
     /// rule set.
     pub fn snapshot(&self) -> DerivedRulesResponse {
         let predicates_holder = self.latest_predicates.read();
-        let (predicates, predicate_origin, predicate_version) =
-            match predicates_holder.as_ref() {
-                Some(p) => (
-                    p.predicates.clone(),
-                    Some(p.origin),
-                    Some(p.version),
-                ),
-                None => (Vec::new(), None, None),
-            };
+        let (predicates, predicate_origin, predicate_version) = match predicates_holder.as_ref() {
+            Some(p) => (p.predicates.clone(), Some(p.origin), Some(p.version)),
+            None => (Vec::new(), None, None),
+        };
         drop(predicates_holder);
         let last_apply_raw = self.last_apply_unix.load(Ordering::Relaxed);
         let last_apply_unix = if last_apply_raw > 0 {
@@ -89,12 +84,7 @@ impl IntrospectionState {
         } else {
             None
         };
-        let derived_rules: Vec<Rule> = self
-            .supervisor
-            .current_set_rx()
-            .borrow()
-            .rules()
-            .to_vec();
+        let derived_rules: Vec<Rule> = self.supervisor.current_set_rx().borrow().rules().to_vec();
         DerivedRulesResponse {
             predicates,
             derived_rules,
@@ -164,12 +154,8 @@ mod tests {
     #[test]
     fn snapshot_with_no_apply_returns_empty_predicates_and_null_metadata() {
         let (supervisor, _tx) = fake_supervisor_handle(rules_with_one());
-        let state = IntrospectionState::new(
-            fake_pubkey(0xAA),
-            Some(fake_pubkey(0xBB)),
-            None,
-            supervisor,
-        );
+        let state =
+            IntrospectionState::new(fake_pubkey(0xAA), Some(fake_pubkey(0xBB)), None, supervisor);
         let snap = state.snapshot();
         assert!(snap.predicates.is_empty(), "no apply → empty predicates");
         assert_eq!(snap.chain.local, fake_pubkey(0xAA));
@@ -188,12 +174,8 @@ mod tests {
     #[test]
     fn record_apply_populates_predicates_and_last_apply_unix() {
         let (supervisor, _tx) = fake_supervisor_handle(RuleSet::default());
-        let state = IntrospectionState::new(
-            fake_pubkey(0x11),
-            None,
-            Some(fake_pubkey(0x22)),
-            supervisor,
-        );
+        let state =
+            IntrospectionState::new(fake_pubkey(0x11), None, Some(fake_pubkey(0x22)), supervisor);
         let set = PredicateSet {
             predicates: vec![Predicate {
                 name: "echo-tcp".into(),
@@ -219,12 +201,7 @@ mod tests {
     #[test]
     fn record_apply_overwrites_previous_set() {
         let (supervisor, _tx) = fake_supervisor_handle(RuleSet::default());
-        let state = IntrospectionState::new(
-            fake_pubkey(0x33),
-            None,
-            None,
-            supervisor,
-        );
+        let state = IntrospectionState::new(fake_pubkey(0x33), None, None, supervisor);
         let v1 = PredicateSet {
             predicates: vec![],
             version: 1,
@@ -250,12 +227,8 @@ mod tests {
     #[test]
     fn render_json_round_trips_through_serde() {
         let (supervisor, _tx) = fake_supervisor_handle(rules_with_one());
-        let state = IntrospectionState::new(
-            fake_pubkey(0x44),
-            Some(fake_pubkey(0x55)),
-            None,
-            supervisor,
-        );
+        let state =
+            IntrospectionState::new(fake_pubkey(0x44), Some(fake_pubkey(0x55)), None, supervisor);
         state.record_apply(&PredicateSet {
             predicates: vec![Predicate {
                 name: "echo-tcp".into(),
@@ -267,8 +240,7 @@ mod tests {
             origin: fake_pubkey(0xDD),
         });
         let json = state.render_json().expect("render_json");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("parse back");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse back");
         let chain = &parsed["chain"];
         assert_eq!(chain["predicate_version"], 42);
         assert!(chain["last_apply_unix"].as_i64().unwrap_or(0) > 0);

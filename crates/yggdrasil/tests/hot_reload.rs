@@ -114,7 +114,10 @@ async fn dropping_a_new_rule_file_adds_a_listener_live() {
     // Sanity: rule-a survived unchanged.
     let rule_a_post = new_snap.iter().find(|r| r.name == "rule-a").unwrap();
     let rule_a_initial = initial.iter().find(|r| r.name == "rule-a").unwrap();
-    assert_eq!(rule_a_post, rule_a_initial, "rule-a must not be touched by reload");
+    assert_eq!(
+        rule_a_post, rule_a_initial,
+        "rule-a must not be touched by reload"
+    );
 
     // Rule A still serves traffic.
     client_a.send(b"a-post").await.unwrap();

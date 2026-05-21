@@ -192,13 +192,19 @@ where
     let mut first = [0u8; 1];
     let n = reader.read(&mut first).await?;
     if n == 0 {
-        return Ok(ProxyDecode { endpoints: None, leftover: Vec::new() });
+        return Ok(ProxyDecode {
+            endpoints: None,
+            leftover: Vec::new(),
+        });
     }
 
     match first[0] {
         b'P' => decode_v1(reader, first[0]).await,
         0x0D => decode_v2(reader, first[0]).await,
-        _ => Ok(ProxyDecode { endpoints: None, leftover: first.to_vec() }),
+        _ => Ok(ProxyDecode {
+            endpoints: None,
+            leftover: first.to_vec(),
+        }),
     }
 }
 
@@ -214,7 +220,10 @@ where
         // splice and continue without PROXY-protocol awareness.
         let mut leftover = vec![first];
         leftover.extend_from_slice(&tail);
-        return Ok(ProxyDecode { endpoints: None, leftover });
+        return Ok(ProxyDecode {
+            endpoints: None,
+            leftover,
+        });
     }
 
     // Now consume until CRLF, capped at V1_MAX_LINE - 6 (already read 6
@@ -249,7 +258,10 @@ where
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "PROXY v1 prefix"))?;
 
     if rest.starts_with("UNKNOWN") {
-        return Ok(ProxyDecode { endpoints: None, leftover: Vec::new() });
+        return Ok(ProxyDecode {
+            endpoints: None,
+            leftover: Vec::new(),
+        });
     }
 
     let mut parts = rest.split(' ');
@@ -270,18 +282,18 @@ where
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 missing sport"))?;
 
     let parse_v4 = |a: &str, p: &str| -> std::io::Result<SocketAddr> {
-        let ip: Ipv4Addr = a.parse().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 bad ipv4")
-        })?;
+        let ip: Ipv4Addr = a
+            .parse()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 bad ipv4"))?;
         let port: u16 = p
             .parse()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 bad port"))?;
         Ok(SocketAddr::new(IpAddr::V4(ip), port))
     };
     let parse_v6 = |a: &str, p: &str| -> std::io::Result<SocketAddr> {
-        let ip: Ipv6Addr = a.parse().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 bad ipv6")
-        })?;
+        let ip: Ipv6Addr = a
+            .parse()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 bad ipv6"))?;
         let port: u16 = p
             .parse()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "v1 bad port"))?;
@@ -289,8 +301,14 @@ where
     };
 
     let endpoints = match fam {
-        "TCP4" => ProxyEndpoints { client: parse_v4(cli, cp)?, server: parse_v4(srv, sp)? },
-        "TCP6" => ProxyEndpoints { client: parse_v6(cli, cp)?, server: parse_v6(srv, sp)? },
+        "TCP4" => ProxyEndpoints {
+            client: parse_v4(cli, cp)?,
+            server: parse_v4(srv, sp)?,
+        },
+        "TCP6" => ProxyEndpoints {
+            client: parse_v6(cli, cp)?,
+            server: parse_v6(srv, sp)?,
+        },
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -299,7 +317,10 @@ where
         }
     };
 
-    Ok(ProxyDecode { endpoints: Some(endpoints), leftover: Vec::new() })
+    Ok(ProxyDecode {
+        endpoints: Some(endpoints),
+        leftover: Vec::new(),
+    })
 }
 
 async fn decode_v2<R>(reader: &mut R, first: u8) -> std::io::Result<ProxyDecode>
@@ -314,7 +335,10 @@ where
     full_sig[1..].copy_from_slice(&rest_sig);
     if full_sig != V2_SIG {
         // Looked like v2 but wasn't; return raw bytes.
-        return Ok(ProxyDecode { endpoints: None, leftover: full_sig.to_vec() });
+        return Ok(ProxyDecode {
+            endpoints: None,
+            leftover: full_sig.to_vec(),
+        });
     }
 
     // Next 4 bytes: ver/cmd | fam/proto | addr_len (u16 BE).
@@ -342,7 +366,10 @@ where
 
     // LOCAL command: header present but addresses unusable.
     if (ver_cmd & 0x0F) == 0x00 {
-        return Ok(ProxyDecode { endpoints: None, leftover: Vec::new() });
+        return Ok(ProxyDecode {
+            endpoints: None,
+            leftover: Vec::new(),
+        });
     }
 
     // Only TCP over IPv4/IPv6 are recognized; UDP/UNIX yield "header present,
@@ -389,7 +416,10 @@ where
         _ => None,
     };
 
-    Ok(ProxyDecode { endpoints, leftover: Vec::new() })
+    Ok(ProxyDecode {
+        endpoints,
+        leftover: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -486,7 +516,9 @@ mod tests {
         .unwrap();
         drop(a);
         let mut buf = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut b, &mut buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut b, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(buf, b"PROXY TCP4 203.0.113.7 198.51.100.4 1 443\r\n");
     }
 
@@ -498,7 +530,9 @@ mod tests {
     async fn decode_v1_round_trips_through_encode() {
         let (mut a, mut b) = tokio::io::duplex(256);
         let header = encode_v1(v4("203.0.113.7:54321"), v4("198.51.100.4:443"));
-        tokio::io::AsyncWriteExt::write_all(&mut a, &header).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &header)
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(
@@ -515,7 +549,9 @@ mod tests {
     async fn decode_v1_v6_round_trips() {
         let (mut a, mut b) = tokio::io::duplex(256);
         let header = encode_v1(v6("[2001:db8::1]:54321"), v6("[2001:db8::2]:443"));
-        tokio::io::AsyncWriteExt::write_all(&mut a, &header).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &header)
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(
@@ -530,7 +566,9 @@ mod tests {
     #[tokio::test]
     async fn decode_v1_unknown_is_header_present_but_no_endpoints() {
         let (mut a, mut b) = tokio::io::duplex(256);
-        tokio::io::AsyncWriteExt::write_all(&mut a, b"PROXY UNKNOWN\r\n").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, b"PROXY UNKNOWN\r\n")
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(out.endpoints, None);
@@ -541,7 +579,9 @@ mod tests {
     async fn decode_v2_v4_round_trips() {
         let (mut a, mut b) = tokio::io::duplex(256);
         let header = encode_v2(v4("203.0.113.7:54321"), v4("198.51.100.4:443"));
-        tokio::io::AsyncWriteExt::write_all(&mut a, &header).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &header)
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(
@@ -558,7 +598,9 @@ mod tests {
     async fn decode_v2_v6_round_trips() {
         let (mut a, mut b) = tokio::io::duplex(256);
         let header = encode_v2(v6("[2001:db8::1]:54321"), v6("[2001:db8::2]:443"));
-        tokio::io::AsyncWriteExt::write_all(&mut a, &header).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &header)
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(
@@ -575,7 +617,9 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(256);
         // Mixed-family encode emits v2 LOCAL.
         let header = encode_v2(v4("203.0.113.7:1"), v6("[2001:db8::2]:1"));
-        tokio::io::AsyncWriteExt::write_all(&mut a, &header).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &header)
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(out.endpoints, None);
@@ -585,7 +629,9 @@ mod tests {
     #[tokio::test]
     async fn decode_no_header_returns_peeked_bytes_as_leftover() {
         let (mut a, mut b) = tokio::io::duplex(256);
-        tokio::io::AsyncWriteExt::write_all(&mut a, b"GET / HTTP/1.1\r\n").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, b"GET / HTTP/1.1\r\n")
+            .await
+            .unwrap();
         drop(a);
         let out = read_optional_header(&mut b).await.unwrap();
         assert_eq!(out.endpoints, None);

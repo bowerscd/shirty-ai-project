@@ -61,11 +61,13 @@ pub fn init_tracing(format: LogFormat) -> Result<()> {
             .context("install pretty tracing subscriber")?,
     }
 
-    let apply = Box::new(move |filter: EnvFilter| -> std::result::Result<(), String> {
-        reload_handle
-            .modify(|f| *f = filter)
-            .map_err(|e| e.to_string())
-    });
+    let apply = Box::new(
+        move |filter: EnvFilter| -> std::result::Result<(), String> {
+            reload_handle
+                .modify(|f| *f = filter)
+                .map_err(|e| e.to_string())
+        },
+    );
 
     let _ = TRACE_CONTROLLER.set(TraceController {
         apply,

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::rule::{Protocol, Rule, RuleSet};
 
-use crate::rules::{RuleUpdate, RuleWatcher, ReloadTrigger};
+use crate::rules::{ReloadTrigger, RuleUpdate, RuleWatcher};
 
 use super::certs::{load_rule_into_store, CertStore, CertWatcher};
 use super::http_frontend::{HttpFrontend, RedirectListener};
@@ -36,9 +36,9 @@ use super::udp::UdpProxy;
 /// be reified into the shared [`CertStore`].
 #[derive(Debug, Clone, Default)]
 pub struct CertConfig {
-    pub cert_dir:      PathBuf,
-    pub default_cert:  Option<PathBuf>,
-    pub default_key:   Option<PathBuf>,
+    pub cert_dir: PathBuf,
+    pub default_cert: Option<PathBuf>,
+    pub default_key: Option<PathBuf>,
     /// Port for the HTTP→HTTPS redirect listener. `None` (default) uses
     /// the standard `:80`. Tests and operators without privileged-port
     /// access can set this to any other value (including `0` for an
@@ -48,11 +48,16 @@ pub struct CertConfig {
 
 impl CertConfig {
     pub fn from_server_section(
-        cert_dir:     PathBuf,
+        cert_dir: PathBuf,
         default_cert: Option<PathBuf>,
-        default_key:  Option<PathBuf>,
+        default_key: Option<PathBuf>,
     ) -> Self {
-        Self { cert_dir, default_cert, default_key, redirect_port: None }
+        Self {
+            cert_dir,
+            default_cert,
+            default_key,
+            redirect_port: None,
+        }
     }
 }
 
@@ -66,11 +71,11 @@ enum ProxyHandle {
 /// HTTPS handle bundles the frontend with the hostnames it registered into
 /// the per-IP redirect listener, so we can deregister cleanly on stop.
 struct HttpsHandle {
-    frontend:        HttpFrontend,
-    redirect_hosts:  Vec<String>,
-    redirect_ip:     IpAddr,
-    listen:          SocketAddr,
-    rule:            Rule,
+    frontend: HttpFrontend,
+    redirect_hosts: Vec<String>,
+    redirect_ip: IpAddr,
+    listen: SocketAddr,
+    rule: Rule,
 }
 
 impl ProxyHandle {
@@ -168,7 +173,10 @@ impl SupervisorHandle {
     /// pushed set has been applied: the watch fires after each successful
     /// apply.
     pub async fn apply_ruleset(&self, set: RuleSet) -> Result<(), SupervisorShutDown> {
-        self.apply_tx.send(set).await.map_err(|_| SupervisorShutDown)
+        self.apply_tx
+            .send(set)
+            .await
+            .map_err(|_| SupervisorShutDown)
     }
 
     /// Subscribe to the supervisor's `current_set` watch. The receiver's
@@ -230,20 +238,15 @@ impl ProxySupervisor {
         // still applying backpressure if the supervisor falls catastrophically
         // behind (which would be a bug worth surfacing).
         let (apply_tx, apply_rx) = mpsc::channel::<RuleSet>(8);
-        let (current_set_tx, current_set_rx) =
-            watch::channel::<RuleSet>(RuleSet::default());
+        let (current_set_tx, current_set_rx) = watch::channel::<RuleSet>(RuleSet::default());
 
         let cert_store = Arc::new(CertStore::new());
         // Share the rule watcher's debounce window with the cert
         // watcher — operators expect both to coalesce on the same
         // tempo.
-        let cert_watcher = CertWatcher::spawn(
-            Arc::clone(&cert_store),
-            debounce,
-            cancel.clone(),
-        )
-        .map(Arc::new)
-        .context("spawn cert watcher")?;
+        let cert_watcher = CertWatcher::spawn(Arc::clone(&cert_store), debounce, cancel.clone())
+            .map(Arc::new)
+            .context("spawn cert watcher")?;
 
         let main_cancel = cancel.clone();
         let main_handle = tokio::spawn(supervisor_loop(
@@ -641,9 +644,9 @@ async fn apply_update(
 }
 
 fn unload_rule_from_cert_store(
-    cert_store:   &Arc<CertStore>,
+    cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
-    rule:         &Rule,
+    rule: &Rule,
 ) {
     if rule.protocol != Protocol::Https {
         return;
@@ -747,12 +750,12 @@ fn collect_claimed_addrs(active: &HashMap<String, ActiveProxy>) -> HashSet<Socke
 }
 
 async fn spawn_https_rule(
-    rule:               Rule,
-    cert_config:        &CertConfig,
-    cert_store:         &Arc<CertStore>,
-    cert_watcher:       &Arc<CertWatcher>,
+    rule: Rule,
+    cert_config: &CertConfig,
+    cert_store: &Arc<CertStore>,
+    cert_watcher: &Arc<CertWatcher>,
     redirect_listeners: &mut HashMap<IpAddr, RedirectListener>,
-    parent_cancel:      &CancellationToken,
+    parent_cancel: &CancellationToken,
 ) -> Result<ActiveProxy> {
     // 1. Load each route's certificate into the shared store. If any route
     //    fails we abort the whole rule and roll back what we loaded so the
@@ -828,12 +831,8 @@ async fn spawn_https_rule(
     }
 
     // 3. Spawn the HTTPS frontend.
-    let frontend_res = HttpFrontend::spawn(
-        &rule,
-        Arc::clone(cert_store),
-        parent_cancel.clone(),
-    )
-    .await;
+    let frontend_res =
+        HttpFrontend::spawn(&rule, Arc::clone(cert_store), parent_cancel.clone()).await;
     let frontend = match frontend_res {
         Ok(f) => f,
         Err(e) => {
@@ -847,7 +846,8 @@ async fn spawn_https_rule(
                 cert_watcher.unregister(host);
                 cert_store.remove(host);
             }
-            return Err(e).with_context(|| format!("spawn HTTPS frontend for rule {:?}", rule.name));
+            return Err(e)
+                .with_context(|| format!("spawn HTTPS frontend for rule {:?}", rule.name));
         }
     };
 
@@ -1145,7 +1145,10 @@ mod tests {
         })
         .await
         .unwrap_or(false);
-        assert!(saw_swap, "timed out waiting for beta upstream port=9999 swap");
+        assert!(
+            saw_swap,
+            "timed out waiting for beta upstream port=9999 swap"
+        );
 
         let snap1 = sup.snapshot();
         let alpha_listen_after = snap1.iter().find(|s| s.name == "alpha").unwrap().listen;
@@ -1301,10 +1304,7 @@ mod tests {
         assert_eq!(rx.borrow().rules()[0].name, "ext-alpha");
 
         // External push of an empty set tears down the proxy.
-        handle
-            .apply_ruleset(RuleSet::default())
-            .await
-            .unwrap();
+        handle.apply_ruleset(RuleSet::default()).await.unwrap();
         await_snapshot_len(&sup, 0).await;
 
         sup.stop().await;

@@ -43,7 +43,11 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Path to the server configuration file.
-    #[arg(long, default_value = "/etc/yggdrasil/config.toml", env = "YGGDRASIL_CONFIG")]
+    #[arg(
+        long,
+        default_value = "/etc/yggdrasil/config.toml",
+        env = "YGGDRASIL_CONFIG"
+    )]
     pub config: PathBuf,
 
     /// Override the rules directory specified in the config file.

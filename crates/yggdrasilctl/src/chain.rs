@@ -156,10 +156,7 @@ async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
     // 2. Locally pre-validate so schema errors don't even hit the
     //    wire. The daemon will run the same checks again.
     if let Err(e) = RuleSet::from_rules(rules.clone()) {
-        bail!(
-            "{} failed local validation: {e}",
-            args.file.display()
-        );
+        bail!("{} failed local validation: {e}", args.file.display());
     }
 
     // 3. Send the request and await the single response line.
@@ -197,11 +194,7 @@ async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
 /// Connect to the UDS, write a single `Request::ChainApply` line, read
 /// exactly one response line back. Mirrors `local::send` but kept
 /// separate so the `chain` scope doesn't depend on `local` internals.
-async fn send_chain_apply(
-    socket: &Path,
-    request: &Request,
-    timeout: Duration,
-) -> Result<Response> {
+async fn send_chain_apply(socket: &Path, request: &Request, timeout: Duration) -> Result<Response> {
     let socket: PathBuf = socket.to_path_buf();
     let mut stream = tokio::time::timeout(timeout, UnixStream::connect(&socket))
         .await
@@ -385,10 +378,7 @@ async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
 /// Send `Request::ChainSummary` over UDS and read back the single
 /// `Response::ChainSummary` ndjson line. Errors are wrapped with the
 /// socket path for operator-friendly diagnostics.
-async fn fetch_chain_summary(
-    socket: &Path,
-    timeout: Duration,
-) -> Result<ChainSummaryResponse> {
+async fn fetch_chain_summary(socket: &Path, timeout: Duration) -> Result<ChainSummaryResponse> {
     let socket_path: PathBuf = socket.to_path_buf();
     let stream = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
         .await
@@ -529,10 +519,7 @@ fn render_human(report: &DiffReport) {
             pk = v.chain.local,
             count = v.predicates.len(),
         );
-        println!(
-            "  derived_rules: {} active",
-            v.derived_rules.len()
-        );
+        println!("  derived_rules: {} active", v.derived_rules.len());
         match &hop.drift {
             None if hop.index == 0 => {}
             None => {
@@ -678,8 +665,7 @@ async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result
     };
 
     if json_output {
-        let s = serde_json::to_string_pretty(&report)
-            .context("serialise chain summary report")?;
+        let s = serde_json::to_string_pretty(&report).context("serialise chain summary report")?;
         println!("{s}");
     } else {
         render_summary_human(&report);
@@ -792,7 +778,11 @@ async fn health(socket: &Path, args: &HealthArgs, json_output: bool) -> Result<(
         .iter()
         .map(|h| classify_hop(h, now_unix))
         .collect();
-    let overall = hops.iter().map(|h| h.tier).max().unwrap_or(HealthTier::Healthy);
+    let overall = hops
+        .iter()
+        .map(|h| h.tier)
+        .max()
+        .unwrap_or(HealthTier::Healthy);
     let report = HealthReport {
         overall,
         hops,
@@ -800,8 +790,7 @@ async fn health(socket: &Path, args: &HealthArgs, json_output: bool) -> Result<(
     };
 
     if json_output {
-        let s = serde_json::to_string_pretty(&report)
-            .context("serialise chain health report")?;
+        let s = serde_json::to_string_pretty(&report).context("serialise chain health report")?;
         println!("{s}");
     } else {
         render_health_human(&report);
@@ -957,9 +946,7 @@ async fn ping(socket: &Path, args: &PingArgs, json_output: bool) -> Result<()> {
     if let Some(filter) = args.hop.as_ref() {
         hops.retain(|h| &h.pubkey == filter);
         if hops.is_empty() {
-            bail!(
-                "--hop {filter} did not match any pubkey in the chain summary"
-            );
+            bail!("--hop {filter} did not match any pubkey in the chain summary");
         }
     }
 
@@ -969,8 +956,7 @@ async fn ping(socket: &Path, args: &PingArgs, json_output: bool) -> Result<()> {
     };
 
     if json_output {
-        let s = serde_json::to_string_pretty(&report)
-            .context("serialise chain ping report")?;
+        let s = serde_json::to_string_pretty(&report).context("serialise chain ping report")?;
         println!("{s}");
     } else {
         render_ping_human(&report);
@@ -1051,7 +1037,10 @@ mod tests {
 
     #[test]
     fn diff_in_sync_when_predicates_versions_origins_all_match() {
-        let preds = vec![pred("a", 1000, Protocol::Tcp), pred("b", 1001, Protocol::Udp)];
+        let preds = vec![
+            pred("a", 1000, Protocol::Tcp),
+            pred("b", 1001, Protocol::Udp),
+        ];
         let local = view(preds.clone(), pk(1), Some(pk(2)), Some(pk(1)), Some(7));
         let upstream = view(preds, pk(2), None, Some(pk(1)), Some(7));
         let d = compute_diff(&local, &upstream).expect("comparable");
@@ -1060,7 +1049,10 @@ mod tests {
 
     #[test]
     fn diff_detects_predicate_missing_upstream() {
-        let local_preds = vec![pred("a", 1000, Protocol::Tcp), pred("b", 1001, Protocol::Udp)];
+        let local_preds = vec![
+            pred("a", 1000, Protocol::Tcp),
+            pred("b", 1001, Protocol::Udp),
+        ];
         let upstream_preds = vec![pred("a", 1000, Protocol::Tcp)];
         let local = view(local_preds, pk(1), Some(pk(2)), Some(pk(1)), Some(7));
         let upstream = view(upstream_preds, pk(2), None, Some(pk(1)), Some(7));
@@ -1075,7 +1067,10 @@ mod tests {
     #[test]
     fn diff_detects_predicate_extra_upstream() {
         let local_preds = vec![pred("a", 1000, Protocol::Tcp)];
-        let upstream_preds = vec![pred("a", 1000, Protocol::Tcp), pred("ghost", 2000, Protocol::Tcp)];
+        let upstream_preds = vec![
+            pred("a", 1000, Protocol::Tcp),
+            pred("ghost", 2000, Protocol::Tcp),
+        ];
         let local = view(local_preds, pk(1), Some(pk(2)), Some(pk(1)), Some(7));
         let upstream = view(upstream_preds, pk(2), None, Some(pk(1)), Some(7));
         let d = compute_diff(&local, &upstream).expect("comparable");

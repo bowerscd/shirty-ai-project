@@ -120,16 +120,12 @@ impl FromStr for PubKey {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         let (algo, hex_str) = s.split_once(':').ok_or_else(|| {
-            Error::InvalidPubKey(format!(
-                "pubkey must be `<algorithm>:<hex>`, got {:?}",
-                s
-            ))
+            Error::InvalidPubKey(format!("pubkey must be `<algorithm>:<hex>`, got {:?}", s))
         })?;
         match algo {
             "x25519" => {
-                let bytes = hex::decode(hex_str).map_err(|e| {
-                    Error::InvalidPubKey(format!("x25519 pubkey hex decode: {e}"))
-                })?;
+                let bytes = hex::decode(hex_str)
+                    .map_err(|e| Error::InvalidPubKey(format!("x25519 pubkey hex decode: {e}")))?;
                 let arr: [u8; PUBLIC_KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
                     Error::InvalidPubKey(format!(
                         "x25519 pubkey must decode to {} bytes, got {}",

@@ -182,9 +182,9 @@ impl std::str::FromStr for TargetHost {
         // and will be caught by the validator below. Splitting on the last
         // colon keeps the error message focused on the hostname rather
         // than producing a confusing "port not a number" message.
-        let (host, port_str) = s.rsplit_once(':').ok_or_else(|| {
-            format!("target_host {s:?}: expected \"hostname:port\"")
-        })?;
+        let (host, port_str) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("target_host {s:?}: expected \"hostname:port\""))?;
         if host.is_empty() {
             return Err(format!("target_host {s:?}: empty hostname"));
         }
@@ -281,7 +281,10 @@ impl<'de> Deserialize<'de> for HstsConfig {
                 )
             }
 
-            fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<HstsConfig, E> {
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                v: bool,
+            ) -> std::result::Result<HstsConfig, E> {
                 if v {
                     Ok(HstsConfig::default())
                 } else {
@@ -393,10 +396,7 @@ impl<'de> Deserialize<'de> for CertSource {
                 f.write_str(r#"either the literal string "ephemeral" or a path string"#)
             }
 
-            fn visit_str<E: serde::de::Error>(
-                self,
-                v: &str,
-            ) -> std::result::Result<CertSource, E> {
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<CertSource, E> {
                 if v == "ephemeral" {
                     Ok(CertSource::Ephemeral)
                 } else if v.is_empty() {
@@ -567,7 +567,11 @@ impl Rule {
         if self.name.is_empty() {
             return Err(Error::InvalidRule("rule name is empty".into()));
         }
-        if self.name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        if self
+            .name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        {
             return Err(Error::InvalidRule(format!(
                 "rule name {:?} contains whitespace or control characters",
                 self.name
@@ -847,8 +851,7 @@ fn validate_http_route(rule_name: &str, route: &HttpRoute) -> Result<()> {
         _ => {}
     }
 
-    if matches!(route.cert, Some(CertSource::Ephemeral))
-        && !is_local_only_hostname(&route.hostname)
+    if matches!(route.cert, Some(CertSource::Ephemeral)) && !is_local_only_hostname(&route.hostname)
     {
         return Err(Error::InvalidRule(format!(
             "rule {:?}: route {:?}: cert = \"ephemeral\" is only allowed for \
@@ -992,10 +995,7 @@ impl RuleFile {
     /// [`RuleFile::validate_each`].
     pub fn from_toml(path: impl Into<std::path::PathBuf>, s: &str) -> Result<Self> {
         let path = path.into();
-        toml::from_str(s).map_err(|source| Error::TomlParse {
-            path,
-            source,
-        })
+        toml::from_str(s).map_err(|source| Error::TomlParse { path, source })
     }
 
     /// Validate every rule in the file. Cross-file uniqueness is enforced by
@@ -1725,10 +1725,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.rule[0].idle_timeout, None);
-        assert_eq!(
-            f.rule[0].resolved_idle_timeout(),
-            DEFAULT_UDP_IDLE_TIMEOUT
-        );
+        assert_eq!(f.rule[0].resolved_idle_timeout(), DEFAULT_UDP_IDLE_TIMEOUT);
     }
 
     // ---- diff tests ----
@@ -1775,13 +1772,13 @@ mod tests {
         let old = set(vec![
             rule("keep", 1000, Protocol::Tcp, 22),
             rule("gone", 2000, Protocol::Tcp, 23),
-            rule("mod",  3000, Protocol::Tcp, 24),
+            rule("mod", 3000, Protocol::Tcp, 24),
         ]);
         // "keep" unchanged, "gone" removed, "mod" target port changed, "new" added.
         let new = set(vec![
             rule("keep", 1000, Protocol::Tcp, 22),
-            rule("mod",  3000, Protocol::Tcp, 99),
-            rule("new",  4000, Protocol::Udp, 53),
+            rule("mod", 3000, Protocol::Tcp, 99),
+            rule("new", 4000, Protocol::Udp, 53),
         ]);
         let d = old.diff(&new);
         assert_eq!(d.added.len(), 1);
@@ -2010,9 +2007,7 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("`target_port` is not valid")),
-        );
+        assert!(matches!(err, Error::InvalidRule(s) if s.contains("`target_port` is not valid")),);
     }
 
     #[test]
@@ -2034,9 +2029,7 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("`target_addr` is not valid")),
-        );
+        assert!(matches!(err, Error::InvalidRule(s) if s.contains("`target_addr` is not valid")),);
     }
 
     #[test]
@@ -2058,9 +2051,7 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("`target_host` is not valid")),
-        );
+        assert!(matches!(err, Error::InvalidRule(s) if s.contains("`target_host` is not valid")),);
     }
 
     #[test]
@@ -2128,7 +2119,9 @@ mod tests {
         .unwrap()
         .validate_each()
         .unwrap_err();
-        assert!(matches!(err, Error::InvalidRule(s) if s.contains("`route` blocks are only valid")));
+        assert!(
+            matches!(err, Error::InvalidRule(s) if s.contains("`route` blocks are only valid"))
+        );
     }
 
     #[test]
@@ -2167,9 +2160,7 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("target URL scheme")),
-        );
+        assert!(matches!(err, Error::InvalidRule(s) if s.contains("target URL scheme")),);
     }
 
     #[test]
@@ -2193,9 +2184,7 @@ mod tests {
         .unwrap();
         r.validate().unwrap();
         assert_eq!(
-            r.routes.as_ref().unwrap()[0]
-                .target
-                .port_or_known_default(),
+            r.routes.as_ref().unwrap()[0].target.port_or_known_default(),
             Some(80)
         );
     }
@@ -2418,10 +2407,9 @@ mod tests {
 
     #[test]
     fn cert_source_deserialises_ephemeral_string() {
-        let cs: CertSource =
-            toml::from_str("v = \"ephemeral\"\n").map(|t: toml::Table| {
-                t["v"].clone().try_into::<CertSource>().unwrap()
-            }).unwrap();
+        let cs: CertSource = toml::from_str("v = \"ephemeral\"\n")
+            .map(|t: toml::Table| t["v"].clone().try_into::<CertSource>().unwrap())
+            .unwrap();
         assert_eq!(cs, CertSource::Ephemeral);
     }
 

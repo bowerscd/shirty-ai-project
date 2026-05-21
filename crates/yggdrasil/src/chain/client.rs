@@ -62,16 +62,16 @@ pub type BodyHandler = Arc<dyn Fn(u8, &[u8]) -> AckStatus + Send + Sync>;
 /// Static configuration of the chain client.
 pub struct ChainClientConfig {
     /// `host:port` (or `[ipv6]:port`) of the upstream node.
-    pub endpoint:           String,
+    pub endpoint: String,
     /// X25519 pubkey of the upstream — what Noise_IK pins.
-    pub upstream_pubkey:    [u8; PUBLIC_KEY_LEN],
+    pub upstream_pubkey: [u8; PUBLIC_KEY_LEN],
     /// This node's static identity.
-    pub local_keys:         StaticKeyPair,
+    pub local_keys: StaticKeyPair,
     pub heartbeat_interval: Duration,
-    pub rekey_interval:     Duration,
+    pub rekey_interval: Duration,
     /// Optional dispatcher for delivered control envelopes. `None` →
     /// every inbound envelope acks [`AckStatus::Unknown`].
-    pub body_handler:       Option<BodyHandler>,
+    pub body_handler: Option<BodyHandler>,
 }
 
 impl std::fmt::Debug for ChainClientConfig {
@@ -91,8 +91,8 @@ impl std::fmt::Debug for ChainClientConfig {
 /// chain client task and folded into the per-session [`ControlChannel`].
 #[derive(Debug)]
 pub struct ControlOp {
-    pub body_type:  u8,
-    pub body:       Vec<u8>,
+    pub body_type: u8,
+    pub body: Vec<u8>,
     pub completion: oneshot::Sender<Result<(), SendError>>,
 }
 
@@ -127,7 +127,11 @@ impl ChainClientHandle {
     ) -> Result<oneshot::Receiver<Result<(), SendError>>, ChainClientShutDown> {
         let (completion, rx) = oneshot::channel();
         self.tx
-            .send(ControlOp { body_type, body, completion })
+            .send(ControlOp {
+                body_type,
+                body,
+                completion,
+            })
             .map_err(|_| ChainClientShutDown)?;
         Ok(rx)
     }
@@ -138,7 +142,10 @@ impl ChainClientHandle {
     #[cfg(test)]
     #[doc(hidden)]
     pub(crate) fn __test_new(tx: mpsc::UnboundedSender<ControlOp>) -> Self {
-        Self { tx, router: QueryRouter::new() }
+        Self {
+            tx,
+            router: QueryRouter::new(),
+        }
     }
 
     /// Shared per-session query router. The body handler installed on
@@ -235,11 +242,11 @@ pub enum QueryError {
 /// Driver: owns the config, the cancel token, and the control-send queue;
 /// consumed by [`ChainClient::run`].
 pub struct ChainClient {
-    config:     ChainClientConfig,
-    cancel:     CancellationToken,
+    config: ChainClientConfig,
+    cancel: CancellationToken,
     control_tx: mpsc::UnboundedSender<ControlOp>,
     control_rx: mpsc::UnboundedReceiver<ControlOp>,
-    router:     Arc<QueryRouter>,
+    router: Arc<QueryRouter>,
 }
 
 impl std::fmt::Debug for ChainClient {
@@ -254,7 +261,13 @@ impl std::fmt::Debug for ChainClient {
 impl ChainClient {
     pub fn new(config: ChainClientConfig, cancel: CancellationToken) -> Self {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        Self { config, cancel, control_tx, control_rx, router: QueryRouter::new() }
+        Self {
+            config,
+            cancel,
+            control_tx,
+            control_rx,
+            router: QueryRouter::new(),
+        }
     }
 
     /// Clone the control-send handle. Multiple callers may hold handles
@@ -354,10 +367,7 @@ impl ChainClient {
             bytes = hs1.len(),
             "sending handshake1"
         );
-        socket
-            .send(&hs1)
-            .await
-            .context("send handshake1")?;
+        socket.send(&hs1).await.context("send handshake1")?;
 
         let mut buf = [0u8; ratatoskr::wire::MAX_PACKET_LEN];
         let n = match tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv(&mut buf)).await {
@@ -372,9 +382,7 @@ impl ChainClient {
                 view.session_id
             );
         }
-        let session = initiator
-            .complete(&view)
-            .context("complete handshake")?;
+        let session = initiator.complete(&view).context("complete handshake")?;
         tracing::info!(session_id = %session_id, "handshake complete");
         Ok(session)
     }
@@ -403,11 +411,7 @@ impl ChainClient {
 
         loop {
             if session_started.elapsed() >= self.config.rekey_interval {
-                tracing::info!(
-                    heartbeats_sent,
-                    acks_received,
-                    "rekey deadline reached"
-                );
+                tracing::info!(heartbeats_sent, acks_received, "rekey deadline reached");
                 return Ok(SessionExit::Rekey);
             }
             if let Some(last) = last_ack_at {
@@ -433,9 +437,7 @@ impl ChainClient {
             let retx_at = channel
                 .next_tick_at()
                 .map(tokio::time::Instant::from_std)
-                .unwrap_or_else(|| {
-                    tokio::time::Instant::now() + Duration::from_secs(3600)
-                });
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
             tokio::select! {
                 biased;
@@ -579,11 +581,7 @@ impl ChainClient {
     }
 }
 
-fn dispatch_body(
-    handler: Option<&BodyHandler>,
-    body_type: u8,
-    body: &[u8],
-) -> AckStatus {
+fn dispatch_body(handler: Option<&BodyHandler>, body_type: u8, body: &[u8]) -> AckStatus {
     let res = match handler {
         Some(h) => h(body_type, body),
         None => AckStatus::Unknown,
@@ -643,8 +641,7 @@ mod tests {
         async fn start(server_keys: StaticKeyPair) -> Self {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
-            let heartbeats_seen =
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let heartbeats_seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let heartbeats_seen_task = heartbeats_seen.clone();
             let handle = tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
@@ -660,8 +657,7 @@ mod tests {
                     };
                     match view.packet_type {
                         PacketType::Handshake1 => {
-                            let half =
-                                Responder::process_handshake_1(&server_keys, &view).unwrap();
+                            let half = Responder::process_handshake_1(&server_keys, &view).unwrap();
                             let (s, reply) = half.complete().unwrap();
                             sock.send_to(&reply, from).await.unwrap();
                             session = Some(s);
@@ -671,8 +667,7 @@ mod tests {
                                 let hb = s.decode_heartbeat(&view).unwrap();
                                 heartbeats_seen_task
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let (_, ack) =
-                                    s.encode_heartbeat_ack(hb.counter, 12345).unwrap();
+                                let (_, ack) = s.encode_heartbeat_ack(hb.counter, 12345).unwrap();
                                 sock.send_to(&ack, from).await.unwrap();
                             }
                         }
@@ -715,11 +710,17 @@ mod tests {
         let client_handle = tokio::spawn(async move { client.run().await });
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        while server.heartbeats_seen.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+        while server
+            .heartbeats_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < 3
+        {
             if Instant::now() > deadline {
                 panic!(
                     "timeout; saw only {} heartbeats",
-                    server.heartbeats_seen.load(std::sync::atomic::Ordering::Relaxed)
+                    server
+                        .heartbeats_seen
+                        .load(std::sync::atomic::Ordering::Relaxed)
                 );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -754,10 +755,8 @@ mod tests {
                 };
                 match view.packet_type {
                     PacketType::Handshake1 => {
-                        handshakes_task
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let half =
-                            Responder::process_handshake_1(&server_keys, &view).unwrap();
+                        handshakes_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let half = Responder::process_handshake_1(&server_keys, &view).unwrap();
                         let (s, reply) = half.complete().unwrap();
                         sock.send_to(&reply, from).await.unwrap();
                         session = Some(s);
@@ -765,8 +764,7 @@ mod tests {
                     PacketType::Heartbeat => {
                         if let Some(s) = session.as_mut() {
                             if let Ok(hb) = s.decode_heartbeat(&view) {
-                                let (_, ack) =
-                                    s.encode_heartbeat_ack(hb.counter, 0).unwrap();
+                                let (_, ack) = s.encode_heartbeat_ack(hb.counter, 0).unwrap();
                                 sock.send_to(&ack, from).await.unwrap();
                             }
                         }
@@ -880,16 +878,12 @@ mod tests {
     /// `P(≥1 timeout) ≈ 22%`. Non-deterministic loss makes the test flake
     /// roughly one run in five.
     struct ControlTestServer {
-        addr:   SocketAddr,
+        addr: SocketAddr,
         handle: tokio::task::JoinHandle<()>,
     }
 
     impl ControlTestServer {
-        async fn start_with_loss(
-            server_keys: StaticKeyPair,
-            loss_pct: u32,
-            seed: u64,
-        ) -> Self {
+        async fn start_with_loss(server_keys: StaticKeyPair, loss_pct: u32, seed: u64) -> Self {
             use rand::rngs::StdRng;
             use rand::{Rng, SeedableRng};
             use ratatoskr::control_frame::{ControlBodyType, ControlEnvelope};
@@ -915,10 +909,7 @@ mod tests {
                     };
                     match view.packet_type {
                         PacketType::Handshake1 => {
-                            let half = match Responder::process_handshake_1(
-                                &server_keys,
-                                &view,
-                            ) {
+                            let half = match Responder::process_handshake_1(&server_keys, &view) {
                                 Ok(h) => h,
                                 Err(_) => continue,
                             };
@@ -930,13 +921,9 @@ mod tests {
                         PacketType::Heartbeat => {
                             if let Some(s) = session.as_mut() {
                                 if let Ok(hb) = s.decode_heartbeat(&view) {
-                                    if let Ok((_, ack)) =
-                                        s.encode_heartbeat_ack(hb.counter, 0)
-                                    {
+                                    if let Ok((_, ack)) = s.encode_heartbeat_ack(hb.counter, 0) {
                                         // Outbound loss injection.
-                                        if loss_pct > 0
-                                            && rng.gen_range(0..100) < loss_pct
-                                        {
+                                        if loss_pct > 0 && rng.gen_range(0..100) < loss_pct {
                                             continue;
                                         }
                                         let _ = sock.send_to(&ack, from).await;
@@ -962,9 +949,7 @@ mod tests {
                             };
                             let ack = ControlAck { seq, status };
                             if let Ok((_, packet)) = s.encode_control_ack(&ack) {
-                                if loss_pct > 0
-                                    && rng.gen_range(0..100) < loss_pct
-                                {
+                                if loss_pct > 0 && rng.gen_range(0..100) < loss_pct {
                                     continue;
                                 }
                                 let _ = sock.send_to(&packet, from).await;

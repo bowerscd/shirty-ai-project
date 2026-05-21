@@ -34,19 +34,16 @@ use tokio::net::{TcpStream, UdpSocket, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
-use ratatoskr::control::{
-    error_codes, Mode, Request, Response, StatusResponse,
-};
+use ratatoskr::control::{error_codes, Mode, Request, Response, StatusResponse};
 use ratatoskr::rule::Protocol;
 
 use yggdrasil::control::ControlServer;
 use yggdrasil::heartbeat::PeerState;
 
 use crate::common::{
-    drive_handshake, echo_tcp_listener, echo_udp_socket, pick_free_tcp_port,
-    pick_free_udp_port, send_heartbeat, spawn_supervisor, spawn_tcp_echo,
-    spawn_terminal_supervisor, spawn_udp_echo, write_rule, write_terminal_rule,
-    HeartbeatHarness,
+    drive_handshake, echo_tcp_listener, echo_udp_socket, pick_free_tcp_port, pick_free_udp_port,
+    send_heartbeat, spawn_supervisor, spawn_tcp_echo, spawn_terminal_supervisor, spawn_udp_echo,
+    write_rule, write_terminal_rule, HeartbeatHarness,
 };
 
 /// Drive the chain `client → relay → terminal → echo` over TCP and assert
@@ -79,12 +76,9 @@ async fn chained_tcp_relay_to_terminal_to_echo_round_trips() {
         terminal_listen_port,
         &format!("127.0.0.1:{}", echo_addr.port()),
     );
-    let terminal_supervisor = spawn_terminal_supervisor(
-        terminal_rules,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let terminal_supervisor =
+        spawn_terminal_supervisor(terminal_rules, Duration::from_millis(50), shutdown.clone())
+            .await;
     assert!(
         terminal_supervisor
             .wait_for_nonempty(Duration::from_secs(2))
@@ -133,13 +127,10 @@ async fn chained_tcp_relay_to_terminal_to_echo_round_trips() {
 
     // External client opens a TCP connection to the relay and round-trips
     // a payload through the full chain.
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect(relay_listen),
-    )
-    .await
-    .expect("relay TcpStream connect timeout")
-    .expect("relay TcpStream connect failed");
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(relay_listen))
+        .await
+        .expect("relay TcpStream connect timeout")
+        .expect("relay TcpStream connect failed");
 
     stream.write_all(b"hello\n").await.unwrap();
     let mut buf = [0u8; 6];
@@ -182,12 +173,9 @@ async fn chained_udp_relay_to_terminal_to_echo_round_trips() {
         terminal_listen_port,
         &format!("127.0.0.1:{}", echo_addr.port()),
     );
-    let terminal_supervisor = spawn_terminal_supervisor(
-        terminal_rules,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let terminal_supervisor =
+        spawn_terminal_supervisor(terminal_rules, Duration::from_millis(50), shutdown.clone())
+            .await;
     assert!(
         terminal_supervisor
             .wait_for_nonempty(Duration::from_secs(2))
@@ -295,12 +283,9 @@ async fn proxy_protocol_v2_passes_through_terminal_unchanged() {
         terminal_listen_port,
         &format!("127.0.0.1:{}", echo_addr.port()),
     );
-    let terminal_supervisor = spawn_terminal_supervisor(
-        terminal_rules,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let terminal_supervisor =
+        spawn_terminal_supervisor(terminal_rules, Duration::from_millis(50), shutdown.clone())
+            .await;
     assert!(
         terminal_supervisor
             .wait_for_nonempty(Duration::from_secs(2))
@@ -382,12 +367,8 @@ async fn terminal_control_status_response_shape() {
     let rules_tmp = tempfile::tempdir().unwrap();
     let rules_dir = rules_tmp.path().join("rules");
     std::fs::create_dir_all(&rules_dir).unwrap();
-    let supervisor = spawn_terminal_supervisor(
-        rules_dir,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let supervisor =
+        spawn_terminal_supervisor(rules_dir, Duration::from_millis(50), shutdown.clone()).await;
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("control.sock");
@@ -443,21 +424,13 @@ async fn terminal_control_peer_commands_are_rejected() {
     let rules_tmp = tempfile::tempdir().unwrap();
     let rules_dir = rules_tmp.path().join("rules");
     std::fs::create_dir_all(&rules_dir).unwrap();
-    let supervisor = spawn_terminal_supervisor(
-        rules_dir,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let supervisor =
+        spawn_terminal_supervisor(rules_dir, Duration::from_millis(50), shutdown.clone()).await;
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("control.sock");
     let config_path = socket_dir.path().join("yggdrasil.toml");
-    std::fs::write(
-        &config_path,
-        "[server]\nmode = \"terminal\"\n",
-    )
-    .unwrap();
+    std::fs::write(&config_path, "[server]\nmode = \"terminal\"\n").unwrap();
 
     let server = ControlServer::bind(
         socket_path.clone(),

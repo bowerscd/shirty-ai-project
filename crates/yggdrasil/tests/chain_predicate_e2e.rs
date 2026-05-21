@@ -71,8 +71,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
     let peer_state = PeerState::new(*client_keys.public_key());
 
     let pending_dir = tempfile::tempdir().unwrap();
-    let pending_store =
-        Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+    let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
 
     // 2. Real proxy supervisor over an empty rules dir.
     let rules_dir = tempfile::tempdir().unwrap();
@@ -94,12 +93,8 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor = ChainAcceptor::load(
-        supervisor.handle(),
-        derive_cfg,
-        state_dir.path(),
-    )
-    .expect("load acceptor");
+    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path())
+        .expect("load acceptor");
 
     // 4. HeartbeatServer bound to a random loopback port with the acceptor.
     let hb_cancel = cancel.clone();
@@ -218,8 +213,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     let client_keys = StaticKeyPair::generate().unwrap();
     let peer_state = PeerState::new(*client_keys.public_key());
     let pending_dir = tempfile::tempdir().unwrap();
-    let pending_store =
-        Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+    let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
 
     let rules_dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
@@ -238,12 +232,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor = ChainAcceptor::load(
-        supervisor.handle(),
-        derive_cfg,
-        state_dir.path(),
-    )
-    .unwrap();
+    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path()).unwrap();
     let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         clone_kp(&server_keys),

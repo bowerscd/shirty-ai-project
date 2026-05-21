@@ -116,8 +116,7 @@ impl DeriveError {
 /// (otherwise the relay would happily reapply stale state).
 pub fn derive(set: &PredicateSet, cfg: &DeriveConfig) -> Result<RuleSet, DeriveError> {
     let mut seen_names: HashSet<&str> = HashSet::with_capacity(set.predicates.len());
-    let mut seen_listens: Vec<(Protocol, u16, &str)> =
-        Vec::with_capacity(set.predicates.len());
+    let mut seen_listens: Vec<(Protocol, u16, &str)> = Vec::with_capacity(set.predicates.len());
     let mut rules = Vec::with_capacity(set.predicates.len());
 
     for predicate in &set.predicates {
@@ -359,6 +358,9 @@ mod tests {
         };
         let set = predicate_set(vec![predicate("ssh", 2222, Protocol::Tcp)]);
         let ruleset = derive(&set, &cfg).unwrap();
-        assert_eq!(ruleset.rules()[0].listen.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            ruleset.rules()[0].listen.ip(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
     }
 }

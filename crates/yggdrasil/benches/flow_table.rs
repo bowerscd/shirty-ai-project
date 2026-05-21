@@ -22,9 +22,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use dashmap::DashMap;
 
 #[derive(Default)]
@@ -111,10 +109,7 @@ fn bench_insert(c: &mut Criterion) {
                 || make_populated_table(n),
                 |table| {
                     // Insert one fresh address, then drop the table.
-                    let key = SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::new(172, 31, 0, 1),
-                        9999,
-                    ));
+                    let key = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(172, 31, 0, 1), 9999));
                     table.insert(key, Arc::new(BenchFlow::default()));
                 },
                 criterion::BatchSize::LargeInput,

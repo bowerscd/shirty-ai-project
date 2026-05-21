@@ -160,7 +160,10 @@ mod tests {
 
     #[test]
     fn ack_postcard_roundtrip_ok() {
-        let ack = ControlAck { seq: 42, status: AckStatus::Ok };
+        let ack = ControlAck {
+            seq: 42,
+            status: AckStatus::Ok,
+        };
         let bytes = postcard::to_allocvec(&ack).unwrap();
         let back: ControlAck = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(ack, back);
@@ -168,7 +171,10 @@ mod tests {
 
     #[test]
     fn ack_postcard_roundtrip_reject() {
-        let ack = ControlAck { seq: 7, status: AckStatus::Reject(0xDEAD) };
+        let ack = ControlAck {
+            seq: 7,
+            status: AckStatus::Reject(0xDEAD),
+        };
         let bytes = postcard::to_allocvec(&ack).unwrap();
         let back: ControlAck = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(ack, back);
@@ -176,7 +182,10 @@ mod tests {
 
     #[test]
     fn ack_postcard_roundtrip_unknown() {
-        let ack = ControlAck { seq: 7, status: AckStatus::Unknown };
+        let ack = ControlAck {
+            seq: 7,
+            status: AckStatus::Unknown,
+        };
         let bytes = postcard::to_allocvec(&ack).unwrap();
         let back: ControlAck = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(ack, back);

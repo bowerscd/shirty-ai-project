@@ -164,6 +164,7 @@ mod tests {
     fn reply_cap_is_below_control_plaintext_budget() {
         // The reply needs to fit alongside ControlEnvelope framing
         // overhead inside MAX_CONTROL_PLAINTEXT_LEN.
-        const _: () = assert!(CHAIN_HOP_REPLY_MAX_WIRE_BYTES < crate::wire::MAX_CONTROL_PLAINTEXT_LEN);
+        const _: () =
+            assert!(CHAIN_HOP_REPLY_MAX_WIRE_BYTES < crate::wire::MAX_CONTROL_PLAINTEXT_LEN);
     }
 }

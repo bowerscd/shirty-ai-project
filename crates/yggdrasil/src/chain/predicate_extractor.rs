@@ -187,16 +187,12 @@ mod tests {
         // HTTPS rule whose `routes` would normally be required.
         let mut rule = https_rule("home-https");
         rule.routes = Some(vec![]); // populated below before validation
-        // Bypass `from_rules` validation for this synthetic mix by
-        // constructing each rule individually well-formed except for the
-        // HTTPS one, which we know `extract` will drop before any L7
-        // logic looks at it.
+                                    // Bypass `from_rules` validation for this synthetic mix by
+                                    // constructing each rule individually well-formed except for the
+                                    // HTTPS one, which we know `extract` will drop before any L7
+                                    // logic looks at it.
         let out = extract_via_unsorted_rules(
-            vec![
-                tcp_rule("ssh", 2222, 22),
-                rule,
-                udp_rule("dns", 53, None),
-            ],
+            vec![tcp_rule("ssh", 2222, 22), rule, udp_rule("dns", 53, None)],
             origin(),
             5,
         );
@@ -234,7 +230,11 @@ mod tests {
     /// Test-only helper that runs the projection logic against a list of
     /// rules without going through `RuleSet::from_rules` (which would
     /// reject HTTPS rules with empty `routes`).
-    fn extract_via_unsorted_rules(rules: Vec<Rule>, origin: PubKey, version: u64) -> ExtractOutcome {
+    fn extract_via_unsorted_rules(
+        rules: Vec<Rule>,
+        origin: PubKey,
+        version: u64,
+    ) -> ExtractOutcome {
         let mut predicates = Vec::with_capacity(rules.len());
         let mut skipped_https = Vec::new();
         for rule in &rules {
@@ -245,7 +245,11 @@ mod tests {
         }
         predicates.sort_by(|a, b| a.name.cmp(&b.name));
         ExtractOutcome {
-            set: PredicateSet { predicates, version, origin },
+            set: PredicateSet {
+                predicates,
+                version,
+                origin,
+            },
             skipped_https,
         }
     }

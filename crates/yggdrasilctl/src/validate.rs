@@ -138,52 +138,36 @@ target_port = 7001
     #[tokio::test]
     async fn validate_succeeds_for_good_config_and_rules() {
         let (_tmp, cfg, _rd) = setup(GOOD_CONFIG, Some(GOOD_RULE));
-        let code = run(
-            ValidateArgs { rules_dir: None },
-            &cfg,
-            true,
-        )
-        .await
-        .unwrap();
+        let code = run(ValidateArgs { rules_dir: None }, &cfg, true)
+            .await
+            .unwrap();
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 
     #[tokio::test]
     async fn validate_succeeds_with_empty_rules_dir() {
         let (_tmp, cfg, _rd) = setup(GOOD_CONFIG, None);
-        let code = run(
-            ValidateArgs { rules_dir: None },
-            &cfg,
-            false,
-        )
-        .await
-        .unwrap();
+        let code = run(ValidateArgs { rules_dir: None }, &cfg, false)
+            .await
+            .unwrap();
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 
     #[tokio::test]
     async fn validate_rejects_config_missing_dial_and_accept() {
         let (_tmp, cfg, _rd) = setup(BAD_CONFIG, None);
-        let code = run(
-            ValidateArgs { rules_dir: None },
-            &cfg,
-            false,
-        )
-        .await
-        .unwrap();
+        let code = run(ValidateArgs { rules_dir: None }, &cfg, false)
+            .await
+            .unwrap();
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
     }
 
     #[tokio::test]
     async fn validate_rejects_invalid_rules() {
         let (_tmp, cfg, _rd) = setup(GOOD_CONFIG, Some("not-toml ::: ["));
-        let code = run(
-            ValidateArgs { rules_dir: None },
-            &cfg,
-            false,
-        )
-        .await
-        .unwrap();
+        let code = run(ValidateArgs { rules_dir: None }, &cfg, false)
+            .await
+            .unwrap();
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(3)));
     }
 

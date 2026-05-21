@@ -25,9 +25,9 @@ use std::path::Path;
 
 use zeroize::Zeroizing;
 
+use crate::control_frame::{ControlAck, ControlEnvelope};
 use crate::error::{Error, Result};
 use crate::wire::{self, PacketType, PacketView, SessionId};
-use crate::control_frame::{ControlAck, ControlEnvelope};
 
 /// Standard Noise pattern string used by all yggdrasil heartbeat peers.
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -58,8 +58,7 @@ impl std::fmt::Debug for StaticKeyPair {
 impl StaticKeyPair {
     /// Generate a fresh keypair via snow's default resolver.
     pub fn generate() -> Result<Self> {
-        let params: snow::params::NoiseParams =
-            NOISE_PATTERN.parse().expect("valid noise pattern");
+        let params: snow::params::NoiseParams = NOISE_PATTERN.parse().expect("valid noise pattern");
         let kp = snow::Builder::new(params).generate_keypair()?;
         debug_assert_eq!(kp.private.len(), SECRET_KEY_LEN);
         debug_assert_eq!(kp.public.len(), PUBLIC_KEY_LEN);
@@ -106,7 +105,7 @@ impl StaticKeyPair {
     /// Read an identity file from disk.
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(|source| Error::ReadFile {
-            path:   path.to_path_buf(),
+            path: path.to_path_buf(),
             source,
         })?;
         Self::from_identity_bytes(&bytes)
@@ -136,10 +135,11 @@ impl StaticKeyPair {
             path: path.to_path_buf(),
             source,
         })?;
-        f.write_all(&self.to_identity_bytes()).map_err(|source| Error::WriteFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        f.write_all(&self.to_identity_bytes())
+            .map_err(|source| Error::WriteFile {
+                path: path.to_path_buf(),
+                source,
+            })?;
         Ok(())
     }
 
@@ -195,7 +195,7 @@ fn noise_params() -> snow::params::NoiseParams {
 /// `Handshake2` is consumed, at which point it becomes a [`Session`].
 #[derive(Debug)]
 pub struct Initiator {
-    inner:      snow::HandshakeState,
+    inner: snow::HandshakeState,
     session_id: SessionId,
 }
 
@@ -292,8 +292,8 @@ impl Responder {
 /// committing.
 #[derive(Debug)]
 pub struct HalfHandshake {
-    inner:         snow::HandshakeState,
-    session_id:    SessionId,
+    inner: snow::HandshakeState,
+    session_id: SessionId,
     remote_public: [u8; PUBLIC_KEY_LEN],
 }
 
@@ -344,8 +344,8 @@ impl HalfHandshake {
 /// and decrypt inbound packets independently using snow's per-direction nonces.
 #[derive(Debug)]
 pub struct Session {
-    transport:         snow::TransportState,
-    session_id:        SessionId,
+    transport: snow::TransportState,
+    session_id: SessionId,
     /// Highest received counter seen on this session. `None` = no packet received yet.
     last_seen_counter: Option<u64>,
 }
@@ -353,17 +353,17 @@ pub struct Session {
 /// Decrypted `Heartbeat` payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedHeartbeat {
-    pub counter:      u64,
+    pub counter: u64,
     pub timestamp_ms: u64,
-    pub flags:        u8,
+    pub flags: u8,
 }
 
 /// Decrypted `HeartbeatAck` payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedHeartbeatAck {
-    pub counter:        u64,
+    pub counter: u64,
     pub echoed_counter: u64,
-    pub server_ts_ms:   u64,
+    pub server_ts_ms: u64,
 }
 
 impl Session {
@@ -481,28 +481,23 @@ impl Session {
         let mut ct_buf = [0u8; wire::MAX_PACKET_LEN];
         let ct_len = self.transport.write_message(plaintext, &mut ct_buf)?;
 
-        let mut packet =
-            Vec::with_capacity(wire::PREAMBLE_LEN + wire::COUNTER_LEN + ct_len);
+        let mut packet = Vec::with_capacity(wire::PREAMBLE_LEN + wire::COUNTER_LEN + ct_len);
         wire::write_preamble(&mut packet, packet_type, self.session_id);
         wire::write_counter(&mut packet, counter);
         packet.extend_from_slice(&ct_buf[..ct_len]);
         Ok(packet)
     }
 
-    fn decode_packet(
-        &mut self,
-        expected: PacketType,
-        view: &PacketView<'_>,
-    ) -> Result<Vec<u8>> {
+    fn decode_packet(&mut self, expected: PacketType, view: &PacketView<'_>) -> Result<Vec<u8>> {
         if view.packet_type != expected {
             return Err(Error::Auth("unexpected packet type"));
         }
         if view.session_id != self.session_id {
             return Err(Error::Auth("session id mismatch"));
         }
-        let counter = view
-            .counter
-            .ok_or(Error::MalformedPacket("post-handshake packet missing counter"))?;
+        let counter = view.counter.ok_or(Error::MalformedPacket(
+            "post-handshake packet missing counter",
+        ))?;
         // Strict-monotonic replay protection.
         if let Some(last) = self.last_seen_counter {
             if counter <= last {
@@ -575,7 +570,9 @@ mod tests {
         let (mut init, mut resp, _, _) = establish();
         // Heartbeat first to push counter forward.
         let (counter, hb_packet) = init.encode_heartbeat(100, 0).unwrap();
-        let _ = resp.decode_heartbeat(&wire::parse(&hb_packet).unwrap()).unwrap();
+        let _ = resp
+            .decode_heartbeat(&wire::parse(&hb_packet).unwrap())
+            .unwrap();
         // Now resp acks.
         let (ack_counter, ack_packet) = resp.encode_heartbeat_ack(counter, 200).unwrap();
         let ack = init
@@ -590,7 +587,9 @@ mod tests {
     fn replay_is_rejected_strictly() {
         let (mut init, mut resp, _, _) = establish();
         let (_, packet) = init.encode_heartbeat(10, 0).unwrap();
-        let _ = resp.decode_heartbeat(&wire::parse(&packet).unwrap()).unwrap();
+        let _ = resp
+            .decode_heartbeat(&wire::parse(&packet).unwrap())
+            .unwrap();
         // Same packet again: counter is no longer strictly greater.
         let err = resp.decode_heartbeat(&wire::parse(&packet).unwrap()).err();
         assert!(matches!(err, Some(Error::Replay { .. })));
@@ -613,8 +612,7 @@ mod tests {
         let (initiator_kp, responder_kp) = make_pair();
         let (_attacker_kp, _) = make_pair();
         let sid = SessionId([9, 9, 9, 9]);
-        let (_init, hs1) =
-            Initiator::start(&initiator_kp, responder_kp.public_key(), sid).unwrap();
+        let (_init, hs1) = Initiator::start(&initiator_kp, responder_kp.public_key(), sid).unwrap();
         let view1 = wire::parse(&hs1).unwrap();
         // Try to process with a DIFFERENT responder key (the wrong key for this handshake).
         let wrong_responder = StaticKeyPair::generate().unwrap();
@@ -657,7 +655,9 @@ mod tests {
                 assert!(counter > p, "counter must be strictly monotonic");
             }
             prev = Some(counter);
-            let hb = resp.decode_heartbeat(&wire::parse(&packet).unwrap()).unwrap();
+            let hb = resp
+                .decode_heartbeat(&wire::parse(&packet).unwrap())
+                .unwrap();
             assert_eq!(hb.timestamp_ms, i);
             assert_eq!(hb.counter, counter);
         }
@@ -685,7 +685,10 @@ mod tests {
     fn control_ack_roundtrips_through_session() {
         use crate::control_frame::{AckStatus, ControlAck};
         let (mut init, mut resp, _, _) = establish();
-        let ack = ControlAck { seq: 99, status: AckStatus::Reject(0xBEEF) };
+        let ack = ControlAck {
+            seq: 99,
+            status: AckStatus::Reject(0xBEEF),
+        };
         let (counter, packet) = resp.encode_control_ack(&ack).unwrap();
         let view = wire::parse(&packet).unwrap();
         assert_eq!(view.packet_type, PacketType::ControlAck);
@@ -698,7 +701,10 @@ mod tests {
     fn control_decode_rejects_wrong_packet_type() {
         use crate::control_frame::{AckStatus, ControlAck};
         let (mut init, mut resp, _, _) = establish();
-        let ack = ControlAck { seq: 1, status: AckStatus::Ok };
+        let ack = ControlAck {
+            seq: 1,
+            status: AckStatus::Ok,
+        };
         let (_, packet) = init.encode_control_ack(&ack).unwrap();
         let view = wire::parse(&packet).unwrap();
         // Trying to decode a ControlAck as a Control should fail.

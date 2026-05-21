@@ -177,7 +177,9 @@ pub enum Response {
     ChainSummary(ChainSummaryResponse),
     Status(StatusResponse),
     Rules(RulesResponse),
-    RulesReloaded { reloaded_rule_count: usize },
+    RulesReloaded {
+        reloaded_rule_count: usize,
+    },
     Downstream(DownstreamResponse),
     DownstreamPending(PendingResponse),
     DownstreamApproved {
@@ -439,10 +441,10 @@ pub mod error_codes {
     /// longer / more specific prefix.
     pub const AMBIGUOUS_FINGERPRINT: &str = "ambiguous_fingerprint";
     pub const CONFIG_WRITE_FAILED: &str = "config_write_failed";
-    pub const RELOAD_FAILED:       &str = "reload_failed";
+    pub const RELOAD_FAILED: &str = "reload_failed";
     pub const DOWNSTREAM_ALREADY_ENROLLED: &str = "downstream_already_enrolled";
-    pub const INVALID_REQUEST:     &str = "invalid_request";
-    pub const INTERNAL_ERROR:      &str = "internal_error";
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    pub const INTERNAL_ERROR: &str = "internal_error";
     /// The daemon is running in `mode = "terminal"`, which has no peer
     /// identity. Peer-related commands (`peer show`, `peer pending`,
     /// `peer approve`) are not meaningful and return this code.
@@ -491,7 +493,9 @@ mod tests {
                 fingerprint: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
             },
             Request::ChainSummary { timeout_ms: None },
-            Request::ChainSummary { timeout_ms: Some(2500) },
+            Request::ChainSummary {
+                timeout_ms: Some(2500),
+            },
         ];
         for r in cases {
             let s = serde_json::to_string(&r).unwrap();
@@ -521,7 +525,10 @@ mod tests {
 
     #[test]
     fn mode_serialises_as_lowercase() {
-        assert_eq!(serde_json::to_string(&Mode::Gateway).unwrap(), "\"gateway\"");
+        assert_eq!(
+            serde_json::to_string(&Mode::Gateway).unwrap(),
+            "\"gateway\""
+        );
         assert_eq!(serde_json::to_string(&Mode::Relay).unwrap(), "\"relay\"");
         assert_eq!(
             serde_json::to_string(&Mode::Terminal).unwrap(),
@@ -594,7 +601,9 @@ mod tests {
 
     #[test]
     fn chain_summary_request_serialises() {
-        let r = Request::ChainSummary { timeout_ms: Some(1000) };
+        let r = Request::ChainSummary {
+            timeout_ms: Some(1000),
+        };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"kind\":\"chain_summary\""), "got: {s}");
         assert!(s.contains("\"timeout_ms\":1000"), "got: {s}");
@@ -674,9 +683,15 @@ mod tests {
     #[test]
     fn chain_apply_error_codes_are_stable_strings() {
         // Pin the wire-stable strings so daemon + CLI never drift.
-        assert_eq!(error_codes::NOT_SUPPORTED_IN_RELAY_MODE, "not_supported_in_relay_mode");
+        assert_eq!(
+            error_codes::NOT_SUPPORTED_IN_RELAY_MODE,
+            "not_supported_in_relay_mode"
+        );
         assert_eq!(error_codes::RULES_INVALID, "rules_invalid");
-        assert_eq!(error_codes::PREDICATE_SET_OVERSIZE, "predicate_set_oversize");
+        assert_eq!(
+            error_codes::PREDICATE_SET_OVERSIZE,
+            "predicate_set_oversize"
+        );
         assert_eq!(error_codes::APPLY_FAILED, "apply_failed");
     }
 }

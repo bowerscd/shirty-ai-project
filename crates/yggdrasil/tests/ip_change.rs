@@ -32,9 +32,7 @@ use ratatoskr::wire::{self, SessionId};
 
 use yggdrasil::heartbeat::PeerState;
 
-use crate::common::{
-    pick_free_udp_port, spawn_supervisor, write_rule, HeartbeatHarness,
-};
+use crate::common::{pick_free_udp_port, spawn_supervisor, write_rule, HeartbeatHarness};
 
 #[tokio::test]
 async fn ip_change_drains_inflight_udp_flow() {
@@ -120,8 +118,7 @@ async fn ip_change_drains_inflight_udp_flow() {
     let sock_hb_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock_hb_a.connect(hb.addr).await.unwrap();
     let sid = SessionId::random();
-    let (init, hs1) = ratatoskr::auth::Initiator::start(&client_keys, &server_pub, sid)
-        .unwrap();
+    let (init, hs1) = ratatoskr::auth::Initiator::start(&client_keys, &server_pub, sid).unwrap();
     sock_hb_a.send(&hs1).await.unwrap();
     let mut buf = [0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(2), sock_hb_a.recv(&mut buf))
@@ -158,7 +155,10 @@ async fn ip_change_drains_inflight_udp_flow() {
     // (the proxy's per-flow upstream port).
     let upstream_pre = {
         let v = seen_a.lock().await;
-        assert!(!v.is_empty(), "echo @ 127.0.0.1 did not receive any datagrams");
+        assert!(
+            !v.is_empty(),
+            "echo @ 127.0.0.1 did not receive any datagrams"
+        );
         v[0]
     };
 

@@ -129,11 +129,7 @@ impl UpstreamResolver {
 /// On lookup failure or an empty result set, the previous value in the
 /// watch is retained — transient resolver outages don't blip the rule
 /// offline.
-fn spawn_dns_refresh(
-    host: String,
-    port: u16,
-    tx: watch::Sender<Option<SocketAddr>>,
-) {
+fn spawn_dns_refresh(host: String, port: u16, tx: watch::Sender<Option<SocketAddr>>) {
     tokio::spawn(async move {
         let target = format!("{host}:{port}");
         let mut ticker = tokio::time::interval(DNS_REFRESH_INTERVAL);
@@ -244,7 +240,11 @@ impl ResolverFactory {
             Host(&'a TargetHost),
             None,
         }
-        let target = match (rule.target_port, rule.target_addr, rule.target_host.as_ref()) {
+        let target = match (
+            rule.target_port,
+            rule.target_addr,
+            rule.target_host.as_ref(),
+        ) {
             (Some(p), None, None) => Target::Port(p),
             (None, Some(a), None) => Target::Addr(a),
             (None, None, Some(h)) => Target::Host(h),
@@ -481,7 +481,10 @@ mod tests {
         let r = f.build(&dns_rule("localhost", 9)).unwrap();
         assert!(matches!(r, UpstreamResolver::Dns { .. }));
         assert!(r.describe().contains("dns:localhost:9"));
-        assert!(!r.is_dynamic(), "Dns resolver should not drive ipchange_loop");
+        assert!(
+            !r.is_dynamic(),
+            "Dns resolver should not drive ipchange_loop"
+        );
 
         // Wait for the refresh task to land an address.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

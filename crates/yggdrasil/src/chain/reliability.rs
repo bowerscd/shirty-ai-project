@@ -92,7 +92,10 @@ struct DedupWindow {
 
 impl DedupWindow {
     fn new(cap: usize) -> Self {
-        Self { seen: VecDeque::with_capacity(cap), cap }
+        Self {
+            seen: VecDeque::with_capacity(cap),
+            cap,
+        }
     }
     fn contains(&self, seq: u32) -> bool {
         self.seen.iter().any(|&s| s == seq)
@@ -147,7 +150,11 @@ impl ControlChannel {
             .next_seq
             .checked_add(1)
             .expect("control channel seq exhausted; rekey before this");
-        let envelope = ControlEnvelope { seq, body_type, body };
+        let envelope = ControlEnvelope {
+            seq,
+            body_type,
+            body,
+        };
         self.outbound.insert(
             seq,
             OutboundEntry {
@@ -317,7 +324,10 @@ mod tests {
     #[test]
     fn unknown_ack_seq_is_silently_dropped() {
         let mut ch = ControlChannel::new();
-        let acked = ch.on_ack(&ControlAck { seq: 9999, status: AckStatus::Ok });
+        let acked = ch.on_ack(&ControlAck {
+            seq: 9999,
+            status: AckStatus::Ok,
+        });
         assert!(!acked);
     }
 
@@ -350,13 +360,20 @@ mod tests {
             let _ = ch.next_due(now);
         }
         assert_eq!(ch.pending(), 0);
-        assert_eq!(rx.await.unwrap(), Err(SendError::Timeout(RETX_MAX_ATTEMPTS)));
+        assert_eq!(
+            rx.await.unwrap(),
+            Err(SendError::Timeout(RETX_MAX_ATTEMPTS))
+        );
     }
 
     #[test]
     fn dedup_window_marks_repeated_seqs_as_duplicate() {
         let mut ch = ControlChannel::new();
-        let env = ControlEnvelope { seq: 7, body_type: 0x01, body: vec![] };
+        let env = ControlEnvelope {
+            seq: 7,
+            body_type: 0x01,
+            body: vec![],
+        };
         match ch.on_inbound(env.clone()) {
             InboundDisposition::Deliver(e) => assert_eq!(e, env),
             InboundDisposition::Duplicate => panic!("first delivery should not be duplicate"),
@@ -370,12 +387,20 @@ mod tests {
         let mut ch = ControlChannel::new();
         // Fill the dedup window plus one extra so seq=0 ages out.
         for i in 0..=DEDUP_WINDOW as u32 {
-            let env = ControlEnvelope { seq: i, body_type: 0x01, body: vec![] };
+            let env = ControlEnvelope {
+                seq: i,
+                body_type: 0x01,
+                body: vec![],
+            };
             let _ = ch.on_inbound(env);
         }
         // seq=0 was the oldest; with the window full + one extra it should
         // now be evicted, so re-presenting it counts as a fresh Deliver.
-        let env0 = ControlEnvelope { seq: 0, body_type: 0x01, body: vec![] };
+        let env0 = ControlEnvelope {
+            seq: 0,
+            body_type: 0x01,
+            body: vec![],
+        };
         match ch.on_inbound(env0.clone()) {
             InboundDisposition::Deliver(e) => assert_eq!(e, env0),
             InboundDisposition::Duplicate => panic!("seq 0 should have aged out"),

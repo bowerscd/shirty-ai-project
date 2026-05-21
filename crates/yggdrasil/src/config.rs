@@ -28,19 +28,19 @@ use ratatoskr::Error as ProtoError;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    pub server:  ServerSection,
+    pub server: ServerSection,
     #[serde(default)]
     pub control: ControlSection,
     /// Outbound chain client. When set, this node dials the configured
     /// upstream and sends heartbeats. Terminal-mode nodes with no upstream
     /// link omit this entirely.
     #[serde(default)]
-    pub dial:    Option<DialSection>,
+    pub dial: Option<DialSection>,
     /// Inbound chain peer. When set, the node accepts inbound chain
     /// traffic on `listen` only from `pubkey`. v1 supports exactly one
     /// inbound peer per node.
     #[serde(default)]
-    pub accept:  Option<AcceptSection>,
+    pub accept: Option<AcceptSection>,
 }
 
 /// Effective runtime mode, derived from top-level chain section presence.
@@ -108,7 +108,7 @@ pub struct ServerSection {
     pub default_cert: Option<PathBuf>,
     /// Default TLS private key (PEM) paired with `default_cert`.
     #[serde(default)]
-    pub default_key:  Option<PathBuf>,
+    pub default_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,12 +158,24 @@ pub struct AcceptSection {
     pub rekey_interval: Duration,
 }
 
-fn default_state_dir() -> PathBuf       { PathBuf::from("/var/lib/yggdrasil") }
-fn default_identity_file() -> PathBuf   { PathBuf::from("/etc/yggdrasil/identity.key") }
-fn default_rules_dir() -> PathBuf       { PathBuf::from("/etc/yggdrasil/conf.d") }
-fn default_cert_dir() -> PathBuf        { PathBuf::from("/etc/yggdrasil/certs") }
-fn default_rekey_interval() -> Duration { Duration::from_secs(3600) }
-fn default_heartbeat_interval() -> Duration { Duration::from_secs(5) }
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/yggdrasil")
+}
+fn default_identity_file() -> PathBuf {
+    PathBuf::from("/etc/yggdrasil/identity.key")
+}
+fn default_rules_dir() -> PathBuf {
+    PathBuf::from("/etc/yggdrasil/conf.d")
+}
+fn default_cert_dir() -> PathBuf {
+    PathBuf::from("/etc/yggdrasil/certs")
+}
+fn default_rekey_interval() -> Duration {
+    Duration::from_secs(3600)
+}
+fn default_heartbeat_interval() -> Duration {
+    Duration::from_secs(5)
+}
 
 impl ServerConfig {
     /// Load and validate a config file from disk.
@@ -172,10 +184,12 @@ impl ServerConfig {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let cfg: ServerConfig = toml::from_str(&raw).map_err(|e| ConfigError::Proto(ProtoError::TomlParse {
-            path:   path.to_path_buf(),
-            source: e,
-        }))?;
+        let cfg: ServerConfig = toml::from_str(&raw).map_err(|e| {
+            ConfigError::Proto(ProtoError::TomlParse {
+                path: path.to_path_buf(),
+                source: e,
+            })
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -183,9 +197,9 @@ impl ServerConfig {
     /// Derive effective runtime mode from section presence.
     pub fn derived_mode(&self) -> Result<Mode, ConfigError> {
         match (self.dial.is_some(), self.accept.is_some()) {
-            (false, true)  => Ok(Mode::Gateway),
-            (true,  true)  => Ok(Mode::Relay),
-            (true,  false) => Ok(Mode::Terminal),
+            (false, true) => Ok(Mode::Gateway),
+            (true, true) => Ok(Mode::Relay),
+            (true, false) => Ok(Mode::Terminal),
             (false, false) => Err(ConfigError::Invalid(
                 "config must define at least one of [dial] or [accept]".into(),
             )),
@@ -256,7 +270,10 @@ impl ServerConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read {path}: {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Proto(#[from] ProtoError),
     #[error("invalid config: {0}")]
@@ -268,10 +285,12 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Result<ServerConfig, ConfigError> {
-        let cfg: ServerConfig = toml::from_str(s).map_err(|e| ConfigError::Proto(ProtoError::TomlParse {
-            path: PathBuf::from("test.toml"),
-            source: e,
-        }))?;
+        let cfg: ServerConfig = toml::from_str(s).map_err(|e| {
+            ConfigError::Proto(ProtoError::TomlParse {
+                path: PathBuf::from("test.toml"),
+                source: e,
+            })
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -336,7 +355,9 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]")));
+        assert!(
+            matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]"))
+        );
     }
 
     #[test]
@@ -431,10 +452,8 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(
-            matches!(err, ConfigError::Invalid(s)
-                if s.contains("default_cert is set but server.default_key is not"))
-        );
+        assert!(matches!(err, ConfigError::Invalid(s)
+                if s.contains("default_cert is set but server.default_key is not")));
     }
 
     #[test]
@@ -451,10 +470,8 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(
-            matches!(err, ConfigError::Invalid(s)
-                if s.contains("default_key is set but server.default_cert is not"))
-        );
+        assert!(matches!(err, ConfigError::Invalid(s)
+                if s.contains("default_key is set but server.default_cert is not")));
     }
 
     // ---- [dial] ----
@@ -649,6 +666,8 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]")));
+        assert!(
+            matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]"))
+        );
     }
 }

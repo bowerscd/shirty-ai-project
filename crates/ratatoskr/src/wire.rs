@@ -106,26 +106,26 @@ impl std::fmt::Display for SessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
-    Handshake1   = TAG_HANDSHAKE_1,
-    Handshake2   = TAG_HANDSHAKE_2,
-    Heartbeat    = TAG_HEARTBEAT,
+    Handshake1 = TAG_HANDSHAKE_1,
+    Handshake2 = TAG_HANDSHAKE_2,
+    Heartbeat = TAG_HEARTBEAT,
     HeartbeatAck = TAG_HEARTBEAT_ACK,
-    Rekey        = TAG_REKEY,
-    Control      = TAG_CONTROL,
-    ControlAck   = TAG_CONTROL_ACK,
+    Rekey = TAG_REKEY,
+    Control = TAG_CONTROL,
+    ControlAck = TAG_CONTROL_ACK,
 }
 
 impl PacketType {
     pub fn from_tag(tag: u8) -> Result<Self> {
         Ok(match tag {
-            TAG_HANDSHAKE_1    => Self::Handshake1,
-            TAG_HANDSHAKE_2    => Self::Handshake2,
-            TAG_HEARTBEAT      => Self::Heartbeat,
-            TAG_HEARTBEAT_ACK  => Self::HeartbeatAck,
-            TAG_REKEY          => Self::Rekey,
-            TAG_CONTROL        => Self::Control,
-            TAG_CONTROL_ACK    => Self::ControlAck,
-            other              => return Err(Error::UnknownPacketType(other)),
+            TAG_HANDSHAKE_1 => Self::Handshake1,
+            TAG_HANDSHAKE_2 => Self::Handshake2,
+            TAG_HEARTBEAT => Self::Heartbeat,
+            TAG_HEARTBEAT_ACK => Self::HeartbeatAck,
+            TAG_REKEY => Self::Rekey,
+            TAG_CONTROL => Self::Control,
+            TAG_CONTROL_ACK => Self::ControlAck,
+            other => return Err(Error::UnknownPacketType(other)),
         })
     }
 
@@ -134,11 +134,7 @@ impl PacketType {
     pub fn has_counter(self) -> bool {
         matches!(
             self,
-            Self::Heartbeat
-                | Self::HeartbeatAck
-                | Self::Rekey
-                | Self::Control
-                | Self::ControlAck,
+            Self::Heartbeat | Self::HeartbeatAck | Self::Rekey | Self::Control | Self::ControlAck,
         )
     }
 }
@@ -147,12 +143,12 @@ impl PacketType {
 #[derive(Debug)]
 pub struct PacketView<'a> {
     pub packet_type: PacketType,
-    pub session_id:  SessionId,
+    pub session_id: SessionId,
     /// Only set for `Heartbeat`/`HeartbeatAck`/`Rekey`; `None` for handshake packets.
-    pub counter:     Option<u64>,
+    pub counter: Option<u64>,
     /// Remaining bytes: for handshake packets, the raw Noise message; for
     /// post-handshake packets, the ciphertext + AEAD tag.
-    pub body:        &'a [u8],
+    pub body: &'a [u8],
 }
 
 /// Parse the preamble (and counter, when present) from an inbound packet.
@@ -170,7 +166,9 @@ pub fn parse(buf: &[u8]) -> Result<PacketView<'_>> {
 
     if packet_type.has_counter() {
         if buf.len() < PREAMBLE_LEN + COUNTER_LEN {
-            return Err(Error::MalformedPacket("packet shorter than preamble + counter"));
+            return Err(Error::MalformedPacket(
+                "packet shorter than preamble + counter",
+            ));
         }
         let counter = u64::from_be_bytes(
             buf[PREAMBLE_LEN..PREAMBLE_LEN + COUNTER_LEN]
@@ -234,7 +232,9 @@ pub fn encode_heartbeat_ack_plaintext(
 
 pub fn decode_heartbeat_ack_plaintext(buf: &[u8]) -> Result<(u64, u64)> {
     if buf.len() != HEARTBEAT_ACK_PT_LEN {
-        return Err(Error::MalformedPacket("heartbeat-ack plaintext wrong length"));
+        return Err(Error::MalformedPacket(
+            "heartbeat-ack plaintext wrong length",
+        ));
     }
     let ec = u64::from_be_bytes(buf[..8].try_into().expect("8 bytes"));
     let ts = u64::from_be_bytes(buf[8..].try_into().expect("8 bytes"));
@@ -248,7 +248,10 @@ mod tests {
     #[test]
     fn parse_rejects_short_packet() {
         assert!(matches!(parse(&[]), Err(Error::MalformedPacket(_))));
-        assert!(matches!(parse(&[0x01, 0, 0, 0]), Err(Error::MalformedPacket(_))));
+        assert!(matches!(
+            parse(&[0x01, 0, 0, 0]),
+            Err(Error::MalformedPacket(_))
+        ));
     }
 
     #[test]

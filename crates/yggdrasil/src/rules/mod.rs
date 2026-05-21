@@ -13,11 +13,10 @@ mod watcher;
 
 #[allow(unused_imports)] // re-exports used by Phase 4/5 proxy modules
 pub use ratatoskr::rule::{
-    RuleDiff, Protocol, ProxyProto, Rule, RuleChange, RuleFile, RuleSet,
-    DEFAULT_UDP_IDLE_TIMEOUT,
+    Protocol, ProxyProto, Rule, RuleChange, RuleDiff, RuleFile, RuleSet, DEFAULT_UDP_IDLE_TIMEOUT,
 };
 #[allow(unused_imports)]
-pub use watcher::{RuleUpdate, RuleWatcher, ReloadTrigger};
+pub use watcher::{ReloadTrigger, RuleUpdate, RuleWatcher};
 
 use std::path::{Path, PathBuf};
 

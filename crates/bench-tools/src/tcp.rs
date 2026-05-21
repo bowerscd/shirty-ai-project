@@ -30,8 +30,9 @@ pub async fn run_tcp(subject: &str, args: TcpArgs) -> Result<Report> {
     } = args;
 
     let total_duration = warmup + duration;
-    let hist: Arc<Mutex<Histogram<u64>>> =
-        Arc::new(Mutex::new(Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap()));
+    let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
+    ));
     let tx_packets = Arc::new(AtomicU64::new(0));
     let rx_packets = Arc::new(AtomicU64::new(0));
     let tx_bytes = Arc::new(AtomicU64::new(0));

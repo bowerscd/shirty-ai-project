@@ -27,9 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ratatoskr::control_frame::ControlBodyType;
-use ratatoskr::predicate::{
-    predicate_reject, Predicate, PREDICATE_SET_MAX_WIRE_BYTES,
-};
+use ratatoskr::predicate::{predicate_reject, Predicate, PREDICATE_SET_MAX_WIRE_BYTES};
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::RuleSet;
 use serde::{Deserialize, Serialize};
@@ -256,26 +254,21 @@ async fn publish_one(
         return None;
     }
 
-    metrics::gauge!("yggdrasil_chain_predicate_set_size_bytes")
-        .set(body.len() as f64);
+    metrics::gauge!("yggdrasil_chain_predicate_set_size_bytes").set(body.len() as f64);
 
-    let ack_rx = match chain_handle.send_control(
-        ControlBodyType::PredicateSetUpdate.as_byte(),
-        body,
-    ) {
-        Ok(rx) => rx,
-        Err(ChainClientShutDown) => {
-            tracing::warn!(
-                "chain client is shut down; dropping predicate push"
-            );
-            metrics::counter!(
-                "yggdrasil_chain_predicate_push_total",
-                "outcome" => "client_down"
-            )
-            .increment(1);
-            return None;
-        }
-    };
+    let ack_rx =
+        match chain_handle.send_control(ControlBodyType::PredicateSetUpdate.as_byte(), body) {
+            Ok(rx) => rx,
+            Err(ChainClientShutDown) => {
+                tracing::warn!("chain client is shut down; dropping predicate push");
+                metrics::counter!(
+                    "yggdrasil_chain_predicate_push_total",
+                    "outcome" => "client_down"
+                )
+                .increment(1);
+                return None;
+            }
+        };
 
     let result = tokio::select! {
         biased;
@@ -300,8 +293,7 @@ async fn publish_one(
                 "outcome" => "ok"
             )
             .increment(1);
-            metrics::gauge!("yggdrasil_chain_predicate_version")
-                .set(predicate_set.version as f64);
+            metrics::gauge!("yggdrasil_chain_predicate_version").set(predicate_set.version as f64);
             // Phase 5B: notify the introspection sink with the set we
             // just successfully pushed. `predicate_set` is moved into
             // `AppliedPush` below, so we record_apply BEFORE the
@@ -405,8 +397,7 @@ fn load_version(path: &Path) -> Result<u64> {
     if !path.exists() {
         return Ok(0);
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let p: PersistedVersion =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(p.version)
@@ -537,11 +528,8 @@ mod tests {
         }
 
         // A NEW set — version should bump to 2.
-        let set2 = RuleSet::from_rules(vec![
-            tcp_rule("alpha", 8080),
-            tcp_rule("beta", 9090),
-        ])
-        .unwrap();
+        let set2 =
+            RuleSet::from_rules(vec![tcp_rule("alpha", 8080), tcp_rule("beta", 9090)]).unwrap();
         tx.send(set2).unwrap();
         let op2 = next_op(&sink).await;
         let decoded2: PredicateSet = postcard::from_bytes(&op2.body).unwrap();
@@ -577,7 +565,9 @@ mod tests {
 
         // Relay says no.
         op1.completion
-            .send(Err(SendError::Rejected(predicate_reject::INVALID_PREDICATE)))
+            .send(Err(SendError::Rejected(
+                predicate_reject::INVALID_PREDICATE,
+            )))
             .unwrap();
 
         // Resending the SAME set should produce a fresh attempt (publisher

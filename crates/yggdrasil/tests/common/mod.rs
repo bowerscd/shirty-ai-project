@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::{Initiator, Session, StaticKeyPair};
@@ -282,11 +282,7 @@ pub async fn spawn_terminal_supervisor_with_certs(
 }
 
 /// Read N bytes from a TCP stream into a heap buffer with a sensible timeout.
-pub async fn read_exact_or_timeout(
-    stream: &mut TcpStream,
-    n: usize,
-    label: &str,
-) -> Vec<u8> {
+pub async fn read_exact_or_timeout(stream: &mut TcpStream, n: usize, label: &str) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
         .await

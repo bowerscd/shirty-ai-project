@@ -58,8 +58,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::header::{
-    HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE,
-    PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
+    TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::{Authority, Scheme, Uri};
 use http::{Request, Response, StatusCode, Version};
@@ -89,10 +89,10 @@ use super::proxy_protocol;
 /// Owning handle for an HTTPS rule's listener task. Cancelling tears down
 /// the acceptor; in-flight connections finish naturally.
 pub struct HttpFrontend {
-    rule_name:  String,
+    rule_name: String,
     local_addr: SocketAddr,
-    cancel:     CancellationToken,
-    handle:     tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for HttpFrontend {
@@ -113,9 +113,9 @@ impl HttpFrontend {
     /// responsible for ensuring the store contains entries for every
     /// hostname this rule serves *before* `spawn` is called.
     pub async fn spawn(
-        rule:       &Rule,
+        rule: &Rule,
         cert_store: Arc<CertStore>,
-        parent:     CancellationToken,
+        parent: CancellationToken,
     ) -> Result<Self> {
         let routes = rule
             .routes
@@ -233,7 +233,7 @@ pub struct RouteTable {
 
 struct RouteEntry {
     target: Url,
-    hsts:   Option<HstsHeader>,
+    hsts: Option<HstsHeader>,
 }
 
 #[derive(Clone)]
@@ -293,13 +293,13 @@ impl RouteTable {
 
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
-    rule_name:  String,
-    listener:   TcpListener,
+    rule_name: String,
+    listener: TcpListener,
     local_addr: SocketAddr,
-    acceptor:   TlsAcceptor,
-    routes:     Arc<RouteTable>,
-    client:     BackendClient,
-    cancel:     CancellationToken,
+    acceptor: TlsAcceptor,
+    routes: Arc<RouteTable>,
+    client: BackendClient,
+    cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
@@ -352,23 +352,20 @@ async fn accept_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
-    rule_name:  String,
-    mut tcp:    TcpStream,
-    peer_addr:  SocketAddr,
+    rule_name: String,
+    mut tcp: TcpStream,
+    peer_addr: SocketAddr,
     local_addr: SocketAddr,
-    acceptor:   TlsAcceptor,
-    routes:     Arc<RouteTable>,
-    client:     BackendClient,
-    cancel:     CancellationToken,
+    acceptor: TlsAcceptor,
+    routes: Arc<RouteTable>,
+    client: BackendClient,
+    cancel: CancellationToken,
 ) -> io::Result<()> {
     // Step 1: optional PROXY-protocol header. We only consume it; the
     // backend will see the recovered client address via X-Forwarded-For.
     let decode = proxy_protocol::read_optional_header(&mut tcp).await?;
 
-    let client_addr = decode
-        .endpoints
-        .map(|e| e.client)
-        .unwrap_or(peer_addr);
+    let client_addr = decode.endpoints.map(|e| e.client).unwrap_or(peer_addr);
 
     // Step 2: build a stream that re-feeds any peeked-but-not-PROXY bytes.
     let stream = PrefixedStream::new(decode.leftover, tcp);
@@ -426,8 +423,7 @@ async fn handle_tcp_connection(
     let io = TokioIo::new(tls);
 
     let serve_res = if alpn_is_h2 {
-        let conn = http2::Builder::new(TokioExecutor::new())
-            .serve_connection(io, service);
+        let conn = http2::Builder::new(TokioExecutor::new()).serve_connection(io, service);
         tokio::pin!(conn);
         tokio::select! {
             r = &mut conn => r.map_err(io::Error::other),
@@ -488,7 +484,11 @@ pin_project_lite::pin_project! {
 
 impl<S> PrefixedStream<S> {
     fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self { prefix, prefix_pos: 0, inner }
+        Self {
+            prefix,
+            prefix_pos: 0,
+            inner,
+        }
     }
 }
 
@@ -531,11 +531,11 @@ impl<S: AsyncWrite> AsyncWrite for PrefixedStream<S> {
 // =============================================================================
 
 struct ConnContext {
-    rule_name:   String,
+    rule_name: String,
     client_addr: SocketAddr,
-    local_addr:  SocketAddr,
-    routes:      Arc<RouteTable>,
-    client:      BackendClient,
+    local_addr: SocketAddr,
+    routes: Arc<RouteTable>,
+    client: BackendClient,
 }
 
 async fn serve_request(
@@ -595,8 +595,7 @@ async fn serve_request(
     // we don't currently negotiate that and let it fall through as a normal
     // CONNECT, which the backend may handle as it sees fit.
     // -------------------------------------------------------------------
-    let is_websocket =
-        req.version() == Version::HTTP_11 && is_websocket_upgrade(req.headers());
+    let is_websocket = req.version() == Version::HTTP_11 && is_websocket_upgrade(req.headers());
 
     let upstream_url = route.target.clone();
     let hsts_header = route.hsts.clone();
@@ -639,10 +638,10 @@ async fn serve_request(
 }
 
 fn record_request_metrics(
-    rule:   &str,
-    route:  &str,
-    resp:   &Response<BoxBody<Bytes, hyper::Error>>,
-    start:  Instant,
+    rule: &str,
+    route: &str,
+    resp: &Response<BoxBody<Bytes, hyper::Error>>,
+    start: Instant,
 ) {
     let status = resp.status().as_u16();
     let class = match status {
@@ -672,10 +671,10 @@ fn record_request_metrics(
 // =============================================================================
 
 async fn forward_normal(
-    ctx:          Arc<ConnContext>,
-    req:          Request<Incoming>,
+    ctx: Arc<ConnContext>,
+    req: Request<Incoming>,
     upstream_url: &Url,
-    host:         &str,
+    host: &str,
 ) -> anyhow::Result<Response<BoxBody<Bytes, hyper::Error>>> {
     let (mut parts, body) = req.into_parts();
 
@@ -716,14 +715,15 @@ async fn forward_normal(
 // =============================================================================
 
 async fn forward_websocket(
-    ctx:          Arc<ConnContext>,
-    req:          Request<Incoming>,
+    ctx: Arc<ConnContext>,
+    req: Request<Incoming>,
     upstream_url: &Url,
-    host:         &str,
+    host: &str,
 ) -> anyhow::Result<Response<BoxBody<Bytes, hyper::Error>>> {
     let (mut parts, body) = req.into_parts();
     // Capture the original on_upgrade future before we rewrite anything.
-    let client_upgrade = hyper::upgrade::on(Request::from_parts(parts.clone(), Empty::<Bytes>::new()));
+    let client_upgrade =
+        hyper::upgrade::on(Request::from_parts(parts.clone(), Empty::<Bytes>::new()));
     sanitise_request_headers_for_websocket(&mut parts.headers);
     inject_forwarded_headers(&mut parts.headers, ctx.client_addr.ip(), host);
 
@@ -775,7 +775,10 @@ async fn forward_websocket(
     });
 
     let (resp_parts, _) = backend_resp.into_parts();
-    let resp = Response::from_parts(resp_parts, Empty::<Bytes>::new().map_err(|e| match e {}).boxed());
+    let resp = Response::from_parts(
+        resp_parts,
+        Empty::<Bytes>::new().map_err(|e| match e {}).boxed(),
+    );
     Ok(resp)
 }
 
@@ -912,17 +915,13 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 }
 
 fn build_upstream_uri(orig: &Uri, upstream: &Url) -> anyhow::Result<Uri> {
-    let path_and_query = orig
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
+    let path_and_query = orig.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let authority = match (upstream.host_str(), upstream.port_or_known_default()) {
         (Some(h), Some(p)) => format!("{h}:{p}"),
         (Some(h), None) => h.to_string(),
         _ => anyhow::bail!("upstream URL has no host"),
     };
-    let authority = Authority::try_from(authority.as_bytes())
-        .context("authority parse")?;
+    let authority = Authority::try_from(authority.as_bytes()).context("authority parse")?;
     Ok(Uri::builder()
         .scheme(Scheme::HTTP)
         .authority(authority)
@@ -930,7 +929,10 @@ fn build_upstream_uri(orig: &Uri, upstream: &Url) -> anyhow::Result<Uri> {
         .build()?)
 }
 
-fn short_response(status: StatusCode, body: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
+fn short_response(
+    status: StatusCode,
+    body: &'static str,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = Full::new(Bytes::from_static(body.as_bytes()))
         .map_err(|e| match e {})
         .boxed();
@@ -949,13 +951,13 @@ fn short_response(status: StatusCode, body: &'static str) -> Response<BoxBody<By
 /// and serves nothing but `301 Moved Permanently` redirects to the
 /// matching HTTPS URL. Hosts that don't match any active route get a 404.
 pub struct RedirectListener {
-    ip:         IpAddr,
+    ip: IpAddr,
     local_addr: SocketAddr,
-    cancel:     CancellationToken,
-    handle:     tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
     /// Per-IP set of hostnames that should be redirected to HTTPS. The
     /// supervisor mutates this on rule reload.
-    hosts:      Arc<parking_lot::RwLock<HostSet>>,
+    hosts: Arc<parking_lot::RwLock<HostSet>>,
 }
 
 impl std::fmt::Debug for RedirectListener {
@@ -1057,8 +1059,8 @@ impl RedirectListener {
 
 async fn redirect_accept_loop(
     listener: TcpListener,
-    hosts:    Arc<parking_lot::RwLock<HostSet>>,
-    cancel:   CancellationToken,
+    hosts: Arc<parking_lot::RwLock<HostSet>>,
+    cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
@@ -1085,10 +1087,10 @@ async fn redirect_accept_loop(
 }
 
 async fn serve_redirect(
-    tcp:      TcpStream,
-    _peer:    SocketAddr,
-    hosts:    Arc<parking_lot::RwLock<HostSet>>,
-    _cancel:  CancellationToken,
+    tcp: TcpStream,
+    _peer: SocketAddr,
+    hosts: Arc<parking_lot::RwLock<HostSet>>,
+    _cancel: CancellationToken,
 ) -> io::Result<()> {
     let io = TokioIo::new(tcp);
     let service = service_fn(move |req: Request<Incoming>| {
@@ -1109,17 +1111,14 @@ async fn serve_redirect(
 }
 
 fn build_redirect_response(
-    req:   Request<Incoming>,
+    req: Request<Incoming>,
     hosts: &Arc<parking_lot::RwLock<HostSet>>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     let host = match extract_host(&req) {
         Some(h) => h,
         None => return short_response(StatusCode::BAD_REQUEST, ""),
     };
-    let bare_host = host
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(&host);
+    let bare_host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host);
     if !hosts.read().contains(bare_host) {
         return short_response(StatusCode::NOT_FOUND, "no route\n");
     }
@@ -1161,8 +1160,14 @@ mod tests {
         h.insert(CONNECTION, HeaderValue::from_static("close, foo"));
         h.insert(TE, HeaderValue::from_static("trailers"));
         h.insert(UPGRADE, HeaderValue::from_static("websocket"));
-        h.insert(HeaderName::from_static("foo"), HeaderValue::from_static("bar"));
-        h.insert(HeaderName::from_static("x-keep"), HeaderValue::from_static("yes"));
+        h.insert(
+            HeaderName::from_static("foo"),
+            HeaderValue::from_static("bar"),
+        );
+        h.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("yes"),
+        );
         strip_hop_by_hop(&mut h);
         assert!(!h.contains_key(CONNECTION));
         assert!(!h.contains_key(TE));
@@ -1174,10 +1179,22 @@ mod tests {
     #[test]
     fn strip_forwarding_claims_removes_all_variants() {
         let mut h = HeaderMap::new();
-        h.insert(HeaderName::from_static("x-forwarded-for"), HeaderValue::from_static("1.2.3.4"));
-        h.insert(HeaderName::from_static("x-forwarded-proto"), HeaderValue::from_static("http"));
-        h.insert(HeaderName::from_static("x-real-ip"), HeaderValue::from_static("5.6.7.8"));
-        h.insert(HeaderName::from_static("forwarded"), HeaderValue::from_static("for=lies"));
+        h.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("1.2.3.4"),
+        );
+        h.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("http"),
+        );
+        h.insert(
+            HeaderName::from_static("x-real-ip"),
+            HeaderValue::from_static("5.6.7.8"),
+        );
+        h.insert(
+            HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("for=lies"),
+        );
         strip_forwarding_claims(&mut h);
         assert!(h.is_empty());
     }
@@ -1229,9 +1246,9 @@ mod tests {
         let routes = vec![HttpRoute {
             hostname: "API.example.com".into(),
             target: "http://10.0.0.1:8080".parse().unwrap(),
-            cert:     None,
-            key:      None,
-            hsts:     None,
+            cert: None,
+            key: None,
+            hsts: None,
         }];
         let t = RouteTable::build(&routes);
         assert!(t.lookup("api.example.com").is_some());

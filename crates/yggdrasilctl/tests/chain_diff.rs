@@ -126,10 +126,7 @@ fn spawn_oneshot_uds_chain_summary(
 fn run_cli(socket: &PathBuf, extra_args: &[&str]) -> Output {
     let bin = env!("CARGO_BIN_EXE_yggdrasilctl");
     let mut cmd = Command::new(bin);
-    cmd.arg("chain")
-        .arg("--socket")
-        .arg(socket)
-        .arg("diff");
+    cmd.arg("chain").arg("--socket").arg(socket).arg("diff");
     for a in extra_args {
         cmd.arg(a);
     }
@@ -327,10 +324,8 @@ fn diff_json_output_round_trips() {
         "CLI exit status was {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         out.status.code()
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or_else(|e| {
-            panic!("stdout was not valid JSON: {e}\nstdout was:\n{stdout}")
-        });
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON: {e}\nstdout was:\n{stdout}"));
     assert_eq!(parsed["drift_detected"], serde_json::Value::Bool(false));
     assert_eq!(parsed["partial"], serde_json::Value::Bool(false));
     let hops = parsed["hops"].as_array().expect("hops is array");

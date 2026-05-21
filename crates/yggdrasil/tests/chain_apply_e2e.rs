@@ -33,9 +33,7 @@ use ratatoskr::rule::{Protocol, Rule};
 
 use yggdrasil::control::ControlServer;
 
-use crate::common::{
-    pick_free_tcp_port, spawn_supervisor, spawn_terminal_supervisor,
-};
+use crate::common::{pick_free_tcp_port, spawn_supervisor, spawn_terminal_supervisor};
 
 /// Build a minimal terminal-mode TCP rule with a unique listen port.
 fn terminal_rule(name: &str, listen_port: u16, target: &str) -> Rule {
@@ -63,12 +61,8 @@ async fn terminal_chain_apply_enqueues_and_reports() {
     let rules_dir = rules_tmp.path().join("rules");
     std::fs::create_dir_all(&rules_dir).unwrap();
 
-    let supervisor = spawn_terminal_supervisor(
-        rules_dir,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let supervisor =
+        spawn_terminal_supervisor(rules_dir, Duration::from_millis(50), shutdown.clone()).await;
 
     // Subscribe before apply so we don't miss the watch tick.
     let mut current_set_rx = supervisor.handle().current_set_rx();
@@ -133,7 +127,11 @@ async fn terminal_chain_apply_enqueues_and_reports() {
             current_set_rx.changed().await.unwrap();
             let snap = current_set_rx.borrow();
             if snap.rules().len() == 2 {
-                return snap.rules().iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+                return snap
+                    .rules()
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect::<Vec<_>>();
             }
         }
     })
@@ -218,12 +216,8 @@ async fn terminal_chain_apply_rejects_duplicate_names() {
     let rules_tmp = tempfile::tempdir().unwrap();
     let rules_dir = rules_tmp.path().join("rules");
     std::fs::create_dir_all(&rules_dir).unwrap();
-    let supervisor = spawn_terminal_supervisor(
-        rules_dir,
-        Duration::from_millis(50),
-        shutdown.clone(),
-    )
-    .await;
+    let supervisor =
+        spawn_terminal_supervisor(rules_dir, Duration::from_millis(50), shutdown.clone()).await;
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("control.sock");
@@ -251,11 +245,7 @@ async fn terminal_chain_apply_rejects_duplicate_names() {
         terminal_rule("dup", 60002, "127.0.0.1:9001"),
     ];
 
-    let resp = send_request(
-        &socket_path,
-        &Request::ChainApply { rules: dup },
-    )
-    .await;
+    let resp = send_request(&socket_path, &Request::ChainApply { rules: dup }).await;
 
     match resp {
         Response::Error { code, message } => {

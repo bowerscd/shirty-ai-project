@@ -64,36 +64,52 @@ fn now_unix_ms() -> u64 {
 pub enum CertError {
     #[error("rule {rule:?}: route {route:?}: cert file {path}: {source}")]
     CertRead {
-        rule:   String,
-        route:  String,
-        path:   PathBuf,
+        rule: String,
+        route: String,
+        path: PathBuf,
         #[source]
         source: io::Error,
     },
     #[error("rule {rule:?}: route {route:?}: key file {path}: {source}")]
     KeyRead {
-        rule:   String,
-        route:  String,
-        path:   PathBuf,
+        rule: String,
+        route: String,
+        path: PathBuf,
         #[source]
         source: io::Error,
     },
     #[error("rule {rule:?}: route {route:?}: cert {path:?} has no parseable certificates")]
-    CertEmpty { rule: String, route: String, path: PathBuf },
+    CertEmpty {
+        rule: String,
+        route: String,
+        path: PathBuf,
+    },
     #[error("rule {rule:?}: route {route:?}: key {path:?} has no parseable private key")]
-    KeyEmpty { rule: String, route: String, path: PathBuf },
+    KeyEmpty {
+        rule: String,
+        route: String,
+        path: PathBuf,
+    },
     #[error("rule {rule:?}: route {route:?}: malformed PEM ({kind}) at {path}: {detail}")]
     Pem {
-        rule:   String,
-        route:  String,
-        kind:   &'static str,
-        path:   PathBuf,
+        rule: String,
+        route: String,
+        kind: &'static str,
+        path: PathBuf,
         detail: String,
     },
     #[error("rule {rule:?}: route {route:?}: failed to load signing key: {detail}")]
-    SigningKey { rule: String, route: String, detail: String },
+    SigningKey {
+        rule: String,
+        route: String,
+        detail: String,
+    },
     #[error("rule {rule:?}: route {route:?}: failed to generate ephemeral cert: {detail}")]
-    Ephemeral { rule: String, route: String, detail: String },
+    Ephemeral {
+        rule: String,
+        route: String,
+        detail: String,
+    },
     #[error(
         "rule {rule:?}: route {route:?}: no cert source matched the resolution chain \
          (no explicit cert, no ephemeral, no convention-dir match, no server.default_cert)"
@@ -142,7 +158,7 @@ impl CertOrigin {
 /// One loaded entry, keyed by hostname inside [`CertStore`].
 #[derive(Clone)]
 pub struct CertEntry {
-    pub key:    Arc<CertifiedKey>,
+    pub key: Arc<CertifiedKey>,
     pub origin: CertOrigin,
     /// Unix epoch milliseconds at the time this entry was inserted.
     /// Used by `yggdrasilctl local status` for operator-facing
@@ -168,11 +184,11 @@ impl std::fmt::Debug for CertEntry {
 /// context with it.
 #[derive(Debug, Clone)]
 pub struct ReloadSpec {
-    pub rule_name:       String,
-    pub route:           HttpRoute,
-    pub rule_cert_dir:   Option<PathBuf>,
+    pub rule_name: String,
+    pub route: HttpRoute,
+    pub rule_cert_dir: Option<PathBuf>,
     pub server_cert_dir: PathBuf,
-    pub server_default:  Option<(PathBuf, PathBuf)>,
+    pub server_default: Option<(PathBuf, PathBuf)>,
 }
 
 /// Hostname → cert map. Implements [`ResolvesServerCert`] so it plugs
@@ -268,8 +284,8 @@ impl CertStore {
             .as_ref()
             .map(|(c, k)| (c.as_path(), k.as_path()));
         let ctx = CertContext {
-            rule_name:       &spec.rule_name,
-            rule_cert_dir:   spec.rule_cert_dir.as_deref(),
+            rule_name: &spec.rule_name,
+            rule_cert_dir: spec.rule_cert_dir.as_deref(),
             server_cert_dir: &spec.server_cert_dir,
             server_default,
         };
@@ -382,7 +398,7 @@ impl ResolvesServerCert for CertStore {
 /// Inputs to [`load_route_cert`] that aren't carried by the route itself.
 #[derive(Debug, Clone)]
 pub struct CertContext<'a> {
-    pub rule_name:    &'a str,
+    pub rule_name: &'a str,
     /// Per-rule `cert_dir` override, if any; otherwise falls back to
     /// `server_cert_dir`.
     pub rule_cert_dir: Option<&'a Path>,
@@ -392,10 +408,7 @@ pub struct CertContext<'a> {
 
 /// Resolve and load the certificate for a single `[[rule.route]]` following
 /// the precedence chain described in the module-level docs.
-pub fn load_route_cert(
-    route: &HttpRoute,
-    ctx:   &CertContext<'_>,
-) -> Result<CertEntry, CertError> {
+pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertEntry, CertError> {
     let hostname = &route.hostname;
 
     // 1) Explicit path.
@@ -404,17 +417,12 @@ pub fn load_route_cert(
             .key
             .as_ref()
             .expect("validator guarantees Path(_) ⇒ Some(key)");
-        let key = load_pem_pair(
-            ctx.rule_name,
-            hostname,
-            cert_path,
-            key_path,
-        )?;
+        let key = load_pem_pair(ctx.rule_name, hostname, cert_path, key_path)?;
         return Ok(CertEntry {
-            key:    Arc::new(key),
+            key: Arc::new(key),
             origin: CertOrigin::Path {
                 cert: cert_path.clone(),
-                key:  key_path.clone(),
+                key: key_path.clone(),
             },
             loaded_at_unix_ms: now_unix_ms(),
         });
@@ -423,12 +431,12 @@ pub fn load_route_cert(
     // 2) Ephemeral sentinel.
     if matches!(route.cert, Some(CertSource::Ephemeral)) {
         let key = generate_ephemeral(hostname).map_err(|e| CertError::Ephemeral {
-            rule:   ctx.rule_name.to_string(),
-            route:  hostname.clone(),
+            rule: ctx.rule_name.to_string(),
+            route: hostname.clone(),
             detail: e.to_string(),
         })?;
         return Ok(CertEntry {
-            key:    Arc::new(key),
+            key: Arc::new(key),
             origin: CertOrigin::Ephemeral,
             loaded_at_unix_ms: now_unix_ms(),
         });
@@ -437,14 +445,14 @@ pub fn load_route_cert(
     // 3) Convention directory.
     let cdir = ctx.rule_cert_dir.unwrap_or(ctx.server_cert_dir);
     let conv_cert = cdir.join(hostname).join("fullchain.pem");
-    let conv_key  = cdir.join(hostname).join("privkey.pem");
+    let conv_key = cdir.join(hostname).join("privkey.pem");
     if conv_cert.is_file() && conv_key.is_file() {
         let key = load_pem_pair(ctx.rule_name, hostname, &conv_cert, &conv_key)?;
         return Ok(CertEntry {
-            key:    Arc::new(key),
+            key: Arc::new(key),
             origin: CertOrigin::Convention {
                 cert: conv_cert,
-                key:  conv_key,
+                key: conv_key,
             },
             loaded_at_unix_ms: now_unix_ms(),
         });
@@ -454,17 +462,17 @@ pub fn load_route_cert(
     if let Some((cert_path, key_path)) = ctx.server_default {
         let key = load_pem_pair(ctx.rule_name, hostname, cert_path, key_path)?;
         return Ok(CertEntry {
-            key:    Arc::new(key),
+            key: Arc::new(key),
             origin: CertOrigin::Default {
                 cert: cert_path.to_path_buf(),
-                key:  key_path.to_path_buf(),
+                key: key_path.to_path_buf(),
             },
             loaded_at_unix_ms: now_unix_ms(),
         });
     }
 
     Err(CertError::NoSource {
-        rule:  ctx.rule_name.to_string(),
+        rule: ctx.rule_name.to_string(),
         route: hostname.clone(),
     })
 }
@@ -479,10 +487,10 @@ pub fn load_route_cert(
 /// extra context from the caller. Ephemeral routes are not recorded —
 /// they have no disk paths to watch.
 pub fn load_rule_into_store(
-    rule:    &Rule,
-    store:   &CertStore,
+    rule: &Rule,
+    store: &CertStore,
     server_cert_dir: &Path,
-    server_default:  Option<(&Path, &Path)>,
+    server_default: Option<(&Path, &Path)>,
 ) -> Result<(), CertError> {
     let routes = rule.routes.as_deref().unwrap_or(&[]);
     let rule_cert_dir = rule.cert_dir.as_deref();
@@ -499,12 +507,11 @@ pub fn load_rule_into_store(
         // observer that sees the entry can also find the spec.
         if !matches!(entry.origin, CertOrigin::Ephemeral) {
             let spec = ReloadSpec {
-                rule_name:       rule.name.clone(),
-                route:           route.clone(),
-                rule_cert_dir:   rule_cert_dir.map(Path::to_path_buf),
+                rule_name: rule.name.clone(),
+                route: route.clone(),
+                rule_cert_dir: rule_cert_dir.map(Path::to_path_buf),
                 server_cert_dir: server_cert_dir.to_path_buf(),
-                server_default:  server_default
-                    .map(|(c, k)| (c.to_path_buf(), k.to_path_buf())),
+                server_default: server_default.map(|(c, k)| (c.to_path_buf(), k.to_path_buf())),
             };
             store
                 .inner
@@ -520,20 +527,20 @@ pub fn load_rule_into_store(
 /// Load and verify a `(cert, key)` PEM pair.
 fn load_pem_pair(
     rule_name: &str,
-    route:     &str,
+    route: &str,
     cert_path: &Path,
-    key_path:  &Path,
+    key_path: &Path,
 ) -> Result<CertifiedKey, CertError> {
     let cert_pem = fs::read(cert_path).map_err(|e| CertError::CertRead {
-        rule:   rule_name.to_string(),
-        route:  route.to_string(),
-        path:   cert_path.to_path_buf(),
+        rule: rule_name.to_string(),
+        route: route.to_string(),
+        path: cert_path.to_path_buf(),
         source: e,
     })?;
     let key_pem = fs::read(key_path).map_err(|e| CertError::KeyRead {
-        rule:   rule_name.to_string(),
-        route:  route.to_string(),
-        path:   key_path.to_path_buf(),
+        rule: rule_name.to_string(),
+        route: route.to_string(),
+        path: key_path.to_path_buf(),
         source: e,
     })?;
     parse_pem_pair(rule_name, route, cert_path, &cert_pem, key_path, &key_pem)
@@ -541,48 +548,48 @@ fn load_pem_pair(
 
 fn parse_pem_pair(
     rule_name: &str,
-    route:     &str,
+    route: &str,
     cert_path: &Path,
-    cert_pem:  &[u8],
-    key_path:  &Path,
-    key_pem:   &[u8],
+    cert_pem: &[u8],
+    key_path: &Path,
+    key_pem: &[u8],
 ) -> Result<CertifiedKey, CertError> {
     let mut cert_slice: &[u8] = cert_pem;
     let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_slice)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CertError::Pem {
-            rule:   rule_name.to_string(),
-            route:  route.to_string(),
-            kind:   "certificate",
-            path:   cert_path.to_path_buf(),
+            rule: rule_name.to_string(),
+            route: route.to_string(),
+            kind: "certificate",
+            path: cert_path.to_path_buf(),
             detail: e.to_string(),
         })?;
     if chain.is_empty() {
         return Err(CertError::CertEmpty {
-            rule:  rule_name.to_string(),
+            rule: rule_name.to_string(),
             route: route.to_string(),
-            path:  cert_path.to_path_buf(),
+            path: cert_path.to_path_buf(),
         });
     }
 
     let mut key_slice: &[u8] = key_pem;
     let key_der: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_slice)
         .map_err(|e| CertError::Pem {
-            rule:   rule_name.to_string(),
-            route:  route.to_string(),
-            kind:   "private key",
-            path:   key_path.to_path_buf(),
+            rule: rule_name.to_string(),
+            route: route.to_string(),
+            kind: "private key",
+            path: key_path.to_path_buf(),
             detail: e.to_string(),
         })?
         .ok_or_else(|| CertError::KeyEmpty {
-            rule:  rule_name.to_string(),
+            rule: rule_name.to_string(),
             route: route.to_string(),
-            path:  key_path.to_path_buf(),
+            path: key_path.to_path_buf(),
         })?;
 
     let signing_key = any_supported_type(&key_der).map_err(|e| CertError::SigningKey {
-        rule:   rule_name.to_string(),
-        route:  route.to_string(),
+        rule: rule_name.to_string(),
+        route: route.to_string(),
         detail: e.to_string(),
     })?;
 
@@ -601,17 +608,21 @@ fn parse_pem_pair(
 /// - Never persisted to disk; lives entirely in memory.
 fn generate_ephemeral(hostname: &str) -> Result<CertifiedKey, rcgen::Error> {
     use rcgen::{
-        date_time_ymd, CertificateParams, DistinguishedName, DnType,
-        ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+        date_time_ymd, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose, SanType,
     };
     use std::str::FromStr;
 
-    let mut sans = vec![SanType::DnsName(
-        rcgen::Ia5String::try_from(hostname.to_string())?,
-    )];
+    let mut sans = vec![SanType::DnsName(rcgen::Ia5String::try_from(
+        hostname.to_string(),
+    )?)];
     if hostname.eq_ignore_ascii_case("localhost") {
-        sans.push(SanType::IpAddress(std::net::IpAddr::from_str("127.0.0.1").unwrap()));
-        sans.push(SanType::IpAddress(std::net::IpAddr::from_str("::1").unwrap()));
+        sans.push(SanType::IpAddress(
+            std::net::IpAddr::from_str("127.0.0.1").unwrap(),
+        ));
+        sans.push(SanType::IpAddress(
+            std::net::IpAddr::from_str("::1").unwrap(),
+        ));
     }
 
     let mut dn = DistinguishedName::new();
@@ -619,11 +630,11 @@ fn generate_ephemeral(hostname: &str) -> Result<CertifiedKey, rcgen::Error> {
 
     let mut params = CertificateParams::default();
     params.distinguished_name = dn;
-    params.subject_alt_names  = sans;
-    params.not_before         = date_time_ymd(2024, 1, 1);
-    params.not_after          = date_time_ymd(2099, 1, 1);
-    params.is_ca              = IsCa::NoCa;
-    params.key_usages         = vec![
+    params.subject_alt_names = sans;
+    params.not_before = date_time_ymd(2024, 1, 1);
+    params.not_after = date_time_ymd(2099, 1, 1);
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyEncipherment,
     ];
@@ -635,12 +646,10 @@ fn generate_ephemeral(hostname: &str) -> Result<CertifiedKey, rcgen::Error> {
 
     let cert_der: CertificateDer<'static> = cert.der().clone();
     let key_pkcs8 = kp.serialize_der();
-    let key_der = PrivateKeyDer::try_from(key_pkcs8).map_err(|e| {
-        rcgen::Error::PemError(format!("PKCS#8 round-trip: {e}"))
-    })?;
-    let signing_key = any_supported_type(&key_der).map_err(|e| {
-        rcgen::Error::PemError(format!("rustls signing-key load: {e:?}"))
-    })?;
+    let key_der = PrivateKeyDer::try_from(key_pkcs8)
+        .map_err(|e| rcgen::Error::PemError(format!("PKCS#8 round-trip: {e}")))?;
+    let signing_key = any_supported_type(&key_der)
+        .map_err(|e| rcgen::Error::PemError(format!("rustls signing-key load: {e:?}")))?;
     Ok(CertifiedKey::new(vec![cert_der], signing_key))
 }
 
@@ -668,8 +677,8 @@ pub struct CertWatcher {
     // the std::sync::mpsc bridge; dropping it closes the bridge, which
     // closes the reload channel, which lets the worker task exit cleanly.
     _debouncer: Mutex<Debouncer<notify::RecommendedWatcher>>,
-    _bridge:    thread::JoinHandle<()>,
-    _worker:    tokio::task::JoinHandle<()>,
+    _bridge: thread::JoinHandle<()>,
+    _worker: tokio::task::JoinHandle<()>,
 }
 
 struct WatcherShared {
@@ -697,15 +706,14 @@ impl CertWatcher {
     /// 250 ms). `shutdown` is observed cooperatively — cancelling it
     /// stops the consumer task; dropping the watcher tears the rest down.
     pub fn spawn(
-        store:    Arc<CertStore>,
+        store: Arc<CertStore>,
         debounce: Duration,
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
         let (notify_tx, notify_rx) = std_mpsc::channel::<NotifyResult>();
         let debouncer = new_debouncer(debounce, notify_tx).map_err(io::Error::other)?;
 
-        let (reload_tx, mut reload_rx) =
-            tokio::sync::mpsc::channel::<HashSet<String>>(32);
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<HashSet<String>>(32);
 
         let shared = Arc::new(WatcherShared {
             store: Arc::clone(&store),
@@ -756,10 +764,10 @@ impl CertWatcher {
         });
 
         Ok(Self {
-            inner:      shared,
+            inner: shared,
             _debouncer: Mutex::new(debouncer),
-            _bridge:    bridge,
-            _worker:    worker,
+            _bridge: bridge,
+            _worker: worker,
         })
     }
 
@@ -780,8 +788,10 @@ impl CertWatcher {
         // watching, so we don't churn inotify watches across spurious
         // re-registers.
         let prev: Vec<PathBuf> = state.host_paths.remove(&key).unwrap_or_default();
-        let prev_dirs: HashSet<PathBuf> =
-            prev.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+        let prev_dirs: HashSet<PathBuf> = prev
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
         let new_dirs: HashSet<PathBuf> = paths
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf))
@@ -849,8 +859,8 @@ impl std::fmt::Debug for CertWatcher {
 }
 
 fn decrement_watched_dir(
-    state:     &mut WatcherState,
-    dir:       &Path,
+    state: &mut WatcherState,
+    dir: &Path,
     debouncer: &Mutex<Debouncer<notify::RecommendedWatcher>>,
 ) {
     let Some(count) = state.watched_dirs.get_mut(dir) else {
@@ -874,8 +884,8 @@ type NotifyResult = Result<Vec<DebouncedEvent>, notify::Error>;
 /// Bridge thread: turns notify-debouncer batches into "reload these
 /// hosts" messages on the tokio side.
 fn bridge_cert_events(
-    rx:        std_mpsc::Receiver<NotifyResult>,
-    shared:    Arc<WatcherShared>,
+    rx: std_mpsc::Receiver<NotifyResult>,
+    shared: Arc<WatcherShared>,
     reload_tx: tokio::sync::mpsc::Sender<HashSet<String>>,
 ) {
     while let Ok(batch) = rx.recv() {
@@ -945,9 +955,9 @@ mod tests {
         HttpRoute {
             hostname: host.to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
-            cert:     Some(CertSource::Ephemeral),
-            key:      None,
-            hsts:     None,
+            cert: Some(CertSource::Ephemeral),
+            key: None,
+            hsts: None,
         }
     }
 
@@ -1010,14 +1020,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cert_pem, key_pem) = make_test_pem("api.local");
         let cert_path = write_file(dir.path(), "fullchain.pem", &cert_pem);
-        let key_path  = write_file(dir.path(), "privkey.pem", &key_pem);
+        let key_path = write_file(dir.path(), "privkey.pem", &key_pem);
 
         let route = HttpRoute {
             hostname: "api.local".to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
-            cert:     Some(CertSource::Path(cert_path.clone())),
-            key:      Some(key_path.clone()),
-            hsts:     None,
+            cert: Some(CertSource::Path(cert_path.clone())),
+            key: Some(key_path.clone()),
+            hsts: None,
         };
         let rule = rule_with_routes(vec![route]);
         let store = CertStore::new();
@@ -1027,7 +1037,7 @@ mod tests {
         match &listed[0].1 {
             CertOrigin::Path { cert, key } => {
                 assert_eq!(cert, &cert_path);
-                assert_eq!(key,  &key_path);
+                assert_eq!(key, &key_path);
             }
             other => panic!("expected CertOrigin::Path, got {other:?}"),
         }
@@ -1040,14 +1050,14 @@ mod tests {
         fs::create_dir_all(&host_dir).unwrap();
         let (cert_pem, key_pem) = make_test_pem("api.local");
         fs::write(host_dir.join("fullchain.pem"), cert_pem).unwrap();
-        fs::write(host_dir.join("privkey.pem"),   key_pem).unwrap();
+        fs::write(host_dir.join("privkey.pem"), key_pem).unwrap();
 
         let route = HttpRoute {
             hostname: "api.local".to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
-            cert:     None,
-            key:      None,
-            hsts:     None,
+            cert: None,
+            key: None,
+            hsts: None,
         };
         let rule = rule_with_routes(vec![route]);
         let store = CertStore::new();
@@ -1061,14 +1071,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cert_pem, key_pem) = make_test_pem("default");
         let cert_path = write_file(dir.path(), "wc.pem", &cert_pem);
-        let key_path  = write_file(dir.path(), "wc.key", &key_pem);
+        let key_path = write_file(dir.path(), "wc.key", &key_pem);
 
         let route = HttpRoute {
             hostname: "api.local".to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
-            cert:     None,
-            key:      None,
-            hsts:     None,
+            cert: None,
+            key: None,
+            hsts: None,
         };
         let rule = rule_with_routes(vec![route]);
         let store = CertStore::new();
@@ -1088,19 +1098,14 @@ mod tests {
         let route = HttpRoute {
             hostname: "api.local".to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
-            cert:     None,
-            key:      None,
-            hsts:     None,
+            cert: None,
+            key: None,
+            hsts: None,
         };
         let rule = rule_with_routes(vec![route]);
         let store = CertStore::new();
-        let err = load_rule_into_store(
-            &rule,
-            &store,
-            &PathBuf::from("/nonexistent-dir"),
-            None,
-        )
-        .unwrap_err();
+        let err = load_rule_into_store(&rule, &store, &PathBuf::from("/nonexistent-dir"), None)
+            .unwrap_err();
         assert!(matches!(err, CertError::NoSource { .. }));
         assert_eq!(store.len(), 0);
     }
@@ -1120,14 +1125,13 @@ mod tests {
         let route = HttpRoute {
             hostname: "api.local".to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
-            cert:     Some(CertSource::Path(cert_path)),
-            key:      Some(key_path),
-            hsts:     None,
+            cert: Some(CertSource::Path(cert_path)),
+            key: Some(key_path),
+            hsts: None,
         };
         let rule = rule_with_routes(vec![route]);
         let store = CertStore::new();
-        let err = load_rule_into_store(&rule, &store, &PathBuf::from("/nx"), None)
-            .unwrap_err();
+        let err = load_rule_into_store(&rule, &store, &PathBuf::from("/nx"), None).unwrap_err();
         assert!(matches!(
             err,
             CertError::Pem {
@@ -1143,7 +1147,7 @@ mod tests {
         assert!(eph.watched_paths().is_empty());
         let p = CertOrigin::Path {
             cert: PathBuf::from("/a"),
-            key:  PathBuf::from("/b"),
+            key: PathBuf::from("/b"),
         };
         assert_eq!(p.watched_paths().len(), 2);
     }
@@ -1154,7 +1158,7 @@ mod tests {
         assert_eq!(
             CertOrigin::Path {
                 cert: PathBuf::from("/etc/a.pem"),
-                key:  PathBuf::from("/etc/a.key"),
+                key: PathBuf::from("/etc/a.key"),
             }
             .as_label(),
             "path:/etc/a.pem"

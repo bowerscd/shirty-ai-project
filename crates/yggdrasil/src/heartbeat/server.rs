@@ -298,7 +298,10 @@ impl HeartbeatServer {
 
         // Authenticated. Build and send the ACK *before* touching peer
         // state so a send failure doesn't leave us with stale `last_seen`.
-        let ack = match state.session.encode_heartbeat_ack(decoded.counter, current_unix_millis()) {
+        let ack = match state
+            .session
+            .encode_heartbeat_ack(decoded.counter, current_unix_millis())
+        {
             Ok((_, p)) => p,
             Err(e) => {
                 tracing::warn!(src = %src, error = %e, "encode HeartbeatAck failed");
@@ -321,8 +324,7 @@ impl HeartbeatServer {
         // value mirrors what `peer_state.last_heartbeat_ms()` just stored,
         // converted to seconds.
         if let Some(ms) = self.peer_state.last_heartbeat_ms() {
-            metrics::gauge!("yggdrasil_last_heartbeat_timestamp_seconds")
-                .set(ms as f64 / 1000.0);
+            metrics::gauge!("yggdrasil_last_heartbeat_timestamp_seconds").set(ms as f64 / 1000.0);
         }
 
         match effect {
@@ -525,9 +527,9 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use ratatoskr::auth::{Initiator, StaticKeyPair};
     use ratatoskr::wire::SessionId;
+    use std::time::Duration;
 
     /// Spawn a server bound to `127.0.0.1:0` and return the (server-pubkey,
     /// peer-state, server-addr, shutdown-token, client-keys) tuple, plus the
@@ -544,8 +546,7 @@ mod tests {
         let client_keys = StaticKeyPair::generate().unwrap();
         let peer_state = PeerState::new(*client_keys.public_key());
         let pending_dir = tempfile::tempdir().unwrap();
-        let pending_store =
-            Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+        let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
         // Leak the tempdir so it lives as long as the test (avoids relying
         // on drop order with the spawned server task).
         std::mem::forget(pending_dir);
@@ -603,12 +604,8 @@ mod tests {
     async fn full_handshake_then_heartbeat_ack() {
         let (server_keys, client_keys, peer_state, server_addr, cancel, handle) =
             spawn_server().await;
-        let (mut session, sock) = handshake_with_server(
-            server_keys.public_key(),
-            &client_keys,
-            server_addr,
-        )
-        .await;
+        let (mut session, sock) =
+            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
 
         // Send a heartbeat and expect an ACK.
         let (counter, hb) = session.encode_heartbeat(1234, 0).unwrap();
@@ -647,12 +644,8 @@ mod tests {
         let mut rx = peer_state.watch();
         assert_eq!(*rx.borrow_and_update(), None);
 
-        let (mut session, sock) = handshake_with_server(
-            server_keys.public_key(),
-            &client_keys,
-            server_addr,
-        )
-        .await;
+        let (mut session, sock) =
+            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
 
         // 25 heartbeats from the same client socket. We expect the watch
         // channel to fire exactly once (the initial None→Some(127.0.0.1)).
@@ -710,12 +703,8 @@ mod tests {
     async fn replayed_heartbeat_is_rejected_without_disturbing_state() {
         let (server_keys, client_keys, peer_state, server_addr, cancel, handle) =
             spawn_server().await;
-        let (mut session, sock) = handshake_with_server(
-            server_keys.public_key(),
-            &client_keys,
-            server_addr,
-        )
-        .await;
+        let (mut session, sock) =
+            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
 
         // Send heartbeat 0, get ACK, then replay the exact same packet.
         let (_, hb0) = session.encode_heartbeat(100, 0).unwrap();
@@ -750,12 +739,8 @@ mod tests {
             spawn_server().await;
 
         // First session.
-        let (mut s1, sock1) = handshake_with_server(
-            server_keys.public_key(),
-            &client_keys,
-            server_addr,
-        )
-        .await;
+        let (mut s1, sock1) =
+            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
         let (_, hb) = s1.encode_heartbeat(1, 0).unwrap();
         sock1.send(&hb).await.unwrap();
         let mut buf = [0u8; 2048];
@@ -766,12 +751,8 @@ mod tests {
 
         // Second handshake on a fresh client socket. The server should
         // accept and replace; the *new* session can send heartbeats.
-        let (mut s2, sock2) = handshake_with_server(
-            server_keys.public_key(),
-            &client_keys,
-            server_addr,
-        )
-        .await;
+        let (mut s2, sock2) =
+            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
         let (counter, hb) = s2.encode_heartbeat(1, 0).unwrap();
         sock2.send(&hb).await.unwrap();
         let n = tokio::time::timeout(Duration::from_secs(2), sock2.recv(&mut buf))

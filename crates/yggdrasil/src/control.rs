@@ -25,16 +25,16 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
-    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse,
-    DownstreamResponse, HealthResponse, MetricsResponse, Mode,
-    PendingResponse, Request, Response, RuleInfo, RulesResponse, StatusResponse,
+    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse, DownstreamResponse,
+    HealthResponse, MetricsResponse, Mode, PendingResponse, Request, Response, RuleInfo,
+    RulesResponse, StatusResponse,
 };
 use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::{Rule, RuleSet};
 
-use crate::chain::predicate_extractor;
 use crate::chain::client::ChainClientHandle;
+use crate::chain::predicate_extractor;
 use crate::heartbeat::PeerState;
 use crate::pending_peers::PendingPeerStore;
 use crate::proxy::supervisor::{ProxySupervisor, SupervisorHandle};
@@ -198,11 +198,7 @@ impl ControlServer {
     }
 }
 
-async fn accept_loop(
-    listener: UnixListener,
-    state: Arc<ControlState>,
-    cancel: CancellationToken,
-) {
+async fn accept_loop(listener: UnixListener, state: Arc<ControlState>, cancel: CancellationToken) {
     loop {
         tokio::select! {
             biased;
@@ -316,19 +312,20 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
             // `downstream_enrolled` from the live peer state. Terminal mode
             // has no downstream concept; emit `None` for the heartbeat
             // fields and `downstream_enrolled = false`.
-            let (downstream_ip, last_heartbeat_age_ms, downstream_enrolled) = match &state.peer_state {
-                Some(ps) => {
-                    let age = ps.last_heartbeat_ms().and_then(|ts| {
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .ok()
-                            .map(|now| now.as_millis() as u64)
-                            .map(|now| now.saturating_sub(ts))
-                    });
-                    (ps.current_ip(), age, ps.is_peer_enrolled())
-                }
-                None => (None, None, false),
-            };
+            let (downstream_ip, last_heartbeat_age_ms, downstream_enrolled) =
+                match &state.peer_state {
+                    Some(ps) => {
+                        let age = ps.last_heartbeat_ms().and_then(|ts| {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .ok()
+                                .map(|now| now.as_millis() as u64)
+                                .map(|now| now.saturating_sub(ts))
+                        });
+                        (ps.current_ip(), age, ps.is_peer_enrolled())
+                    }
+                    None => (None, None, false),
+                };
             let rule_count = state.snapshot_rx.borrow().len();
             // Cert summary: traverse the cert store once for the
             // default-cert age and ephemeral count. The default cert's
@@ -438,8 +435,7 @@ fn dispatch(req: Request, state: &ControlState) -> Response {
             Some(ix) => Response::DerivedRules(ix.snapshot()),
             None => Response::Error {
                 code: error_codes::INTERNAL_ERROR.into(),
-                message: "introspection state not configured for this daemon"
-                    .into(),
+                message: "introspection state not configured for this daemon".into(),
             },
         },
         Request::ChainSummary { timeout_ms: _ } => Response::Error {
@@ -676,15 +672,13 @@ async fn dispatch_chain_summary(timeout_ms: Option<u64>, state: &ControlState) -
 /// Default budget for `dispatch_rules_reload`. Bounded so a stuck
 /// watcher worker can never hang the control socket; on timeout we
 /// fall back to reporting the current snapshot count.
-const RULES_RELOAD_BLOCK_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const RULES_RELOAD_BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Follow-on grace window after the watcher signals completion, used
 /// to also wait for the supervisor's snapshot publication when the
 /// reload was non-noop. Noop reloads don't update the snapshot at
 /// all, so we time out cheaply and proceed.
-const RULES_RELOAD_SNAPSHOT_GRACE: std::time::Duration =
-    std::time::Duration::from_millis(500);
+const RULES_RELOAD_SNAPSHOT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Async dispatch for [`Request::RulesReload`]. Triggers a reload and
 /// blocks until both the watcher has drained the trigger and (when
@@ -757,9 +751,7 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
         Ok(crate::pending_peers::ApproveOutcome::NotFound) => {
             return Response::Error {
                 code: error_codes::NO_SUCH_FINGERPRINT.into(),
-                message: format!(
-                    "no pending candidate matches fingerprint prefix {fingerprint:?}"
-                ),
+                message: format!("no pending candidate matches fingerprint prefix {fingerprint:?}"),
             };
         }
         Ok(crate::pending_peers::ApproveOutcome::Ambiguous { matches }) => {
@@ -818,7 +810,8 @@ fn approve_downstream(state: &ControlState, fingerprint: &str) -> Response {
 fn update_downstream_pubkey(config_path: &Path, tagged_pubkey: &str) -> Result<()> {
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
-    let mut doc: toml::Value = text.parse()
+    let mut doc: toml::Value = text
+        .parse()
         .with_context(|| format!("parse {}", config_path.display()))?;
     let table = doc
         .as_table_mut()
@@ -828,10 +821,7 @@ fn update_downstream_pubkey(config_path: &Path, tagged_pubkey: &str) -> Result<(
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
     let accept_table = accept_entry
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!(
-            "`accept` in {} is not a table",
-            config_path.display()
-        ))?;
+        .ok_or_else(|| anyhow::anyhow!("`accept` in {} is not a table", config_path.display()))?;
     accept_table.insert(
         "pubkey".to_string(),
         toml::Value::String(tagged_pubkey.to_string()),
@@ -890,11 +880,7 @@ mod tests {
         let config_path = dir.join("yggdrasil.toml");
         // Minimal valid TOML so `update_downstream_pubkey` has something
         // to round-trip if a test ends up approving.
-        std::fs::write(
-            &config_path,
-            "[server]\nidentity_file = \"/tmp/id.key\"\n",
-        )
-        .unwrap();
+        std::fs::write(&config_path, "[server]\nidentity_file = \"/tmp/id.key\"\n").unwrap();
         (store, config_path)
     }
 
@@ -974,8 +960,7 @@ mod tests {
     async fn status_reflects_heartbeat() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
-        let (supervisor, peer_state, shutdown) =
-            make_supervisor_with_enrolled(&rules, true).await;
+        let (supervisor, peer_state, shutdown) = make_supervisor_with_enrolled(&rules, true).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
         let server = bind_relay_control(
@@ -1009,8 +994,7 @@ mod tests {
     async fn downstream_show_returns_pubkey_when_enrolled() {
         let tmp = tempfile::tempdir().unwrap();
         let rules = tmp.path().join("rules");
-        let (supervisor, peer_state, shutdown) =
-            make_supervisor_with_enrolled(&rules, true).await;
+        let (supervisor, peer_state, shutdown) = make_supervisor_with_enrolled(&rules, true).await;
         let socket = tmp.path().join("control.sock");
         let (pending, cfg) = aux_state(tmp.path());
         let server = bind_relay_control(

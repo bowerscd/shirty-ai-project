@@ -53,10 +53,15 @@ impl TcpProxy {
     /// is listening so callers can rely on connect attempts succeeding
     /// immediately after this resolves.
     pub async fn spawn(rule: Rule, resolver: UpstreamResolver) -> Result<Self> {
-        let listener = TcpListener::bind(rule.listen)
-            .await
-            .with_context(|| format!("bind TCP listener for rule {:?} on {}", rule.name, rule.listen))?;
-        let local_addr = listener.local_addr().context("read TcpListener local_addr")?;
+        let listener = TcpListener::bind(rule.listen).await.with_context(|| {
+            format!(
+                "bind TCP listener for rule {:?} on {}",
+                rule.name, rule.listen
+            )
+        })?;
+        let local_addr = listener
+            .local_addr()
+            .context("read TcpListener local_addr")?;
 
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -271,10 +276,10 @@ fn is_benign_close(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatoskr::rule::ProxyProto;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use ratatoskr::rule::ProxyProto;
 
     use crate::heartbeat::PeerState;
 

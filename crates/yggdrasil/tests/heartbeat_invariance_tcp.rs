@@ -65,7 +65,9 @@ async fn full_stack_heartbeat_storm_does_not_disturb_tcp_connection() {
     // Drive the handshake and a few initial heartbeats to populate peer_ip.
     let (mut session, hb_sock) = drive_handshake(&server_pub, &client_keys, hb.addr).await;
     for counter in 0..5u64 {
-        send_heartbeat(&mut session, &hb_sock, counter).await.unwrap();
+        send_heartbeat(&mut session, &hb_sock, counter)
+            .await
+            .unwrap();
     }
     assert!(peer_state.current_ip().is_some());
 
@@ -73,13 +75,10 @@ async fn full_stack_heartbeat_storm_does_not_disturb_tcp_connection() {
     let _ = watch_rx.borrow_and_update(); // consume the initial None→Some change.
 
     // Open the TCP connection through the proxy.
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect(proxy_listen),
-    )
-    .await
-    .expect("TcpStream connect timeout")
-    .expect("TcpStream connect failed");
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(proxy_listen))
+        .await
+        .expect("TcpStream connect timeout")
+        .expect("TcpStream connect failed");
 
     // Verify round-trip works.
     stream.write_all(b"hello\n").await.unwrap();

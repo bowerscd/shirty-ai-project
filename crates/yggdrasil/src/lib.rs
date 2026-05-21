@@ -14,7 +14,6 @@
 //! internals are expected to be either the binary entrypoint or the
 //! integration test / bench suite living inside this crate.
 
-pub mod rules;
 pub mod chain;
 pub mod cli;
 pub mod config;
@@ -25,6 +24,7 @@ pub mod log;
 pub mod metrics;
 pub mod pending_peers;
 pub mod proxy;
+pub mod rules;
 pub mod systemd;
 
 use std::sync::Arc;
@@ -134,8 +134,7 @@ pub async fn run_relay(
 
     // 2b. TOFU staging store, persisted under state_dir.
     let pending_store = Arc::new(
-        PendingPeerStore::load(&config.server.state_dir)
-            .context("loading pending peer store")?,
+        PendingPeerStore::load(&config.server.state_dir).context("loading pending peer store")?,
     );
 
     // 3. One shutdown token rules them all.
@@ -146,8 +145,8 @@ pub async fn run_relay(
     //    Text exposition is served exclusively over the UDS via
     //    [`ratatoskr::control::Request::Metrics`]; there is no HTTP
     //    listener.
-    let prom_handle = metrics::install_recorder(wire_mode)
-        .context("installing prometheus recorder")?;
+    let prom_handle =
+        metrics::install_recorder(wire_mode).context("installing prometheus recorder")?;
 
     // 5. Rule-driven proxy supervisor. Built *before* the heartbeat
     //    listener so the chain acceptor can hold a handle to it.
@@ -201,12 +200,8 @@ pub async fn run_relay(
             proxy_protocol: None,
         };
         Some(
-            ChainAcceptor::load(
-                supervisor.handle(),
-                derive_cfg,
-                &config.server.state_dir,
-            )
-            .context("loading chain acceptor state")?,
+            ChainAcceptor::load(supervisor.handle(), derive_cfg, &config.server.state_dir)
+                .context("loading chain acceptor state")?,
         )
     } else {
         None
@@ -229,9 +224,7 @@ pub async fn run_relay(
     //    forwarding. The client itself is spawned later, after its
     //    body handler is wired.
     let built_chain_client = build_chain_client(&config, &local_keys, shutdown.clone());
-    if let (Some(acc), Some(built)) =
-        (chain_acceptor.as_ref(), built_chain_client.as_ref())
-    {
+    if let (Some(acc), Some(built)) = (chain_acceptor.as_ref(), built_chain_client.as_ref()) {
         acc.set_upstream(built.handle.clone())
             .map_err(|_| anyhow::anyhow!("upstream set twice on acceptor"))?;
     }
@@ -277,10 +270,7 @@ pub async fn run_relay(
     //     so awaiting `query_upstream` callers resolve correctly.
     let (chain_client_join, chain_client_handle) = match built_chain_client {
         Some(mut built) => {
-            let router_handler = built
-                .client
-                .query_router()
-                .install_into_body_handler(None);
+            let router_handler = built.client.query_router().install_into_body_handler(None);
             built.client.set_body_handler(router_handler);
             let handle = built.handle.clone();
             let client = built.client;
@@ -369,8 +359,8 @@ pub async fn run_terminal(
 
     // 3. Metrics recorder. The introspection state is constructed in
     //    step 4a and passed directly into the UDS control server.
-    let prom_handle = metrics::install_recorder(wire_mode)
-        .context("installing prometheus recorder")?;
+    let prom_handle =
+        metrics::install_recorder(wire_mode).context("installing prometheus recorder")?;
 
     // 3b. Outbound chain client — only when [dial] is set.
     //     A terminal node without an upstream is still useful (pure local
@@ -378,10 +368,7 @@ pub async fn run_terminal(
     let (chain_client_join, chain_client_handle) =
         match build_chain_client(&config, &local_keys, shutdown.clone()) {
             Some(mut built) => {
-                let router_handler = built
-                    .client
-                    .query_router()
-                    .install_into_body_handler(None);
+                let router_handler = built.client.query_router().install_into_body_handler(None);
                 built.client.set_body_handler(router_handler);
                 let handle = built.handle.clone();
                 let client = built.client;
@@ -508,9 +495,8 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<StaticKeyPair> {
     } else {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("creating identity directory {}", parent.display())
-                })?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating identity directory {}", parent.display()))?;
             }
         }
         let kp = StaticKeyPair::generate().context("generating identity")?;
@@ -580,4 +566,3 @@ async fn wait_for_shutdown() {
         _ = sigterm.recv()          => tracing::info!("received SIGTERM"),
     }
 }
-

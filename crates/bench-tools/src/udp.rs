@@ -33,13 +33,16 @@ pub async fn run_udp(subject: &str, args: UdpArgs) -> Result<Report> {
     // Per-flow socket + send-time map.
     let mut flow_socks: Vec<Arc<UdpSocket>> = Vec::with_capacity(flows as usize);
     for _ in 0..flows {
-        let sock = UdpSocket::bind("0.0.0.0:0").await.context("bind UDP flow")?;
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind UDP flow")?;
         sock.connect(target).await.context("connect UDP flow")?;
         flow_socks.push(Arc::new(sock));
     }
 
-    let hist: Arc<Mutex<Histogram<u64>>> =
-        Arc::new(Mutex::new(Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap()));
+    let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
+    ));
     let tx_packets = Arc::new(AtomicU64::new(0));
     let rx_packets = Arc::new(AtomicU64::new(0));
     let tx_bytes = Arc::new(AtomicU64::new(0));
@@ -228,14 +231,11 @@ pub async fn run_udp_churn(subject: &str, args: UdpChurnArgs) -> Result<Report> 
                         // whether the proxy actually responded. Use a tight
                         // budget so churn rate is the dominant signal.
                         let mut buf = [0u8; 64];
-                        if tokio::time::timeout(
-                            Duration::from_millis(20),
-                            sock.recv(&mut buf),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .is_some()
+                        if tokio::time::timeout(Duration::from_millis(20), sock.recv(&mut buf))
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .is_some()
                         {
                             rx_packets.fetch_add(1, Ordering::Relaxed);
                         }

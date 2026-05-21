@@ -199,8 +199,7 @@ fn load_config_doc(path: &Path) -> Result<toml::Value> {
     if !path.exists() {
         return Ok(toml::Value::Table(toml::value::Table::new()));
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     text.parse::<toml::Value>()
         .with_context(|| format!("parse {}", path.display()))
 }
@@ -231,7 +230,12 @@ fn print_kv(json: bool, kvs: &[(&str, &str)]) -> Result<()> {
     if json {
         let obj: serde_json::Map<String, serde_json::Value> = kvs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), serde_json::Value::String((*v).to_string())))
+            .map(|(k, v)| {
+                (
+                    (*k).to_string(),
+                    serde_json::Value::String((*v).to_string()),
+                )
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
@@ -316,7 +320,10 @@ fn rotate(args: RotateArgs, config_path: &Path, json: bool) -> Result<()> {
                 config_path.display()
             );
             for e in &enrollments {
-                eprintln!("  - [{}] peer={} {}", e.section, e.peer_pubkey, e.endpoint_label);
+                eprintln!(
+                    "  - [{}] peer={} {}",
+                    e.section, e.peer_pubkey, e.endpoint_label
+                );
             }
         }
 
@@ -544,7 +551,10 @@ fn add_dial(args: AddDialArgs, config_path: &Path, json: bool) -> Result<()> {
         &[
             ("config:", cfg_str.as_str()),
             ("accept_pubkey:", accept_pubkey_str.as_str()),
-            ("accept_fingerprint:", grant.grant.accept_fingerprint.as_str()),
+            (
+                "accept_fingerprint:",
+                grant.grant.accept_fingerprint.as_str(),
+            ),
             ("accept_endpoint:", grant.grant.accept_endpoint.as_str()),
             ("action:", "wrote_[dial]"),
         ],

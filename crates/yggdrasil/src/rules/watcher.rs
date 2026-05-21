@@ -70,8 +70,8 @@ impl RuleWatcher {
         // Initial load — propagate parse/validation errors so the daemon
         // refuses to start with a broken rules directory rather than running
         // with an empty set.
-        let initial = load_dir(&dir)
-            .with_context(|| format!("initial rule load from {}", dir.display()))?;
+        let initial =
+            load_dir(&dir).with_context(|| format!("initial rule load from {}", dir.display()))?;
 
         // Bounded so multiple rapid events collapse to a single pending reload.
         let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
@@ -84,8 +84,8 @@ impl RuleWatcher {
 
         // notify → std mpsc → tokio mpsc bridge.
         let (notify_tx, notify_rx) = std::sync::mpsc::channel::<NotifyResult>();
-        let mut debouncer = new_debouncer(debounce, notify_tx)
-            .context("failed to construct notify debouncer")?;
+        let mut debouncer =
+            new_debouncer(debounce, notify_tx).context("failed to construct notify debouncer")?;
         debouncer
             .watcher()
             .watch(&dir, RecursiveMode::NonRecursive)
@@ -286,11 +286,7 @@ mod tests {
 
     /// Wait up to `timeout` for the next [`RuleUpdate`], failing the test
     /// with a clear message on timeout instead of hanging.
-    async fn next_update(
-        w: &mut RuleWatcher,
-        timeout: Duration,
-        ctx: &str,
-    ) -> RuleUpdate {
+    async fn next_update(w: &mut RuleWatcher, timeout: Duration, ctx: &str) -> RuleUpdate {
         tokio::time::timeout(timeout, w.recv())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {ctx}"))
@@ -482,8 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_directory_at_spawn_is_an_error() {
-        let err =
-            RuleWatcher::spawn("/this/does/not/exist/rules", Duration::from_millis(50)).err();
+        let err = RuleWatcher::spawn("/this/does/not/exist/rules", Duration::from_millis(50)).err();
         assert!(err.is_some());
     }
 }

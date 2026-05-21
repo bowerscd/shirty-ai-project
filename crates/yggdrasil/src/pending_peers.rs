@@ -148,9 +148,8 @@ impl PendingPeerStore {
             [] => Ok(ApproveOutcome::NotFound),
             [idx] => {
                 let removed = guard.candidates.remove(*idx);
-                let bytes = hex::decode(&removed.public_key_hex).with_context(|| {
-                    format!("decode staged pubkey for {}", removed.fingerprint)
-                })?;
+                let bytes = hex::decode(&removed.public_key_hex)
+                    .with_context(|| format!("decode staged pubkey for {}", removed.fingerprint))?;
                 if bytes.len() != PUBLIC_KEY_LEN {
                     anyhow::bail!(
                         "staged pubkey for {} has wrong length {} (want {PUBLIC_KEY_LEN})",
@@ -291,10 +290,7 @@ mod tests {
     fn approve_unknown_fingerprint_returns_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let store = PendingPeerStore::load(dir.path()).unwrap();
-        assert_eq!(
-            store.approve("deadbeef").unwrap(),
-            ApproveOutcome::NotFound
-        );
+        assert_eq!(store.approve("deadbeef").unwrap(), ApproveOutcome::NotFound);
     }
 
     #[test]

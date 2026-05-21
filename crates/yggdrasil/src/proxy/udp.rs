@@ -91,9 +91,12 @@ impl UdpProxy {
         resolver: UpstreamResolver,
         max_flows: usize,
     ) -> Result<Self> {
-        let frontend = UdpSocket::bind(rule.listen)
-            .await
-            .with_context(|| format!("bind UDP frontend for rule {:?} on {}", rule.name, rule.listen))?;
+        let frontend = UdpSocket::bind(rule.listen).await.with_context(|| {
+            format!(
+                "bind UDP frontend for rule {:?} on {}",
+                rule.name, rule.listen
+            )
+        })?;
         let local_addr = frontend.local_addr().context("read UdpSocket local_addr")?;
         let frontend = Arc::new(frontend);
 
@@ -652,12 +655,10 @@ mod tests {
         .unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client
-            .send_to(b"silent", proxy.local_addr())
-            .await
-            .unwrap();
+        client.send_to(b"silent", proxy.local_addr()).await.unwrap();
         let mut buf = [0u8; 2048];
-        let res = tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await;
+        let res =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await;
         assert!(res.is_err(), "expected timeout — no peer IP means drop");
         assert_eq!(proxy.active_flows(), 0);
 
@@ -675,7 +676,9 @@ mod tests {
             r.idle_timeout = Some(Duration::from_millis(200));
             r
         };
-        let proxy = UdpProxy::spawn(rule, dynamic_resolver(peer, upstream.port())).await.unwrap();
+        let proxy = UdpProxy::spawn(rule, dynamic_resolver(peer, upstream.port()))
+            .await
+            .unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let _ = send_recv(&client, proxy.local_addr(), b"x").await;

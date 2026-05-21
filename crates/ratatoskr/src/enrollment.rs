@@ -134,9 +134,8 @@ impl RequestFile {
 
     /// Serialize to TOML text.
     pub fn to_toml(&self) -> Result<String> {
-        toml::to_string_pretty(self).map_err(|e| {
-            Error::InvalidEnrollmentToken(format!("request toml serialise: {e}"))
-        })
+        toml::to_string_pretty(self)
+            .map_err(|e| Error::InvalidEnrollmentToken(format!("request toml serialise: {e}")))
     }
 
     /// Parse from TOML text, validating fingerprint consistency and version.
@@ -225,9 +224,8 @@ impl GrantFile {
 
     /// Serialize to TOML text.
     pub fn to_toml(&self) -> Result<String> {
-        toml::to_string_pretty(self).map_err(|e| {
-            Error::InvalidEnrollmentToken(format!("grant toml serialise: {e}"))
-        })
+        toml::to_string_pretty(self)
+            .map_err(|e| Error::InvalidEnrollmentToken(format!("grant toml serialise: {e}")))
     }
 
     /// Parse from TOML text. Validates both fingerprints and version.
@@ -297,9 +295,14 @@ mod tests {
     fn request_rejects_fingerprint_mismatch() {
         let req = RequestFile::new(pk(0x22), 1, "");
         let mut bad = req.to_toml().unwrap();
-        bad = bad.replace(&req.request.fingerprint, "x25519:00112233445566778899aabbccddeeff");
+        bad = bad.replace(
+            &req.request.fingerprint,
+            "x25519:00112233445566778899aabbccddeeff",
+        );
         let err = RequestFile::from_toml(&bad).unwrap_err();
-        assert!(matches!(err, Error::InvalidEnrollmentToken(s) if s.contains("does not match pubkey")));
+        assert!(
+            matches!(err, Error::InvalidEnrollmentToken(s) if s.contains("does not match pubkey"))
+        );
     }
 
     #[test]
@@ -335,7 +338,9 @@ mod tests {
         let grant = GrantFile::new(&req, pk(0x99), "", 2, "");
         let toml = grant.to_toml().unwrap();
         let err = GrantFile::from_toml(&toml).unwrap_err();
-        assert!(matches!(err, Error::InvalidEnrollmentToken(s) if s.contains("accept_endpoint must not be empty")));
+        assert!(
+            matches!(err, Error::InvalidEnrollmentToken(s) if s.contains("accept_endpoint must not be empty"))
+        );
     }
 
     #[test]
@@ -345,6 +350,8 @@ mod tests {
         grant.grant.accept_fingerprint = "x25519:00".to_string();
         let toml = grant.to_toml().unwrap();
         let err = GrantFile::from_toml(&toml).unwrap_err();
-        assert!(matches!(err, Error::InvalidEnrollmentToken(s) if s.contains("accept_fingerprint")));
+        assert!(
+            matches!(err, Error::InvalidEnrollmentToken(s) if s.contains("accept_fingerprint"))
+        );
     }
 }
