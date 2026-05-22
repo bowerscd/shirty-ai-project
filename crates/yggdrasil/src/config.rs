@@ -91,6 +91,12 @@ pub struct ServerSection {
     /// config across hosts with different network interfaces.
     #[serde(default)]
     pub default_bind: Option<IpAddr>,
+    /// Per-host default UDP frontend worker count. `None` means resolve to
+    /// `std::thread::available_parallelism()` when a proxy is spawned;
+    /// `Some(n)` overrides every UDP rule that does not set its own value.
+    /// `Some(0)` is rejected during validation.
+    #[serde(default)]
+    pub udp_workers: Option<usize>,
     /// Per-host state directory (TOFU staging, runtime markers).
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
@@ -210,6 +216,13 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // ---- Derived mode shape ----
         let _ = self.derived_mode()?;
+
+        // ---- [server] sanity ----
+        if matches!(self.server.udp_workers, Some(0)) {
+            return Err(ConfigError::Invalid(
+                "[server].udp_workers must be >= 1 when set".into(),
+            ));
+        }
 
         // ---- [dial] sanity ----
         if let Some(up) = &self.dial {
@@ -399,6 +412,46 @@ mod tests {
             cfg.server.default_bind,
             Some("192.168.1.5".parse::<IpAddr>().unwrap())
         );
+    }
+
+    #[test]
+    fn udp_workers_defaults_to_none() {
+        let cfg = parse(relay_minimal_toml()).unwrap();
+        assert_eq!(cfg.server.udp_workers, None);
+    }
+
+    #[test]
+    fn udp_workers_override_parses() {
+        let cfg = parse(
+            r#"
+            [server]
+            udp_workers = 4
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.udp_workers, Some(4));
+    }
+
+    #[test]
+    fn udp_workers_zero_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            udp_workers = 0
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Invalid(s)
+                if s.contains("[server].udp_workers must be >= 1 when set")));
     }
 
     #[test]

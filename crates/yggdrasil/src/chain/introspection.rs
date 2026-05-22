@@ -144,9 +144,12 @@ mod tests {
             target_addr: Some("127.0.0.1:9100".parse().unwrap()),
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         };
         RuleSet::from_rules(vec![rule]).expect("RuleSet build")
     }
@@ -182,6 +185,7 @@ mod tests {
                 listen_port: 9001,
                 protocol: Protocol::Tcp,
                 idle_timeout_ms: None,
+                https_http3: false,
             }],
             version: 7,
             origin: fake_pubkey(0xEE),
@@ -213,6 +217,7 @@ mod tests {
                 listen_port: 9001,
                 protocol: Protocol::Tcp,
                 idle_timeout_ms: None,
+                https_http3: false,
             }],
             version: 2,
             origin: fake_pubkey(0xCC),
@@ -235,6 +240,7 @@ mod tests {
                 listen_port: 9001,
                 protocol: Protocol::Tcp,
                 idle_timeout_ms: Some(60_000),
+                https_http3: false,
             }],
             version: 42,
             origin: fake_pubkey(0xDD),

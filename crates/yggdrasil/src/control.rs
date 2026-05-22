@@ -862,6 +862,7 @@ mod tests {
             Duration::from_millis(50),
             ResolverFactory::new_relay(peer_state.clone()),
             None,
+            None,
             CertConfig::default(),
             shutdown.clone(),
         )

@@ -160,6 +160,7 @@ pub async fn run_relay(
         RULE_DEBOUNCE,
         resolver_factory,
         config.server.default_bind,
+        config.server.udp_workers,
         CertConfig::from_server_section(
             config.server.cert_dir.clone(),
             config.server.default_cert.clone(),
@@ -392,6 +393,7 @@ pub async fn run_terminal(
         RULE_DEBOUNCE,
         resolver_factory,
         config.server.default_bind,
+        config.server.udp_workers,
         CertConfig::from_server_section(
             config.server.cert_dir.clone(),
             config.server.default_cert.clone(),

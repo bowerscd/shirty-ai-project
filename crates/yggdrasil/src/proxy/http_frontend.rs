@@ -61,7 +61,6 @@ use http::header::{
     HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
     TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
-use http::uri::{Authority, Scheme, Uri};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -77,10 +76,43 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use ratatoskr::rule::{HttpRoute, Rule};
+use ratatoskr::rule::{HstsConfig, HttpRoute, Rule};
 
 use super::certs::CertStore;
+pub(crate) use super::forward::build_upstream_uri;
+use super::forward::{
+    inject_forwarded, maybe_inject_hsts, strip_hop_by_hop, strip_untrusted_forwarding,
+};
 use super::proxy_protocol;
+
+// =============================================================================
+// TLS configuration
+// =============================================================================
+
+/// Build a `rustls::ServerConfig` for an HTTPS rule.
+///
+/// `alpns` is caller-supplied so the same builder serves both the TCP
+/// acceptor (`["h2", "http/1.1"]`) and the future QUIC acceptor (`["h3"]`).
+/// The cert_resolver is the shared per-supervisor `CertStore` — every HTTPS
+/// rule uses the same store, so cert rotation propagates uniformly.
+///
+/// Cert rotation that updates the underlying `CertStore` is observed by both
+/// TCP and QUIC acceptors automatically — both hold an `Arc<dyn
+/// ResolvesServerCert>` pointing at the same store.
+///
+/// Returns an `Arc<ServerConfig>` so callers can clone it cheaply when they
+/// need to hand it to both `tokio_rustls::TlsAcceptor` and
+/// `quinn::crypto::rustls::QuicServerConfig::try_from(...)`.
+pub(crate) fn build_rustls_server_config(
+    cert_store: Arc<CertStore>,
+    alpns: &[&[u8]],
+) -> Arc<ServerConfig> {
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(cert_store);
+    cfg.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
+    Arc::new(cfg)
+}
 
 // =============================================================================
 // Public types
@@ -130,13 +162,8 @@ impl HttpFrontend {
 
         let route_table = Arc::new(RouteTable::build(routes));
 
-        // Build rustls ServerConfig with the shared cert store as resolver
-        // and ALPN advertising h2 + http/1.1.
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(cert_store);
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let server_config = build_rustls_server_config(cert_store, &[b"h2", b"http/1.1"]);
+        let acceptor = TlsAcceptor::from(server_config);
 
         let listener = TcpListener::bind(rule.listen).await.with_context(|| {
             format!(
@@ -151,6 +178,7 @@ impl HttpFrontend {
         let cancel = parent.child_token();
         let backend_client = build_backend_client();
 
+        let task_rule = Arc::new(rule.clone());
         let task_rule_name = rule.name.clone();
         let task_cancel = cancel.clone();
         let task_routes = Arc::clone(&route_table);
@@ -161,6 +189,7 @@ impl HttpFrontend {
         let handle = tokio::spawn(async move {
             accept_loop(
                 task_rule_name,
+                task_rule,
                 listener,
                 task_local,
                 task_acceptor,
@@ -210,9 +239,9 @@ impl HttpFrontend {
 
 /// HTTP/1.1 + HTTP/2 capable client that pools connections per (host, port).
 /// One instance per frontend; cloning is cheap (it's an Arc internally).
-type BackendClient = LegacyClient<HttpConnector, BoxBody<Bytes, hyper::Error>>;
+pub(crate) type BackendClient = LegacyClient<HttpConnector, BoxBody<Bytes, hyper::Error>>;
 
-fn build_backend_client() -> BackendClient {
+pub(crate) fn build_backend_client() -> BackendClient {
     let mut http = HttpConnector::new();
     http.set_nodelay(true);
     http.enforce_http(true); // refuse non-http:// upstreams; HTTPS upstreams unsupported in this phase.
@@ -231,41 +260,27 @@ pub struct RouteTable {
     by_host: HashMap<String, RouteEntry>,
 }
 
-struct RouteEntry {
-    target: Url,
-    hsts: Option<HstsHeader>,
+pub(crate) struct RouteEntry {
+    pub(crate) target: Url,
+    pub(crate) hsts: Option<HstsConfig>,
 }
 
-#[derive(Clone)]
-struct HstsHeader(HeaderValue);
-
 impl RouteTable {
-    fn build(routes: &[HttpRoute]) -> Self {
+    pub(crate) fn build(routes: &[HttpRoute]) -> Self {
         let mut by_host = HashMap::with_capacity(routes.len());
         for r in routes {
-            let hsts = r.hsts.map(|cfg| {
-                let mut v = format!("max-age={}", cfg.max_age);
-                if cfg.include_subdomains {
-                    v.push_str("; includeSubDomains");
-                }
-                if cfg.preload {
-                    v.push_str("; preload");
-                }
-                // Safety: composed from %u32 + ASCII literals only.
-                HstsHeader(HeaderValue::from_str(&v).expect("HSTS header is ASCII"))
-            });
             by_host.insert(
                 r.hostname.to_ascii_lowercase(),
                 RouteEntry {
                     target: r.target.clone(),
-                    hsts,
+                    hsts: r.hsts,
                 },
             );
         }
         Self { by_host }
     }
 
-    fn lookup(&self, host: &str) -> Option<&RouteEntry> {
+    pub(crate) fn lookup(&self, host: &str) -> Option<&RouteEntry> {
         // Strip trailing dot ("foo.example.com.") and port if present.
         let host = host.trim_end_matches('.');
         let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
@@ -294,6 +309,7 @@ impl RouteTable {
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     rule_name: String,
+    rule: Arc<Rule>,
     listener: TcpListener,
     local_addr: SocketAddr,
     acceptor: TlsAcceptor,
@@ -320,13 +336,15 @@ async fn accept_loop(
                 if let Err(e) = tcp.set_nodelay(true) {
                     debug!(rule = %rule_name, error = %e, "set_nodelay failed");
                 }
-                let conn_rule = rule_name.clone();
+                let conn_rule_name = rule_name.clone();
+                let conn_rule = Arc::clone(&rule);
                 let conn_acceptor = acceptor.clone();
                 let conn_routes = Arc::clone(&routes);
                 let conn_client = client.clone();
                 let conn_cancel = cancel.child_token();
                 tokio::spawn(async move {
                     if let Err(e) = handle_tcp_connection(
+                        conn_rule_name,
                         conn_rule,
                         tcp,
                         peer_addr,
@@ -353,6 +371,7 @@ async fn accept_loop(
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     rule_name: String,
+    rule: Arc<Rule>,
     mut tcp: TcpStream,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -408,6 +427,7 @@ async fn handle_tcp_connection(
         .unwrap_or(false);
 
     let conn_ctx = Arc::new(ConnContext {
+        rule,
         rule_name: rule_name.clone(),
         client_addr,
         local_addr,
@@ -531,6 +551,7 @@ impl<S: AsyncWrite> AsyncWrite for PrefixedStream<S> {
 // =============================================================================
 
 struct ConnContext {
+    rule: Arc<Rule>,
     rule_name: String,
     client_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -561,7 +582,9 @@ async fn serve_request(
             // "drop TCP" for h1.0 / missing-Host; on h2 we have no way to
             // close just the stream without a status, so 400 is the closest
             // honest answer. The connection itself is the caller's choice.
-            return short_response(StatusCode::BAD_REQUEST, "");
+            let mut resp = short_response(StatusCode::BAD_REQUEST, "");
+            maybe_inject_alt_svc(&mut resp, &ctx.rule);
+            return resp;
         }
     };
 
@@ -583,7 +606,8 @@ async fn serve_request(
                 host = %host,
                 "no route for Host; replying 404"
             );
-            let resp = short_response(StatusCode::NOT_FOUND, "no route\n");
+            let mut resp = short_response(StatusCode::NOT_FOUND, "no route\n");
+            maybe_inject_alt_svc(&mut resp, &ctx.rule);
             record_request_metrics(&ctx.rule_name, "_unknown", &resp, started);
             return resp;
         }
@@ -598,7 +622,7 @@ async fn serve_request(
     let is_websocket = req.version() == Version::HTTP_11 && is_websocket_upgrade(req.headers());
 
     let upstream_url = route.target.clone();
-    let hsts_header = route.hsts.clone();
+    let hsts_header = route.hsts;
 
     // -------------------------------------------------------------------
     // Forward.
@@ -626,13 +650,9 @@ async fn serve_request(
 
     // HSTS opt-in. Safe to inject even on error responses we generated; in
     // practice 502s won't be flagged by browsers for HSTS purposes anyway.
-    if let Some(h) = hsts_header {
-        resp.headers_mut().insert(
-            HeaderName::from_static("strict-transport-security"),
-            h.0.clone(),
-        );
-    }
+    maybe_inject_hsts(resp.headers_mut(), hsts_header.as_ref());
 
+    maybe_inject_alt_svc(&mut resp, &ctx.rule);
     record_request_metrics(&ctx.rule_name, &route_label, &resp, started);
     resp
 }
@@ -681,7 +701,7 @@ async fn forward_normal(
     // Strip untrusted forwarding metadata, strip hop-by-hop, inject our
     // own X-Forwarded-* / X-Real-IP. Preserve the inbound Host header.
     sanitise_request_headers(&mut parts.headers);
-    inject_forwarded_headers(&mut parts.headers, ctx.client_addr.ip(), host);
+    inject_forwarded(&mut parts.headers, ctx.client_addr.ip(), Some(host));
 
     // Rewrite URI authority to the backend.
     let new_uri = build_upstream_uri(&parts.uri, upstream_url)?;
@@ -725,7 +745,7 @@ async fn forward_websocket(
     let client_upgrade =
         hyper::upgrade::on(Request::from_parts(parts.clone(), Empty::<Bytes>::new()));
     sanitise_request_headers_for_websocket(&mut parts.headers);
-    inject_forwarded_headers(&mut parts.headers, ctx.client_addr.ip(), host);
+    inject_forwarded(&mut parts.headers, ctx.client_addr.ip(), Some(host));
 
     let new_uri = build_upstream_uri(&parts.uri, upstream_url)?;
     parts.uri = new_uri;
@@ -790,9 +810,9 @@ async fn forward_websocket(
 /// claims (untrusted, we own the inbound edge) plus hop-by-hop per RFC 7230
 /// §6.1. We do *not* strip Host — the route lookup needs it, and the
 /// backend cares.
-fn sanitise_request_headers(headers: &mut HeaderMap) {
+pub(crate) fn sanitise_request_headers(headers: &mut HeaderMap) {
     strip_hop_by_hop(headers);
-    strip_forwarding_claims(headers);
+    strip_untrusted_forwarding(headers);
 }
 
 /// Same as `sanitise_request_headers` but preserves `Upgrade` and
@@ -821,71 +841,35 @@ fn sanitise_request_headers_for_websocket(headers: &mut HeaderMap) {
     if !keep_connection {
         headers.remove(CONNECTION);
     }
-    strip_forwarding_claims(headers);
+    strip_untrusted_forwarding(headers);
 }
 
-fn sanitise_response_headers(headers: &mut HeaderMap) {
+pub(crate) fn sanitise_response_headers(headers: &mut HeaderMap) {
     strip_hop_by_hop(headers);
 }
 
-fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    // RFC 7230 §6.1 allows `Connection: <token>` to nominate further
-    // hop-by-hop headers. Collect those tokens *first*, before we remove
-    // the Connection header itself, otherwise we can't see them.
-    let tokens: Vec<HeaderName> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .filter_map(|tok| {
-            let t = tok.trim();
-            if t.eq_ignore_ascii_case("close") || t.eq_ignore_ascii_case("keep-alive") {
-                None
-            } else {
-                HeaderName::from_bytes(t.as_bytes()).ok()
-            }
-        })
-        .collect();
-    for t in tokens {
-        headers.remove(t);
+/// Append `Alt-Svc: h3=":<port>"; ma=86400` to a TCP HTTPS response when
+/// the rule has HTTP/3 enabled. Idempotent: if the header is already set,
+/// the existing value wins.
+fn maybe_inject_alt_svc<B>(resp: &mut http::Response<B>, rule: &ratatoskr::rule::Rule) {
+    if rule.protocol != ratatoskr::rule::Protocol::Https {
+        return;
     }
-    for name in [
-        CONNECTION,
-        PROXY_AUTHENTICATE,
-        PROXY_AUTHORIZATION,
-        TE,
-        TRAILER,
-        TRANSFER_ENCODING,
-        UPGRADE,
-    ] {
-        headers.remove(name);
+    if rule.http3 == Some(false) {
+        return;
     }
-}
+    if rule.alt_svc == Some(false) {
+        return;
+    }
 
-fn strip_forwarding_claims(headers: &mut HeaderMap) {
-    headers.remove(HeaderName::from_static("x-forwarded-for"));
-    headers.remove(HeaderName::from_static("x-forwarded-proto"));
-    headers.remove(HeaderName::from_static("x-forwarded-host"));
-    headers.remove(HeaderName::from_static("x-forwarded-port"));
-    headers.remove(HeaderName::from_static("x-real-ip"));
-    headers.remove(HeaderName::from_static("forwarded"));
-}
-
-fn inject_forwarded_headers(headers: &mut HeaderMap, client_ip: IpAddr, host: &str) {
-    let ip_str = match client_ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => v6.to_string(),
-    };
-    if let Ok(v) = HeaderValue::from_str(&ip_str) {
-        headers.insert(HeaderName::from_static("x-forwarded-for"), v.clone());
-        headers.insert(HeaderName::from_static("x-real-ip"), v);
+    let alt_svc = HeaderName::from_static("alt-svc");
+    if resp.headers().contains_key(&alt_svc) {
+        return;
     }
-    headers.insert(
-        HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static("https"),
-    );
-    if let Ok(v) = HeaderValue::from_str(host) {
-        headers.insert(HeaderName::from_static("x-forwarded-host"), v);
+
+    let value = format!("h3=\":{}\"; ma=86400", rule.listen.port());
+    if let Ok(hv) = HeaderValue::from_str(&value) {
+        resp.headers_mut().insert(alt_svc, hv);
     }
 }
 
@@ -912,21 +896,6 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         .map(|s| s.to_ascii_lowercase().contains("upgrade"))
         .unwrap_or(false);
     upgrade_ws && conn_upgrade
-}
-
-fn build_upstream_uri(orig: &Uri, upstream: &Url) -> anyhow::Result<Uri> {
-    let path_and_query = orig.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let authority = match (upstream.host_str(), upstream.port_or_known_default()) {
-        (Some(h), Some(p)) => format!("{h}:{p}"),
-        (Some(h), None) => h.to_string(),
-        _ => anyhow::bail!("upstream URL has no host"),
-    };
-    let authority = Authority::try_from(authority.as_bytes()).context("authority parse")?;
-    Ok(Uri::builder()
-        .scheme(Scheme::HTTP)
-        .authority(authority)
-        .path_and_query(path_and_query)
-        .build()?)
 }
 
 fn short_response(
@@ -1145,6 +1114,7 @@ mod tests {
     use super::*;
     use http::Method;
     use http::Request as HttpRequest;
+    use http::Uri;
 
     fn req_with(headers: &[(&'static str, &'static str)]) -> HttpRequest<()> {
         let mut b = HttpRequest::builder().uri("/foo").method(Method::GET);
@@ -1155,59 +1125,12 @@ mod tests {
     }
 
     #[test]
-    fn strip_hop_by_hop_removes_listed_names() {
-        let mut h = HeaderMap::new();
-        h.insert(CONNECTION, HeaderValue::from_static("close, foo"));
-        h.insert(TE, HeaderValue::from_static("trailers"));
-        h.insert(UPGRADE, HeaderValue::from_static("websocket"));
-        h.insert(
-            HeaderName::from_static("foo"),
-            HeaderValue::from_static("bar"),
-        );
-        h.insert(
-            HeaderName::from_static("x-keep"),
-            HeaderValue::from_static("yes"),
-        );
-        strip_hop_by_hop(&mut h);
-        assert!(!h.contains_key(CONNECTION));
-        assert!(!h.contains_key(TE));
-        assert!(!h.contains_key(UPGRADE));
-        assert!(!h.contains_key(HeaderName::from_static("foo")));
-        assert_eq!(h.get(HeaderName::from_static("x-keep")).unwrap(), "yes");
-    }
-
-    #[test]
-    fn strip_forwarding_claims_removes_all_variants() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            HeaderName::from_static("x-forwarded-for"),
-            HeaderValue::from_static("1.2.3.4"),
-        );
-        h.insert(
-            HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static("http"),
-        );
-        h.insert(
-            HeaderName::from_static("x-real-ip"),
-            HeaderValue::from_static("5.6.7.8"),
-        );
-        h.insert(
-            HeaderName::from_static("forwarded"),
-            HeaderValue::from_static("for=lies"),
-        );
-        strip_forwarding_claims(&mut h);
-        assert!(h.is_empty());
-    }
-
-    #[test]
-    fn inject_forwarded_headers_writes_canonical_values() {
-        let mut h = HeaderMap::new();
-        let ip: IpAddr = "203.0.113.7".parse().unwrap();
-        inject_forwarded_headers(&mut h, ip, "api.example.com");
-        assert_eq!(h.get("x-forwarded-for").unwrap(), "203.0.113.7");
-        assert_eq!(h.get("x-real-ip").unwrap(), "203.0.113.7");
-        assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
-        assert_eq!(h.get("x-forwarded-host").unwrap(), "api.example.com");
+    fn server_config_is_quic_compatible() {
+        let store = Arc::new(CertStore::new());
+        let cfg = build_rustls_server_config(store, &[b"h3"]);
+        let inner: rustls::ServerConfig = (*cfg).clone();
+        let _quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(inner)
+            .expect("ServerConfig must be QUIC-compatible");
     }
 
     #[test]

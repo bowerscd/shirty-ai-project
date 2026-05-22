@@ -39,6 +39,7 @@ blake2      = { workspace = true }
 
 dashmap     = { workspace = true }
 parking_lot = { workspace = true }
+socket2     = { workspace = true }
 
 notify                = { workspace = true }
 notify-debouncer-mini = { workspace = true }
@@ -56,11 +57,17 @@ http            = { workspace = true }
 http-body-util  = { workspace = true }
 tokio-rustls    = { workspace = true }
 rustls          = { workspace = true }
+quinn           = { workspace = true }
+h3              = { workspace = true }
+h3-quinn        = { workspace = true }
 rustls-pemfile  = { workspace = true }
 rcgen           = { workspace = true }
 url             = { workspace = true }
 bytes           = { workspace = true }
 pin-project-lite = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile  = { workspace = true }
@@ -68,4 +75,8 @@ criterion = { workspace = true }
 
 [[bench]]
 name    = "flow_table"
+harness = false
+
+[[bench]]
+name    = "h3_forward"
 harness = false

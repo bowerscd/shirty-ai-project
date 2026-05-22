@@ -104,6 +104,10 @@ bench/udp-pps.sh
 bench/tcp-throughput.sh
 ```
 
+### Criterion microbenches
+
+Workspace Criterion benches live under `crates/*/benches/`. `crates/yggdrasil/benches/flow_table.rs` compares UDP flow-table insertion through the old single shared shard against the current per-worker-shard layout used by `UdpProxy`. `crates/yggdrasil/benches/h3_forward.rs` tracks HTTP/3 request-rewrite CPU cost (forwarding header strip/inject, URI rewrite, and HSTS injection).
+
 Override defaults via env vars (each script documents which it reads):
 
 ```bash

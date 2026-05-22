@@ -423,9 +423,9 @@ pub struct ChainAppliedResponse {
     /// set, if the daemon has a chain upstream. Zero on terminals
     /// without `[dial]` and on pure-local nodes.
     pub predicate_count: usize,
-    /// Names of rules dropped during predicate projection because their
-    /// protocol isn't representable as a predicate (currently HTTPS).
-    /// Empty on nodes without an upstream because no projection is run.
+    /// Compatibility list for rules skipped by older HTTPS-unaware predicate
+    /// projection. Current daemons emit HTTPS predicates, so this is empty;
+    /// it is also empty on nodes without an upstream because no projection is run.
     pub skipped_https: Vec<String>,
 }
 
@@ -655,9 +655,12 @@ mod tests {
                 target_port: None,
                 target_host: None,
                 idle_timeout: None,
+                udp_workers: None,
                 proxy_protocol: None,
                 routes: None,
                 cert_dir: None,
+                http3: None,
+                alt_svc: None,
             }],
         };
         let s = serde_json::to_string(&r).unwrap();

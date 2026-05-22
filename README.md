@@ -7,7 +7,8 @@ A residential reverse proxy with a chain control plane. One binary, two modes:
   downstream peer most recently authenticated from.
 * **terminal** — runs on a home box behind a dynamic IP / CGNAT. Dials a
   relay upstream over UDP, sends authenticated heartbeats, publishes the
-  local rule set as a predicate set the relay derives its own listeners from.
+  local TCP, UDP, and HTTPS rule set as predicates the relay derives its own
+  listeners from.
 
 Both modes are the same `yggdrasil` binary; the difference is section shape:
 `[dial]` only => terminal, `[accept]` only or both => relay. A
@@ -18,6 +19,18 @@ It is **not** a tunnel. There is no overlay network, no kernel module, no
 userspace TUN. The L4 data plane learns where to send traffic from
 authenticated heartbeats; when the home box's residential IP changes, the
 next heartbeat updates the mapping and traffic keeps flowing.
+
+```text
+internet clients -- TCP/TLS or UDP/QUIC --> relay derived listeners
+                                      Noise_IK chain --> terminal HTTPS frontend
+                                                           (certs, SNI, Alt-Svc)
+                                                        --> HTTP backends
+```
+
+HTTPS is first-class through the chain: a terminal HTTPS rule derives TCP
+for TLS-wrapped HTTP/1.1 + HTTP/2 and, by default, UDP for HTTP/3 / QUIC.
+Certificates and L7 routing stay on the terminal; relays passthrough both
+transports.
 
 ## Get up and running
 
@@ -149,6 +162,9 @@ ssh -p 2222 user@vps.example.net
 | `yggdrasilctl`  | bin `yggdrasilctl`                  | Admin CLI. Three scopes: `local`, `chain`, `identity`.    |
 | `ratatoskr`     | (lib only)                          | Shared protocol types, wire format, Noise_IK auth.        |
 | `bench-tools`   | bins `loadgen`, `bench-echo` (workspace-internal) | Helpers used by [bench/](bench/README.md): UDP/TCP load generator and a native echo backend. |
+
+HTTPS rules include an L7 frontend for HTTP/1.1, HTTP/2, and HTTP/3 / QUIC,
+with Alt-Svc advertising enabled by default.
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 

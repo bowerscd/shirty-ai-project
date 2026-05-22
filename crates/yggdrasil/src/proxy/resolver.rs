@@ -330,9 +330,12 @@ mod tests {
             target_addr: None,
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 
@@ -345,9 +348,12 @@ mod tests {
             target_addr: Some(addr.parse().unwrap()),
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 
@@ -466,9 +472,12 @@ mod tests {
                 port,
             }),
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 

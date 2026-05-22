@@ -82,12 +82,18 @@ type, labels, meaning.
 
 | Metric                                            | Type      | Labels                          | Notes                                                                 |
 | ------------------------------------------------- | --------- | ------------------------------- | --------------------------------------------------------------------- |
-| `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | `rule`                          | UDP flows torn down because the downstream IP changed under them.      |
-| `yggdrasil_udp_flows_rejected_total`              | counter   | `rule`, `reason`                | UDP flows rejected before insertion (`cap`, etc.).                    |
+| `yggdrasil_udp_workers`                           | gauge     | `rule`                          | Configured UDP frontend worker count for each rule.                    |
+| `yggdrasil_udp_datagrams_received_total`          | counter   | `rule`, `worker`                | Frontend datagrams received by each zero-based UDP worker.             |
+| `yggdrasil_udp_active_flows`                      | gauge     | `rule`, `worker`                | Active UDP flows currently held by each zero-based worker shard.       |
+| `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | `rule`, `worker`                | UDP flows torn down per worker because the downstream IP changed.      |
+| `yggdrasil_udp_flows_rejected_total`              | counter   | `rule`, `worker`, `reason`      | UDP flows rejected before insertion (`cap`, etc.) per worker.         |
 | `yggdrasil_https_tls_handshakes_total`            | counter   | `rule`, `result`                | TLS handshake outcomes for HTTPS rules.                                |
 | `yggdrasil_https_cert_reload_total`               | counter   | `route`, `result`               | Per-route cert source reload outcomes.                                 |
 | `yggdrasil_http_requests_total`                   | counter   | `rule`, `route`, …              | Requests routed by the HTTPS frontend.                                |
 | `yggdrasil_http_request_duration_seconds`         | histogram | `rule`, `route`                 | Per-route HTTPS request latency.                                       |
+
+To roll up UDP counters across workers, use Prometheus
+`sum by (rule) (yggdrasil_udp_datagrams_received_total)`.
 
 ### Suggested alerts
 

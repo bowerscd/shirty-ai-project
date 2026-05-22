@@ -26,10 +26,11 @@ use ratatoskr::rule::{Protocol, Rule, RuleSet};
 use crate::rules::{ReloadTrigger, RuleUpdate, RuleWatcher};
 
 use super::certs::{load_rule_into_store, CertStore, CertWatcher};
+use super::h3_frontend::H3Frontend;
 use super::http_frontend::{HttpFrontend, RedirectListener};
 use super::resolver::{ResolverFactory, UpstreamResolver};
 use super::tcp::TcpProxy;
-use super::udp::UdpProxy;
+use super::udp::{resolve_workers, UdpProxy, MAX_FLOWS_PER_RULE_DEFAULT};
 
 /// Certificate-loading configuration extracted from `ServerSection`. Held
 /// by the supervisor and consulted whenever an HTTPS rule's routes need to
@@ -65,13 +66,14 @@ impl CertConfig {
 enum ProxyHandle {
     Tcp(TcpProxy),
     Udp(UdpProxy),
-    Https(HttpsHandle),
+    Https(Box<HttpsHandle>),
 }
 
 /// HTTPS handle bundles the frontend with the hostnames it registered into
 /// the per-IP redirect listener, so we can deregister cleanly on stop.
 struct HttpsHandle {
     frontend: HttpFrontend,
+    h3: Option<H3Frontend>,
     redirect_hosts: Vec<String>,
     redirect_ip: IpAddr,
     listen: SocketAddr,
@@ -99,7 +101,13 @@ impl ProxyHandle {
         match self {
             Self::Tcp(p) => p.stop().await,
             Self::Udp(p) => p.stop().await,
-            Self::Https(h) => h.frontend.stop().await,
+            Self::Https(h) => {
+                let HttpsHandle { frontend, h3, .. } = *h;
+                if let Some(q) = h3 {
+                    q.stop().await;
+                }
+                frontend.stop().await;
+            }
         }
     }
 }
@@ -222,6 +230,7 @@ impl ProxySupervisor {
         debounce: Duration,
         resolver_factory: ResolverFactory,
         default_bind: Option<IpAddr>,
+        default_udp_workers: Option<usize>,
         cert_config: CertConfig,
         shutdown: CancellationToken,
     ) -> Result<Self> {
@@ -255,6 +264,7 @@ impl ProxySupervisor {
             current_set_tx,
             resolver_factory,
             default_bind,
+            default_udp_workers,
             cert_config,
             Arc::clone(&cert_store),
             Arc::clone(&cert_watcher),
@@ -351,6 +361,7 @@ async fn supervisor_loop(
     current_set_tx: watch::Sender<RuleSet>,
     resolver_factory: ResolverFactory,
     default_bind: Option<IpAddr>,
+    default_udp_workers: Option<usize>,
     cert_config: CertConfig,
     cert_store: Arc<CertStore>,
     cert_watcher: Arc<CertWatcher>,
@@ -387,6 +398,7 @@ async fn supervisor_loop(
                             "file_watcher",
                             &resolver_factory,
                             default_bind,
+                            default_udp_workers,
                             &cert_config,
                             &cert_store,
                             &cert_watcher,
@@ -413,6 +425,7 @@ async fn supervisor_loop(
                             "external_push",
                             &resolver_factory,
                             default_bind,
+                            default_udp_workers,
                             &cert_config,
                             &cert_store,
                             &cert_watcher,
@@ -464,6 +477,7 @@ async fn apply_set(
     source: &'static str,
     resolver_factory: &ResolverFactory,
     default_bind: Option<IpAddr>,
+    default_udp_workers: Option<usize>,
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
@@ -488,6 +502,7 @@ async fn apply_set(
         RuleUpdate { set, diff },
         resolver_factory,
         default_bind,
+        default_udp_workers,
         cert_config,
         cert_store,
         cert_watcher,
@@ -504,6 +519,7 @@ async fn apply_update(
     update: RuleUpdate,
     resolver_factory: &ResolverFactory,
     default_bind: Option<IpAddr>,
+    default_udp_workers: Option<usize>,
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
@@ -560,6 +576,7 @@ async fn apply_update(
             change.new.clone(),
             resolver_factory,
             default_bind,
+            default_udp_workers,
             cert_config,
             cert_store,
             cert_watcher,
@@ -588,6 +605,7 @@ async fn apply_update(
             added.clone(),
             resolver_factory,
             default_bind,
+            default_udp_workers,
             cert_config,
             cert_store,
             cert_watcher,
@@ -664,6 +682,7 @@ async fn spawn_proxy_for_rule(
     rule: Rule,
     resolver_factory: &ResolverFactory,
     default_bind: Option<IpAddr>,
+    default_udp_workers: Option<usize>,
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
@@ -713,7 +732,13 @@ async fn spawn_proxy_for_rule(
             let upstream_description = resolver.describe();
             let handle = match rule.protocol {
                 Protocol::Tcp => ProxyHandle::Tcp(TcpProxy::spawn(rule, resolver).await?),
-                Protocol::Udp => ProxyHandle::Udp(UdpProxy::spawn(rule, resolver).await?),
+                Protocol::Udp => {
+                    let workers = resolve_workers(&rule, default_udp_workers);
+                    ProxyHandle::Udp(
+                        UdpProxy::spawn_with(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT, workers)
+                            .await?,
+                    )
+                }
                 Protocol::Https => unreachable!(),
             };
             Ok(ActiveProxy {
@@ -851,14 +876,32 @@ async fn spawn_https_rule(
         }
     };
 
+    // 4. Optionally spawn the HTTP/3 endpoint alongside.
+    let h3 = if rule.http3 != Some(false) {
+        match H3Frontend::spawn(rule.clone(), Arc::clone(cert_store)).await {
+            Ok(q) => Some(q),
+            Err(e) => {
+                tracing::warn!(
+                    rule = %rule.name,
+                    error = %e,
+                    "failed to bring up HTTP/3 endpoint; serving TCP HTTPS only"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let listen = frontend.local_addr();
-    let handle = ProxyHandle::Https(HttpsHandle {
+    let handle = ProxyHandle::Https(Box::new(HttpsHandle {
         frontend,
+        h3,
         redirect_hosts,
         redirect_ip: ip,
         listen,
         rule: rule.clone(),
-    });
+    }));
 
     Ok(ActiveProxy {
         handle,
@@ -984,6 +1027,7 @@ mod tests {
             Duration::from_millis(50),
             factory,
             None,
+            None,
             CertConfig::default(),
             shutdown.clone(),
         )
@@ -1016,6 +1060,7 @@ mod tests {
             dir.path().to_path_buf(),
             Duration::from_millis(50),
             factory,
+            None,
             None,
             CertConfig::default(),
             shutdown.clone(),
@@ -1062,6 +1107,7 @@ mod tests {
             Duration::from_millis(50),
             factory,
             None,
+            None,
             CertConfig::default(),
             shutdown.clone(),
         )
@@ -1100,6 +1146,7 @@ mod tests {
             dir.path().to_path_buf(),
             Duration::from_millis(50),
             factory,
+            None,
             None,
             CertConfig::default(),
             shutdown.clone(),
@@ -1193,6 +1240,7 @@ mod tests {
             Duration::from_millis(50),
             factory,
             None,
+            None,
             CertConfig::default(),
             shutdown.clone(),
         )
@@ -1238,6 +1286,7 @@ mod tests {
             Duration::from_millis(50),
             factory,
             None,
+            None,
             CertConfig::default(),
             shutdown,
         )
@@ -1260,6 +1309,7 @@ mod tests {
             Duration::from_millis(50),
             factory,
             None,
+            None,
             CertConfig::default(),
             shutdown.clone(),
         )
@@ -1280,9 +1330,12 @@ mod tests {
             target_addr: None,
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         };
         let set = RuleSet::from_rules(vec![rule]).unwrap();
         handle.apply_ruleset(set.clone()).await.unwrap();

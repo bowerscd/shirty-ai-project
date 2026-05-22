@@ -16,10 +16,9 @@
 //! * **PROXY-protocol toggle** is stripped — relays decide independently
 //!   whether to emit PROXY headers based on their local
 //!   `[accept]` configuration. The terminal cannot dictate that.
-//! * **HTTPS routes / cert directories** are stripped along with the
-//!   entire rule: Phase 3 only supports TCP and UDP predicates. HTTPS
-//!   rules are filtered out of the projection with a warning log; a
-//!   later phase can re-introduce them with a richer predicate shape.
+//! * **HTTPS routes / cert directories** are stripped. HTTPS rules are
+//!   still projected as predicates, carrying only their listen port and
+//!   whether HTTP/3 is enabled.
 //!
 //! ## Determinism
 //!
@@ -35,18 +34,16 @@ use ratatoskr::rule::{Protocol, Rule, RuleSet};
 /// Project a [`RuleSet`] into a [`PredicateSet`] stamped with `origin`
 /// and `version`.
 ///
-/// HTTPS rules are filtered out of the projection; their names are
-/// returned in `skipped_https` so the caller can log them once per
-/// extraction. (Returning the names rather than logging in this function
-/// keeps the extractor pure for unit testing.)
+/// HTTPS rules are projected as HTTPS predicates. Their route and
+/// certificate fields remain terminal-local; only the chain-invariant
+/// listen port and HTTP/3 enablement are carried upstream.
 pub fn extract(ruleset: &RuleSet, origin: PubKey, version: u64) -> ExtractOutcome {
     let mut predicates = Vec::with_capacity(ruleset.rules().len());
-    let mut skipped_https = Vec::new();
 
     for rule in ruleset.rules() {
         match rule.protocol {
             Protocol::Tcp | Protocol::Udp => predicates.push(project_rule(rule)),
-            Protocol::Https => skipped_https.push(rule.name.clone()),
+            Protocol::Https => predicates.push(project_https_rule(rule)),
         }
     }
 
@@ -60,7 +57,7 @@ pub fn extract(ruleset: &RuleSet, origin: PubKey, version: u64) -> ExtractOutcom
             version,
             origin,
         },
-        skipped_https,
+        skipped_https: Vec::new(),
     }
 }
 
@@ -72,8 +69,9 @@ pub struct ExtractOutcome {
     ///
     /// [`ControlEnvelope`]: ratatoskr::control_frame::ControlEnvelope
     pub set: PredicateSet,
-    /// Names of rules that were filtered out because their protocol is
-    /// not yet representable as a predicate.
+    /// Compatibility field for control responses that used to report HTTPS
+    /// rules skipped by projection. New extraction keeps HTTPS rules, so this
+    /// is always empty.
     pub skipped_https: Vec<String>,
 }
 
@@ -92,6 +90,19 @@ fn project_rule(rule: &Rule) -> Predicate {
             }),
             _ => None,
         },
+        https_http3: false,
+    }
+}
+
+fn project_https_rule(rule: &Rule) -> Predicate {
+    Predicate {
+        name: rule.name.clone(),
+        listen_port: rule.listen.port(),
+        protocol: Protocol::Https,
+        // HTTPS predicates carry no UDP idle_timeout at the predicate level.
+        // The derived UDP rule on the relay uses a hardcoded default.
+        idle_timeout_ms: None,
+        https_http3: rule.http3 != Some(false),
     }
 }
 
@@ -100,9 +111,10 @@ mod tests {
     use super::*;
     use ratatoskr::auth::PUBLIC_KEY_LEN;
     use ratatoskr::pubkey::PubKey;
-    use ratatoskr::rule::Rule;
+    use ratatoskr::rule::{HttpRoute, Rule};
     use std::net::SocketAddr;
     use std::time::Duration;
+    use url::Url;
 
     fn ruleset_from(rules: Vec<Rule>) -> RuleSet {
         RuleSet::from_rules(rules).expect("test rule set must validate")
@@ -121,9 +133,12 @@ mod tests {
             target_addr: None,
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 
@@ -136,24 +151,36 @@ mod tests {
             target_addr: None,
             target_host: None,
             idle_timeout: idle,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 
-    fn https_rule(name: &str) -> Rule {
+    fn https_rule(name: &str, port: u16, http3: Option<bool>) -> Rule {
         Rule {
             name: name.to_string(),
-            listen: SocketAddr::from(([0, 0, 0, 0], 443)),
+            listen: SocketAddr::from(([0, 0, 0, 0], port)),
             protocol: Protocol::Https,
             target_port: None,
             target_addr: None,
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
-            routes: None,
+            routes: Some(vec![HttpRoute {
+                hostname: format!("{name}.localhost"),
+                target: Url::parse("http://127.0.0.1:8080").unwrap(),
+                cert: None,
+                key: None,
+                hsts: None,
+            }]),
             cert_dir: None,
+            http3,
+            alt_svc: None,
         }
     }
 
@@ -173,37 +200,102 @@ mod tests {
         assert_eq!(out.set.predicates[0].protocol, Protocol::Udp);
         assert_eq!(out.set.predicates[0].listen_port, 53);
         assert_eq!(out.set.predicates[0].idle_timeout_ms, Some(30_000));
+        assert!(!out.set.predicates[0].https_http3);
         assert_eq!(out.set.predicates[1].name, "ssh");
         assert_eq!(out.set.predicates[1].protocol, Protocol::Tcp);
         assert_eq!(out.set.predicates[1].listen_port, 2222);
         assert_eq!(out.set.predicates[1].idle_timeout_ms, None);
+        assert!(!out.set.predicates[1].https_http3);
     }
 
     #[test]
-    fn filters_out_https_rules() {
-        // RuleSet::from_rules validates HTTPS rules require routes; the
-        // extractor itself doesn't care, so build the RuleSet by hand for
-        // this test. We hit the extractor's filtering path even for an
-        // HTTPS rule whose `routes` would normally be required.
-        let mut rule = https_rule("home-https");
-        rule.routes = Some(vec![]); // populated below before validation
-                                    // Bypass `from_rules` validation for this synthetic mix by
-                                    // constructing each rule individually well-formed except for the
-                                    // HTTPS one, which we know `extract` will drop before any L7
-                                    // logic looks at it.
-        let out = extract_via_unsorted_rules(
-            vec![tcp_rule("ssh", 2222, 22), rule, udp_rule("dns", 53, None)],
+    fn extracts_https_default_http3_enabled() {
+        let rule = https_rule("web-default", 8443, None);
+        let listen_port = rule.listen.port();
+        let out = extract(&ruleset_from(vec![rule]), origin(), 2);
+
+        assert_eq!(out.set.predicates.len(), 1);
+        assert!(out.skipped_https.is_empty());
+        let predicate = &out.set.predicates[0];
+        assert_eq!(predicate.name, "web-default");
+        assert_eq!(predicate.protocol, Protocol::Https);
+        assert_eq!(predicate.listen_port, listen_port);
+        assert_eq!(predicate.idle_timeout_ms, None);
+        assert!(predicate.https_http3);
+    }
+
+    #[test]
+    fn extracts_https_explicit_http3_true() {
+        let out = extract(
+            &ruleset_from(vec![https_rule("web-h3", 9443, Some(true))]),
             origin(),
-            5,
+            3,
         );
-        assert_eq!(out.set.predicates.len(), 2);
-        assert_eq!(out.skipped_https, vec!["home-https".to_string()]);
+
+        assert_eq!(out.set.predicates.len(), 1);
+        assert_eq!(out.set.predicates[0].protocol, Protocol::Https);
+        assert!(out.set.predicates[0].https_http3);
+    }
+
+    #[test]
+    fn extracts_https_explicit_http3_false() {
+        let out = extract(
+            &ruleset_from(vec![https_rule("web-h2", 10443, Some(false))]),
+            origin(),
+            4,
+        );
+
+        assert_eq!(out.set.predicates.len(), 1);
+        assert_eq!(out.set.predicates[0].protocol, Protocol::Https);
+        assert!(!out.set.predicates[0].https_http3);
+    }
+
+    #[test]
+    fn extracts_mixed_rules_in_name_order() {
+        let ruleset = ruleset_from(vec![
+            tcp_rule("ssh", 2222, 22),
+            udp_rule("dns", 53, Some(Duration::from_secs(30))),
+            https_rule("web", 8443, Some(false)),
+        ]);
+        let out = extract(&ruleset, origin(), 5);
+
+        assert!(out.skipped_https.is_empty());
+        assert_eq!(out.set.predicates.len(), 3);
+        assert_eq!(out.set.predicates[0].name, "dns");
+        assert_eq!(out.set.predicates[1].name, "ssh");
+        assert_eq!(out.set.predicates[2].name, "web");
+
+        let dns = &out.set.predicates[0];
+        assert_eq!(dns.protocol, Protocol::Udp);
+        assert_eq!(dns.listen_port, 53);
+        assert_eq!(dns.idle_timeout_ms, Some(30_000));
+        assert!(!dns.https_http3);
+
+        let ssh = &out.set.predicates[1];
+        assert_eq!(ssh.protocol, Protocol::Tcp);
+        assert_eq!(ssh.listen_port, 2222);
+        assert_eq!(ssh.idle_timeout_ms, None);
+        assert!(!ssh.https_http3);
+
+        let web = &out.set.predicates[2];
+        assert_eq!(web.protocol, Protocol::Https);
+        assert_eq!(web.listen_port, 8443);
+        assert_eq!(web.idle_timeout_ms, None);
+        assert!(!web.https_http3);
     }
 
     #[test]
     fn output_is_deterministic_across_input_order() {
-        let a = ruleset_from(vec![tcp_rule("ssh", 2222, 22), udp_rule("dns", 53, None)]);
-        let b = ruleset_from(vec![udp_rule("dns", 53, None), tcp_rule("ssh", 2222, 22)]);
+        let a = ruleset_from(vec![
+            tcp_rule("ssh", 2222, 22),
+            https_rule("web", 8443, Some(true)),
+            udp_rule("dns", 53, None),
+        ]);
+        let b = ruleset_from(vec![
+            udp_rule("dns", 53, None),
+            tcp_rule("ssh", 2222, 22),
+            https_rule("web", 8443, Some(true)),
+        ]);
         let out_a = extract(&a, origin(), 1);
         let out_b = extract(&b, origin(), 1);
         // Comparing the PredicateSet values directly is equivalent to
@@ -228,19 +320,17 @@ mod tests {
     }
 
     /// Test-only helper that runs the projection logic against a list of
-    /// rules without going through `RuleSet::from_rules` (which would
-    /// reject HTTPS rules with empty `routes`).
+    /// rules without going through `RuleSet::from_rules`.
     fn extract_via_unsorted_rules(
         rules: Vec<Rule>,
         origin: PubKey,
         version: u64,
     ) -> ExtractOutcome {
         let mut predicates = Vec::with_capacity(rules.len());
-        let mut skipped_https = Vec::new();
         for rule in &rules {
             match rule.protocol {
                 Protocol::Tcp | Protocol::Udp => predicates.push(super::project_rule(rule)),
-                Protocol::Https => skipped_https.push(rule.name.clone()),
+                Protocol::Https => predicates.push(super::project_https_rule(rule)),
             }
         }
         predicates.sort_by(|a, b| a.name.cmp(&b.name));
@@ -250,7 +340,7 @@ mod tests {
                 version,
                 origin,
             },
-            skipped_https,
+            skipped_https: Vec::new(),
         }
     }
 }

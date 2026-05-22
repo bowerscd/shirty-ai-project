@@ -27,6 +27,7 @@ hex is rejected on parse.
 | ------------------ | ---------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `rules_dir`        | path                   | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
 | `default_bind`     | IP                     | unset                            | If set, hard-rewrites every rule's `listen` IP to this address (the port is preserved). Used to share one config across hosts with different network interfaces. |
+| `udp_workers`      | optional positive integer | unset (`None` → `available_parallelism()` at proxy spawn) | Per-host default for every UDP rule unless the rule sets `udp_workers`; `0` is rejected. |
 | `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
 | `identity_file`    | path                   | `/etc/yggdrasil/identity.key`    | Long-term X25519 identity (64 bytes: 32 secret ++ 32 public). Mode 0600. Auto-generated on first start if missing. |
 | `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the convention cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). |
@@ -145,8 +146,11 @@ one unified rule set with global uniqueness checks.
 | `target_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. Literal upstream socket address. Mutually exclusive with `target_port` and `target_host`.       |
 | `target_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. DNS-resolved upstream. Re-resolves periodically; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `target_port` and `target_addr`. |
 | `idle_timeout`   | `humantime`                | —   | ✓   | —     | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP / HTTPS rules.            |
+| `udp_workers`    | optional positive integer  | —   | ✓   | —     | inherits from `[server]` | UDP only. Overrides `[server].udp_workers` for this rule; `0` is rejected. Rejected on TCP / HTTPS rules. |
 | `proxy_protocol` | `"v1"`/`"v2"`              | ✓   | —   | —     | absent        | TCP relay rules only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and on terminal-mode rules (`target_addr` / `target_host`). |
 | `cert_dir`       | path                       | —   | —   | ✓     | inherits from `[server]` | HTTPS only. Per-rule override of the convention cert directory.                                          |
+| `http3`          | `Option<bool>`             | —   | —   | ✓     | `true`        | HTTPS only. Enables HTTP/3 over UDP / QUIC on the same `(ip, port)` as TCP HTTPS. Set `http3 = false` to opt out and derive / listen TCP only. |
+| `alt_svc`        | `Option<bool>`             | —   | —   | ✓     | `true` when `http3` is on | HTTPS only. Controls the TCP HTTPS `Alt-Svc: h3=":<port>"; ma=86400` response header that advertises HTTP/3. Set `alt_svc = false` to suppress it. `alt_svc = true` with `http3 = false` is rejected. |
 | `[[rule.route]]` | table                      | —   | —   | ✓     | **required**  | HTTPS only. One entry per virtual host — see the HTTPS section below.                                              |
 
 Validation runs at load time. A malformed rule file fails the **whole**
@@ -218,14 +222,27 @@ target_port = 22
 
 ### HTTPS rules
 
-An `https` rule terminates TLS on the relay, performs SNI-based virtual-host
-routing, and forwards each request as cleartext HTTP to a per-route
-backend URL. Each `[[rule.route]]` table is one virtual host.
+An `https` rule on the terminal is the L7 frontend. It terminates TLS for
+HTTP/1.1 and HTTP/2, terminates QUIC/TLS for HTTP/3 unless `http3 = false`,
+performs SNI-based virtual-host routing, and forwards each request as
+cleartext HTTP to a per-route backend URL. Each `[[rule.route]]` table is
+one virtual host.
+
+HTTPS rules with `http3` enabled (the default) automatically listen on both
+TCP and UDP `(ip, port)`. The QUIC listener shares the rule's cert
+resolution and route table with the TCP path.
+
+When the terminal publishes the rule through the chain, operators no longer
+need to manually create matching TCP/443 plus UDP/443 passthrough rules on
+the relay. A terminal HTTPS rule publishes one HTTPS predicate; the relay
+derives TCP for the TLS listener and, when HTTP/3 is enabled, UDP with a
+30s idle timeout for QUIC datagrams. Certificate resolution remains
+terminal-only; the relay is L4 passthrough on both transports.
 
 | Key              | Type        | Default              | Notes                                                                                                       |
 | ---------------- | ----------- | -------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `hostname`       | DNS name    | **required**         | SNI / `Host:` value. Case-insensitive. Globally unique across all https routes.                             |
-| `upstream`       | `http://…`  | **required**         | Backend URL. Cleartext HTTP only — the encrypted leg ends at the relay.                                     |
+| `target`         | `http://…`  | **required**         | Backend URL. Cleartext HTTP only — the encrypted leg ends at the terminal HTTPS frontend.                   |
 | `cert`           | path or `"ephemeral"` | unset      | Per-route certificate. A path PEM pairs with `key`. The literal string `"ephemeral"` generates a self-signed cert in memory — only valid for localhost-shaped hostnames (testing). |
 | `key`            | path        | unset                | Per-route private key PEM. Must accompany a path-style `cert`; forbidden with `cert = "ephemeral"`.         |
 | `hsts`           | bool/table  | `false`              | `true` ⇒ default `Strict-Transport-Security` header. Table form (`max_age`, `include_subdomains`, `preload`) gives fine control. |

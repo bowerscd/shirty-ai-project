@@ -98,11 +98,19 @@ struct EchoBackend {
 
 impl EchoBackend {
     async fn spawn(label: &'static str) -> Self {
+        Self::spawn_with_headers(label, Vec::new()).await
+    }
+
+    async fn spawn_with_headers(
+        label: &'static str,
+        response_headers: Vec<(&'static str, &'static str)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let req_clone = Arc::clone(&requests);
         let body_label = format!("echo:{label}");
+        let response_headers = Arc::new(response_headers);
         let handle = tokio::spawn(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
@@ -111,10 +119,12 @@ impl EchoBackend {
                 };
                 let req_clone2 = Arc::clone(&req_clone);
                 let body_label2 = body_label.clone();
+                let response_headers2 = Arc::clone(&response_headers);
                 tokio::spawn(async move {
                     let svc = service_fn(move |mut req: HyperReq<Incoming>| {
                         let req_clone3 = Arc::clone(&req_clone2);
                         let body_label3 = body_label2.clone();
+                        let response_headers3 = Arc::clone(&response_headers2);
                         async move {
                             let mut captured = CapturedRequest {
                                 method: req.method().to_string(),
@@ -136,11 +146,13 @@ impl EchoBackend {
                                 .unwrap_or_default();
                             captured.body = body_bytes.to_vec();
                             req_clone3.lock().await.push(captured);
-                            let resp = HyperResp::builder()
+                            let mut builder = HyperResp::builder()
                                 .status(StatusCode::OK)
-                                .header("content-type", "text/plain")
-                                .body(Full::new(Bytes::from(body_label3)))
-                                .unwrap();
+                                .header("content-type", "text/plain");
+                            for (name, value) in response_headers3.iter() {
+                                builder = builder.header(*name, *value);
+                            }
+                            let resp = builder.body(Full::new(Bytes::from(body_label3))).unwrap();
                             Ok::<_, Infallible>(resp)
                         }
                     });
@@ -270,9 +282,23 @@ where
     Ok(buf)
 }
 
+fn http1_header(resp: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(resp);
+    text.split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+}
+
 /// Write an HTTPS rule file to `rules_dir` with two routes pointing at
 /// the supplied backend URLs. Both routes use `cert = "ephemeral"`.
-fn write_https_rule_two_routes(
+#[allow(clippy::too_many_arguments)]
+fn write_https_rule_two_routes_with_options(
     rules_dir: &Path,
     rule_name: &str,
     listen: SocketAddr,
@@ -280,6 +306,7 @@ fn write_https_rule_two_routes(
     api_target: &str,
     app_host: &str,
     app_target: &str,
+    rule_options: &str,
 ) {
     let toml = format!(
         r#"
@@ -287,7 +314,7 @@ fn write_https_rule_two_routes(
 name = "{rule_name}"
 protocol = "https"
 listen = "{listen}"
-
+{rule_options}
 [[rule.route]]
 hostname = "{api_host}"
 target = "{api_target}"
@@ -364,6 +391,13 @@ struct TwoRouteFixture {
 
 impl TwoRouteFixture {
     async fn spawn() -> Self {
+        Self::spawn_with_options("", Vec::new()).await
+    }
+
+    async fn spawn_with_options(
+        rule_options: &str,
+        api_response_headers: Vec<(&'static str, &'static str)>,
+    ) -> Self {
         init_tracing();
         // Each test gets unique hostnames so they can't collide when
         // running in parallel (they all share `127.0.0.1`).
@@ -371,7 +405,7 @@ impl TwoRouteFixture {
         let api_host = format!("api{suffix}.localhost");
         let app_host = format!("app{suffix}.localhost");
 
-        let api = EchoBackend::spawn("api").await;
+        let api = EchoBackend::spawn_with_headers("api", api_response_headers).await;
         let app = EchoBackend::spawn("app").await;
 
         let tmpdir = tempfile::tempdir().unwrap();
@@ -388,7 +422,7 @@ impl TwoRouteFixture {
         let redirect_port = pick_free_tcp_port().await;
         let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
 
-        write_https_rule_two_routes(
+        write_https_rule_two_routes_with_options(
             &rules_dir,
             "front",
             frontend_addr,
@@ -396,6 +430,7 @@ impl TwoRouteFixture {
             &api.upstream_url(),
             &app_host,
             &app.upstream_url(),
+            rule_options,
         );
 
         let shutdown = CancellationToken::new();
@@ -560,6 +595,88 @@ async fn matched_sni_unknown_host_returns_404() {
     fx.stop().await;
 }
 
+#[tokio::test]
+async fn default_https_responses_include_alt_svc() {
+    let fx = TwoRouteFixture::spawn().await;
+    let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
+        .await
+        .unwrap();
+    let resp = http1_request(&mut tls, Some(&fx.api_host), &[], "/")
+        .await
+        .unwrap();
+    let expected = format!("h3=\":{}\"; ma=86400", fx.frontend_addr.port());
+    assert_eq!(
+        http1_header(&resp, "alt-svc").as_deref(),
+        Some(expected.as_str())
+    );
+    fx.stop().await;
+}
+
+#[tokio::test]
+async fn alt_svc_false_suppresses_alt_svc_header() {
+    let fx = TwoRouteFixture::spawn_with_options("alt_svc = false\n", Vec::new()).await;
+    let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
+        .await
+        .unwrap();
+    let resp = http1_request(&mut tls, Some(&fx.api_host), &[], "/")
+        .await
+        .unwrap();
+    assert_eq!(http1_header(&resp, "alt-svc"), None);
+    fx.stop().await;
+}
+
+#[tokio::test]
+async fn http3_false_suppresses_alt_svc_header() {
+    let fx = TwoRouteFixture::spawn_with_options("http3 = false\n", Vec::new()).await;
+    let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
+        .await
+        .unwrap();
+    let resp = http1_request(&mut tls, Some(&fx.api_host), &[], "/")
+        .await
+        .unwrap();
+    assert_eq!(http1_header(&resp, "alt-svc"), None);
+    fx.stop().await;
+}
+
+#[tokio::test]
+async fn upstream_alt_svc_header_is_preserved() {
+    let upstream_alt_svc = "h3=\":9443\"; ma=123";
+    let fx = TwoRouteFixture::spawn_with_options("", vec![("alt-svc", upstream_alt_svc)]).await;
+    let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
+        .await
+        .unwrap();
+    let resp = http1_request(&mut tls, Some(&fx.api_host), &[], "/")
+        .await
+        .unwrap();
+    assert_eq!(
+        http1_header(&resp, "alt-svc").as_deref(),
+        Some(upstream_alt_svc)
+    );
+    fx.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_host_404_includes_alt_svc() {
+    let fx = TwoRouteFixture::spawn().await;
+    let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
+        .await
+        .unwrap();
+    let resp = http1_request(&mut tls, Some("nowhere.localhost"), &[], "/")
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&resp);
+    assert!(
+        body.starts_with("HTTP/1.1 404"),
+        "expected 404, got: {body}"
+    );
+    let expected = format!("h3=\":{}\"; ma=86400", fx.frontend_addr.port());
+    assert_eq!(
+        http1_header(&resp, "alt-svc").as_deref(),
+        Some(expected.as_str())
+    );
+    fx.stop().await;
+}
+
 /// §6h(8): the route's backend is unreachable → 502.
 #[tokio::test]
 async fn dead_backend_returns_502() {
@@ -617,6 +734,11 @@ cert = "ephemeral"
     assert!(
         body.starts_with("HTTP/1.1 502"),
         "expected 502, got: {body}"
+    );
+    let expected = format!("h3=\":{}\"; ma=86400", frontend_addr.port());
+    assert_eq!(
+        http1_header(&resp, "alt-svc").as_deref(),
+        Some(expected.as_str())
     );
     shutdown.cancel();
 }

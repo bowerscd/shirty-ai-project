@@ -946,8 +946,11 @@ mod tests {
             target_host: None,
             proxy_protocol: None,
             idle_timeout: None,
+            udp_workers: None,
             routes: Some(routes),
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 

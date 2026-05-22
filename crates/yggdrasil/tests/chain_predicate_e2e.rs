@@ -81,6 +81,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
         Duration::from_millis(50),
         ResolverFactory::new_relay(peer_state.clone()),
         Some("127.0.0.1".parse().unwrap()),
+        None,
         CertConfig::default(),
         cancel.clone(),
     )
@@ -124,6 +125,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
             listen_port,
             protocol: Protocol::Tcp,
             idle_timeout_ms: None,
+            https_http3: false,
         }],
         version: 1,
         origin,
@@ -168,6 +170,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
             listen_port,
             protocol: Protocol::Tcp,
             idle_timeout_ms: None,
+            https_http3: false,
         }],
         version: 1,
         origin,
@@ -222,6 +225,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
         Duration::from_millis(50),
         ResolverFactory::new_relay(peer_state.clone()),
         Some("127.0.0.1".parse().unwrap()),
+        None,
         CertConfig::default(),
         cancel.clone(),
     )

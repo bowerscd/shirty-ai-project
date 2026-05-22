@@ -233,6 +233,7 @@ pub async fn spawn_supervisor(
         debounce,
         ResolverFactory::new_relay(peer_state),
         None,
+        None,
         CertConfig::default(),
         shutdown,
     )
@@ -252,6 +253,7 @@ pub async fn spawn_terminal_supervisor(
         rules_dir,
         debounce,
         ResolverFactory::new_terminal(),
+        None,
         None,
         CertConfig::default(),
         shutdown,
@@ -273,6 +275,7 @@ pub async fn spawn_terminal_supervisor_with_certs(
         rules_dir,
         debounce,
         ResolverFactory::new_terminal(),
+        None,
         None,
         cert_config,
         shutdown,

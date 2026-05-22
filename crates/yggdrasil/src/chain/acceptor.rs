@@ -280,10 +280,10 @@ impl ChainAcceptor {
             .increment(1);
             return AckStatus::Reject(predicate_reject::PREDICATE_SET_TOO_LARGE);
         }
-        let set: PredicateSet = match postcard::from_bytes(body) {
+        let set: PredicateSet = match PredicateSet::from_wire_bytes(body) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, "predicate set decode failed");
+                tracing::warn!(error = %e, "predicate set decode/validation failed");
                 metrics::counter!(
                     "yggdrasil_chain_predicate_recv_total",
                     "outcome" => "decode_error",
@@ -699,6 +699,7 @@ mod tests {
                 listen_port: *p,
                 protocol: Protocol::Tcp,
                 idle_timeout_ms: None,
+                https_http3: false,
             })
             .collect();
         predicates.sort_by(|a, b| a.name.cmp(&b.name));
@@ -726,6 +727,7 @@ mod tests {
             Duration::from_millis(50),
             factory,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None,
             CertConfig::default(),
             cancel,
         )

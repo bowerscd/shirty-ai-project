@@ -74,6 +74,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
         Duration::from_millis(50),
         ResolverFactory::new_relay(peer_state.clone()),
         Some("127.0.0.1".parse().unwrap()),
+        None,
         CertConfig::default(),
         cancel.clone(),
     )
@@ -130,6 +131,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
             listen_port,
             protocol: Protocol::Tcp,
             idle_timeout_ms: None,
+            https_http3: false,
         }],
         version: 1,
         origin,

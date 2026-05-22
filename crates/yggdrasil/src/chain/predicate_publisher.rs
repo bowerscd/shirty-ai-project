@@ -2,8 +2,7 @@
 //!
 //! Watches the proxy supervisor's `current_set` channel; on each applied
 //! [`RuleSet`] the publisher projects to a [`PredicateSet`], dedupes by
-//! the projected predicates list (so HTTPS-only diffs are filtered out),
-//! and pushes the result to the upstream relay via
+//! the projected predicates list, and pushes the result to the upstream relay via
 //! [`ChainClientHandle::send_control`] as a
 //! [`ControlBodyType::PredicateSetUpdate`] envelope.
 //!
@@ -195,13 +194,6 @@ async fn publish_one(
 ) -> Option<AppliedPush> {
     let outcome = predicate_extractor::extract(set, origin, next_version);
     let predicate_set = outcome.set;
-    if !outcome.skipped_https.is_empty() {
-        tracing::debug!(
-            count = outcome.skipped_https.len(),
-            names = ?outcome.skipped_https,
-            "skipped HTTPS rules during predicate extraction"
-        );
-    }
 
     // Dedup against the last successfully-sent predicates list. Identical
     // predicates → no wire push; the persisted upstream state is already
@@ -441,9 +433,12 @@ mod tests {
             target_addr: None,
             target_host: None,
             idle_timeout: None,
+            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,
+            http3: None,
+            alt_svc: None,
         }
     }
 

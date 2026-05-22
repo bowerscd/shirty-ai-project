@@ -7,6 +7,8 @@
 #![allow(dead_code)] // wired into run() in the supervisor pass
 
 pub mod certs;
+pub mod forward;
+pub mod h3_frontend;
 pub mod http_frontend;
 pub mod proxy_protocol;
 pub mod resolver;

@@ -279,35 +279,99 @@ benefit and bulk-byte workloads are unaffected.
 
 The interesting one — UDP has no inherent connection, so we build one.
 
-* One `Arc<UdpSocket>` per rule, bound to `rule.listen`. We deliberately
-  reuse the same kernel socket for outbound responses so the client sees
-  the same source IP:port pair across the whole flow.
-* A `DashMap<SocketAddr, Arc<FlowEntry>>` keyed by client address. Each
-  `FlowEntry` owns a freshly-bound ephemeral UDP socket connected to the
-  resolved upstream, plus an `AbortHandle` for the `upstream_to_client_loop`
-  task.
+* Each UDP rule runs N workers (defaulting to `available_parallelism()`,
+  configurable via `[server].udp_workers` global or per-rule `udp_workers`).
+  For multi-worker fan-out, each worker binds its own `UdpSocket` to
+  `(ip, port)` with `SO_REUSEADDR + SO_REUSEPORT`; the kernel hashes inbound
+  4-tuples consistently across the workers so a given client always lands on
+  the same worker. The flow table is sharded per-worker, so each worker reads
+  + writes its own `DashMap` shard without cross-worker contention. On
+  platforms without `SO_REUSEPORT` fan-out, the proxy runs one worker.
+* Each `FlowEntry` owns a freshly-bound ephemeral UDP socket connected to the
+  resolved upstream, the originating worker's frontend socket, plus an
+  `AbortHandle` for the `upstream_to_client_loop` task.
 * Inbound packets from a known client: update `last_seen_ms`, forward.
   Unknown client: resolve dial target (drop if `None` in relay mode),
   bind ephemeral socket, spawn the return-path task, insert atomically
-  via `DashMap::entry`, forward.
+  via the worker's `DashMap::entry`, forward.
+* Return-path datagrams use the originating worker's frontend socket via
+  `send_to(client)` — this preserves the client's NAT mapping (the source
+  port the client first contacted is the source port the reply comes from).
+* On Linux, each worker uses `libc::recvmmsg` to drain up to 32 datagrams per
+  syscall (`proxy::udp::recvmmsg_linux`). On non-Linux, and when `recvmmsg`
+  returns `ENOSYS` / `EPERM` at runtime, the worker falls back to
+  per-datagram `recv_from`.
 * A reaper task wakes periodically and evicts flows older than the rule's
   `idle_timeout` (default 60s, configurable per rule).
 * A separate **`ipchange_loop`** task subscribes to `peer_state.watch()`.
-  When the channel fires (real IP change), it drains every flow:
-  `flows.retain(|_, e| { e.upstream_task.abort(); false })`. Subsequent
-  client packets bind fresh sockets pointed at the new IP. (Relay only;
-  terminal-mode rules dial fixed addresses and have no `ipchange_loop`.)
+  When the channel fires (real IP change), it drains every worker shard and
+  aborts each upstream task. Subsequent client packets bind fresh sockets
+  pointed at the new IP. (Relay only; terminal-mode rules dial fixed
+  addresses and have no `ipchange_loop`.)
 
 The structural reason same-IP heartbeats are cheap is that the watch
 channel never fires for them — `ipchange_loop` is parked, the reaper is
-unaffected, and the frontend recv loop never even reads `peer_state` for
-known clients (it just hashes into `DashMap`).
+unaffected, and the frontend worker recv loops never even read `peer_state`
+for known clients (they just hit the worker's local `DashMap` shard).
 
-### HTTPS (`proxy/http_frontend.rs`)
+### HTTPS (`proxy/http_frontend.rs`, `proxy/h3_frontend.rs`)
 
-L7 frontend, relay-only. Terminates TLS, performs SNI-based virtual-host
-routing, and forwards each request as cleartext HTTP to a per-route
-backend URL. See [configuration.md → HTTPS rules](configuration.md#https-rules).
+Terminal-side HTTPS rules are the L7 frontend: they resolve certificates,
+terminate TLS for HTTP/1.1 and HTTP/2, terminate QUIC/TLS for HTTP/3 when
+HTTP/3 is enabled, perform SNI / `Host:` virtual-host routing, and forward
+requests as cleartext HTTP to per-route backend URLs. Certificate
+resolution stays terminal-only.
+
+#### HTTPS-predicate derivation
+
+When predicates flow upward, each terminal HTTPS rule publishes an HTTPS
+predicate with a `https_http3` flag. The relay derives a `(Tcp, port)`
+listener for every HTTPS predicate. When `https_http3 = true`, it also
+derives a `(Udp, port)` listener with `idle_timeout = 30s`. TCP carries
+TLS-wrapped HTTP/1.1 and HTTP/2; UDP carries QUIC datagrams for HTTP/3.
+The relay is L4 passthrough on both transports: it does not resolve
+certificates or inspect TLS / QUIC payloads.
+
+For multi-hop chain traffic, `X-Forwarded-For` headers injected by the
+terminal's HTTPS frontend show the immediate upstream relay's IP, not the
+real client's IP. The relay-side PROXY-protocol mechanism that addresses
+this for plain TCP HTTPS rules does not yet have an equivalent for UDP /
+QUIC traffic (PROXY v2 over UDP datagrams). This is a documented
+limitation, not a regression — the same behavior applies to TCP HTTPS rules
+today when `proxy_protocol` is not set. See
+[configuration.md → HTTPS rules](configuration.md#https-rules).
+
+#### HTTP/3 (QUIC)
+
+Each HTTPS rule with `http3 != Some(false)` auto-opens a QUIC endpoint on
+UDP `(rule.listen.ip(), rule.listen.port())` alongside the TCP TLS
+listener. The QUIC path uses `quinn` 0.11 + `h3` 0.0.8 + `h3-quinn` over
+the same `rustls 0.23` server config built by
+`build_rustls_server_config` (ALPN `h3` vs `["h2", "http/1.1"]` for TCP)
+— cert resolution propagates automatically across both transports because
+both hold an `Arc<dyn ResolvesServerCert>` pointing at the same
+`CertStore`.
+
+Connection migration is on; 0-RTT is explicitly off (per-route opt-in
+machinery isn't in this phase — replay-safety would require it). Idle
+timeout is 30 s with 15 s keep-alive PINGs; concurrent bidi streams cap is
+256 per connection.
+
+Per-request handling mirrors the TCP path byte-for-byte: extract
+`:authority`, look up the route, sanitise inbound headers, inject
+`X-Forwarded-For/Proto/Host` + `X-Real-IP`, rewrite the URI authority to
+the backend, dispatch via the shared `hyper-util` `LegacyClient`
+(HTTP/1.1 cleartext to LAN). Request bodies are buffered up to 16 MiB
+(`H3_REQUEST_BODY_LIMIT`); larger uploads get 413. Response bodies stream
+back in 8 KiB chunks via `send_data`.
+
+WebSocket-over-h3 (RFC 9220 extended CONNECT) is **not** supported — any
+CONNECT receives 501 with `Sec-WebSocket-Version: 13` so the client falls
+back to the HTTP/2 WS handshake on the TCP path.
+
+The TCP HTTPS path injects `Alt-Svc: h3=":<port>"; ma=86400` on every
+response so capable clients upgrade to HTTP/3 on the next request.
+Disabled per-rule via `alt_svc = false`.
 
 ## Rules: hot reload (terminal-side)
 

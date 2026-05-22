@@ -43,6 +43,9 @@ pub enum Error {
     #[error("invalid pubkey: {0}")]
     InvalidPubKey(String),
 
+    #[error("invalid predicate: {0}")]
+    InvalidPredicate(String),
+
     // ---- Crypto ----
     #[error("noise protocol error: {0}")]
     Noise(#[from] snow::Error),

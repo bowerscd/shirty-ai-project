@@ -86,8 +86,11 @@
 //! * `name` is non-empty and contains no whitespace or control characters.
 //! * `idle_timeout` is only meaningful for UDP; setting it on a TCP or
 //!   HTTPS rule is rejected.
+//! * `udp_workers` is only meaningful for UDP; `Some(0)` is rejected.
 //! * `proxy_protocol` is only meaningful for TCP; setting it on a UDP or
 //!   HTTPS rule is rejected.
+//! * `http3` and `alt_svc` are only meaningful for HTTPS; setting either on
+//!   TCP or UDP is rejected. `alt_svc = true` with `http3 = false` is rejected.
 //! * `listen` port must be non-zero (binding to port 0 makes no sense for a
 //!   fixed-listener proxy).
 //! * For `protocol = "tcp" | "udp"`: exactly one of `target_port` /
@@ -100,17 +103,17 @@
 //!   passes through verbatim).
 //! * For `protocol = "https"`: `routes` is present and non-empty;
 //!   `target_port` / `target_addr` / `target_host` / `proxy_protocol`
-//!   / `idle_timeout` are all absent. Per-route invariants: hostname is a syntactically
-//!   valid DNS name (no duplicates within the rule); `target` URL scheme
+//!   / `idle_timeout` / `udp_workers` are all absent. Per-route invariants:
+//!   hostname is a syntactically valid DNS name (no duplicates within the rule); `target` URL scheme
 //!   is `"http"` with explicit host + port; `cert` as a path requires `key`
 //!   alongside; `cert = "ephemeral"` requires the hostname to match
 //!   `localhost`, `*.localhost`, or `*.local`.
 //!
 //! Cross-file:
 //! * `name` must be globally unique.
-//! * `listen` socket address must be globally unique (no two rules can claim
-//!   the same `(ip, port, protocol)` triple — different protocols *can* share
-//!   `(ip, port)`).
+//! * `listen` socket claims must be globally unique: no two rules can claim
+//!   the same `(ip, port, protocol)` triple. TCP and UDP may share `(ip, port)`,
+//!   but HTTPS claims both TCP and UDP on its `(ip, port)` for HTTP/3.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -541,6 +544,11 @@ pub struct Rule {
     /// Default applied at load time (see [`Rule::resolved_idle_timeout`]).
     #[serde(default, with = "humantime_serde::option")]
     pub idle_timeout: Option<Duration>,
+    /// UDP only: per-rule frontend worker-count override. `None` inherits from
+    /// `[server].udp_workers`; `Some(0)` is rejected. Setting this on a non-UDP
+    /// rule is rejected because it is only meaningful when `protocol = "udp"`.
+    #[serde(default)]
+    pub udp_workers: Option<usize>,
     /// TCP only: emit a PROXY-protocol header to the upstream before forwarding.
     /// Rejected when `target_addr` or `target_host` is set (terminal rules
     /// must not synthesise PROXY-protocol headers; relay-written headers pass
@@ -555,6 +563,22 @@ pub struct Rule {
     /// rule's routes. Absent → fall back to `[server].cert_dir`.
     #[serde(default)]
     pub cert_dir: Option<PathBuf>,
+
+    // --- HTTPS L7 options ---
+    /// HTTPS-only: when `Some(false)`, suppress the HTTP/3 listener for this
+    /// rule. `None` and `Some(true)` are equivalent (HTTP/3 enabled).
+    /// Setting this field on a non-HTTPS rule is rejected at validation.
+    #[serde(default)]
+    pub http3: Option<bool>,
+
+    /// HTTPS-only: when `Some(false)`, suppress the `Alt-Svc: h3=...` header
+    /// on TCP HTTPS responses for this rule. `None` and `Some(true)` are
+    /// equivalent (header emitted). If this field is absent and `http3 = false`,
+    /// the header is implicitly suppressed. Setting `alt_svc = true` together
+    /// with `http3 = false` is rejected (an Alt-Svc header pointing nowhere is
+    /// a footgun). Setting this field on a non-HTTPS rule is rejected.
+    #[serde(default)]
+    pub alt_svc: Option<bool>,
 }
 
 /// Default UDP idle timeout if a rule does not specify one.
@@ -583,6 +607,12 @@ impl Rule {
                 self.name
             )));
         }
+        if matches!(self.udp_workers, Some(0)) {
+            return Err(Error::InvalidRule(format!(
+                "rule {:?}: udp_workers must be >= 1 when set",
+                self.name
+            )));
+        }
         match self.protocol {
             Protocol::Tcp | Protocol::Udp => self.validate_l4(),
             Protocol::Https => self.validate_l7(),
@@ -601,6 +631,18 @@ impl Rule {
         if self.cert_dir.is_some() {
             return Err(Error::InvalidRule(format!(
                 "rule {:?}: `cert_dir` is only valid for protocol = \"https\"",
+                self.name
+            )));
+        }
+        if self.http3.is_some() {
+            return Err(Error::InvalidRule(format!(
+                "rule {:?}: `http3` is only meaningful for `protocol = \"https\"` rules",
+                self.name
+            )));
+        }
+        if self.alt_svc.is_some() {
+            return Err(Error::InvalidRule(format!(
+                "rule {:?}: `alt_svc` is only meaningful for `protocol = \"https\"` rules",
                 self.name
             )));
         }
@@ -668,6 +710,12 @@ impl Rule {
                         self.name
                     )));
                 }
+                if self.udp_workers.is_some() {
+                    return Err(Error::InvalidRule(format!(
+                        "rule {:?}: udp_workers is only meaningful for UDP rules",
+                        self.name
+                    )));
+                }
             }
             Protocol::Udp => {
                 if self.proxy_protocol.is_some() {
@@ -716,6 +764,18 @@ impl Rule {
         if self.idle_timeout.is_some() {
             return Err(Error::InvalidRule(format!(
                 "rule {:?}: `idle_timeout` is only valid for udp rules",
+                self.name
+            )));
+        }
+        if self.udp_workers.is_some() {
+            return Err(Error::InvalidRule(format!(
+                "rule {:?}: udp_workers is only meaningful for UDP rules",
+                self.name
+            )));
+        }
+        if self.alt_svc == Some(true) && self.http3 == Some(false) {
+            return Err(Error::InvalidRule(format!(
+                "rule {:?}: `alt_svc = true` is incompatible with `http3 = false` — an Alt-Svc header would advertise a non-existent listener",
                 self.name
             )));
         }
@@ -1054,18 +1114,38 @@ impl RuleSet {
             }
         }
 
-        // Duplicate listen-addr+protocol check.
+        // Duplicate listen claim check. TCP and UDP can share an address, but
+        // HTTPS also claims UDP on the same port for HTTP/3.
         {
-            let mut seen = std::collections::HashSet::<(SocketAddr, Protocol)>::new();
+            let mut listens = std::collections::HashMap::<SocketAddr, Vec<(&str, Protocol)>>::new();
             for r in &rules {
-                if !seen.insert((r.listen, r.protocol)) {
-                    return Err(Error::InvalidRule(format!(
-                        "duplicate listen address {} for protocol {} (rule {:?})",
-                        r.listen,
-                        r.protocol.as_str(),
-                        r.name
-                    )));
+                if let Some(existing) = listens.get(&r.listen) {
+                    for (other_name, other_proto) in existing {
+                        if r.protocol == *other_proto {
+                            return Err(Error::InvalidRule(format!(
+                                "duplicate listen address {} for protocol {} (rules {:?} and {:?})",
+                                r.listen,
+                                r.protocol.as_str(),
+                                r.name,
+                                other_name
+                            )));
+                        }
+                        if r.protocol == Protocol::Https || *other_proto == Protocol::Https {
+                            return Err(Error::InvalidRule(format!(
+                                "rules {:?} ({}) and {:?} ({}) share listen address {}; HTTPS rules implicitly claim both TCP and UDP on the port (HTTP/3 listens on UDP), so no other rule may share the same (ip, port)",
+                                r.name,
+                                r.protocol.as_str(),
+                                other_name,
+                                other_proto.as_str(),
+                                r.listen
+                            )));
+                        }
+                    }
                 }
+                listens
+                    .entry(r.listen)
+                    .or_default()
+                    .push((r.name.as_str(), r.protocol));
             }
         }
 
@@ -1184,6 +1264,7 @@ mod tests {
         assert_eq!(r.target_port, Some(22));
         assert_eq!(r.target_addr, None);
         assert_eq!(r.idle_timeout, None);
+        assert_eq!(r.udp_workers, None);
         assert_eq!(r.proxy_protocol, None);
         f.validate_each().unwrap();
     }
@@ -1267,6 +1348,64 @@ mod tests {
         .unwrap();
         assert_eq!(f.rule[0].proxy_protocol, Some(ProxyProto::V2));
         f.validate_each().unwrap();
+    }
+
+    #[test]
+    fn parses_udp_rule_with_udp_workers() {
+        let f = parse(
+            r#"
+            [[rule]]
+            name = "dns"
+            listen = "0.0.0.0:53"
+            protocol = "udp"
+            target_port = 53
+            udp_workers = 4
+            "#,
+        )
+        .unwrap();
+        f.validate_each().unwrap();
+        assert_eq!(f.rule[0].udp_workers, Some(4));
+
+        let toml = toml::to_string(&f).unwrap();
+        let back = parse(&toml).unwrap();
+        back.validate_each().unwrap();
+        assert_eq!(back.rule[0].udp_workers, Some(4));
+    }
+
+    #[test]
+    fn rejects_zero_udp_workers() {
+        let f = parse(
+            r#"
+            [[rule]]
+            name = "dns"
+            listen = "0.0.0.0:53"
+            protocol = "udp"
+            target_port = 53
+            udp_workers = 0
+            "#,
+        )
+        .unwrap();
+        let err = f.validate_each().err();
+        assert!(matches!(err, Some(Error::InvalidRule(s))
+            if s.contains("udp_workers must be >= 1 when set")));
+    }
+
+    #[test]
+    fn rejects_udp_workers_on_tcp_rule() {
+        let f = parse(
+            r#"
+            [[rule]]
+            name = "ssh"
+            listen = "0.0.0.0:22"
+            protocol = "tcp"
+            target_port = 22
+            udp_workers = 4
+            "#,
+        )
+        .unwrap();
+        let err = f.validate_each().err();
+        assert!(matches!(err, Some(Error::InvalidRule(s))
+            if s.contains("udp_workers is only meaningful for UDP rules")));
     }
 
     #[test]
@@ -1644,57 +1783,119 @@ mod tests {
         assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("duplicate rule name")));
     }
 
-    #[test]
-    fn rule_set_rejects_duplicate_listen_within_protocol() {
-        let a = parse(
+    fn l4_rule_file(name: &str, listen: &str, protocol: Protocol) -> RuleFile {
+        parse(&format!(
             r#"
             [[rule]]
-            name = "x"
-            listen = "0.0.0.0:1111"
-            protocol = "tcp"
-            target_port = 1
+            name = "{name}"
+            listen = "{listen}"
+            protocol = "{}"
+            target_port = 53
             "#,
-        )
-        .unwrap();
-        let b = parse(
+            protocol.as_str()
+        ))
+        .unwrap()
+    }
+
+    fn https_rule_file(name: &str, listen: &str) -> RuleFile {
+        let hostname = name.replace('_', "-");
+        parse(&format!(
             r#"
             [[rule]]
-            name = "y"
-            listen = "0.0.0.0:1111"
-            protocol = "tcp"
-            target_port = 2
+            name = "{name}"
+            listen = "{listen}"
+            protocol = "https"
+
+              [[rule.route]]
+              hostname = "{hostname}.local"
+              target = "http://127.0.0.1:8080"
+              cert     = "ephemeral"
             "#,
-        )
-        .unwrap();
-        let err = RuleSet::from_files([a, b]).err();
-        assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("duplicate listen")));
+        ))
+        .unwrap()
     }
 
     #[test]
-    fn rule_set_allows_same_listen_addr_across_different_protocols() {
-        // tcp and udp can share `(ip, port)` — different sockets entirely.
-        let a = parse(
-            r#"
-            [[rule]]
-            name = "x-tcp"
-            listen = "0.0.0.0:53"
-            protocol = "tcp"
-            target_port = 53
-            "#,
-        )
+    fn rule_set_allows_tcp_and_udp_on_same_listen_addr() {
+        let set = RuleSet::from_files([
+            l4_rule_file("dns-tcp", "0.0.0.0:53", Protocol::Tcp),
+            l4_rule_file("dns-udp", "0.0.0.0:53", Protocol::Udp),
+        ])
         .unwrap();
-        let b = parse(
-            r#"
-            [[rule]]
-            name = "x-udp"
-            listen = "0.0.0.0:53"
-            protocol = "udp"
-            target_port = 53
-            "#,
-        )
-        .unwrap();
-        let set = RuleSet::from_files([a, b]).unwrap();
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn rule_set_allows_https_rules_on_different_ports() {
+        let set = RuleSet::from_files([
+            https_rule_file("https-443", "0.0.0.0:443"),
+            https_rule_file("https-8443", "0.0.0.0:8443"),
+        ])
+        .unwrap();
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn rule_set_allows_https_and_udp_on_different_ips_same_port() {
+        let set = RuleSet::from_files([
+            https_rule_file("https-a", "192.0.2.1:443"),
+            l4_rule_file("udp-b", "192.0.2.2:443", Protocol::Udp),
+        ])
+        .unwrap();
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn rule_set_rejects_https_and_tcp_on_same_listen_addr() {
+        let err = RuleSet::from_files([
+            https_rule_file("https-web", "0.0.0.0:443"),
+            l4_rule_file("tcp-web", "0.0.0.0:443", Protocol::Tcp),
+        ])
+        .unwrap_err();
+        let Error::InvalidRule(msg) = err else {
+            panic!("expected InvalidRule");
+        };
+        assert!(msg.contains("\"https-web\""), "got: {msg}");
+        assert!(msg.contains("\"tcp-web\""), "got: {msg}");
+        assert!(msg.contains("(https)"), "got: {msg}");
+        assert!(msg.contains("(tcp)"), "got: {msg}");
+        assert!(
+            msg.contains("HTTPS rules implicitly claim both TCP and UDP"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rule_set_rejects_https_and_udp_on_same_listen_addr() {
+        let err = RuleSet::from_files([
+            l4_rule_file("udp-web", "0.0.0.0:443", Protocol::Udp),
+            https_rule_file("https-web", "0.0.0.0:443"),
+        ])
+        .err();
+        assert!(matches!(err, Some(Error::InvalidRule(s))
+            if s.contains("HTTPS rules implicitly claim both TCP and UDP")));
+    }
+
+    #[test]
+    fn rule_set_rejects_two_https_rules_on_same_listen_addr() {
+        let err = RuleSet::from_files([
+            https_rule_file("https-a", "0.0.0.0:443"),
+            https_rule_file("https-b", "0.0.0.0:443"),
+        ])
+        .err();
+        assert!(matches!(err, Some(Error::InvalidRule(s))
+            if s.contains("duplicate listen address") && s.contains("protocol https")));
+    }
+
+    #[test]
+    fn rule_set_rejects_two_tcp_rules_on_same_listen_addr() {
+        let err = RuleSet::from_files([
+            l4_rule_file("tcp-a", "0.0.0.0:1111", Protocol::Tcp),
+            l4_rule_file("tcp-b", "0.0.0.0:1111", Protocol::Tcp),
+        ])
+        .err();
+        assert!(matches!(err, Some(Error::InvalidRule(s))
+            if s.contains("duplicate listen address") && s.contains("protocol tcp")));
     }
 
     #[test]
@@ -1725,6 +1926,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.rule[0].idle_timeout, None);
+        assert_eq!(f.rule[0].udp_workers, None);
         assert_eq!(f.rule[0].resolved_idle_timeout(), DEFAULT_UDP_IDLE_TIMEOUT);
     }
 
@@ -2441,5 +2643,150 @@ mod tests {
         let v = serde_json::to_string(&p).unwrap();
         assert_eq!(v, "\"https\"");
         assert_eq!(p.as_str(), "https");
+    }
+
+    fn https_rule_with_options(extra: &str) -> String {
+        format!(
+            r#"
+            [[rule]]
+            name = "h"
+            listen = "0.0.0.0:443"
+            protocol = "https"
+            {extra}
+
+              [[rule.route]]
+              hostname = "app.local"
+              target = "http://127.0.0.1:8080"
+              cert     = "ephemeral"
+            "#,
+        )
+    }
+
+    #[test]
+    fn https_rule_parses_http3_true() {
+        let r = parse_one(&https_rule_with_options("http3 = true")).unwrap();
+        r.validate().unwrap();
+        assert_eq!(r.http3, Some(true));
+        assert_eq!(r.alt_svc, None);
+    }
+
+    #[test]
+    fn https_rule_parses_http3_false() {
+        let r = parse_one(&https_rule_with_options("http3 = false")).unwrap();
+        r.validate().unwrap();
+        assert_eq!(r.http3, Some(false));
+        assert_eq!(r.alt_svc, None);
+    }
+
+    #[test]
+    fn https_rule_defaults_h3_options_to_absent() {
+        let r = parse_one(&https_rule_with_options("")).unwrap();
+        r.validate().unwrap();
+        assert_eq!(r.http3, None);
+        assert_eq!(r.alt_svc, None);
+    }
+
+    #[test]
+    fn https_rule_accepts_http3_false_and_alt_svc_false() {
+        let r = parse_one(&https_rule_with_options(
+            "http3 = false\n            alt_svc = false",
+        ))
+        .unwrap();
+        r.validate().unwrap();
+        assert_eq!(r.http3, Some(false));
+        assert_eq!(r.alt_svc, Some(false));
+    }
+
+    #[test]
+    fn https_rule_accepts_alt_svc_true_alone() {
+        let r = parse_one(&https_rule_with_options("alt_svc = true")).unwrap();
+        r.validate().unwrap();
+        assert_eq!(r.http3, None);
+        assert_eq!(r.alt_svc, Some(true));
+    }
+
+    #[test]
+    fn https_rule_rejects_alt_svc_true_when_http3_disabled() {
+        let err = parse_one(&https_rule_with_options(
+            "http3 = false\n            alt_svc = true",
+        ))
+        .unwrap()
+        .validate()
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRule(s)
+            if s.contains("`alt_svc = true` is incompatible with `http3 = false`")));
+    }
+
+    #[test]
+    fn tcp_rule_rejects_http3() {
+        let err = parse(
+            r#"
+            [[rule]]
+            name = "ssh"
+            listen = "0.0.0.0:22"
+            protocol = "tcp"
+            target_port = 22
+            http3 = true
+            "#,
+        )
+        .unwrap()
+        .validate_each()
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRule(s)
+            if s.contains("`http3` is only meaningful for `protocol = \"https\"` rules")));
+    }
+
+    #[test]
+    fn udp_rule_rejects_alt_svc() {
+        let err = parse(
+            r#"
+            [[rule]]
+            name = "dns"
+            listen = "0.0.0.0:53"
+            protocol = "udp"
+            target_port = 53
+            alt_svc = true
+            "#,
+        )
+        .unwrap()
+        .validate_each()
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRule(s)
+            if s.contains("`alt_svc` is only meaningful for `protocol = \"https\"` rules")));
+    }
+
+    #[test]
+    fn https_h3_options_toml_round_trip() {
+        let rule = Rule {
+            name: "h".to_string(),
+            listen: "0.0.0.0:443".parse().unwrap(),
+            protocol: Protocol::Https,
+            target_port: None,
+            target_addr: None,
+            target_host: None,
+            idle_timeout: None,
+            udp_workers: None,
+            proxy_protocol: None,
+            routes: Some(vec![HttpRoute {
+                hostname: "app.local".to_string(),
+                target: Url::parse("http://127.0.0.1:8080").unwrap(),
+                cert: Some(CertSource::Ephemeral),
+                key: None,
+                hsts: None,
+            }]),
+            cert_dir: None,
+            http3: Some(false),
+            alt_svc: Some(false),
+        };
+        rule.validate().unwrap();
+        let f = RuleFile {
+            rule: vec![rule.clone()],
+        };
+        let toml = toml::to_string(&f).unwrap();
+        assert!(toml.contains("http3 = false"), "toml was: {toml}");
+        assert!(toml.contains("alt_svc = false"), "toml was: {toml}");
+        let back = parse(&toml).unwrap();
+        back.validate_each().unwrap();
+        assert_eq!(back.rule[0], rule);
     }
 }

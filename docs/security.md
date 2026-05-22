@@ -94,19 +94,47 @@ you don't trust the transport.
 
 | Hop                                | State                                                                                              |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Internet ↔ relay's public port      | Cleartext from the original client. The relay forwards it like any reverse proxy.                  |
+| Internet ↔ relay's public port      | Whatever the application protocol carries: cleartext TCP/UDP, or TLS/QUIC for HTTPS / HTTP/3.       |
 | Relay ↔ next hop ↔ … ↔ terminal     | Encrypted under Noise_IK + ChaCha20-Poly1305. Strict-monotonic replay window.                       |
 | Terminal ↔ application backend       | Cleartext from the terminal to `127.0.0.1` (or whatever `target_addr` / `target_host` resolves to). |
 | `yggdrasilctl` ↔ daemon              | Unix domain socket, no encryption. Restrict via filesystem permissions.                              |
 
 The chain plane gives you confidentiality and integrity **only between
-chain neighbours**. From the open internet to the relay, traffic is
-cleartext — whatever the application protocol carries. From the
-terminal to the actual backend, it's cleartext on the loopback
-interface of the terminal host. If you need end-to-end encryption
-across the chain, run a TLS-terminating application on top (the HTTPS
-proxy in yggdrasil does this for HTTPS rules — but the cleartext leg
-inside the relay is still part of your attack surface).
+chain neighbours**. From the open internet to the relay, traffic has only
+whatever protection the application protocol provides. From the terminal
+to the actual backend, it's cleartext on the loopback interface of the
+terminal host. If you need encryption across the public internet and the
+chain, run TLS or QUIC on top. Terminal HTTPS rules do this for the
+client-to-terminal leg while keeping certificate resolution on the
+terminal; the relay is L4 passthrough, but still sees metadata such as
+addresses, ports, byte counts, and timing.
+
+* **HTTP/3 attack surface.** The QUIC endpoint terminates TLS with the
+  same rustls config (and certs) as the TCP HTTPS path. Specific
+  properties:
+
+  * 0-RTT (early data) is **disabled**. We do not opt rustls into TLS
+    1.3 ticket-based resumption with early-data carriage. A future
+    per-route opt-in could enable it for idempotent endpoints (e.g.
+    static GET) but the default stays off.
+  * Connection migration is **enabled** (quinn default). A client moving
+    between source IPs continues its connection; the QUIC stack validates
+    the new path via address-validation tokens before shifting traffic.
+  * QUIC amplification mitigations are quinn's defaults: each new path
+    receives 3× as many bytes as it has validated, capping the
+    amplification factor at the spec-mandated bound.
+  * Stateless retry / address-validation tokens are quinn defaults; we
+    don't override them.
+  * **Limitation:** for multi-hop chain traffic through a relay, the
+    `X-Forwarded-For` header value will reflect the
+    *immediate-upstream relay's* IP, not the real client's IP. The
+    relay-to-terminal PROXY-protocol mechanism that addresses this for
+    plain TCP HTTPS rules does not yet have an equivalent for UDP/QUIC
+    traffic (PROXY v2 over UDP datagrams). Documented separately under
+    [HTTPS-predicate derivation](architecture.md#https-predicate-derivation).
+    Until a follow-up lands, h3 rules behind a relay should not be used
+    by applications that rely on client-IP-based authorisation or
+    rate-limiting.
 
 ## What yggdrasil protects against
 
@@ -145,6 +173,10 @@ inside the relay is still part of your attack surface).
   out-of-band rotation by your peers; you'd notice only when the
   Noise handshake stops succeeding. Pin fingerprints in an out-of-band
   ledger and watch them.
+* **Real client IP for multi-hop HTTP/3 traffic.** Covered above under
+  HTTP/3 attack surface; until UDP/QUIC client-IP propagation lands, h3
+  rules behind a relay should not be used by applications that rely on
+  client-IP-based authorisation or rate-limiting.
 * **Side channels.** ChaCha20-Poly1305 is hardware-friendly and
   constant-time on every platform we care about, but the surrounding
   Rust code is not audited for timing side channels.

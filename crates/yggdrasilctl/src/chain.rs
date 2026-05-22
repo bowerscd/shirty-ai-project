@@ -1011,6 +1011,7 @@ mod tests {
             listen_port: port,
             protocol: proto,
             idle_timeout_ms: None,
+            https_http3: false,
         }
     }
 
