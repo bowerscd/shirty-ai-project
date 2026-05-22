@@ -41,16 +41,28 @@ readonly OUTDIR="$(bench_results_dir)"
 command -v jq >/dev/null || die "jq is required for $SCENARIO post-processing"
 command -v ss >/dev/null || die "ss (iproute2) is required for $SCENARIO"
 
-# Sum PSS in KiB across a process and all its descendants from
-# /proc/<pid>/smaps_rollup. Walks the tree via /proc/<pid>/task/<pid>/children.
+# Sum PSS in KiB across one OR more root processes and all their descendants
+# from /proc/<pid>/smaps_rollup. Walks each root via /proc/<pid>/task/<pid>/children.
+#
+# Accepts a space-separated list of PIDs as the first argument — pass multiple
+# for chain subjects (gateway + terminal, outer + inner) since those are
+# sibling processes spawned by bash, not parent/child.
 sample_pss_tree() {
-    local root_pid="$1"
-    if [[ -z "$root_pid" ]] || [[ ! -d "/proc/$root_pid" ]]; then
-        printf 0
-        return
-    fi
-    local -a pids=("$root_pid")
-    local -a frontier=("$root_pid")
+    local pids_arg="$1"
+    local -a roots
+    # shellcheck disable=SC2206
+    roots=( $pids_arg )
+    [[ ${#roots[@]} -gt 0 ]] || { printf 0; return; }
+
+    local -a pids=()
+    local -a frontier=()
+    local r
+    for r in "${roots[@]}"; do
+        [[ -z "$r" ]] && continue
+        [[ -d "/proc/$r" ]] || continue
+        pids+=("$r")
+        frontier+=("$r")
+    done
     while ((${#frontier[@]} > 0)); do
         local -a next=()
         local p
@@ -87,8 +99,13 @@ sample_pss_tree() {
 # and the count of ESTABLISHED conns with sport=listen_port (i.e. the
 # proxy-accepted side). Write the running maxima to disk so the parent
 # can harvest them after loadgen finishes.
+#
+# For chain subjects, peak_conns approximately doubles because each TCP
+# connection has an ESTABLISHED entry at each hop (loadgen↔outer AND
+# outer↔inner, both with sport=$listen_port via the IP pinning trick).
+# The PSS sum is the more meaningful per-conn cost number.
 run_sampler() {
-    local root_pid="$1"
+    local root_pids="$1"
     local listen_port="$2"
     local rss_file="$3"
     local conn_file="$4"
@@ -98,7 +115,7 @@ run_sampler() {
     local conn_at_max=0
     while true; do
         local r c
-        r="$(sample_pss_tree "$root_pid")"
+        r="$(sample_pss_tree "$root_pids")"
         c=$(ss -tnH state established "( sport = :$listen_port )" 2>/dev/null | wc -l)
         if (( r > max_rss )); then
             max_rss="$r"
@@ -135,36 +152,58 @@ run_subject() {
 
     local target=""
     local listen=""
-    local proxy_pid=""
+    # Space-separated list of root PIDs whose process trees the sampler
+    # walks. For chain subjects this carries the outer + inner PIDs so the
+    # PSS sum is the whole topology, comparable to yggdrasil-chain's
+    # gateway+terminal pair.
+    local proxy_pids=""
     case "$subject" in
         direct)
             target="127.0.0.1:$echo_port"
             ;;
-        yggdrasil)
+        yggdrasil-terminal)
             listen="$(pick_free_tcp_port)"
-            bench_spin_yggdrasil "$tmp" "$listen" "$echo_port" tcp
+            bench_spin_yggdrasil_terminal "$tmp" "$listen" "$echo_port" tcp
             target="127.0.0.1:$listen"
-            proxy_pid="${YGG_GW_PID:-}"
+            proxy_pids="${YGG_TM_PID:-}"
+            ;;
+        yggdrasil-chain)
+            listen="$(pick_free_tcp_port)"
+            bench_spin_yggdrasil_chain "$tmp" "$listen" "$echo_port" tcp
+            target="127.0.0.1:$listen"
+            proxy_pids="${YGG_GW_PID:-} ${YGG_TM_PID:-}"
             ;;
         nginx)
             listen="$(pick_free_tcp_port)"
             bench_spin_nginx "$tmp" "$listen" "$echo_port" tcp
             target="127.0.0.1:$listen"
-            proxy_pid="${NGINX_PID:-}"
+            proxy_pids="${NGINX_PID:-}"
+            ;;
+        nginx-chain)
+            listen="$(pick_free_tcp_port)"
+            bench_spin_nginx_chain "$tmp" "$listen" "$echo_port" tcp
+            target="127.0.0.1:$listen"
+            proxy_pids="${NGINX_OUTER_PID:-} ${NGINX_INNER_PID:-}"
             ;;
         haproxy)
             listen="$(pick_free_tcp_port)"
             bench_spin_haproxy "$tmp" "$listen" "$echo_port" tcp
             target="127.0.0.1:$listen"
-            proxy_pid="${HAPROXY_PID:-}"
+            proxy_pids="${HAPROXY_PID:-}"
+            ;;
+        haproxy-chain)
+            listen="$(pick_free_tcp_port)"
+            bench_spin_haproxy_chain "$tmp" "$listen" "$echo_port" tcp
+            target="127.0.0.1:$listen"
+            proxy_pids="${HAPROXY_OUTER_PID:-} ${HAPROXY_INNER_PID:-}"
             ;;
         *) die "unknown subject $subject" ;;
     esac
 
     # Baseline PSS before any connections.
     local baseline_rss=0
-    if [[ -n "$proxy_pid" ]]; then
-        baseline_rss=$(sample_pss_tree "$proxy_pid")
+    if [[ -n "${proxy_pids// }" ]]; then
+        baseline_rss=$(sample_pss_tree "$proxy_pids")
     fi
 
     local out="$OUTDIR/$SCENARIO-$subject.json"
@@ -185,14 +224,14 @@ run_subject() {
     local peak_conns=0
     local conns_at_peak_rss=0
     local sampler_pid=""
-    if [[ -n "$proxy_pid" ]] && [[ -n "$listen" ]]; then
+    if [[ -n "${proxy_pids// }" ]] && [[ -n "$listen" ]]; then
         local rss_file="$tmp/sampler.rss"
         local conn_file="$tmp/sampler.conns"
         local cap_file="$tmp/sampler.conns_at_peak_rss"
         : > "$rss_file"
         : > "$conn_file"
         : > "$cap_file"
-        run_sampler "$proxy_pid" "$listen" "$rss_file" "$conn_file" "$cap_file" &
+        run_sampler "$proxy_pids" "$listen" "$rss_file" "$conn_file" "$cap_file" &
         sampler_pid=$!
     fi
 
@@ -204,12 +243,12 @@ run_subject() {
         sample_kib=$(read_int_or_zero "$tmp/sampler.rss")
         peak_conns=$(read_int_or_zero "$tmp/sampler.conns")
         conns_at_peak_rss=$(read_int_or_zero "$tmp/sampler.conns_at_peak_rss")
-        log "  proxy_pid=$proxy_pid baseline=${baseline_rss}KiB peak=${sample_kib}KiB peak_conns=${peak_conns} conns_at_peak_rss=${conns_at_peak_rss}"
+        log "  proxy_pids=[$proxy_pids] baseline=${baseline_rss}KiB peak=${sample_kib}KiB peak_conns=${peak_conns} conns_at_peak_rss=${conns_at_peak_rss}"
     fi
 
     # Inject the proxy memory facts into loadgen's JSON.
     local tmpfile="$out.tmp"
-    if [[ -n "$proxy_pid" ]]; then
+    if [[ -n "${proxy_pids// }" ]]; then
         jq --argjson rss "$sample_kib" \
            --argjson base "$baseline_rss" \
            --argjson peak_conns "$peak_conns" \
@@ -230,7 +269,7 @@ run_subject() {
     bench_leg_teardown
 }
 
-for s in direct yggdrasil nginx haproxy; do
+for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain haproxy haproxy-chain; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done

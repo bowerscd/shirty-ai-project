@@ -177,22 +177,25 @@ def diff_runs(base: Dict[Tuple[str, str], Report],
     return rows, regressions
 
 
-def _check_peer_deltas(
+def _check_pair_deltas(
     cand: Dict[Tuple[str, str], Report],
+    ygg_subject: str,
     peer_subject: str,
     delta_budget: Dict[Tuple[str, str], float],
     p99_budget_pct: float,
 ) -> List[str]:
-    """Within a single candidate run, ensure yggdrasil is within budget of `peer_subject`.
+    """Within a single candidate run, ensure `ygg_subject` is within budget of
+    `peer_subject` across all scenarios both ran.
 
     Returns one failure string per metric-budget violation. Scenarios where
-    either yggdrasil or the peer subject didn't run are silently skipped —
-    that's how HAProxy stays out of UDP scenarios without a special case.
+    either subject didn't run are silently skipped — that's how haproxy stays
+    out of UDP scenarios and how either side stays out of scenarios it doesn't
+    target, without a special case.
     """
     failures: List[str] = []
     scenarios = {scenario for (scenario, _subject) in cand}
     for scenario in sorted(scenarios):
-        ygg = cand.get((scenario, "yggdrasil"))
+        ygg = cand.get((scenario, ygg_subject))
         peer = cand.get((scenario, peer_subject))
         if not ygg or not peer:
             continue
@@ -210,7 +213,7 @@ def _check_peer_deltas(
                 delta = (ygg_v - peer_v) / peer_v * 100.0
                 if delta > budget_pct:
                     failures.append(
-                        f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {delta:.1f}% "
+                        f"{scenario}: {ygg_subject} {metric}={ygg_v:.2f} is {delta:.1f}% "
                         f"above {peer_subject} ({peer_v:.2f}); budget allows {budget_pct}%"
                     )
             else:
@@ -219,7 +222,7 @@ def _check_peer_deltas(
                 delta = (ygg_v - peer_v) / peer_v * 100.0
                 if delta < -budget_pct:
                     failures.append(
-                        f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {-delta:.1f}% "
+                        f"{scenario}: {ygg_subject} {metric}={ygg_v:.2f} is {-delta:.1f}% "
                         f"below {peer_subject} ({peer_v:.2f}); budget allows {budget_pct}%"
                     )
         # p99 latency budget.
@@ -230,7 +233,7 @@ def _check_peer_deltas(
                 ratio_pct = (ygg_p99 - peer_p99) / peer_p99 * 100.0
                 if ratio_pct > p99_budget_pct:
                     failures.append(
-                        f"{scenario}: yggdrasil p99={ygg_p99:.2f}us is "
+                        f"{scenario}: {ygg_subject} p99={ygg_p99:.2f}us is "
                         f"{ratio_pct:.0f}% above {peer_subject} p99 ({peer_p99:.2f}us); "
                         f"budget allows {p99_budget_pct}%"
                     )
@@ -238,11 +241,26 @@ def _check_peer_deltas(
 
 
 def check_nginx_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
-    return _check_peer_deltas(cand, "nginx", NGINX_DELTA_BUDGET, NGINX_P99_BUDGET_PCT)
+    # Two apples-to-apples pairings: single-hop terminal vs nginx, and
+    # full chain vs nginx-chain. Same budget table applies to both, since
+    # per-hop costs should match regardless of chain length.
+    failures = _check_pair_deltas(
+        cand, "yggdrasil-terminal", "nginx", NGINX_DELTA_BUDGET, NGINX_P99_BUDGET_PCT
+    )
+    failures += _check_pair_deltas(
+        cand, "yggdrasil-chain", "nginx-chain", NGINX_DELTA_BUDGET, NGINX_P99_BUDGET_PCT
+    )
+    return failures
 
 
 def check_haproxy_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
-    return _check_peer_deltas(cand, "haproxy", HAPROXY_DELTA_BUDGET, HAPROXY_P99_BUDGET_PCT)
+    failures = _check_pair_deltas(
+        cand, "yggdrasil-terminal", "haproxy", HAPROXY_DELTA_BUDGET, HAPROXY_P99_BUDGET_PCT
+    )
+    failures += _check_pair_deltas(
+        cand, "yggdrasil-chain", "haproxy-chain", HAPROXY_DELTA_BUDGET, HAPROXY_P99_BUDGET_PCT
+    )
+    return failures
 
 
 def main() -> int:

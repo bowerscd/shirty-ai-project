@@ -2,7 +2,7 @@
 # UDP single-flow pps + RTT scenario.
 #
 # Measures how many round-trips per second a single UDP flow can sustain through
-# direct → yggdrasil → nginx, with p50/p99 latency from loadgen's HDR histogram.
+# direct → yggdrasil-* → nginx-*, with p50/p99 latency from loadgen's HDR histogram.
 #
 # Acceptable delta vs nginx: pps within 20%, p99 ≤ 2× nginx (see plan §11.5).
 
@@ -32,32 +32,42 @@ run_leg() {
         --warmup "$WARMUP"
 }
 
-# ---------- direct ----------
-log "$SCENARIO/direct: starting"
-echo_port="$(pick_free_udp_port)"
-tmp="$(bench_mktempdir)"
-bench_spawn_udp_echo ECHO_PID "$echo_port" "$tmp/echo.log"
-run_leg direct 127.0.0.1 "$echo_port"
-bench_leg_teardown
+run_subject() {
+    local subject="$1"
+    local echo_port; echo_port="$(pick_free_udp_port)"
+    local tmp; tmp="$(bench_mktempdir)"
+    bench_spawn_udp_echo ECHO_PID "$echo_port" "$tmp/echo.log"
+    case "$subject" in
+        direct)
+            run_leg direct 127.0.0.1 "$echo_port"
+            ;;
+        yggdrasil-terminal)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_yggdrasil_terminal "$tmp" "$listen" "$echo_port" udp
+            run_leg yggdrasil-terminal 127.0.0.1 "$listen"
+            ;;
+        yggdrasil-chain)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_yggdrasil_chain "$tmp" "$listen" "$echo_port" udp
+            run_leg yggdrasil-chain 127.0.0.1 "$listen"
+            ;;
+        nginx)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_nginx "$tmp" "$listen" "$echo_port" udp
+            run_leg nginx 127.0.0.1 "$listen"
+            ;;
+        nginx-chain)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_nginx_chain "$tmp" "$listen" "$echo_port" udp
+            run_leg nginx-chain 127.0.0.1 "$listen"
+            ;;
+        *) die "unknown subject $subject" ;;
+    esac
+    bench_leg_teardown
+}
 
-# ---------- yggdrasil ----------
-log "$SCENARIO/yggdrasil: starting"
-echo_port="$(pick_free_udp_port)"
-listen_port="$(pick_free_udp_port)"
-tmp="$(bench_mktempdir)"
-bench_spawn_udp_echo ECHO_PID "$echo_port" "$tmp/echo.log"
-bench_spin_yggdrasil "$tmp" "$listen_port" "$echo_port" udp
-run_leg yggdrasil 127.0.0.1 "$listen_port"
-bench_leg_teardown
-
-# ---------- nginx ----------
-log "$SCENARIO/nginx: starting"
-echo_port="$(pick_free_udp_port)"
-listen_port="$(pick_free_udp_port)"
-tmp="$(bench_mktempdir)"
-bench_spawn_udp_echo ECHO_PID "$echo_port" "$tmp/echo.log"
-bench_spin_nginx "$tmp" "$listen_port" "$echo_port" udp
-run_leg nginx 127.0.0.1 "$listen_port"
-bench_leg_teardown
-
+for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain; do
+    log "$SCENARIO/$s: starting"
+    run_subject "$s"
+done
 log "$SCENARIO: done. results in $OUTDIR/"

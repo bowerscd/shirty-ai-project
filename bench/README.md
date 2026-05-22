@@ -1,25 +1,45 @@
 # Yggdrasil bench harness
 
-End-to-end benchmark suite that compares **yggdrasil** against **nginx** (stream module), **HAProxy**, and a **direct** baseline. Each scenario emits a JSON report under `bench/results/<git-sha>/<scenario>-<subject>.json`. `bench/compare.py` diffs two such trees and gates regressions.
+End-to-end benchmark suite that compares **yggdrasil** (both as a single-hop terminal and as a full gateway→terminal chain) against **nginx** (stream module) and **HAProxy** (also each in single-hop and chained variants), plus a **direct** baseline. Each scenario emits a JSON report under `bench/results/<git-sha>/<scenario>-<subject>.json`. `bench/compare.py` diffs two such trees and gates regressions.
+
+## Subjects
+
+Every scenario runs against up to seven subjects so the topology counts match in comparisons (chain vs chain, single hop vs single hop):
+
+| Subject | Hops | Topology | TCP | UDP |
+| --- | --- | --- | --- | --- |
+| `direct` | 0 | loadgen → echo | ✓ | ✓ |
+| `yggdrasil-terminal` | 1 | loadgen → yggdrasil terminal → echo | ✓ | ✓ |
+| `yggdrasil-chain` | 2 | loadgen → gateway → terminal → echo | ✓ | ✓ |
+| `nginx` | 1 | loadgen → nginx → echo | ✓ | ✓ |
+| `nginx-chain` | 2 | loadgen → outer nginx → inner nginx → echo | ✓ | ✓ |
+| `haproxy` | 1 | loadgen → haproxy → echo | ✓ | — |
+| `haproxy-chain` | 2 | loadgen → outer haproxy → inner haproxy → echo | ✓ | — |
+
+HAProxy 3.x has no `mode udp`, so it sits out the three UDP scenarios in both variants.
 
 ## Why nginx and HAProxy?
 
 Both are widely-deployed L4 reverse proxies and the de-facto incumbents we have to be within a small constant of to claim "production-grade":
 
 * **nginx** stream module — TCP **and** UDP stream proxying, hot reload via `nginx -s reload`. The only mainstream OSS reverse proxy that also does UDP at L4, so it's the only comparison subject for the UDP scenarios.
-* **HAProxy** — TCP-only at L4 (`mode tcp`); HAProxy 3.x has no `mode udp` and no generic UDP forwarder, so it participates only in the four TCP scenarios. Renowned for its TCP performance and per-connection memory footprint, which makes it a tougher comparison than nginx on those axes.
+* **HAProxy** — TCP-only at L4 (`mode tcp`). Renowned for its TCP performance and per-connection memory footprint, which makes it a tougher comparison than nginx on those axes.
 
-The plan's acceptable-delta budgets (Phase 11.5):
+Why two variants each? Yggdrasil's headline shape is a chain (gateway on a VPS dialing a terminal at home). Comparing chain-mode yggdrasil to a single nginx process gives yggdrasil two proxy hops while nginx has one — apples vs oranges. The `-chain` variants put the same number of hops on both sides for an honest comparison.
 
-| Scenario          | Metric           | vs nginx          | vs HAProxy        |
+The plan's acceptable-delta budgets (Phase 11.5) apply per-hop:
+
+| Scenario          | Metric           | vs nginx*         | vs HAProxy*       |
 | ----------------- | ---------------- | ----------------- | ----------------- |
 | `tcp-throughput`  | bytes/sec        | **−10 %**         | **−10 %**         |
 | `tcp-connrate`    | conns/sec        | **−25 %**         | **−25 %**         |
-| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× nginx**    | **≤ 2× HAProxy**  |
+| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× peer**     | **≤ 2× peer**     |
 | `udp-pps`         | pkts/sec         | **−20 %**         | n/a — no UDP      |
 | `udp-flows`       | pkts/sec         | **−20 %**         | n/a — no UDP      |
 | `udp-flowchurn`   | new-flows/sec    | **−20 %**         | n/a — no UDP      |
-| (all latency)     | p99              | **≤ 2× nginx**    | **≤ 2× HAProxy**  |
+| (all latency)     | p99              | **≤ 2× peer**     | **≤ 2× peer**     |
+
+\*Each gate is enforced twice: `yggdrasil-terminal` vs `nginx`/`haproxy` (1-hop pair) and `yggdrasil-chain` vs `nginx-chain`/`haproxy-chain` (2-hop pair).
 
 `compare.py --check-nginx` and `compare.py --check-haproxy` enforce these budgets and exit 1 on violation. They can be combined.
 
@@ -33,7 +53,7 @@ The plan's acceptable-delta budgets (Phase 11.5):
 > on every `bench/run-all.sh` invocation as a yggdrasil-only correctness
 > and regression signal against previous yggdrasil runs.
 
-The `direct` leg (loadgen → echo with no proxy in between) bounds what the kernel + echo backend can deliver in principle — useful for spotting cases where *all three* proxies are bottlenecked on the harness, not the systems under test.
+The `direct` leg (loadgen → echo with no proxy in between) bounds what the kernel + echo backend can deliver in principle — useful for spotting cases where every proxy is bottlenecked on the harness, not the systems under test.
 
 ## Prerequisites
 
@@ -107,16 +127,18 @@ Exit codes:
 
 ## Scenario catalogue
 
-| Script               | Subjects                            | What it measures                                                |
-| -------------------- | ----------------------------------- | --------------------------------------------------------------- |
-| `udp-pps.sh`         | direct, yggdrasil, nginx            | single-flow UDP RTT & pps; sniff-test for per-packet overhead   |
-| `udp-flows.sh`       | direct, yggdrasil, nginx            | 100 k concurrent flows; flow-table scaling                      |
-| `udp-flowchurn.sh`   | direct, yggdrasil, nginx            | sustained new-flow rate; per-flow setup cost                    |
-| `tcp-latency.sh`     | direct, yggdrasil, nginx, haproxy   | TCP ping-pong p50/p99/p99.9                                     |
-| `tcp-throughput.sh`  | direct, yggdrasil, nginx, haproxy   | bulk TCP MB/s with a handful of streams                         |
-| `tcp-connrate.sh`    | direct, yggdrasil, nginx, haproxy   | TCP handshake rate (connect + close)                            |
-| `tcp-idle-conns.sh`  | direct, yggdrasil, nginx, haproxy   | proxy PSS while holding N idle TCP conns (per-conn memory cost) |
-| `reload-latency.sh`  | yggdrasil only                      | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why nginx and HAProxy? above for why there's no peer leg) |
+The "Subjects" column abbreviates the 5- or 7-row matrix above. UDP scenarios omit haproxy/haproxy-chain (no `mode udp`); reload-latency stays yggdrasil-only.
+
+| Script               | Subjects                                                                                              | What it measures                                                |
+| -------------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `udp-pps.sh`         | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain                                                | single-flow UDP RTT & pps; sniff-test for per-packet overhead   |
+| `udp-flows.sh`       | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain                                                | 100 k concurrent flows; flow-table scaling                      |
+| `udp-flowchurn.sh`   | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain                                                | sustained new-flow rate; per-flow setup cost                    |
+| `tcp-latency.sh`     | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | TCP ping-pong p50/p99/p99.9                                     |
+| `tcp-throughput.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | bulk TCP MB/s with a handful of streams                         |
+| `tcp-connrate.sh`    | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | TCP handshake rate (connect + close)                            |
+| `tcp-idle-conns.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | proxy PSS while holding N idle TCP conns (per-conn memory cost; chain subjects sum PSS over both hops) |
+| `reload-latency.sh`  | yggdrasil-chain only                                                                                  | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why nginx and HAProxy? above for why there's no peer leg) |
 
 A future `heartbeat-roundtrip.sh` (yggdrasil-only — neither nginx nor HAProxy has an analogous heartbeat) is tracked under Phase 12.
 
@@ -129,16 +151,28 @@ For each non-direct subject, the harness:
    backend has plenty of headroom and never bottlenecks the proxy under
    test.
 2. Renders a fresh config + identity into a `mktemp -d` workspace:
-   - **yggdrasil**: spins two `yggdrasil` daemons on loopback — a
-     gateway (accept-mode) and a terminal (dial-mode). Identities are
-     minted with `yggdrasilctl identity rotate` and wired together via
-     the offline `identity export-request` → `identity add-accept`
-     → `identity add-dial` handshake. The terminal owns the rule
-     set; the gateway derives a matching listener from the chain
-     predicate published over the dial session. The bench rule uses
-     the current `target_addr = "127.0.0.1:<echo_port>"` schema.
-   - **nginx**: a minimal `stream { server { listen <listen>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }` config, started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
-   - **haproxy**: a minimal `frontend / default_backend echo` config in `mode tcp` with `nbthread = $(nproc)`, started in foreground via `haproxy -db -f $tmp/haproxy/haproxy.cfg`. TCP scenarios only.
+   - **yggdrasil-terminal**: one `yggdrasil` daemon in terminal mode, no
+     chain. Static rule binds `127.0.0.1:<listen_port>` →
+     `127.0.0.1:<echo_port>`. The loadgen target is `127.0.0.1:<listen_port>`.
+   - **yggdrasil-chain**: two `yggdrasil` daemons on loopback — gateway on
+     `127.0.0.1` (accept-mode), terminal on `127.0.0.2` (dial-mode); the
+     distinct loopback IPs are pinned via `[server].default_bind` so the
+     two daemons don't collide on `<addr>:<listen_port>`. Identities are
+     minted with `yggdrasilctl identity rotate` and wired via the offline
+     `identity export-request` → `add-accept` → `add-dial` handshake. The
+     terminal owns the rule set; the gateway derives a matching listener
+     from the chain predicate published over the dial session. Loadgen
+     target is `127.0.0.1:<listen_port>` (the gateway).
+   - **nginx** / **haproxy**: a single proxy process. nginx: minimal
+     `stream { server { listen <addr>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }`
+     started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
+     haproxy: minimal `frontend / default_backend echo` in `mode tcp`,
+     `nbthread = $(nproc)`, started with `haproxy -db -f $tmp/haproxy/haproxy.cfg`.
+   - **nginx-chain** / **haproxy-chain**: two of the same proxy on
+     distinct loopback IPs — outer on `127.0.0.1:<listen_port>` proxying
+     to inner on `127.0.0.2:<listen_port>`, inner proxying to the echo
+     backend. Same IP-pinning trick as yggdrasil-chain. Loadgen target is
+     `127.0.0.1:<listen_port>` (the outer).
 3. Runs `loadgen` against `127.0.0.1:<listen_port>` (or `<echo_port>` for the direct leg).
 4. SIGTERMs everything, removes the tmpdir, and pauses briefly to let TIME_WAIT clear before the next leg.
 
@@ -148,6 +182,7 @@ For each non-direct subject, the harness:
 
 - 127.0.0.1 loopback bypasses the NIC entirely, so we are measuring per-packet overhead, scheduling, and userspace cost — *not* anything network-stack-bound. To exercise the NIC, replace `127.0.0.1` targets with a host on a separate kernel and rerun.
 - `bench/collect-env.sh` records governor + sysctls but does **not** refuse to run on a misconfigured host. Check `env.json` before trusting the numbers.
+- For chain subjects, `tcp-idle-conns.peak_established_conns` ~doubles because each TCP connection has an ESTABLISHED entry at each hop. The `proxy_rss_kib` PSS sum is the meaningful per-connection memory number — it's measured across both hops' process trees.
 
 ## Adding a new scenario
 

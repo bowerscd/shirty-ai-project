@@ -44,22 +44,32 @@ run_subject() {
         direct)
             run_leg direct 127.0.0.1 "$echo_port"
             ;;
-        yggdrasil)
+        yggdrasil-terminal)
             local listen; listen="$(pick_free_udp_port)"
-            bench_spin_yggdrasil "$tmp" "$listen" "$echo_port" udp
-            run_leg yggdrasil 127.0.0.1 "$listen"
+            bench_spin_yggdrasil_terminal "$tmp" "$listen" "$echo_port" udp
+            run_leg yggdrasil-terminal 127.0.0.1 "$listen"
+            ;;
+        yggdrasil-chain)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_yggdrasil_chain "$tmp" "$listen" "$echo_port" udp
+            run_leg yggdrasil-chain 127.0.0.1 "$listen"
             ;;
         nginx)
             local listen; listen="$(pick_free_udp_port)"
             bench_spin_nginx "$tmp" "$listen" "$echo_port" udp
             run_leg nginx 127.0.0.1 "$listen"
             ;;
+        nginx-chain)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_nginx_chain "$tmp" "$listen" "$echo_port" udp
+            run_leg nginx-chain 127.0.0.1 "$listen"
+            ;;
         *) die "unknown subject $subject" ;;
     esac
     bench_leg_teardown
 }
 
-for s in direct yggdrasil nginx; do
+for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done

@@ -114,7 +114,7 @@ run_yggdrasil() {
     bench_spawn_tcp_echo ECHO_B_PID "$echo_port_b" "$tmp/echo-b.log"
 
     # Start with one rule (rule-a) already in place.
-    bench_spin_yggdrasil "$tmp" "$listen_a" "$echo_port_a" tcp
+    bench_spin_yggdrasil_chain "$tmp" "$listen_a" "$echo_port_a" tcp
 
     # We'll add additional branch files for rule-b<i> on each iteration.
     local samples=""
@@ -135,12 +135,12 @@ EOF
         local t1_ns; t1_ns="$(date +%s%N)"
         samples+="$(( t1_ns - t0_ns )),"
     done
-    record_iterations yggdrasil "$OUTDIR/$SCENARIO-yggdrasil.json" "$samples"
+    record_iterations yggdrasil-chain "$OUTDIR/$SCENARIO-yggdrasil-chain.json" "$samples"
 }
 
-# Only one leg — yggdrasil. There is no nginx comparison for this scenario;
+# Only one leg — yggdrasil-chain. There is no nginx comparison for this scenario;
 # see the file header for why.
-log "$SCENARIO/yggdrasil: starting"
+log "$SCENARIO/yggdrasil-chain: starting"
 run_yggdrasil
 bench_leg_teardown
 log "$SCENARIO: done. results in $OUTDIR/"

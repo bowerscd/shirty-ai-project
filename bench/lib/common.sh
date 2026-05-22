@@ -82,7 +82,11 @@ bench_wait_listen_tcp() {
     local host="$1" port="$2" deadline_s="${3:-5}"
     local deadline=$(( SECONDS + deadline_s ))
     while (( SECONDS < deadline )); do
-        if ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+        # Match the specific (host, port) — not just the port — so a
+        # listener bound to a different loopback IP on the same port
+        # (e.g. an inner haproxy on 127.0.0.2 while we wait for the
+        # outer on 127.0.0.1) doesn't falsely satisfy the wait.
+        if ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qx "${host}:${port}"; then
             return 0
         fi
         sleep 0.05
@@ -94,7 +98,7 @@ bench_wait_listen_udp() {
     local host="$1" port="$2" deadline_s="${3:-5}"
     local deadline=$(( SECONDS + deadline_s ))
     while (( SECONDS < deadline )); do
-        if ss -lun "sport = :$port" 2>/dev/null | grep -q UNCONN; then
+        if ss -lunH 2>/dev/null | awk '{print $4}' | grep -qx "${host}:${port}"; then
             return 0
         fi
         sleep 0.05
@@ -178,39 +182,114 @@ bench_spawn_tcp_echo() {
 
 # ---------- yggdrasil stack orchestration ----------
 #
-# bench_spin_yggdrasil <tmpdir> <listen_port> <upstream_port> <protocol> [extra_rule_toml]
+# Two flavours:
 #
-# Spins a two-daemon yggdrasil topology on loopback:
+#   bench_spin_yggdrasil_terminal <tmp> <listen_port> <upstream_port> <proto> [extra]
+#       Single daemon, terminal mode, no chain. Used by the apples-to-apples
+#       single-hop comparison subject (`yggdrasil-terminal`) so we can put
+#       yggdrasil head-to-head against nginx/haproxy at the same hop count.
+#       Binds 127.0.0.1:$listen_port → 127.0.0.1:$upstream_port via a static
+#       rule. The loadgen target is 127.0.0.1:$listen_port.
 #
-#   * gateway (accept-mode): binds the proxy listener on
-#     127.0.0.1:$listen_port that the load generator hits. Owns no rules
-#     of its own; the listener is derived from the chain predicate
-#     published over the dial session.
-#   * terminal (dial-mode):  owns the rule set under $tmp/rules and dials
-#     the gateway's accept listener on 127.0.0.1:$accept_port. The local
-#     echo backend on 127.0.0.1:$upstream_port runs in the same netns,
-#     so target_addr resolves there.
+#   bench_spin_yggdrasil_chain <tmp> <listen_port> <upstream_port> <proto> [extra]
+#       Two-daemon gateway+terminal topology on loopback (the `yggdrasil-chain`
+#       subject, what real deployments run). Pins the gateway to 127.0.0.1
+#       and the terminal to 127.0.0.2 via `[server].default_bind` so their
+#       listeners can't collide.
 #
-# Steps:
-#   1. write seed configs for gateway + terminal
-#   2. mint identity keys for both
-#   3. offline request/grant: terminal exports request, gateway mints
-#      grant (writes [accept] to gateway config), terminal applies grant
-#      (writes [dial] to terminal config)
-#   4. write the bench rule under the terminal's rules dir
-#   5. start both daemons; wait for the gateway-side proxy listener
-#      AND give the heartbeat + chain predicate a moment to settle
-#
-# Exports:
-#   YGG_LISTEN_PORT       — the gateway-side proxy port (loadgen target)
-#   YGG_HB_PORT           — the gateway's accept (heartbeat) UDP port
-#   YGG_CTRL_SOCK         — the TERMINAL's control socket (rules live here,
-#                           so reload/predicate-add scenarios drive it)
+# Exports (chain flavour):
+#   YGG_LISTEN_PORT       — gateway-side proxy port (loadgen target)
+#   YGG_LISTEN_ADDR       — gateway-side bind address (127.0.0.1)
+#   YGG_HB_PORT           — gateway's accept (heartbeat) UDP port
+#   YGG_GW_PID            — gateway daemon PID
+#   YGG_TM_PID            — terminal daemon PID
+#   YGG_CTRL_SOCK         — terminal control socket (rules live there)
 #   YGG_CONFIG            — terminal config path
 #   YGG_GATEWAY_CONFIG    — gateway config path
 #   YGG_GATEWAY_CTRL_SOCK — gateway control socket
+#
+# Exports (terminal flavour):
+#   YGG_LISTEN_PORT, YGG_LISTEN_ADDR, YGG_TM_PID, YGG_CTRL_SOCK, YGG_CONFIG
+#   (the GW_*/HB_*/GATEWAY_* variables are unset)
 
-bench_spin_yggdrasil() {
+bench_spin_yggdrasil_terminal() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
+    local extra="${5:-}"
+    local root
+    root="$(bench_workspace_root)"
+
+    local ygg_bin="$root/target/release/yggdrasil"
+    local ctl_bin="$root/target/release/yggdrasilctl"
+    [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
+    [[ -x "$ctl_bin" ]] || die "missing $ctl_bin — run: cargo build --release -p yggdrasilctl"
+
+    mkdir -p "$tmp"/{terminal,rules,tm-state,tm-run,logs}
+    local tm_bind="127.0.0.1"
+
+    # The daemon's config validator requires a [dial] OR [accept] section
+    # (see `derived_mode` in crates/yggdrasil/src/config.rs). A terminal
+    # mode node must have [dial], so synthesise one pointing at a closed
+    # UDP port on loopback with a throwaway pubkey. The chain client will
+    # retry the handshake forever in the background; the local rule
+    # listener (the thing we're measuring) binds and serves regardless,
+    # and the chain-failure path is async so it doesn't perturb the
+    # measured TCP/UDP throughput. This is the cleanest way to spin a
+    # "yggdrasil-as-a-standalone-reverse-proxy" topology for an
+    # apples-to-apples comparison vs single-hop nginx/haproxy.
+    local fake_upstream_key="$tmp/fake-upstream.key"
+    "$ctl_bin" identity rotate --identity-file "$fake_upstream_key" --force >/dev/null
+    local fake_pubkey
+    fake_pubkey=$("$ctl_bin" identity show --identity-file "$fake_upstream_key" 2>/dev/null \
+        | awk '/^pubkey:/ {print $2; exit}')
+    [[ -n "$fake_pubkey" ]] || die "failed to extract fake upstream pubkey"
+    local dummy_endpoint="127.0.0.1:1"
+
+    local tm_cfg="$tmp/terminal/config.toml"
+    local tm_key="$tmp/terminal/identity.key"
+    cat > "$tm_cfg" <<EOF
+[server]
+rules_dir     = "$tmp/rules"
+state_dir     = "$tmp/tm-state"
+identity_file = "$tm_key"
+default_bind  = "$tm_bind"
+
+[control]
+socket = "$tmp/tm-run/control.sock"
+
+[dial]
+pubkey   = "$fake_pubkey"
+endpoint = "$dummy_endpoint"
+EOF
+
+    "$ctl_bin" --config "$tm_cfg" identity rotate \
+        --identity-file "$tm_key" --force >/dev/null
+
+    cat > "$tmp/rules/scenario.toml" <<EOF
+[[rule]]
+name        = "bench"
+listen      = "$tm_bind:$listen_port"
+protocol    = "$proto"
+target_addr = "127.0.0.1:$upstream_port"
+$extra
+EOF
+
+    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format pretty run --config "$tm_cfg"
+
+    if [[ "$proto" == "tcp" ]]; then
+        bench_wait_listen_tcp "$tm_bind" "$listen_port" 5
+    else
+        bench_wait_listen_udp "$tm_bind" "$listen_port" 5
+    fi
+    sleep 0.2
+
+    export YGG_LISTEN_PORT="$listen_port"
+    export YGG_LISTEN_ADDR="$tm_bind"
+    export YGG_CTRL_SOCK="$tmp/tm-run/control.sock"
+    export YGG_CONFIG="$tm_cfg"
+    unset YGG_GW_PID YGG_HB_PORT YGG_GATEWAY_CONFIG YGG_GATEWAY_CTRL_SOCK
+}
+
+bench_spin_yggdrasil_chain() {
     local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
     local extra="${5:-}"
     local root
@@ -265,13 +344,11 @@ default_bind  = "$tm_bind"
 socket = "$tmp/tm-run/control.sock"
 EOF
 
-    # Mint identities (yggdrasilctl `identity rotate` writes the key file).
     "$ctl_bin" --config "$gw_cfg" identity rotate \
         --identity-file "$gw_key" --force >/dev/null
     "$ctl_bin" --config "$tm_cfg" identity rotate \
         --identity-file "$tm_key" --force >/dev/null
 
-    # Offline request/grant handshake. Terminal asks; gateway grants.
     "$ctl_bin" --config "$tm_cfg" identity export-request \
         --identity-file "$tm_key" \
         --out "$tmp/request.txt" \
@@ -287,10 +364,6 @@ EOF
         --from "$tmp/grant.txt" >/dev/null
     rm -f "$tmp/request.txt" "$tmp/grant.txt"
 
-    # Bench rule on the terminal. The terminal's [server].default_bind
-    # rewrites this listen IP to $tm_bind:$listen_port at load time, and
-    # the published predicate carries just the port — the gateway derives
-    # its own listener at $gw_bind:$listen_port via its own default_bind.
     cat > "$tmp/rules/scenario.toml" <<EOF
 [[rule]]
 name        = "bench"
@@ -303,16 +376,11 @@ EOF
     bench_spawn YGG_GW_PID "$tmp/logs/gateway.log"  -- "$ygg_bin" --log-format pretty run --config "$gw_cfg"
     bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format pretty run --config "$tm_cfg"
 
-    # The gateway is the loadgen target. Its listener only comes up after
-    # the first chain predicate arrives from the terminal, which in turn
-    # only happens after the dial-side Noise_IK handshake completes.
     if [[ "$proto" == "tcp" ]]; then
         bench_wait_listen_tcp "$gw_bind" "$listen_port" 5
     else
         bench_wait_listen_udp "$gw_bind" "$listen_port" 5
     fi
-    # Give the chain predicate a beat to land + the gateway to record the
-    # terminal's source IP from the first heartbeat.
     sleep 0.6
 
     export YGG_LISTEN_PORT="$listen_port"
@@ -322,6 +390,12 @@ EOF
     export YGG_CONFIG="$tm_cfg"
     export YGG_GATEWAY_CONFIG="$gw_cfg"
     export YGG_GATEWAY_CTRL_SOCK="$tmp/gw-run/control.sock"
+}
+
+# Back-compat alias so existing call sites keep working through the
+# subject-matrix expansion. New scripts should call the explicit name.
+bench_spin_yggdrasil() {
+    bench_spin_yggdrasil_chain "$@"
 }
 
 # ---------- nginx orchestration ----------
@@ -405,6 +479,87 @@ EOF
     fi
 }
 
+# ---------- nginx chain orchestration ----------
+#
+# bench_spin_nginx_chain <tmpdir> <listen_port> <upstream_port> <protocol>
+#
+# Spins TWO nginx processes on loopback to mirror yggdrasil's
+# gateway→terminal chain topology, so chain-vs-chain comparisons are honest:
+#
+#   loadgen → outer nginx (127.0.0.1:$listen_port)
+#           → inner nginx (127.0.0.2:$listen_port)
+#           → echo        (127.0.0.1:$upstream_port)
+#
+# Same proto applies to both legs.  TCP and UDP both supported via
+# `[udp;]` on `listen`.
+#
+# Exports NGINX_OUTER_PID and NGINX_INNER_PID — tcp-idle-conns sums both
+# for the proxy_rss_kib metric so the chain memory cost is comparable to
+# yggdrasil-chain's (gw + tm).
+
+bench_spin_nginx_chain() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
+    local nginx_bin
+    nginx_bin="${BENCH_NGINX:-$(command -v nginx || true)}"
+    [[ -x "$nginx_bin" ]] || die "nginx binary not found; set BENCH_NGINX=/path/to/nginx or install nginx"
+
+    local stream_loader
+    stream_loader="$(bench_nginx_stream_loader "$nginx_bin")"
+    local udp_kw=""
+    [[ "$proto" == "udp" ]] && udp_kw="udp"
+
+    local outer_bind="127.0.0.1"
+    local inner_bind="127.0.0.2"
+
+    # ---- inner (closer to the echo backend) ----
+    mkdir -p "$tmp/nginx-inner/logs"
+    cat > "$tmp/nginx-inner/nginx.conf" <<EOF
+${stream_loader}worker_processes auto;
+pid $tmp/nginx-inner/nginx.pid;
+error_log $tmp/nginx-inner/error.log warn;
+events { worker_connections 4096; }
+stream {
+    server {
+        listen $inner_bind:$listen_port $udp_kw;
+        proxy_pass 127.0.0.1:$upstream_port;
+        proxy_timeout 60s;
+        proxy_connect_timeout 5s;
+    }
+}
+EOF
+    bench_spawn NGINX_INNER_PID "$tmp/nginx-inner/spawn.log" -- \
+        "$nginx_bin" -p "$tmp/nginx-inner" -c "$tmp/nginx-inner/nginx.conf" -g "daemon off;"
+    if [[ "$proto" == "tcp" ]]; then
+        bench_wait_listen_tcp "$inner_bind" "$listen_port" 5
+    else
+        bench_wait_listen_udp "$inner_bind" "$listen_port" 5
+    fi
+
+    # ---- outer (loadgen-facing) ----
+    mkdir -p "$tmp/nginx-outer/logs"
+    cat > "$tmp/nginx-outer/nginx.conf" <<EOF
+${stream_loader}worker_processes auto;
+pid $tmp/nginx-outer/nginx.pid;
+error_log $tmp/nginx-outer/error.log warn;
+events { worker_connections 4096; }
+stream {
+    server {
+        listen $outer_bind:$listen_port $udp_kw;
+        proxy_pass $inner_bind:$listen_port;
+        proxy_timeout 60s;
+        proxy_connect_timeout 5s;
+    }
+}
+EOF
+    bench_spawn NGINX_OUTER_PID "$tmp/nginx-outer/spawn.log" -- \
+        "$nginx_bin" -p "$tmp/nginx-outer" -c "$tmp/nginx-outer/nginx.conf" -g "daemon off;"
+    if [[ "$proto" == "tcp" ]]; then
+        bench_wait_listen_tcp "$outer_bind" "$listen_port" 5
+    else
+        bench_wait_listen_udp "$outer_bind" "$listen_port" 5
+    fi
+}
+
 # ---------- haproxy orchestration ----------
 #
 # bench_spin_haproxy <tmpdir> <listen_port> <upstream_port> <protocol>
@@ -447,6 +602,71 @@ EOF
     # to own the PID, and -db gives us that.
     bench_spawn HAPROXY_PID "$tmp/haproxy/spawn.log" -- "$haproxy_bin" -db -f "$tmp/haproxy/haproxy.cfg"
     bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
+}
+
+# ---------- haproxy chain orchestration ----------
+#
+# bench_spin_haproxy_chain <tmpdir> <listen_port> <upstream_port> <protocol>
+#
+# Two HAProxy processes mirroring yggdrasil-chain's topology. Same loopback-IP
+# pinning trick as nginx_chain. TCP only (HAProxy has no UDP L4 mode).
+# Exports HAPROXY_OUTER_PID and HAPROXY_INNER_PID for chain-aware PSS sampling.
+
+bench_spin_haproxy_chain() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
+    local haproxy_bin
+    haproxy_bin="${BENCH_HAPROXY:-$(command -v haproxy || true)}"
+    [[ -x "$haproxy_bin" ]] || die "haproxy binary not found; set BENCH_HAPROXY=/path/to/haproxy or install haproxy"
+    [[ "$proto" == "tcp" ]] || die "bench_spin_haproxy_chain: HAProxy has no generic UDP L4 forwarder (mode udp does not exist); got proto=$proto"
+
+    local nthreads
+    nthreads="$(nproc 2>/dev/null || echo 1)"
+    local outer_bind="127.0.0.1"
+    local inner_bind="127.0.0.2"
+
+    # ---- inner ----
+    mkdir -p "$tmp/haproxy-inner"
+    cat > "$tmp/haproxy-inner/haproxy.cfg" <<EOF
+global
+    nbthread $nthreads
+    maxconn 65535
+    log /dev/null local0
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+frontend in
+    bind $inner_bind:$listen_port
+    default_backend echo
+backend echo
+    server echo 127.0.0.1:$upstream_port
+EOF
+    bench_spawn HAPROXY_INNER_PID "$tmp/haproxy-inner/spawn.log" -- \
+        "$haproxy_bin" -db -f "$tmp/haproxy-inner/haproxy.cfg"
+    bench_wait_listen_tcp "$inner_bind" "$listen_port" 5
+
+    # ---- outer ----
+    mkdir -p "$tmp/haproxy-outer"
+    cat > "$tmp/haproxy-outer/haproxy.cfg" <<EOF
+global
+    nbthread $nthreads
+    maxconn 65535
+    log /dev/null local0
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+frontend in
+    bind $outer_bind:$listen_port
+    default_backend chain
+backend chain
+    server inner $inner_bind:$listen_port
+EOF
+    bench_spawn HAPROXY_OUTER_PID "$tmp/haproxy-outer/spawn.log" -- \
+        "$haproxy_bin" -db -f "$tmp/haproxy-outer/haproxy.cfg"
+    bench_wait_listen_tcp "$outer_bind" "$listen_port" 5
 }
 
 # ---------- loadgen invocation ----------
