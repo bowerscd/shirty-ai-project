@@ -316,11 +316,14 @@ pub async fn run_relay(
         if config.dial.is_some() { "yes" } else { "no" },
     ));
 
+    let sighup_join = spawn_sighup_handler(supervisor.reload_trigger(), shutdown.clone());
+
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
+    let _ = sighup_join.await;
     if let Some(handle) = hb_handle {
         let _ = handle.await;
     }
@@ -468,11 +471,14 @@ pub async fn run_terminal(
         if config.dial.is_some() { "yes" } else { "no" },
     ));
 
+    let sighup_join = spawn_sighup_handler(supervisor.reload_trigger(), shutdown.clone());
+
     wait_for_shutdown().await;
     tracing::info!("yggdrasil shutting down");
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
+    let _ = sighup_join.await;
     if let Some(handle) = predicate_publisher_join {
         let _ = handle.await;
     }
@@ -568,4 +574,40 @@ async fn wait_for_shutdown() {
         _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
         _ = sigterm.recv()          => tracing::info!("received SIGTERM"),
     }
+}
+
+/// Spawn a SIGHUP handler that calls `force_reload` on every signal.
+/// Returns a join handle scoped to `shutdown` — the task exits cleanly
+/// when the parent cancels.
+///
+/// This is what makes `systemctl reload yggdrasil` (paired with
+/// `Type=notify-reload` in the unit file) trigger an actual rule rescan
+/// rather than just delivering the signal into the void. The reload work
+/// itself runs on the supervisor task; this handler only nudges it.
+fn spawn_sighup_handler(
+    reload_trigger: crate::rules::ReloadTrigger,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGHUP handler; reload-on-SIGHUP disabled");
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                got = sighup.recv() => {
+                    if got.is_none() {
+                        return;
+                    }
+                    tracing::info!("received SIGHUP; requesting rules reload");
+                    reload_trigger.force_reload();
+                }
+            }
+        }
+    })
 }

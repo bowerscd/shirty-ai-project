@@ -8,7 +8,7 @@ walks through the first heartbeat-to-traffic loop.
 
 * Linux x86\_64 and aarch64 (musl or glibc).
 * Rust toolchain pinned in `rust-toolchain.toml` (currently `1.95.0`,
-  edition 2021, MSRV 1.85).
+  edition 2021, MSRV 1.95).
 * A POSIX-compliant init system. systemd unit files are provided below;
   OpenRC and runit users will need to adapt them.
 
@@ -83,13 +83,19 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# `notify` (paired with sd_notify(READY=1) in yggdrasil) means `is-active`
-# reports `active` only after the chain listener (if any), proxy
-# supervisor, and control socket have all bound — not just after the
-# process forked. Dependent units therefore order correctly.
-Type=notify
+# `notify-reload` (paired with sd_notify(READY=1) in yggdrasil) means
+# `is-active` reports `active` only after the chain listener (if any),
+# proxy supervisor, and control socket have all bound — not just after
+# the process forked. The `-reload` half also wires `systemctl reload
+# yggdrasil` (default action: SIGHUP) to an authoritative rule rescan:
+# the daemon emits RELOADING=1 / MONOTONIC_USEC before the watcher
+# drains the trigger, then READY=1 once the supervisor has reconciled
+# the new set, so systemd knows the reload settled before returning to
+# the operator.
+Type=notify-reload
 NotifyAccess=main
 ExecStart=/usr/local/bin/yggdrasil run
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 

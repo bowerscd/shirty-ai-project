@@ -151,6 +151,20 @@ rule set and returns the post-swap rule count; a non-zero exit code
 means the new set failed validation and the daemon kept the previous
 one.
 
+Under systemd, the unit is `Type=notify-reload` and wires
+`ExecReload=/bin/kill -HUP $MAINPID`, so the canonical way to ask for
+a reload is also:
+
+```bash
+sudo systemctl reload yggdrasil
+```
+
+SIGHUP forces the same rescan path. The daemon emits `RELOADING=1` +
+`MONOTONIC_USEC` to systemd before the supervisor reconciles and
+`READY=1` once the new set is live; `systemctl reload` only returns
+after that second notification, so `is-active` reflects post-reload
+state.
+
 To push a rule file **without** writing it to disk (e.g. dry runs from
 a deploy box), use `chain apply`:
 

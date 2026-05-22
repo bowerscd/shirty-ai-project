@@ -19,6 +19,23 @@
 //! are logged at warn and swallowed — systemd integration must never block
 //! or fail startup.
 //!
+//! ## Reload contract (`Type=notify-reload`)
+//!
+//! When `systemctl reload yggdrasil` is invoked, systemd sends SIGHUP to
+//! the main PID. The daemon then:
+//!
+//! 1. emits `RELOADING=1` *and* `MONOTONIC_USEC=<n>` before starting the
+//!    reload work, where `n` is the current monotonic-clock value in
+//!    microseconds (see [`notify_reloading`]);
+//! 2. performs the reload (in our case: the rule-watcher + supervisor
+//!    reconcile pipeline);
+//! 3. emits `READY=1` after the reload settles (see
+//!    [`notify_ready_after_reload`]).
+//!
+//! systemd uses the `MONOTONIC_USEC` value to disambiguate the matching
+//! `READY=1` from a stale one — without it, the reload would silently
+//! fail with EPROTO. Both helpers are no-ops when `NOTIFY_SOCKET` is unset.
+//!
 //! [`ProxySupervisor::spawn`]: crate::proxy::supervisor::ProxySupervisor::spawn
 //! [`run_relay`]: crate::run_relay
 //! [`run_terminal`]: crate::run_terminal
@@ -51,6 +68,40 @@ pub fn notify_ready_with_status(status: &str) {
     }
 }
 
+/// Send `RELOADING=1` plus `MONOTONIC_USEC=<n>` to systemd. Required by
+/// `Type=notify-reload` units before the daemon begins reload work.
+///
+/// `unset_env = false` because the supervisor is still running and may
+/// reload again later; we don't want to forget the socket path between
+/// reloads.
+///
+/// No-op when `NOTIFY_SOCKET` is unset.
+pub fn notify_reloading() {
+    let usec = match sd_notify::NotifyState::monotonic_usec_now() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read monotonic clock; skipping RELOADING=1");
+            return;
+        }
+    };
+    match sd_notify::notify(false, &[sd_notify::NotifyState::Reloading, usec]) {
+        Ok(()) => tracing::debug!("sent sd_notify RELOADING=1 + MONOTONIC_USEC"),
+        Err(e) => tracing::warn!(error = %e, "sd_notify RELOADING failed; continuing"),
+    }
+}
+
+/// Send `READY=1` after a reload completes. Distinct from
+/// [`notify_ready`] only in that it preserves `NOTIFY_SOCKET` for the
+/// next reload (the daemon is still running).
+///
+/// No-op when `NOTIFY_SOCKET` is unset.
+pub fn notify_ready_after_reload() {
+    match sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        Ok(()) => tracing::debug!("sent sd_notify READY=1 (post-reload)"),
+        Err(e) => tracing::warn!(error = %e, "sd_notify READY=1 (post-reload) failed; continuing"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +120,7 @@ mod tests {
         unsafe { std::env::remove_var("NOTIFY_SOCKET") };
         notify_ready();
         notify_ready_with_status("mode=relay, accept=yes, dial=no");
+        notify_reloading();
+        notify_ready_after_reload();
     }
 }
