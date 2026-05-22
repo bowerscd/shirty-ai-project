@@ -13,17 +13,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Args;
 use serde::Serialize;
 
-#[derive(Debug, Args)]
-pub struct ValidateArgs {
-    /// Override the rules directory. When omitted, uses
-    /// `[server].rules_dir` from the loaded config (default
-    /// `/etc/yggdrasil/conf.d`).
-    #[arg(long)]
-    rules_dir: Option<PathBuf>,
-}
+pub use cli_defs::yggdrasilctl::validate::ValidateArgs;
 
 #[derive(Debug, Serialize)]
 struct ValidateReport {

@@ -7,7 +7,7 @@
 //! daemon entrypoint.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use yggdrasil::{cli, log, run};
 
@@ -26,6 +26,11 @@ fn main() -> Result<()> {
             cli::Command::Run(run_args) => run(run_args).await,
             cli::Command::Version => {
                 println!("yggdrasil {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
+            cli::Command::Completions(c) => {
+                let mut cmd = cli::Cli::command();
+                clap_complete::generate(c.shell, &mut cmd, "yggdrasil", &mut std::io::stdout());
                 Ok(())
             }
         }

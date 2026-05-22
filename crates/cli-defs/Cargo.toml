@@ -1,0 +1,23 @@
+[package]
+name        = "cli-defs"
+description = "clap-derive command-tree definitions shared by yggdrasil and yggdrasilctl"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish     = false
+
+# Lib only. Pulled in twice by each consumer bin: once as a regular
+# `[dependencies]` (so the binary uses the same `Cli` it advertises at
+# runtime) and once as `[build-dependencies]` so `build.rs` can drive
+# `clap-markdown` against the same definitions.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ratatoskr       = { workspace = true }
+clap            = { workspace = true }
+clap_complete   = { workspace = true }
+humantime       = { workspace = true }
+humantime-serde = { workspace = true }

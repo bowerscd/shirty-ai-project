@@ -3,75 +3,16 @@
 //! As of the chain-control rework the daemon binary exposes only `run`
 //! (and the inherent `version` subcommand). Identity management,
 //! enrollment, and administrative queries live in `yggdrasilctl`.
+//!
+//! The clap-derive type definitions live in the sibling `cli-defs`
+//! crate so `crates/yggdrasil/build.rs` (a separate compile unit) can
+//! introspect them for the auto-generated CLI reference. We re-export
+//! them here so downstream call-sites (`crate::lib`, `tests`) keep
+//! using the original `crate::cli::*` paths.
 
-use std::net::IpAddr;
-use std::path::PathBuf;
-
-use clap::{Args, Parser, Subcommand, ValueEnum};
+pub use cli_defs::yggdrasil::{Cli, Command, LogFormat, RequireModeArg, RunArgs};
 
 use crate::config::Mode;
-
-/// `yggdrasil` — reverse proxy server.
-#[derive(Debug, Parser)]
-#[command(name = "yggdrasil", version, about, propagate_version = true)]
-pub struct Cli {
-    /// Output format for structured logs.
-    #[arg(long, value_enum, default_value_t = LogFormat::Json, global = true,
-          env = "YGGDRASIL_LOG_FORMAT")]
-    pub log_format: LogFormat,
-
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum LogFormat {
-    /// One JSON object per line (suitable for journald, ELK, Loki, etc.).
-    Json,
-    /// Human-readable single-line format with ANSI colour (suitable for terminals).
-    Pretty,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    /// Run the proxy server.
-    Run(RunArgs),
-    /// Print the build version.
-    Version,
-}
-
-#[derive(Debug, Args)]
-pub struct RunArgs {
-    /// Path to the server configuration file.
-    #[arg(
-        long,
-        default_value = "/etc/yggdrasil/config.toml",
-        env = "YGGDRASIL_CONFIG"
-    )]
-    pub config: PathBuf,
-
-    /// Override the rules directory specified in the config file.
-    #[arg(long, env = "YGGDRASIL_RULES_DIR")]
-    pub rules_dir: Option<PathBuf>,
-
-    /// Assert the config resolves to this derived mode and fail fast if not.
-    #[arg(long, value_enum)]
-    pub require_mode: Option<RequireModeArg>,
-
-    /// Hard-override every rule's `listen` IP with this address. The rule's
-    /// port is preserved; only the IP is replaced. Overrides
-    /// `[server].default_bind`.
-    #[arg(long, value_name = "IP")]
-    pub bind: Option<IpAddr>,
-}
-
-/// CLI-side mirror of [`crate::config::Mode`].
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum RequireModeArg {
-    Gateway,
-    Relay,
-    Terminal,
-}
 
 impl From<RequireModeArg> for Mode {
     fn from(m: RequireModeArg) -> Self {

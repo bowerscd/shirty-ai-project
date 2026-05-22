@@ -4,83 +4,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Subcommand};
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use ratatoskr::control::{Mode, Request, Response};
 
-#[derive(Debug, Subcommand)]
-pub enum Cmd {
-    /// Show high-level server status (mode, downstream IP, last heartbeat,
-    /// rule count, uptime).
-    Status,
-    /// Inspect or manage loaded rules.
-    Rules {
-        #[command(subcommand)]
-        action: RuleAction,
-    },
-    /// Inspect or manage the enrolled accept-side peer (the inbound chain
-    /// peer pinned by `[accept]` — for relay-mode this is the downstream
-    /// terminal node).
-    Accept {
-        #[command(subcommand)]
-        action: AcceptAction,
-    },
-    /// Render the daemon's Prometheus metrics in text exposition
-    /// format, retrieved over the control socket.
-    Metrics,
-    /// Liveness/readiness probe served over the control socket. Exit
-    /// status: 0 if ready, 1 if not yet ready, 2 on RPC error.
-    Health,
-    /// Snapshot of this node's chain-applied predicates, derived rule
-    /// set, and chain identity. Pretty-printed JSON to stdout.
-    DerivedRules,
-    /// Adjust the daemon's tracing-subscriber filter at runtime.
-    /// Pass a directive (`debug`, `yggdrasil::heartbeat=trace,info`,
-    /// etc.) or `--reset` to revert to the startup filter. With no
-    /// args, prints the current and default directives without
-    /// changing anything.
-    Trace(TraceArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct TraceArgs {
-    /// New EnvFilter directive to install. Required unless `--reset` is set.
-    #[arg(conflicts_with = "reset", required_unless_present = "reset")]
-    pub directive: Option<String>,
-    /// Restore the directive the daemon was launched with.
-    #[arg(long)]
-    pub reset: bool,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum RuleAction {
-    /// List loaded rules.
-    List,
-    /// Force a reload of the rules directory (in addition to inotify).
-    Reload,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AcceptAction {
-    /// Show the currently enrolled accept-side pubkey and fingerprint.
-    Show,
-    /// List staged TOFU candidates awaiting approval.
-    Pending,
-    /// Approve a staged candidate by its fingerprint or any unique
-    /// 8+-hex-char prefix.
-    Approve(ApproveArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ApproveArgs {
-    /// Full BLAKE2s-128 fingerprint (32 hex chars) of the accept-side
-    /// peer to approve, or any unique prefix of at least 8 hex chars. The
-    /// daemon disambiguates against the staged queue; ambiguous
-    /// prefixes return an error listing every match.
-    pub fingerprint: String,
-}
+// The `ApproveArgs` and `TraceArgs` re-exports are unused by the bin's
+// own production code path (the dispatch deconstructs via `Cmd::Trace`
+// / `AcceptAction::Approve`) but are referenced by name in this file's
+// unit tests. Allow the dead re-export at lint time so both targets
+// build clean under `-D warnings`.
+#[allow(unused_imports)]
+pub use cli_defs::yggdrasilctl::local::{
+    AcceptAction, AcmeAction, AcmeRenewArgs, ApproveArgs, Cmd, RuleAction, TraceArgs,
+};
 
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     let request = build_request(&cmd);
@@ -120,6 +58,12 @@ fn build_request(cmd: &Cmd) -> Request {
                 Request::TraceSet { directive: Some(d) }
             }
         }
+        Cmd::Acme { action } => match action {
+            AcmeAction::List => Request::AcmeList,
+            AcmeAction::Renew(a) => Request::AcmeRenew {
+                hostname: a.hostname.clone(),
+            },
+        },
     }
 }
 
@@ -298,8 +242,65 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
             println!("trace: active={active}");
             println!("       default={default}");
         }
+        Response::AcmeList(a) => {
+            if a.hosts.is_empty() {
+                println!("(no ACME-managed hosts)");
+            } else {
+                println!(
+                    "{:<32}  {:<7}  {:<10}  {:<10}  next_renewal",
+                    "hostname", "chall", "provider", "state",
+                );
+                for h in &a.hosts {
+                    let next = match h.next_renewal_unix {
+                        Some(ts) => format_unix_secs(ts),
+                        None => "(unscheduled)".to_string(),
+                    };
+                    let provider = h.provider.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<32}  {:<7}  {:<10}  {:<10}  {}",
+                        h.hostname, h.challenge, provider, h.state, next,
+                    );
+                    if let Some(err) = &h.last_error {
+                        println!("    last_error: {err}");
+                    }
+                }
+            }
+        }
+        Response::AcmeRenewed { hostname, success } => {
+            if *success {
+                println!("renewed {hostname}");
+            } else {
+                println!("renewal kicked for {hostname} (no result)");
+            }
+        }
     }
     Ok(())
+}
+
+fn format_unix_secs(secs: u64) -> String {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let when = UNIX_EPOCH + Duration::from_secs(secs);
+    match when.duration_since(SystemTime::now()) {
+        Ok(future) => {
+            let mins = future.as_secs() / 60;
+            if mins < 60 {
+                format!("in {mins} m  ({secs})")
+            } else {
+                let h = mins / 60;
+                let m = mins % 60;
+                if h < 48 {
+                    format!("in {h} h {m} m  ({secs})")
+                } else {
+                    let d = h / 24;
+                    format!("in {d} d  ({secs})")
+                }
+            }
+        }
+        Err(e) => {
+            let ago = e.duration().as_secs() / 60;
+            format!("{ago} m ago  ({secs})")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -377,5 +378,28 @@ mod tests {
             reset: true,
         }));
         assert_eq!(req, Request::TraceSet { directive: None });
+    }
+
+    #[test]
+    fn build_request_maps_acme_list() {
+        let req = build_request(&Cmd::Acme {
+            action: AcmeAction::List,
+        });
+        assert_eq!(req, Request::AcmeList);
+    }
+
+    #[test]
+    fn build_request_maps_acme_renew() {
+        let req = build_request(&Cmd::Acme {
+            action: AcmeAction::Renew(AcmeRenewArgs {
+                hostname: "example.com".into(),
+            }),
+        });
+        assert_eq!(
+            req,
+            Request::AcmeRenew {
+                hostname: "example.com".into(),
+            }
+        );
     }
 }

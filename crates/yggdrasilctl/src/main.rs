@@ -1,95 +1,44 @@
 //! yggdrasilctl — admin CLI for yggdrasil.
 //!
-//! The CLI is organised into three scopes:
+//! The CLI is organised into four scopes:
 //!
 //! * `local` — talks to the running daemon over its Unix domain socket
 //!   (`/run/yggdrasil/control.sock` by default). Used for status, rule
 //!   inspection, and downstream TOFU management.
-//! * `chain` — inspects/manages the chain-control plane. Stubs in Phase 1;
-//!   filled in in Phase 4-5 once the chain wire protocol lands.
+//! * `chain` — inspects/manages the chain-control plane.
 //! * `identity` — offline operations on this node's identity file and the
-//!   daemon's config TOML. Mints intro/invite files and edits
+//!   daemon's config TOML. Mints request/grant files and edits
 //!   `[dial]` / `[accept]` sections. No daemon required.
+//! * `validate` — offline check of the config + rules directory.
+//!
+//! All clap-derive command-tree types live in the sibling `cli-defs`
+//! crate so `crates/yggdrasilctl/build.rs` (a separate compile unit)
+//! can introspect them for the auto-generated CLI reference. Dispatch
+//! logic stays here.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser};
+
+use cli_defs::yggdrasilctl::{Cli, Scope};
 
 mod chain;
 mod identity;
 mod local;
 mod validate;
 
-/// Default path to the daemon's main config file.
-const DEFAULT_CONFIG_PATH: &str = "/etc/yggdrasil/config.toml";
-
-/// Default path to the daemon's control socket.
-const DEFAULT_SOCKET_PATH: &str = "/run/yggdrasil/control.sock";
-
-#[derive(Debug, Parser)]
-#[command(name = "yggdrasilctl", version, about, propagate_version = true)]
-struct Cli {
-    /// Path to the yggdrasil config file. Used by the `identity` and
-    /// `validate` scopes; `local` and `chain` ignore it.
-    #[arg(
-        long,
-        default_value = DEFAULT_CONFIG_PATH,
-        env = "YGGDRASIL_CONFIG",
-        global = true
-    )]
-    config: PathBuf,
-
-    /// Emit responses as raw JSON instead of human-readable text.
-    #[arg(long, global = true)]
-    json: bool,
-
-    #[command(subcommand)]
-    scope: Scope,
-}
-
-/// Shared `--socket` option for the daemon-talking scopes (`local` and
-/// `chain`). Identity and validate scopes never contact the daemon and
-/// deliberately don't accept this flag (config-UX item 28).
-#[derive(Debug, clap::Args)]
-struct SocketOpts {
-    /// Path to the yggdrasil control socket.
-    #[arg(
-        long,
-        default_value = DEFAULT_SOCKET_PATH,
-        env = "YGGDRASIL_CONTROL_SOCKET",
-    )]
-    socket: PathBuf,
-}
-
-#[derive(Debug, Subcommand)]
-enum Scope {
-    /// Daemon-local operations over the control socket.
-    Local {
-        #[command(flatten)]
-        socket: SocketOpts,
-        #[command(subcommand)]
-        cmd: local::Cmd,
-    },
-    /// Chain-control plane operations.
-    Chain {
-        #[command(flatten)]
-        socket: SocketOpts,
-        #[command(subcommand)]
-        cmd: chain::Cmd,
-    },
-    /// Identity and enrollment (offline; mutates config file).
-    Identity {
-        #[command(subcommand)]
-        cmd: identity::Cmd,
-    },
-    /// Validate the daemon's config file and rules directory offline.
-    Validate(validate::ValidateArgs),
-}
-
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+
+    // The `completions` scope is synchronous and doesn't need a tokio
+    // runtime. Handle it before building the runtime to avoid the
+    // per-process cost on a no-op.
+    if let Scope::Completions(c) = &cli.scope {
+        let mut cmd = Cli::command();
+        clap_complete::generate(c.shell, &mut cmd, "yggdrasilctl", &mut std::io::stdout());
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -108,6 +57,7 @@ fn main() -> Result<ExitCode> {
                 .await
                 .map(|()| ExitCode::SUCCESS),
             Scope::Validate(args) => validate::run(args, &cli.config, cli.json).await,
+            Scope::Completions(_) => unreachable!("handled before runtime build"),
         }
     })
 }

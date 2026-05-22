@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cli-defs",
     "crates/ratatoskr",
     "crates/yggdrasil",
     "crates/yggdrasilctl",
@@ -34,6 +35,8 @@ anyhow       = "1"
 
 # CLI
 clap         = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+clap-markdown = "0.1"
 
 # Logging
 tracing            = "0.1"
@@ -96,6 +99,7 @@ pin-project-lite = "0.2"
 # Internal crates
 ratatoskr = { path = "crates/ratatoskr" }
 yggdrasil = { path = "crates/yggdrasil" }
+cli-defs  = { path = "crates/cli-defs" }
 
 [profile.release]
 opt-level     = 3
