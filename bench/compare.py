@@ -75,6 +75,18 @@ HAPROXY_DELTA_BUDGET = {
 }
 HAPROXY_P99_BUDGET_PCT = 100
 
+# Traefik comparison — covers both TCP and UDP (Traefik 3.x supports both
+# at L4). Same budget shape as nginx.
+TRAEFIK_DELTA_BUDGET = {
+    ("tcp-throughput",  "bytes_per_sec_rx"): 10,
+    ("tcp-connrate",    "pps_rx"):           25,
+    ("udp-pps",         "pps_rx"):           20,
+    ("udp-flows",       "pps_rx"):           20,
+    ("udp-flowchurn",   "pps_rx"):           20,
+    ("tcp-idle-conns",  "proxy_rss_kib"):    100,
+}
+TRAEFIK_P99_BUDGET_PCT = 100
+
 
 @dataclass
 class Report:
@@ -263,6 +275,16 @@ def check_haproxy_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
     return failures
 
 
+def check_traefik_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
+    failures = _check_pair_deltas(
+        cand, "yggdrasil-terminal", "traefik", TRAEFIK_DELTA_BUDGET, TRAEFIK_P99_BUDGET_PCT
+    )
+    failures += _check_pair_deltas(
+        cand, "yggdrasil-chain", "traefik-chain", TRAEFIK_DELTA_BUDGET, TRAEFIK_P99_BUDGET_PCT
+    )
+    return failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -276,6 +298,8 @@ def main() -> int:
                     help="also check yggdrasil-vs-nginx SLO deltas")
     ap.add_argument("--check-haproxy", action="store_true",
                     help="also check yggdrasil-vs-haproxy SLO deltas (TCP scenarios only)")
+    ap.add_argument("--check-traefik", action="store_true",
+                    help="also check yggdrasil-vs-traefik SLO deltas (TCP + UDP)")
     args = ap.parse_args()
 
     base_dir = args.baseline_opt or args.baseline
@@ -315,6 +339,15 @@ def main() -> int:
             failures.extend(haproxy_failures)
         else:
             print("\nhaproxy SLO check: all within budget")
+    if args.check_traefik:
+        traefik_failures = check_traefik_deltas(cand)
+        if traefik_failures:
+            print("\ntraefik SLO check:")
+            for f in traefik_failures:
+                print(f"  FAIL: {f}")
+            failures.extend(traefik_failures)
+        else:
+            print("\ntraefik SLO check: all within budget")
 
     if failures:
         print(f"\n{len(failures)} failure(s):", file=sys.stderr)

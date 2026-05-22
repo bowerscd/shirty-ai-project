@@ -70,12 +70,22 @@ run_subject() {
             bench_spin_haproxy_chain "$tmp" "$listen" "$echo_port" tcp
             run_leg haproxy-chain "127.0.0.1:$listen"
             ;;
+        traefik)
+            local listen; listen="$(pick_free_tcp_port)"
+            bench_spin_traefik "$tmp" "$listen" "$echo_port" tcp
+            run_leg traefik "127.0.0.1:$listen"
+            ;;
+        traefik-chain)
+            local listen; listen="$(pick_free_tcp_port)"
+            bench_spin_traefik_chain "$tmp" "$listen" "$echo_port" tcp
+            run_leg traefik-chain "127.0.0.1:$listen"
+            ;;
         *) die "unknown subject $subject" ;;
     esac
     bench_leg_teardown
 }
 
-for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain haproxy haproxy-chain; do
+for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain haproxy haproxy-chain traefik traefik-chain; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done

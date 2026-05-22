@@ -669,6 +669,149 @@ EOF
     bench_wait_listen_tcp "$outer_bind" "$listen_port" 5
 }
 
+# ---------- traefik orchestration ----------
+#
+# bench_spin_traefik <tmpdir> <listen_port> <upstream_port> <protocol>
+#
+# Renders a Traefik static-config + dynamic-config pair, starts the daemon
+# in foreground, and waits for the listener.
+#
+# Traefik does both TCP and UDP at L4, so a single helper covers both
+# protocols (with HAProxy we needed `mode tcp` only). The TCP rule uses
+# the catch-all SNI matcher `HostSNI(\`*\`)` for raw-passthrough behaviour
+# without inspecting the bytes.
+
+bench_spin_traefik() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
+    local traefik_bin
+    traefik_bin="${BENCH_TRAEFIK:-$(command -v traefik || true)}"
+    [[ -x "$traefik_bin" ]] || die "traefik binary not found; set BENCH_TRAEFIK=/path/to/traefik or install traefik"
+
+    mkdir -p "$tmp/traefik"
+    _bench_render_traefik_configs "$tmp/traefik" "127.0.0.1" "$listen_port" "127.0.0.1:$upstream_port" "$proto"
+
+    bench_spawn TRAEFIK_PID "$tmp/traefik/spawn.log" -- \
+        "$traefik_bin" --configfile="$tmp/traefik/traefik.yaml"
+
+    if [[ "$proto" == "tcp" ]]; then
+        bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
+    else
+        bench_wait_listen_udp 127.0.0.1 "$listen_port" 5
+    fi
+    # Traefik binds the entry-point listener before its router/service
+    # pipeline is wired through the file provider; the first connection
+    # to arrive in that window stalls until the dynamic config loads.
+    # Settle for a bit so the bench measures steady-state cost, not a
+    # cold-start race that varies wildly between runs.
+    sleep 0.4
+}
+
+# ---------- traefik chain orchestration ----------
+#
+# Two Traefik processes mirroring yggdrasil-chain's outer→inner topology.
+# Same loopback-IP pinning (outer 127.0.0.1, inner 127.0.0.2). Supports
+# both TCP and UDP. Exports TRAEFIK_OUTER_PID and TRAEFIK_INNER_PID for
+# chain-aware PSS sampling.
+
+bench_spin_traefik_chain() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
+    local traefik_bin
+    traefik_bin="${BENCH_TRAEFIK:-$(command -v traefik || true)}"
+    [[ -x "$traefik_bin" ]] || die "traefik binary not found; set BENCH_TRAEFIK=/path/to/traefik or install traefik"
+
+    local outer_bind="127.0.0.1"
+    local inner_bind="127.0.0.2"
+
+    # ---- inner ----
+    mkdir -p "$tmp/traefik-inner"
+    _bench_render_traefik_configs "$tmp/traefik-inner" "$inner_bind" "$listen_port" "127.0.0.1:$upstream_port" "$proto"
+    bench_spawn TRAEFIK_INNER_PID "$tmp/traefik-inner/spawn.log" -- \
+        "$traefik_bin" --configfile="$tmp/traefik-inner/traefik.yaml"
+    if [[ "$proto" == "tcp" ]]; then
+        bench_wait_listen_tcp "$inner_bind" "$listen_port" 5
+    else
+        bench_wait_listen_udp "$inner_bind" "$listen_port" 5
+    fi
+    sleep 0.4
+
+    # ---- outer ----
+    mkdir -p "$tmp/traefik-outer"
+    _bench_render_traefik_configs "$tmp/traefik-outer" "$outer_bind" "$listen_port" "$inner_bind:$listen_port" "$proto"
+    bench_spawn TRAEFIK_OUTER_PID "$tmp/traefik-outer/spawn.log" -- \
+        "$traefik_bin" --configfile="$tmp/traefik-outer/traefik.yaml"
+    if [[ "$proto" == "tcp" ]]; then
+        bench_wait_listen_tcp "$outer_bind" "$listen_port" 5
+    else
+        bench_wait_listen_udp "$outer_bind" "$listen_port" 5
+    fi
+    # Same router-pipeline-readiness settle as bench_spin_traefik; applies
+    # per-instance, so we get one for inner and one for outer.
+    sleep 0.4
+}
+
+# Private: render Traefik's static + dynamic config pair into $dir.
+# Args: dir, bind_addr, listen_port, upstream_addr, proto
+_bench_render_traefik_configs() {
+    local dir="$1" bind_addr="$2" port="$3" upstream="$4" proto="$5"
+    local ep_suffix=""
+    [[ "$proto" == "udp" ]] && ep_suffix="/udp"
+
+    # Static config — entryPoints + a file provider pointing at dynamic.yaml.
+    # Disable the dashboard, telemetry, and access log so nothing else
+    # competes for cpu/io on the bench host.
+    cat > "$dir/traefik.yaml" <<EOF
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+log:
+  level: ERROR
+accessLog:
+  filePath: /dev/null
+entryPoints:
+  bench:
+    address: "$bind_addr:$port$ep_suffix"
+providers:
+  file:
+    filename: "$dir/dynamic.yaml"
+    watch: false
+EOF
+
+    # Dynamic config — one router + one service in the right protocol section.
+    if [[ "$proto" == "tcp" ]]; then
+        # The default `HostSNI(\`*\`)` matcher requires Traefik to peek for
+        # a TLS ClientHello to extract SNI — plain TCP traffic stalls
+        # forever waiting for bytes that match. `ClientIP` matches purely
+        # on the source address, available right after accept(), so it's
+        # the correct rule for raw L4 passthrough.
+        cat > "$dir/dynamic.yaml" <<EOF
+tcp:
+  routers:
+    bench:
+      entryPoints: [bench]
+      rule: "ClientIP(\`0.0.0.0/0\`) || ClientIP(\`::/0\`)"
+      service: echo
+  services:
+    echo:
+      loadBalancer:
+        servers:
+          - address: "$upstream"
+EOF
+    else
+        cat > "$dir/dynamic.yaml" <<EOF
+udp:
+  routers:
+    bench:
+      entryPoints: [bench]
+      service: echo
+  services:
+    echo:
+      loadBalancer:
+        servers:
+          - address: "$upstream"
+EOF
+    fi
+}
+
 # ---------- loadgen invocation ----------
 #
 # bench_run_loadgen <subject> <out_json_path> <args...>

@@ -197,6 +197,18 @@ run_subject() {
             target="127.0.0.1:$listen"
             proxy_pids="${HAPROXY_OUTER_PID:-} ${HAPROXY_INNER_PID:-}"
             ;;
+        traefik)
+            listen="$(pick_free_tcp_port)"
+            bench_spin_traefik "$tmp" "$listen" "$echo_port" tcp
+            target="127.0.0.1:$listen"
+            proxy_pids="${TRAEFIK_PID:-}"
+            ;;
+        traefik-chain)
+            listen="$(pick_free_tcp_port)"
+            bench_spin_traefik_chain "$tmp" "$listen" "$echo_port" tcp
+            target="127.0.0.1:$listen"
+            proxy_pids="${TRAEFIK_OUTER_PID:-} ${TRAEFIK_INNER_PID:-}"
+            ;;
         *) die "unknown subject $subject" ;;
     esac
 
@@ -269,7 +281,7 @@ run_subject() {
     bench_leg_teardown
 }
 
-for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain haproxy haproxy-chain; do
+for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain haproxy haproxy-chain traefik traefik-chain; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done

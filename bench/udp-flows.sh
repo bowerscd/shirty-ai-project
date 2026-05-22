@@ -64,12 +64,22 @@ run_subject() {
             bench_spin_nginx_chain "$tmp" "$listen" "$echo_port" udp
             run_leg nginx-chain 127.0.0.1 "$listen"
             ;;
+        traefik)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_traefik "$tmp" "$listen" "$echo_port" udp
+            run_leg traefik 127.0.0.1 "$listen"
+            ;;
+        traefik-chain)
+            local listen; listen="$(pick_free_udp_port)"
+            bench_spin_traefik_chain "$tmp" "$listen" "$echo_port" udp
+            run_leg traefik-chain 127.0.0.1 "$listen"
+            ;;
         *) die "unknown subject $subject" ;;
     esac
     bench_leg_teardown
 }
 
-for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain; do
+for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain traefik traefik-chain; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done

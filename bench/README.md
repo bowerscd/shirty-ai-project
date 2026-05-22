@@ -1,10 +1,10 @@
 # Yggdrasil bench harness
 
-End-to-end benchmark suite that compares **yggdrasil** (both as a single-hop terminal and as a full gateway→terminal chain) against **nginx** (stream module) and **HAProxy** (also each in single-hop and chained variants), plus a **direct** baseline. Each scenario emits a JSON report under `bench/results/<git-sha>/<scenario>-<subject>.json`. `bench/compare.py` diffs two such trees and gates regressions.
+End-to-end benchmark suite that compares **yggdrasil** (both as a single-hop terminal and as a full gateway→terminal chain) against **nginx** (stream module), **HAProxy**, and **Traefik** — each in single-hop and chained variants — plus a **direct** baseline. Each scenario emits a JSON report under `bench/results/<git-sha>/<scenario>-<subject>.json`. `bench/compare.py` diffs two such trees and gates regressions.
 
 ## Subjects
 
-Every scenario runs against up to seven subjects so the topology counts match in comparisons (chain vs chain, single hop vs single hop):
+Every scenario runs against up to nine subjects so the topology counts match in comparisons (chain vs chain, single hop vs single hop):
 
 | Subject | Hops | Topology | TCP | UDP |
 | --- | --- | --- | --- | --- |
@@ -15,43 +15,46 @@ Every scenario runs against up to seven subjects so the topology counts match in
 | `nginx-chain` | 2 | loadgen → outer nginx → inner nginx → echo | ✓ | ✓ |
 | `haproxy` | 1 | loadgen → haproxy → echo | ✓ | — |
 | `haproxy-chain` | 2 | loadgen → outer haproxy → inner haproxy → echo | ✓ | — |
+| `traefik` | 1 | loadgen → traefik → echo | ✓ | ✓ |
+| `traefik-chain` | 2 | loadgen → outer traefik → inner traefik → echo | ✓ | ✓ |
 
-HAProxy 3.x has no `mode udp`, so it sits out the three UDP scenarios in both variants.
+HAProxy 3.x has no `mode udp`, so it sits out the three UDP scenarios in both variants. Traefik supports both protocols at L4, so it covers everything.
 
-## Why nginx and HAProxy?
+## Why these peers?
 
-Both are widely-deployed L4 reverse proxies and the de-facto incumbents we have to be within a small constant of to claim "production-grade":
+Each is a widely-deployed L4 reverse proxy and the de-facto incumbent we have to be within a small constant of to claim "production-grade":
 
-* **nginx** stream module — TCP **and** UDP stream proxying, hot reload via `nginx -s reload`. The only mainstream OSS reverse proxy that also does UDP at L4, so it's the only comparison subject for the UDP scenarios.
+* **nginx** stream module — TCP + UDP stream proxying, hot reload via `nginx -s reload`. The original mainstream OSS L4 proxy with UDP support.
 * **HAProxy** — TCP-only at L4 (`mode tcp`). Renowned for its TCP performance and per-connection memory footprint, which makes it a tougher comparison than nginx on those axes.
+* **Traefik** — Go, dynamic-first design, TCP + UDP at L4 (since v2.0). Different runtime/model than the C-based incumbents; included to broaden the UDP comparison beyond nginx and to triangulate per-hop costs against a Go event loop.
 
 Why two variants each? Yggdrasil's headline shape is a chain (gateway on a VPS dialing a terminal at home). Comparing chain-mode yggdrasil to a single nginx process gives yggdrasil two proxy hops while nginx has one — apples vs oranges. The `-chain` variants put the same number of hops on both sides for an honest comparison.
 
 The plan's acceptable-delta budgets (Phase 11.5) apply per-hop:
 
-| Scenario          | Metric           | vs nginx*         | vs HAProxy*       |
-| ----------------- | ---------------- | ----------------- | ----------------- |
-| `tcp-throughput`  | bytes/sec        | **−10 %**         | **−10 %**         |
-| `tcp-connrate`    | conns/sec        | **−25 %**         | **−25 %**         |
-| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× peer**     | **≤ 2× peer**     |
-| `udp-pps`         | pkts/sec         | **−20 %**         | n/a — no UDP      |
-| `udp-flows`       | pkts/sec         | **−20 %**         | n/a — no UDP      |
-| `udp-flowchurn`   | new-flows/sec    | **−20 %**         | n/a — no UDP      |
-| (all latency)     | p99              | **≤ 2× peer**     | **≤ 2× peer**     |
+| Scenario          | Metric           | vs nginx*         | vs HAProxy*       | vs Traefik*       |
+| ----------------- | ---------------- | ----------------- | ----------------- | ----------------- |
+| `tcp-throughput`  | bytes/sec        | **−10 %**         | **−10 %**         | **−10 %**         |
+| `tcp-connrate`    | conns/sec        | **−25 %**         | **−25 %**         | **−25 %**         |
+| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× peer**     | **≤ 2× peer**     | **≤ 2× peer**     |
+| `udp-pps`         | pkts/sec         | **−20 %**         | n/a — no UDP      | **−20 %**         |
+| `udp-flows`       | pkts/sec         | **−20 %**         | n/a — no UDP      | **−20 %**         |
+| `udp-flowchurn`   | new-flows/sec    | **−20 %**         | n/a — no UDP      | **−20 %**         |
+| (all latency)     | p99              | **≤ 2× peer**     | **≤ 2× peer**     | **≤ 2× peer**     |
 
-\*Each gate is enforced twice: `yggdrasil-terminal` vs `nginx`/`haproxy` (1-hop pair) and `yggdrasil-chain` vs `nginx-chain`/`haproxy-chain` (2-hop pair).
+\*Each gate is enforced twice: 1-hop vs 1-hop (`yggdrasil-terminal` vs `nginx`/`haproxy`/`traefik`) and 2-hop vs 2-hop (`yggdrasil-chain` vs `nginx-chain`/`haproxy-chain`/`traefik-chain`).
 
-`compare.py --check-nginx` and `compare.py --check-haproxy` enforce these budgets and exit 1 on violation. They can be combined.
+`compare.py --check-nginx`, `--check-haproxy`, and `--check-traefik` enforce these budgets and exit 1 on violation. They can be combined.
 
-> **Note — `reload-latency` has no nginx or HAProxy leg.**
+> **Note — `reload-latency` has no nginx/HAProxy/Traefik leg.**
 > Yggdrasil's rule hot-reload is driven by inotify with a 250 ms debounce
 > window (so half-written / `cp`-streamed config drops don't trigger reload
 > storms); `nginx -s reload` and `haproxy -sf` are operator-explicit IPCs
-> with no debounce. The trigger models measure fundamentally different
-> things, and rules in a yggdrasil deployment change on a human cadence
-> (minutes-to-days), not in the bench's hot loop. We still run the scenario
-> on every `bench/run-all.sh` invocation as a yggdrasil-only correctness
-> and regression signal against previous yggdrasil runs.
+> with no debounce. Traefik does run a file watcher similar to yggdrasil's,
+> but its rule shape is significantly different (full YAML reload vs
+> per-fragment TOML drop-ins) so the comparison would still mislead. We
+> run the scenario on every `bench/run-all.sh` invocation as a
+> yggdrasil-only correctness and regression signal against previous yggdrasil runs.
 
 The `direct` leg (loadgen → echo with no proxy in between) bounds what the kernel + echo backend can deliver in principle — useful for spotting cases where every proxy is bottlenecked on the harness, not the systems under test.
 
@@ -63,6 +66,7 @@ This harness is **Linux-only** (Linux loopback semantics, `/sys/devices/system/c
 - The yggdrasil workspace toolchain (`rustup show` matches `rust-toolchain.toml`)
 - `nginx` ≥ 1.18 with the `stream` module (Ubuntu/Debian: `apt install nginx`; Arch: `pacman -S nginx-mainline`). Set `BENCH_NGINX=/path/to/nginx` if it's not on `$PATH`.
 - `haproxy` ≥ 2.4 (Ubuntu/Debian: `apt install haproxy`; Arch: `pacman -S haproxy`). Set `BENCH_HAPROXY=/path/to/haproxy` if it's not on `$PATH`.
+- `traefik` ≥ 3.0 (Ubuntu/Debian: `apt install traefik`; Arch: `pacman -S traefik`). Set `BENCH_TRAEFIK=/path/to/traefik` if it's not on `$PATH`.
 
 ### Host preparation for trustworthy numbers
 
@@ -115,32 +119,32 @@ Results land under `bench/results/<short-sha>/`. To benchmark uncommitted work, 
 # Regression gate: candidate must not be more than 5% worse on any metric.
 bench/compare.py bench/results/abc1234 bench/results/def5678
 
-# Per-PR CI use: also enforce the nginx and HAProxy delta budget tables above.
-bench/compare.py --check-nginx --check-haproxy bench/results/main bench/results/HEAD
+# Per-PR CI use: also enforce the nginx, HAProxy, and Traefik delta budget tables above.
+bench/compare.py --check-nginx --check-haproxy --check-traefik bench/results/main bench/results/HEAD
 ```
 
 Exit codes:
 
-- `0` — no regression beyond `--fail-on-regress` (default 5 %) and (if `--check-nginx` / `--check-haproxy`) within the budget table
+- `0` — no regression beyond `--fail-on-regress` (default 5 %) and (if `--check-nginx` / `--check-haproxy` / `--check-traefik`) within the budget table
 - `1` — at least one regression or budget violation
 - `2` — input error (missing dir, malformed JSON)
 
 ## Scenario catalogue
 
-The "Subjects" column abbreviates the 5- or 7-row matrix above. UDP scenarios omit haproxy/haproxy-chain (no `mode udp`); reload-latency stays yggdrasil-only.
+The "Subjects" column abbreviates the matrix above. UDP scenarios omit haproxy/haproxy-chain (no `mode udp`); reload-latency stays yggdrasil-only.
 
 | Script               | Subjects                                                                                              | What it measures                                                |
 | -------------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `udp-pps.sh`         | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain                                                | single-flow UDP RTT & pps; sniff-test for per-packet overhead   |
-| `udp-flows.sh`       | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain                                                | 100 k concurrent flows; flow-table scaling                      |
-| `udp-flowchurn.sh`   | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain                                                | sustained new-flow rate; per-flow setup cost                    |
-| `tcp-latency.sh`     | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | TCP ping-pong p50/p99/p99.9                                     |
-| `tcp-throughput.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | bulk TCP MB/s with a handful of streams                         |
-| `tcp-connrate.sh`    | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | TCP handshake rate (connect + close)                            |
-| `tcp-idle-conns.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain                        | proxy PSS while holding N idle TCP conns (per-conn memory cost; chain subjects sum PSS over both hops) |
-| `reload-latency.sh`  | yggdrasil-chain only                                                                                  | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why nginx and HAProxy? above for why there's no peer leg) |
+| `udp-pps.sh`         | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, traefik, traefik-chain                        | single-flow UDP RTT & pps; sniff-test for per-packet overhead   |
+| `udp-flows.sh`       | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, traefik, traefik-chain                        | 100 k concurrent flows; flow-table scaling                      |
+| `udp-flowchurn.sh`   | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, traefik, traefik-chain                        | sustained new-flow rate; per-flow setup cost                    |
+| `tcp-latency.sh`     | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain, traefik, traefik-chain | TCP ping-pong p50/p99/p99.9                                     |
+| `tcp-throughput.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain, traefik, traefik-chain | bulk TCP MB/s with a handful of streams                         |
+| `tcp-connrate.sh`    | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain, traefik, traefik-chain | TCP handshake rate (connect + close)                            |
+| `tcp-idle-conns.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain, traefik, traefik-chain | proxy PSS while holding N idle TCP conns (per-conn memory cost; chain subjects sum PSS over both hops) |
+| `reload-latency.sh`  | yggdrasil-chain only                                                                                  | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why these peers? above for why there's no peer leg) |
 
-A future `heartbeat-roundtrip.sh` (yggdrasil-only — neither nginx nor HAProxy has an analogous heartbeat) is tracked under Phase 12.
+A future `heartbeat-roundtrip.sh` (yggdrasil-only — none of the peer proxies has an analogous heartbeat) is tracked under Phase 12.
 
 ## How each leg works
 
@@ -163,16 +167,22 @@ For each non-direct subject, the harness:
      terminal owns the rule set; the gateway derives a matching listener
      from the chain predicate published over the dial session. Loadgen
      target is `127.0.0.1:<listen_port>` (the gateway).
-   - **nginx** / **haproxy**: a single proxy process. nginx: minimal
-     `stream { server { listen <addr>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }`
-     started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
-     haproxy: minimal `frontend / default_backend echo` in `mode tcp`,
-     `nbthread = $(nproc)`, started with `haproxy -db -f $tmp/haproxy/haproxy.cfg`.
-   - **nginx-chain** / **haproxy-chain**: two of the same proxy on
-     distinct loopback IPs — outer on `127.0.0.1:<listen_port>` proxying
-     to inner on `127.0.0.2:<listen_port>`, inner proxying to the echo
-     backend. Same IP-pinning trick as yggdrasil-chain. Loadgen target is
-     `127.0.0.1:<listen_port>` (the outer).
+   - **nginx** / **haproxy** / **traefik**: a single proxy process.
+     - nginx: minimal `stream { server { listen <addr>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }`
+       started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
+     - haproxy: minimal `frontend / default_backend echo` in `mode tcp`,
+       `nbthread = $(nproc)`, started with `haproxy -db -f $tmp/haproxy/haproxy.cfg`.
+     - traefik: a `traefik.yaml` static config (entry point + file
+       provider) + a `dynamic.yaml` carrying the TCP or UDP router and
+       service. The TCP rule uses `ClientIP(\`0.0.0.0/0\`) || ClientIP(\`::/0\`)`
+       for raw passthrough — the default `HostSNI(\`*\`)` matcher would
+       block on a TLS ClientHello that never arrives. Started with
+       `traefik --configfile=$tmp/traefik/traefik.yaml`.
+   - **nginx-chain** / **haproxy-chain** / **traefik-chain**: two of the
+     same proxy on distinct loopback IPs — outer on `127.0.0.1:<listen_port>`
+     proxying to inner on `127.0.0.2:<listen_port>`, inner proxying to
+     the echo backend. Same IP-pinning trick as yggdrasil-chain. Loadgen
+     target is `127.0.0.1:<listen_port>` (the outer).
 3. Runs `loadgen` against `127.0.0.1:<listen_port>` (or `<echo_port>` for the direct leg).
 4. SIGTERMs everything, removes the tmpdir, and pauses briefly to let TIME_WAIT clear before the next leg.
 
@@ -189,4 +199,4 @@ For each non-direct subject, the harness:
 1. Copy the closest existing script (e.g. `bench/tcp-latency.sh`) to `bench/<new>.sh`.
 2. Adjust `SCENARIO=`, the loadgen subcommand, and any tunables.
 3. Add the scenario name to the `SCENARIOS` array in `bench/run-all.sh`.
-4. If the metric needs a new comparison rule, extend `HIGHER_BETTER`/`LOWER_BETTER`/`NGINX_DELTA_BUDGET`/`HAPROXY_DELTA_BUDGET` in `bench/compare.py`.
+4. If the metric needs a new comparison rule, extend `HIGHER_BETTER`/`LOWER_BETTER`/`NGINX_DELTA_BUDGET`/`HAPROXY_DELTA_BUDGET`/`TRAEFIK_DELTA_BUDGET` in `bench/compare.py`.
