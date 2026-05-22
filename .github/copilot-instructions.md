@@ -30,7 +30,7 @@ tests/e2e/run-chain.sh  # 3-node chain
 tests/e2e/run-l7.sh     # L7 HTTP frontend
 ```
 
-Minimum toolchain: stable Rust ≥1.85, CI pins 1.95.0. No C dependencies or FFI.
+Minimum toolchain: Rust 1.95.0, pinned in `rust-toolchain.toml` and matched by CI. No C dependencies or FFI.
 
 ## Architecture
 

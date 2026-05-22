@@ -144,6 +144,31 @@ accepted.
 | ----------------- | ------------------------------------------------------------------------------------ |
 | `<fingerprint>`   | Full BLAKE2s-128 fingerprint (32 hex chars) shown by `accept pending`, or any unique 8+-hex-char prefix. The daemon disambiguates against the staged queue; ambiguous prefixes return `error_codes::AMBIGUOUS_FINGERPRINT` listing every match. |
 
+### `local acme list`
+
+Print one row per ACME-managed hostname with its challenge type
+(`http01` / `dns01`), provider (`cloudflare` / `-` for HTTP-01),
+renewer state (`idle` / `pending` / `failed`), next scheduled renewal
+(absolute Unix epoch plus a relative "in 3 d" / "<expired>" hint), and
+the last error message when one is recorded. Hostnames are sourced from
+the live derived rule set, so a route that was just added but hasn't
+yet been picked up by the renewer shows up as `pending` with no next
+renewal time. Returns `error_codes::ACME_NOT_CONFIGURED` if `[acme]` is
+absent from the daemon config.
+
+### `local acme renew <hostname>`
+
+Force an immediate ACME issuance for `<hostname>`, bypassing the
+renewer's schedule. The CLI blocks until issuance completes (typically
+5-60 s) or the daemon's 5-minute deadline expires. On success, the
+freshly-issued PEM is written under `[acme].storage_dir` and
+`CertStore::reload_host` swaps it in atomically — clients see no
+connection interruption. Returns `error_codes::ACME_UNKNOWN_HOST` if
+the hostname isn't in the derived rule set,
+`error_codes::ACME_RENEW_FAILED` (with the underlying CA error) on
+issuance failure, or `error_codes::ACME_NOT_CONFIGURED` if `[acme]` is
+absent.
+
 ---
 
 ## `yggdrasilctl chain <cmd>` — chain-control plane commands
@@ -371,3 +396,27 @@ Shared flags:
 * `--workers <N>` — number of independent listener sockets bound via
   `SO_REUSEPORT`. Defaults to available_parallelism so the kernel can
   spread load across cores.
+
+---
+
+## Complete auto-generated reference
+
+The curated prose above documents the verbs operators reach for most
+often. For the exhaustive command tree — every subcommand, every flag,
+every default value — see the auto-generated docs. They're regenerated
+from the live clap definitions on every `cargo build` and committed
+alongside the code, so they cannot drift from the binaries.
+
+* [`docs/cli-reference/yggdrasil.md`](cli-reference/yggdrasil.md) —
+  the daemon (`yggdrasil`).
+* [`docs/cli-reference/yggdrasilctl.md`](cli-reference/yggdrasilctl.md)
+  — the admin CLI (`yggdrasilctl`).
+
+Both binaries also ship `completions <shell>` subcommands that print
+shell-completion scripts for `bash`, `zsh`, `fish`, `elvish`, and
+`powershell`. The install one-liner is:
+
+```bash
+yggdrasilctl completions bash | sudo tee /etc/bash_completion.d/yggdrasilctl
+yggdrasil    completions bash | sudo tee /etc/bash_completion.d/yggdrasil
+```

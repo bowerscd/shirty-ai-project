@@ -153,6 +153,7 @@ ssh -p 2222 user@vps.example.net
 * [docs/security.md](docs/security.md) — threat model, crypto, request/grant
 * [tests/e2e/run.sh](tests/e2e/run.sh) — 2-node podman-compose smoke
 * [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain smoke
+* [tests/e2e/run-acme.sh](tests/e2e/run-acme.sh) — ACME issuance smoke against a local pebble CA
 
 ## What's in the box
 
@@ -161,10 +162,15 @@ ssh -p 2222 user@vps.example.net
 | `yggdrasil`     | bin `yggdrasil` (daemon)            | The proxy / chain node. Same binary in relay or terminal. |
 | `yggdrasilctl`  | bin `yggdrasilctl`                  | Admin CLI. Three scopes: `local`, `chain`, `identity`.    |
 | `ratatoskr`     | (lib only)                          | Shared protocol types, wire format, Noise_IK auth.        |
+| `cli-defs`      | (lib only)                          | Shared clap-derive structs both binaries + their `build.rs` scripts consume to keep the auto-generated reference in [docs/cli-reference/](docs/cli-reference/) drift-free. |
 | `bench-tools`   | bins `loadgen`, `bench-echo` (workspace-internal) | Helpers used by [bench/](bench/README.md): UDP/TCP load generator and a native echo backend. |
 
 HTTPS rules include an L7 frontend for HTTP/1.1, HTTP/2, and HTTP/3 / QUIC,
-with Alt-Svc advertising enabled by default.
+with Alt-Svc advertising enabled by default. Certs can be sourced from
+disk, an in-memory ephemeral self-signed CA (test fixtures), or ACME
+(RFC 8555) — both HTTP-01 and DNS-01 (Cloudflare) are supported, with
+`yggdrasilctl local acme {list,renew}` for inspection and on-demand
+issuance.
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 
