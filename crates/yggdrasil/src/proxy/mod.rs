@@ -6,6 +6,7 @@
 
 #![allow(dead_code)] // wired into run() in the supervisor pass
 
+pub mod acme;
 pub mod certs;
 pub mod forward;
 pub mod h3_frontend;

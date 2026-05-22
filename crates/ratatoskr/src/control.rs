@@ -163,6 +163,19 @@ pub enum Request {
         /// default.
         directive: Option<String>,
     },
+    /// List ACME-managed hostnames with the renewer's view of their
+    /// state (next-renewal timestamp, last result, current cert
+    /// origin). Backs `yggdrasilctl local acme list`.
+    AcmeList,
+    /// Force an immediate ACME issuance for `hostname`, bypassing the
+    /// renewer's schedule. The daemon performs the standard
+    /// order/authorise/finalise flow and returns once the result is
+    /// known (success → cert reloaded into the live store; failure →
+    /// stand-in keeps serving). Backs `yggdrasilctl local acme renew`.
+    AcmeRenew {
+        /// The route hostname (case-insensitive).
+        hostname: String,
+    },
 }
 
 /// All possible server → client messages.
@@ -216,6 +229,18 @@ pub enum Response {
         /// e.g. "no_such_fingerprint", "config_write_failed", "unknown_request".
         code: String,
         message: String,
+    },
+    /// Successful response to [`Request::AcmeList`].
+    AcmeList(AcmeListResponse),
+    /// Successful response to [`Request::AcmeRenew`].
+    AcmeRenewed {
+        /// The hostname whose renewer was kicked.
+        hostname: String,
+        /// `true` if the daemon ran issuance to completion and wrote a
+        /// fresh PEM to disk; `false` if issuance failed (the daemon
+        /// returns a separate `Error` response in that case, so this
+        /// field is `true` in practice).
+        success: bool,
     },
 }
 
@@ -429,6 +454,40 @@ pub struct ChainAppliedResponse {
     pub skipped_https: Vec<String>,
 }
 
+/// Successful response to [`Request::AcmeList`]. Empty when `[acme]`
+/// is unconfigured or no routes declare `cert = "acme"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcmeListResponse {
+    pub hosts: Vec<AcmeHostInfo>,
+}
+
+/// Per-managed-host renewer snapshot. Returned in
+/// [`AcmeListResponse::hosts`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcmeHostInfo {
+    /// Lowercased route hostname.
+    pub hostname: String,
+    /// Either `"http01"` or `"dns01"`. Stable string so older
+    /// `yggdrasilctl` builds don't break when newer challenge types
+    /// land.
+    pub challenge: String,
+    /// DNS-01 provider name, if `challenge == "dns01"`.
+    pub provider: Option<String>,
+    /// State of the current cert. One of `"pending"` (renewer hasn't
+    /// completed first issuance), `"active"` (PEM on disk, in use),
+    /// `"error"` (last issuance attempt failed; stand-in still serving).
+    pub state: String,
+    /// Last error message from the renewer task, if any.
+    pub last_error: Option<String>,
+    /// Unix-epoch seconds of the next scheduled renewal attempt.
+    /// `None` if the renewer hasn't computed a schedule yet (e.g.
+    /// initial issuance still in progress).
+    pub next_renewal_unix: Option<u64>,
+    /// Unix-epoch seconds of the current cert's `not_after`, when
+    /// known. `None` for `pending` / `error` states.
+    pub not_after_unix: Option<u64>,
+}
+
 /// Stable error-code strings used in `Response::Error.code`. Kept in one place
 /// so tests on both sides can assert against them without typos.
 pub mod error_codes {
@@ -469,6 +528,17 @@ pub mod error_codes {
     /// cannot accept the candidate rule set. The daemon is likely on
     /// its way down; the operator should restart and try again.
     pub const APPLY_FAILED: &str = "apply_failed";
+    /// `local acme renew <host>` was called for a host that the
+    /// daemon's `AcmeManager` doesn't know about (no `cert = "acme"`
+    /// route declares it, or `[acme]` itself is unconfigured).
+    pub const ACME_UNKNOWN_HOST: &str = "acme_unknown_host";
+    /// `local acme renew <host>` ran issuance but it failed before
+    /// the daemon could write a new cert to disk. The error
+    /// `message` field carries the detail.
+    pub const ACME_RENEW_FAILED: &str = "acme_renew_failed";
+    /// The daemon has no `[acme]` section configured but the operator
+    /// asked for ACME-managed state via `local acme list/renew`.
+    pub const ACME_NOT_CONFIGURED: &str = "acme_not_configured";
 }
 
 /// Default UDS path the server binds and the CLI connects to.

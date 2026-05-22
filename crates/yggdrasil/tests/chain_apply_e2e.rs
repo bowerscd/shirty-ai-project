@@ -92,6 +92,7 @@ async fn terminal_chain_apply_enqueues_and_reports() {
         yggdrasil::metrics::detached_handle_for_tests(),
         None,
         None,
+        None,
         shutdown.clone(),
     )
     .await
@@ -186,6 +187,7 @@ async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
         yggdrasil::metrics::detached_handle_for_tests(),
         None,
         None,
+        None,
         shutdown.clone(),
     )
     .await
@@ -236,6 +238,7 @@ async fn terminal_chain_apply_rejects_duplicate_names() {
         config_path,
         false,
         yggdrasil::metrics::detached_handle_for_tests(),
+        None,
         None,
         None,
         shutdown.clone(),
@@ -306,6 +309,7 @@ async fn terminal_chain_apply_rejects_oversize_predicate_set() {
         config_path,
         true,
         yggdrasil::metrics::detached_handle_for_tests(),
+        None,
         None,
         None,
         shutdown.clone(),

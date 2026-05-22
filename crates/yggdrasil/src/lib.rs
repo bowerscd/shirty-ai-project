@@ -298,6 +298,7 @@ pub async fn run_relay(
         prom_handle.clone(),
         Some(introspection_state.clone()),
         chain_client_handle.clone(),
+        None, // relay nodes never wire an AcmeManager (no HTTPS rules)
         shutdown.clone(),
     )
     .await
@@ -391,21 +392,53 @@ pub async fn run_terminal(
     //    rule must carry `target_addr`; `target_port` rules are
     //    rejected by `ResolverFactory::build`.
     let resolver_factory = ResolverFactory::new_terminal();
-    let supervisor = ProxySupervisor::spawn(
+
+    // 4a. Share one `CertStore` between the supervisor and the ACME
+    //     manager so the renewer's `reload_host` calls touch the
+    //     same map the cert watcher updates.
+    let cert_store = std::sync::Arc::new(crate::proxy::certs::CertStore::new());
+
+    // 4b. Build the optional ACME manager. Only meaningful on
+    //     terminal-mode nodes (relays passthrough TLS without
+    //     terminating, so they never load an HTTPS rule and never
+    //     have a `cert = "acme"` route). When `[acme]` is absent the
+    //     supervisor's `CertConfig.acme` stays `None`, which keeps
+    //     the redirect listener in its pre-ACME behaviour.
+    let acme_manager = match config.acme.as_ref() {
+        Some(acme_cfg) => Some(
+            crate::proxy::acme::AcmeManager::spawn(
+                acme_cfg.clone(),
+                config.server.cert_dir.clone(),
+                std::sync::Arc::clone(&cert_store),
+                shutdown.clone(),
+            )
+            .context("building ACME manager")?,
+        ),
+        None => None,
+    };
+
+    let mut cert_config = CertConfig::from_server_section(
+        config.server.cert_dir.clone(),
+        config.server.default_cert.clone(),
+        config.server.default_key.clone(),
+    );
+    if let Some(acme_mgr) = acme_manager.clone() {
+        cert_config = cert_config.with_acme(acme_mgr);
+    }
+
+    let supervisor = ProxySupervisor::spawn_with_cert_store(
         config.server.rules_dir.clone(),
         RULE_DEBOUNCE,
         resolver_factory,
         config.server.default_bind,
         config.server.udp_workers,
-        CertConfig::from_server_section(
-            config.server.cert_dir.clone(),
-            config.server.default_cert.clone(),
-            config.server.default_key.clone(),
-        ),
+        cert_config,
+        cert_store,
         shutdown.clone(),
     )
     .await
     .context("spawning proxy supervisor")?;
+    let _ = &acme_manager; // kept alive for the supervisor's lifetime
 
     // 4a. Phase 5B introspection state. Terminals have no inbound
     //     chain listener, so `record_apply` is exclusively driven by
@@ -432,6 +465,7 @@ pub async fn run_terminal(
         prom_handle.clone(),
         Some(introspection_state.clone()),
         chain_client_handle.clone(),
+        acme_manager.clone(),
         shutdown.clone(),
     )
     .await

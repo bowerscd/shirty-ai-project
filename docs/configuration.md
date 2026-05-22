@@ -80,6 +80,60 @@ session. Presence of `[accept]` makes the effective mode `relay`.
 | `listen`             | `host:port`    | **required** | UDP socket to bind. Public-facing on the root relay.                  |
 | `rekey_interval`     | `humantime`    | `1h`    | Force a fresh Noise handshake at most this often.                      |
 
+### `[acme]` — optional (terminal mode only)
+
+Configures ACME (RFC 8555) issuance + renewal for HTTPS routes that
+declare `cert = "acme"`. Only meaningful on terminal nodes — relays
+passthrough TLS without terminating and have no `[[rule.route]]`
+blocks to issue against. When this section is absent, any `cert =
+"acme"` route is rejected at config load.
+
+| Key                          | Type        | Default                                              | Notes                                                                                                            |
+| ---------------------------- | ----------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `directory_url`              | string URL  | `https://acme-v02.api.letsencrypt.org/directory`    | LE staging is `https://acme-staging-v02.api.letsencrypt.org/directory`; flip while shaking out a deployment.    |
+| `contact_email`              | string      | **required**                                         | Registered with the CA so it can notify you about impending expiries or account problems.                       |
+| `account_key_path`           | path        | `/var/lib/yggdrasil/acme/account.key`                | Long-lived ACME account credentials. Auto-generated on first run; mode `0600`.                                  |
+| `storage_dir`                | path        | (`[server].cert_dir`)                                | Where renewed PEMs land. Defaults to the cert dir so the existing `CertWatcher` reload pipeline picks them up. |
+| `terms_of_service_agreed`    | bool        | **required, must be `true`**                          | Operator must explicitly opt in to the directory's ToS.                                                          |
+| `renew_before`               | `humantime` | `30d`                                                | Renew this far in advance of `not_after`.                                                                       |
+| `renew_jitter`               | `humantime` | `12h`                                                | Random jitter added to spread renewal load.                                                                     |
+
+DNS-01 providers live under sub-tables `[acme.dns.<name>]`. The only
+provider implemented today is `cloudflare`:
+
+| Key             | Type        | Notes                                                                                                |
+| --------------- | ----------- | ---------------------------------------------------------------------------------------------------- |
+| `api_token`     | string      | Inline Cloudflare API token (scope: `Zone.DNS:Edit`). Mutually exclusive with `api_token_env`.       |
+| `api_token_env` | string      | Name of an environment variable holding the token. Preferred — keeps the secret out of the config.  |
+
+Per-route challenge selection:
+
+```toml
+[[rule.route]]
+hostname = "api.example.com"
+target   = "http://192.168.1.10:8080"
+cert     = "acme"                       # HTTP-01 shorthand
+
+[[rule.route]]
+hostname = "wildcard.example.com"
+target   = "http://192.168.1.11:8080"
+
+  [rule.route.cert.acme]                # DNS-01 explicit form
+  challenge = "dns01"
+  provider  = "cloudflare"
+```
+
+HTTP-01 requires the terminal's predicate set to include a TCP rule
+on port 80 reachable from the public internet (so the CA can fetch
+`/.well-known/acme-challenge/<token>`). The daemon's `:80` redirect
+listener answers the challenge in-band before falling through to
+its usual HTTP→HTTPS redirect.
+
+While the first issuance is in flight, the daemon serves an
+in-memory ephemeral self-signed cert as a stand-in. Browsers will
+warn until the renewer writes the real PEM and `CertStore::reload_host`
+swaps it in.
+
 ### Complete example (root relay)
 
 ```toml

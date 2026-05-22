@@ -89,6 +89,8 @@ type, labels, meaning.
 | `yggdrasil_udp_flows_rejected_total`              | counter   | `rule`, `worker`, `reason`      | UDP flows rejected before insertion (`cap`, etc.) per worker.         |
 | `yggdrasil_https_tls_handshakes_total`            | counter   | `rule`, `result`                | TLS handshake outcomes for HTTPS rules.                                |
 | `yggdrasil_https_cert_reload_total`               | counter   | `route`, `result`               | Per-route cert source reload outcomes.                                 |
+| `yggdrasil_acme_renew_total`                      | counter   | `hostname`, `result`            | ACME issuance/renewal outcomes (`ok` / `err`).                         |
+| `yggdrasil_acme_expiry_seconds`                   | gauge     | `hostname`                      | Unix-epoch `not_after` of each ACME-managed cert; useful for "renewal stuck" alerts. |
 | `yggdrasil_http_requests_total`                   | counter   | `rule`, `route`, …              | Requests routed by the HTTPS frontend.                                |
 | `yggdrasil_http_request_duration_seconds`         | histogram | `rule`, `route`                 | Per-route HTTPS request latency.                                       |
 

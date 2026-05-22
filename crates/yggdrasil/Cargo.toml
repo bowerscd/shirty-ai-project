@@ -66,6 +66,13 @@ url             = { workspace = true }
 bytes           = { workspace = true }
 pin-project-lite = { workspace = true }
 
+# ACME integration (Phase D)
+instant-acme    = { workspace = true }
+reqwest         = { workspace = true }
+hickory-resolver = { workspace = true }
+x509-parser     = { workspace = true }
+async-trait     = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 

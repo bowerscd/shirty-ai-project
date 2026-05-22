@@ -41,6 +41,12 @@ pub struct ServerConfig {
     /// inbound peer per node.
     #[serde(default)]
     pub accept: Option<AcceptSection>,
+    /// ACME (Let's Encrypt / RFC 8555) configuration for routes that
+    /// declare `cert = "acme"`. Only meaningful on terminal-mode nodes
+    /// (relays don't terminate TLS). The presence of this section also
+    /// gates the daemon's per-host renewer task.
+    #[serde(default)]
+    pub acme: Option<AcmeSection>,
 }
 
 /// Effective runtime mode, derived from top-level chain section presence.
@@ -164,6 +170,68 @@ pub struct AcceptSection {
     pub rekey_interval: Duration,
 }
 
+/// `[acme]` — ACME (RFC 8555) configuration for routes that declare
+/// `cert = "acme"`. Only meaningful on terminal-mode nodes (relays
+/// passthrough TLS bytes without terminating). When this section is
+/// absent, any `cert = "acme"` route is rejected at config-load time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSection {
+    /// ACME directory URL. Defaults to Let's Encrypt production.
+    /// Override with the LE staging endpoint
+    /// (`https://acme-staging-v02.api.letsencrypt.org/directory`) when
+    /// shaking out the renewer.
+    #[serde(default = "default_acme_directory_url")]
+    pub directory_url: String,
+    /// Contact email registered with the ACME account. Used by the CA
+    /// to notify the operator about impending expirations or account
+    /// problems.
+    pub contact_email: String,
+    /// Where to persist the long-lived ACME account key. Auto-generated
+    /// on first use; mode `0600`.
+    #[serde(default = "default_acme_account_key_path")]
+    pub account_key_path: PathBuf,
+    /// Where renewed certs land on disk. Defaults to
+    /// `[server].cert_dir` so the existing `CertWatcher` reload
+    /// pipeline picks them up automatically.
+    #[serde(default)]
+    pub storage_dir: Option<PathBuf>,
+    /// Operator must explicitly opt in to the ACME directory's ToS.
+    /// Rejected at config load if `false` or absent.
+    #[serde(default)]
+    pub terms_of_service_agreed: bool,
+    /// Renew certs this far in advance of `not_after`. Default 30 days.
+    #[serde(default = "default_acme_renew_before", with = "humantime_serde")]
+    pub renew_before: Duration,
+    /// Random jitter added to the renewal time to spread load. Default
+    /// 12 hours; the actual schedule is `not_after - renew_before -
+    /// rand(0..renew_jitter)`.
+    #[serde(default = "default_acme_renew_jitter", with = "humantime_serde")]
+    pub renew_jitter: Duration,
+    /// Per-DNS-provider tables, keyed by provider name. Names referenced
+    /// by `cert.acme.provider` must appear here. Each provider parses
+    /// its own credentials block (see [`AcmeDnsProviderConfig`]).
+    #[serde(default)]
+    pub dns: std::collections::BTreeMap<String, AcmeDnsProviderConfig>,
+}
+
+/// Catch-all DNS-provider credentials block. Each provider implementation
+/// knows how to interpret its own fields; the schema here is intentionally
+/// loose so adding a new provider doesn't require touching the schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeDnsProviderConfig {
+    /// Inline API token (string). Mutually exclusive with `api_token_env`;
+    /// at least one must be set for the Cloudflare provider.
+    #[serde(default)]
+    pub api_token: Option<String>,
+    /// Name of an environment variable holding the API token.
+    /// Operator-facing best practice — keeps secrets out of the config
+    /// file. Mutually exclusive with `api_token`.
+    #[serde(default)]
+    pub api_token_env: Option<String>,
+}
+
 fn default_state_dir() -> PathBuf {
     PathBuf::from("/var/lib/yggdrasil")
 }
@@ -181,6 +249,18 @@ fn default_rekey_interval() -> Duration {
 }
 fn default_heartbeat_interval() -> Duration {
     Duration::from_secs(5)
+}
+fn default_acme_directory_url() -> String {
+    "https://acme-v02.api.letsencrypt.org/directory".to_string()
+}
+fn default_acme_account_key_path() -> PathBuf {
+    PathBuf::from("/var/lib/yggdrasil/acme/account.key")
+}
+fn default_acme_renew_before() -> Duration {
+    Duration::from_secs(30 * 86_400)
+}
+fn default_acme_renew_jitter() -> Duration {
+    Duration::from_secs(12 * 3600)
 }
 
 impl ServerConfig {
@@ -275,6 +355,50 @@ impl ServerConfig {
                 ));
             }
             _ => {}
+        }
+
+        // ---- [acme] sanity ----
+        if let Some(acme) = &self.acme {
+            if !acme.terms_of_service_agreed {
+                return Err(ConfigError::Invalid(
+                    "[acme].terms_of_service_agreed = true must be set explicitly \
+                     to acknowledge the ACME directory's terms of service"
+                        .into(),
+                ));
+            }
+            if acme.contact_email.trim().is_empty() || !acme.contact_email.contains('@') {
+                return Err(ConfigError::Invalid(format!(
+                    "[acme].contact_email must be a valid address (got {:?})",
+                    acme.contact_email
+                )));
+            }
+            if acme.directory_url.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[acme].directory_url must not be empty".into(),
+                ));
+            }
+            if acme.renew_before.is_zero() {
+                return Err(ConfigError::Invalid(
+                    "[acme].renew_before must be > 0".into(),
+                ));
+            }
+            for (name, prov) in &acme.dns {
+                match (&prov.api_token, &prov.api_token_env) {
+                    (Some(_), Some(_)) => {
+                        return Err(ConfigError::Invalid(format!(
+                            "[acme.dns.{name}]: api_token and api_token_env \
+                             are mutually exclusive",
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(ConfigError::Invalid(format!(
+                            "[acme.dns.{name}]: one of api_token or \
+                             api_token_env must be set",
+                        )));
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
     }
