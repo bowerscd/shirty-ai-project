@@ -5,7 +5,7 @@
 # Plain Dockerfile (OCI) syntax — no BuildKit-only directives — so the build
 # runs cleanly under `podman build` (and `docker build` if you ever need it).
 
-ARG RUST_VERSION=1.85
+ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
 
 # ---------------------------------------------------------------- builder
