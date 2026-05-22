@@ -387,6 +387,50 @@ EOF
     fi
 }
 
+# ---------- haproxy orchestration ----------
+#
+# bench_spin_haproxy <tmpdir> <listen_port> <upstream_port> <protocol>
+#
+# Renders a minimal HAProxy config with a `mode tcp` frontend proxying to the
+# echo backend, starts haproxy in foreground (via -db), and waits for the
+# listener to come up.
+#
+# HAProxy 3.x has `mode tcp` and `mode http` only — there is no generic
+# UDP L4 forwarder, so this helper refuses non-TCP protocols.
+
+bench_spin_haproxy() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"; local proto="$4"
+    local haproxy_bin
+    haproxy_bin="${BENCH_HAPROXY:-$(command -v haproxy || true)}"
+    [[ -x "$haproxy_bin" ]] || die "haproxy binary not found; set BENCH_HAPROXY=/path/to/haproxy or install haproxy"
+    [[ "$proto" == "tcp" ]] || die "bench_spin_haproxy: HAProxy has no generic UDP L4 forwarder (mode udp does not exist); got proto=$proto"
+
+    local nthreads
+    nthreads="$(nproc 2>/dev/null || echo 1)"
+
+    mkdir -p "$tmp/haproxy"
+    cat > "$tmp/haproxy/haproxy.cfg" <<EOF
+global
+    nbthread $nthreads
+    maxconn 65535
+    log /dev/null local0
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+frontend in
+    bind 127.0.0.1:$listen_port
+    default_backend echo
+backend echo
+    server echo 127.0.0.1:$upstream_port
+EOF
+    # -db = foreground (overrides any 'daemon' keyword); we want bench_spawn
+    # to own the PID, and -db gives us that.
+    bench_spawn HAPROXY_PID "$tmp/haproxy/spawn.log" -- "$haproxy_bin" -db -f "$tmp/haproxy/haproxy.cfg"
+    bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
+}
+
 # ---------- loadgen invocation ----------
 #
 # bench_run_loadgen <subject> <out_json_path> <args...>

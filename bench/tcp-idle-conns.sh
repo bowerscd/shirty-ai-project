@@ -152,6 +152,12 @@ run_subject() {
             target="127.0.0.1:$listen"
             proxy_pid="${NGINX_PID:-}"
             ;;
+        haproxy)
+            listen="$(pick_free_tcp_port)"
+            bench_spin_haproxy "$tmp" "$listen" "$echo_port" tcp
+            target="127.0.0.1:$listen"
+            proxy_pid="${HAPROXY_PID:-}"
+            ;;
         *) die "unknown subject $subject" ;;
     esac
 
@@ -224,7 +230,7 @@ run_subject() {
     bench_leg_teardown
 }
 
-for s in direct yggdrasil nginx; do
+for s in direct yggdrasil nginx haproxy; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done

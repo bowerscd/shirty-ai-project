@@ -65,6 +65,16 @@ NGINX_DELTA_BUDGET = {
 # p99 must be ≤ 2× nginx for these (i.e. up to 100% worse is allowed)
 NGINX_P99_BUDGET_PCT = 100
 
+# HAProxy comparison — TCP scenarios only (HAProxy has no generic UDP L4
+# forwarder). Same budget shape as nginx; HAProxy is L4-only but otherwise
+# in the same ballpark as nginx stream, so the deltas should hold.
+HAPROXY_DELTA_BUDGET = {
+    ("tcp-throughput",  "bytes_per_sec_rx"): 10,
+    ("tcp-connrate",    "pps_rx"):           25,
+    ("tcp-idle-conns",  "proxy_rss_kib"):    100,
+}
+HAPROXY_P99_BUDGET_PCT = 100
+
 
 @dataclass
 class Report:
@@ -167,54 +177,72 @@ def diff_runs(base: Dict[Tuple[str, str], Report],
     return rows, regressions
 
 
-def check_nginx_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
-    """Within a single candidate run, ensure yggdrasil is within budget of nginx."""
+def _check_peer_deltas(
+    cand: Dict[Tuple[str, str], Report],
+    peer_subject: str,
+    delta_budget: Dict[Tuple[str, str], float],
+    p99_budget_pct: float,
+) -> List[str]:
+    """Within a single candidate run, ensure yggdrasil is within budget of `peer_subject`.
+
+    Returns one failure string per metric-budget violation. Scenarios where
+    either yggdrasil or the peer subject didn't run are silently skipped —
+    that's how HAProxy stays out of UDP scenarios without a special case.
+    """
     failures: List[str] = []
     scenarios = {scenario for (scenario, _subject) in cand}
     for scenario in sorted(scenarios):
         ygg = cand.get((scenario, "yggdrasil"))
-        ngx = cand.get((scenario, "nginx"))
-        if not ygg or not ngx:
+        peer = cand.get((scenario, peer_subject))
+        if not ygg or not peer:
             continue
         # Primary throughput / pps metric.
-        for (sc, metric), budget_pct in NGINX_DELTA_BUDGET.items():
+        for (sc, metric), budget_pct in delta_budget.items():
             if sc != scenario:
                 continue
             ygg_v = ygg.metric(metric)
-            ngx_v = ngx.metric(metric)
-            if ygg_v is None or ngx_v is None or ngx_v == 0:
+            peer_v = peer.metric(metric)
+            if ygg_v is None or peer_v is None or peer_v == 0:
                 continue
             if metric in LOWER_BETTER:
                 # Lower-is-better metric: "worse" means yggdrasil's value is
-                # ABOVE nginx's by more than budget%.
-                delta = (ygg_v - ngx_v) / ngx_v * 100.0
+                # ABOVE the peer's by more than budget%.
+                delta = (ygg_v - peer_v) / peer_v * 100.0
                 if delta > budget_pct:
                     failures.append(
                         f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {delta:.1f}% "
-                        f"above nginx ({ngx_v:.2f}); budget allows {budget_pct}%"
+                        f"above {peer_subject} ({peer_v:.2f}); budget allows {budget_pct}%"
                     )
             else:
                 # Higher-is-better metric: "worse" means yggdrasil's value
-                # is BELOW nginx's by more than budget%.
-                delta = (ygg_v - ngx_v) / ngx_v * 100.0
+                # is BELOW the peer's by more than budget%.
+                delta = (ygg_v - peer_v) / peer_v * 100.0
                 if delta < -budget_pct:
                     failures.append(
                         f"{scenario}: yggdrasil {metric}={ygg_v:.2f} is {-delta:.1f}% "
-                        f"below nginx ({ngx_v:.2f}); budget allows {budget_pct}%"
+                        f"below {peer_subject} ({peer_v:.2f}); budget allows {budget_pct}%"
                     )
         # p99 latency budget.
-        if ygg.latency and ngx.latency:
+        if ygg.latency and peer.latency:
             ygg_p99 = ygg.latency.get("p99")
-            ngx_p99 = ngx.latency.get("p99")
-            if ygg_p99 and ngx_p99 and ngx_p99 > 0:
-                ratio_pct = (ygg_p99 - ngx_p99) / ngx_p99 * 100.0
-                if ratio_pct > NGINX_P99_BUDGET_PCT:
+            peer_p99 = peer.latency.get("p99")
+            if ygg_p99 and peer_p99 and peer_p99 > 0:
+                ratio_pct = (ygg_p99 - peer_p99) / peer_p99 * 100.0
+                if ratio_pct > p99_budget_pct:
                     failures.append(
                         f"{scenario}: yggdrasil p99={ygg_p99:.2f}us is "
-                        f"{ratio_pct:.0f}% above nginx p99 ({ngx_p99:.2f}us); "
-                        f"budget allows {NGINX_P99_BUDGET_PCT}%"
+                        f"{ratio_pct:.0f}% above {peer_subject} p99 ({peer_p99:.2f}us); "
+                        f"budget allows {p99_budget_pct}%"
                     )
     return failures
+
+
+def check_nginx_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
+    return _check_peer_deltas(cand, "nginx", NGINX_DELTA_BUDGET, NGINX_P99_BUDGET_PCT)
+
+
+def check_haproxy_deltas(cand: Dict[Tuple[str, str], Report]) -> List[str]:
+    return _check_peer_deltas(cand, "haproxy", HAPROXY_DELTA_BUDGET, HAPROXY_P99_BUDGET_PCT)
 
 
 def main() -> int:
@@ -228,6 +256,8 @@ def main() -> int:
                     help="threshold percentage (default 5)")
     ap.add_argument("--check-nginx", action="store_true",
                     help="also check yggdrasil-vs-nginx SLO deltas")
+    ap.add_argument("--check-haproxy", action="store_true",
+                    help="also check yggdrasil-vs-haproxy SLO deltas (TCP scenarios only)")
     args = ap.parse_args()
 
     base_dir = args.baseline_opt or args.baseline
@@ -258,6 +288,15 @@ def main() -> int:
             failures.extend(nginx_failures)
         else:
             print("\nnginx SLO check: all within budget")
+    if args.check_haproxy:
+        haproxy_failures = check_haproxy_deltas(cand)
+        if haproxy_failures:
+            print("\nhaproxy SLO check:")
+            for f in haproxy_failures:
+                print(f"  FAIL: {f}")
+            failures.extend(haproxy_failures)
+        else:
+            print("\nhaproxy SLO check: all within budget")
 
     if failures:
         print(f"\n{len(failures)} failure(s):", file=sys.stderr)

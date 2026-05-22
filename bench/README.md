@@ -1,34 +1,39 @@
 # Yggdrasil bench harness
 
-End-to-end benchmark suite that compares **yggdrasil** against **nginx** (stream module) and a **direct** baseline. Each scenario emits a JSON report under `bench/results/<git-sha>/<scenario>-<subject>.json`. `bench/compare.py` diffs two such trees and gates regressions.
+End-to-end benchmark suite that compares **yggdrasil** against **nginx** (stream module), **HAProxy**, and a **direct** baseline. Each scenario emits a JSON report under `bench/results/<git-sha>/<scenario>-<subject>.json`. `bench/compare.py` diffs two such trees and gates regressions.
 
-## Why nginx?
+## Why nginx and HAProxy?
 
-nginx is the only widely-deployed L4 reverse proxy with comparable feature surface (TCP+UDP stream proxying, hot reload). It is the de-facto incumbent, and we should not claim "production-grade" without showing we are within a small constant of its performance on the same workload. The plan's acceptable-delta budget vs nginx (Phase 11.5):
+Both are widely-deployed L4 reverse proxies and the de-facto incumbents we have to be within a small constant of to claim "production-grade":
 
-| Scenario          | Metric           | Yggdrasil must be within |
-| ----------------- | ---------------- | ------------------------ |
-| `tcp-throughput`  | bytes/sec        | **−10 %**                |
-| `tcp-connrate`    | conns/sec        | **−25 %**                |
-| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× nginx**          |
-| `udp-pps`         | pkts/sec         | **−20 %**                |
-| `udp-flows`       | pkts/sec         | **−20 %**                |
-| `udp-flowchurn`   | new-flows/sec    | **−20 %**                |
-| (all latency)     | p99              | **≤ 2× nginx**           |
+* **nginx** stream module — TCP **and** UDP stream proxying, hot reload via `nginx -s reload`. The only mainstream OSS reverse proxy that also does UDP at L4, so it's the only comparison subject for the UDP scenarios.
+* **HAProxy** — TCP-only at L4 (`mode tcp`); HAProxy 3.x has no `mode udp` and no generic UDP forwarder, so it participates only in the four TCP scenarios. Renowned for its TCP performance and per-connection memory footprint, which makes it a tougher comparison than nginx on those axes.
 
-`compare.py --check-nginx` enforces these budgets and exits 1 on violation.
+The plan's acceptable-delta budgets (Phase 11.5):
 
-> **Note — `reload-latency` has no nginx leg.**
+| Scenario          | Metric           | vs nginx          | vs HAProxy        |
+| ----------------- | ---------------- | ----------------- | ----------------- |
+| `tcp-throughput`  | bytes/sec        | **−10 %**         | **−10 %**         |
+| `tcp-connrate`    | conns/sec        | **−25 %**         | **−25 %**         |
+| `tcp-idle-conns`  | proxy PSS KiB    | **≤ 2× nginx**    | **≤ 2× HAProxy**  |
+| `udp-pps`         | pkts/sec         | **−20 %**         | n/a — no UDP      |
+| `udp-flows`       | pkts/sec         | **−20 %**         | n/a — no UDP      |
+| `udp-flowchurn`   | new-flows/sec    | **−20 %**         | n/a — no UDP      |
+| (all latency)     | p99              | **≤ 2× nginx**    | **≤ 2× HAProxy**  |
+
+`compare.py --check-nginx` and `compare.py --check-haproxy` enforce these budgets and exit 1 on violation. They can be combined.
+
+> **Note — `reload-latency` has no nginx or HAProxy leg.**
 > Yggdrasil's rule hot-reload is driven by inotify with a 250 ms debounce
 > window (so half-written / `cp`-streamed config drops don't trigger reload
-> storms); `nginx -s reload` is an operator-explicit IPC with no debounce.
-> The two paths measure fundamentally different things and rules in a
-> yggdrasil deployment change on a human cadence (minutes-to-days), not in
-> the bench's hot loop. We still run the scenario on every `bench/run-all.sh`
-> invocation as a yggdrasil-only correctness and regression signal against
-> previous yggdrasil runs.
+> storms); `nginx -s reload` and `haproxy -sf` are operator-explicit IPCs
+> with no debounce. The trigger models measure fundamentally different
+> things, and rules in a yggdrasil deployment change on a human cadence
+> (minutes-to-days), not in the bench's hot loop. We still run the scenario
+> on every `bench/run-all.sh` invocation as a yggdrasil-only correctness
+> and regression signal against previous yggdrasil runs.
 
-The `direct` leg (loadgen → echo with no proxy in between) bounds what the kernel + echo backend can deliver in principle — useful for spotting cases where *both* proxies are bottlenecked on the harness, not the system under test.
+The `direct` leg (loadgen → echo with no proxy in between) bounds what the kernel + echo backend can deliver in principle — useful for spotting cases where *all three* proxies are bottlenecked on the harness, not the systems under test.
 
 ## Prerequisites
 
@@ -37,6 +42,7 @@ This harness is **Linux-only** (Linux loopback semantics, `/sys/devices/system/c
 - `bash`, `python3 ≥ 3.8`, `ss` (iproute2), `git`
 - The yggdrasil workspace toolchain (`rustup show` matches `rust-toolchain.toml`)
 - `nginx` ≥ 1.18 with the `stream` module (Ubuntu/Debian: `apt install nginx`; Arch: `pacman -S nginx-mainline`). Set `BENCH_NGINX=/path/to/nginx` if it's not on `$PATH`.
+- `haproxy` ≥ 2.4 (Ubuntu/Debian: `apt install haproxy`; Arch: `pacman -S haproxy`). Set `BENCH_HAPROXY=/path/to/haproxy` if it's not on `$PATH`.
 
 ### Host preparation for trustworthy numbers
 
@@ -89,30 +95,30 @@ Results land under `bench/results/<short-sha>/`. To benchmark uncommitted work, 
 # Regression gate: candidate must not be more than 5% worse on any metric.
 bench/compare.py bench/results/abc1234 bench/results/def5678
 
-# Per-PR CI use: also enforce the nginx delta budget table above.
-bench/compare.py --check-nginx bench/results/main bench/results/HEAD
+# Per-PR CI use: also enforce the nginx and HAProxy delta budget tables above.
+bench/compare.py --check-nginx --check-haproxy bench/results/main bench/results/HEAD
 ```
 
 Exit codes:
 
-- `0` — no regression beyond `--fail-on-regress` (default 5 %) and (if `--check-nginx`) within the budget table
+- `0` — no regression beyond `--fail-on-regress` (default 5 %) and (if `--check-nginx` / `--check-haproxy`) within the budget table
 - `1` — at least one regression or budget violation
 - `2` — input error (missing dir, malformed JSON)
 
 ## Scenario catalogue
 
-| Script               | Subjects                  | What it measures                                                |
-| -------------------- | ------------------------- | --------------------------------------------------------------- |
-| `udp-pps.sh`         | direct, yggdrasil, nginx  | single-flow UDP RTT & pps; sniff-test for per-packet overhead   |
-| `udp-flows.sh`       | direct, yggdrasil, nginx  | 100 k concurrent flows; flow-table scaling                      |
-| `udp-flowchurn.sh`   | direct, yggdrasil, nginx  | sustained new-flow rate; per-flow setup cost                    |
-| `tcp-latency.sh`     | direct, yggdrasil, nginx  | TCP ping-pong p50/p99/p99.9                                     |
-| `tcp-throughput.sh`  | direct, yggdrasil, nginx  | bulk TCP MB/s with a handful of streams                         |
-| `tcp-connrate.sh`    | direct, yggdrasil, nginx  | TCP handshake rate (connect + close)                            |
-| `tcp-idle-conns.sh`  | direct, yggdrasil, nginx  | proxy PSS while holding N idle TCP conns (per-conn memory cost) |
-| `reload-latency.sh`  | yggdrasil only            | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why nginx? above for why there's no nginx leg) |
+| Script               | Subjects                            | What it measures                                                |
+| -------------------- | ----------------------------------- | --------------------------------------------------------------- |
+| `udp-pps.sh`         | direct, yggdrasil, nginx            | single-flow UDP RTT & pps; sniff-test for per-packet overhead   |
+| `udp-flows.sh`       | direct, yggdrasil, nginx            | 100 k concurrent flows; flow-table scaling                      |
+| `udp-flowchurn.sh`   | direct, yggdrasil, nginx            | sustained new-flow rate; per-flow setup cost                    |
+| `tcp-latency.sh`     | direct, yggdrasil, nginx, haproxy   | TCP ping-pong p50/p99/p99.9                                     |
+| `tcp-throughput.sh`  | direct, yggdrasil, nginx, haproxy   | bulk TCP MB/s with a handful of streams                         |
+| `tcp-connrate.sh`    | direct, yggdrasil, nginx, haproxy   | TCP handshake rate (connect + close)                            |
+| `tcp-idle-conns.sh`  | direct, yggdrasil, nginx, haproxy   | proxy PSS while holding N idle TCP conns (per-conn memory cost) |
+| `reload-latency.sh`  | yggdrasil only                      | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why nginx and HAProxy? above for why there's no peer leg) |
 
-A future `heartbeat-roundtrip.sh` (yggdrasil-only — nginx has no analogous heartbeat) is tracked under Phase 12.
+A future `heartbeat-roundtrip.sh` (yggdrasil-only — neither nginx nor HAProxy has an analogous heartbeat) is tracked under Phase 12.
 
 ## How each leg works
 
@@ -132,6 +138,7 @@ For each non-direct subject, the harness:
      predicate published over the dial session. The bench rule uses
      the current `target_addr = "127.0.0.1:<echo_port>"` schema.
    - **nginx**: a minimal `stream { server { listen <listen>; proxy_pass 127.0.0.1:<upstream>; [udp;] } }` config, started with `nginx -p $tmp -c $tmp/nginx.conf -g 'daemon off;'`.
+   - **haproxy**: a minimal `frontend / default_backend echo` config in `mode tcp` with `nbthread = $(nproc)`, started in foreground via `haproxy -db -f $tmp/haproxy/haproxy.cfg`. TCP scenarios only.
 3. Runs `loadgen` against `127.0.0.1:<listen_port>` (or `<echo_port>` for the direct leg).
 4. SIGTERMs everything, removes the tmpdir, and pauses briefly to let TIME_WAIT clear before the next leg.
 
@@ -147,4 +154,4 @@ For each non-direct subject, the harness:
 1. Copy the closest existing script (e.g. `bench/tcp-latency.sh`) to `bench/<new>.sh`.
 2. Adjust `SCENARIO=`, the loadgen subcommand, and any tunables.
 3. Add the scenario name to the `SCENARIOS` array in `bench/run-all.sh`.
-4. If the metric needs a new comparison rule, extend `HIGHER_BETTER`/`LOWER_BETTER`/`NGINX_DELTA_BUDGET` in `bench/compare.py`.
+4. If the metric needs a new comparison rule, extend `HIGHER_BETTER`/`LOWER_BETTER`/`NGINX_DELTA_BUDGET`/`HAPROXY_DELTA_BUDGET` in `bench/compare.py`.

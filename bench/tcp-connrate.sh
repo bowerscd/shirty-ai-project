@@ -47,12 +47,17 @@ run_subject() {
             bench_spin_nginx "$tmp" "$listen" "$echo_port" tcp
             run_leg nginx "127.0.0.1:$listen"
             ;;
+        haproxy)
+            local listen; listen="$(pick_free_tcp_port)"
+            bench_spin_haproxy "$tmp" "$listen" "$echo_port" tcp
+            run_leg haproxy "127.0.0.1:$listen"
+            ;;
         *) die "unknown subject $subject" ;;
     esac
     bench_leg_teardown
 }
 
-for s in direct yggdrasil nginx; do
+for s in direct yggdrasil nginx haproxy; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done
