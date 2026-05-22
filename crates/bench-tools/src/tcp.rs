@@ -162,30 +162,40 @@ pub async fn run_tcp_throughput(subject: &str, args: TcpThroughputArgs) -> Resul
             let send_buf = vec![0xAAu8; buffer_size];
             let tx_bytes_w = tx_bytes.clone();
             let errors_w = errors.clone();
-            // Pump writes.
+            // Pump writes. The `tokio::select!` against the deadline
+            // bounds the loop hard so a slow / backpressuring upstream
+            // can't keep us blocked in `write_all` after the duration
+            // expires — without this, both halves can wedge until the
+            // entire process is killed.
             let w_task = tokio::spawn(async move {
-                while Instant::now() < deadline {
-                    match wr.write_all(&send_buf).await {
-                        Ok(()) => {
-                            tx_bytes_w.fetch_add(buffer_size as u64, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            errors_w.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline.into()) => return,
+                        res = wr.write_all(&send_buf) => match res {
+                            Ok(()) => {
+                                tx_bytes_w.fetch_add(buffer_size as u64, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                errors_w.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        },
                     }
                 }
             });
             // Drain reads (echo bytes coming back from the upstream).
             let r_task = tokio::spawn(async move {
                 let mut recv_buf = vec![0u8; buffer_size];
-                while Instant::now() < deadline {
-                    match rd.read(&mut recv_buf).await {
-                        Ok(0) => return,
-                        Ok(n) => {
-                            rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                        Err(_) => return,
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline.into()) => return,
+                        res = rd.read(&mut recv_buf) => match res {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                            Err(_) => return,
+                        },
                     }
                 }
             });
