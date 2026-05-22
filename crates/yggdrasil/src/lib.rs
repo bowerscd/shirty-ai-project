@@ -538,6 +538,7 @@ fn build_chain_client(
         heartbeat_interval: up.heartbeat_interval,
         rekey_interval: up.rekey_interval,
         body_handler: None,
+        local_bind: config.server.default_bind,
     };
     let upstream_fp = ratatoskr::auth::public_key_fingerprint(&upstream_pubkey);
     tracing::info!(

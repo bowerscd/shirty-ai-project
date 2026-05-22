@@ -24,7 +24,7 @@
 //! [`ChainClientHandle`], and dispatches inbound envelopes through an
 //! optional [`BodyHandler`] (production default: ack everything `Unknown`).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,6 +72,15 @@ pub struct ChainClientConfig {
     /// Optional dispatcher for delivered control envelopes. `None` →
     /// every inbound envelope acks [`AckStatus::Unknown`].
     pub body_handler: Option<BodyHandler>,
+    /// Optional source IP for the outbound UDP socket. When `None`, the
+    /// client binds the wildcard (`0.0.0.0:0` / `[::]:0`) and the kernel
+    /// picks the source address by routing. When `Some(ip)` and the
+    /// resolved upstream address is the same family, the client binds
+    /// `(ip, 0)` so the upstream sees that IP as the peer source —
+    /// this is what `[server].default_bind` plumbs through.
+    /// A family mismatch (IPv4 local_bind, IPv6 upstream or vice versa)
+    /// silently falls back to the wildcard.
+    pub local_bind: Option<IpAddr>,
 }
 
 impl std::fmt::Debug for ChainClientConfig {
@@ -83,6 +92,7 @@ impl std::fmt::Debug for ChainClientConfig {
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("rekey_interval", &self.rekey_interval)
             .field("body_handler", &self.body_handler.as_ref().map(|_| "<fn>"))
+            .field("local_bind", &self.local_bind)
             .finish()
     }
 }
@@ -333,9 +343,11 @@ impl ChainClient {
 
     async fn run_session_once(&mut self) -> Result<SessionExit> {
         let target_addr = resolve_endpoint(&self.config.endpoint).await?;
-        let bind_addr: SocketAddr = match target_addr {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        let bind_addr: SocketAddr = match (self.config.local_bind, target_addr) {
+            (Some(ip @ IpAddr::V4(_)), SocketAddr::V4(_))
+            | (Some(ip @ IpAddr::V6(_)), SocketAddr::V6(_)) => SocketAddr::new(ip, 0),
+            (_, SocketAddr::V4(_)) => "0.0.0.0:0".parse().unwrap(),
+            (_, SocketAddr::V6(_)) => "[::]:0".parse().unwrap(),
         };
         let socket = UdpSocket::bind(bind_addr)
             .await
@@ -705,6 +717,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -782,6 +795,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(20),
             rekey_interval: Duration::from_millis(200),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -817,6 +831,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -847,6 +862,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let client_handle = tokio::spawn(async move { client.run().await });
@@ -992,6 +1008,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(200),
             rekey_interval: Duration::from_secs(120),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let handle = client.handle();
@@ -1066,6 +1083,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(200),
             rekey_interval: Duration::from_secs(120),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let handle = client.handle();
@@ -1121,6 +1139,7 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             rekey_interval: Duration::from_secs(60),
             body_handler: None,
+            local_bind: None,
         };
         let client = ChainClient::new(cfg, cancel.clone());
         let handle = client.handle();

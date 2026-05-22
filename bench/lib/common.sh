@@ -224,6 +224,16 @@ bench_spin_yggdrasil() {
     mkdir -p "$tmp"/{gateway,terminal,rules,gw-rules,gw-state,tm-state,gw-run,tm-run,logs}
     local accept_port; accept_port="$(pick_free_udp_port)"
 
+    # Pin gateway and terminal to distinct loopback addresses so they don't
+    # collide on the same `<addr>:<listen_port>` socket. Without this, the
+    # gateway's derived listener (default bind_addr = 0.0.0.0) and the
+    # terminal's rule listener both want port $listen_port on the same host
+    # — the second bind() returns EADDRINUSE, only one daemon ends up
+    # serving traffic, and the chain isn't exercised. 127.0.0.0/8 is loopback
+    # so any 127.x.y.z works without privilege.
+    local gw_bind="127.0.0.1"
+    local tm_bind="127.0.0.2"
+
     # ---- gateway (accept-mode) ----
     local gw_cfg="$tmp/gateway/config.toml"
     local gw_key="$tmp/gateway/identity.key"
@@ -232,12 +242,13 @@ bench_spin_yggdrasil() {
 rules_dir     = "$tmp/gw-rules"
 state_dir     = "$tmp/gw-state"
 identity_file = "$gw_key"
+default_bind  = "$gw_bind"
 
 [control]
 socket = "$tmp/gw-run/control.sock"
 
 [accept]
-listen = "127.0.0.1:$accept_port"
+listen = "$gw_bind:$accept_port"
 EOF
 
     # ---- terminal (dial-mode) ----
@@ -248,6 +259,7 @@ EOF
 rules_dir     = "$tmp/rules"
 state_dir     = "$tmp/tm-state"
 identity_file = "$tm_key"
+default_bind  = "$tm_bind"
 
 [control]
 socket = "$tmp/tm-run/control.sock"
@@ -267,7 +279,7 @@ EOF
     "$ctl_bin" --config "$gw_cfg" identity add-accept \
         --identity-file "$gw_key" \
         --from "$tmp/request.txt" \
-        --my-endpoint "127.0.0.1:$accept_port" \
+        --my-endpoint "$gw_bind:$accept_port" \
         --out "$tmp/grant.txt" \
         --note "bench gw->tm" >/dev/null
     "$ctl_bin" --config "$tm_cfg" identity add-dial \
@@ -275,12 +287,14 @@ EOF
         --from "$tmp/grant.txt" >/dev/null
     rm -f "$tmp/request.txt" "$tmp/grant.txt"
 
-    # Bench rule on the terminal. Gateway derives a matching listener via
-    # the chain predicate pushed over the dial session.
+    # Bench rule on the terminal. The terminal's [server].default_bind
+    # rewrites this listen IP to $tm_bind:$listen_port at load time, and
+    # the published predicate carries just the port — the gateway derives
+    # its own listener at $gw_bind:$listen_port via its own default_bind.
     cat > "$tmp/rules/scenario.toml" <<EOF
 [[rule]]
 name        = "bench"
-listen      = "127.0.0.1:$listen_port"
+listen      = "$tm_bind:$listen_port"
 protocol    = "$proto"
 target_addr = "127.0.0.1:$upstream_port"
 $extra
@@ -289,16 +303,20 @@ EOF
     bench_spawn YGG_GW_PID "$tmp/logs/gateway.log"  -- "$ygg_bin" --log-format pretty run --config "$gw_cfg"
     bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format pretty run --config "$tm_cfg"
 
+    # The gateway is the loadgen target. Its listener only comes up after
+    # the first chain predicate arrives from the terminal, which in turn
+    # only happens after the dial-side Noise_IK handshake completes.
     if [[ "$proto" == "tcp" ]]; then
-        bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
+        bench_wait_listen_tcp "$gw_bind" "$listen_port" 5
     else
-        bench_wait_listen_udp 127.0.0.1 "$listen_port" 5
+        bench_wait_listen_udp "$gw_bind" "$listen_port" 5
     fi
     # Give the chain predicate a beat to land + the gateway to record the
     # terminal's source IP from the first heartbeat.
     sleep 0.6
 
     export YGG_LISTEN_PORT="$listen_port"
+    export YGG_LISTEN_ADDR="$gw_bind"
     export YGG_HB_PORT="$accept_port"
     export YGG_CTRL_SOCK="$tmp/tm-run/control.sock"
     export YGG_CONFIG="$tm_cfg"
