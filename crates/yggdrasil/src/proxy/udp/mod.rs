@@ -36,6 +36,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod recvmmsg_linux;
+#[cfg(target_os = "linux")]
+pub mod sendmmsg_linux;
 
 mod batch_recv;
 
@@ -833,6 +835,231 @@ impl UdpProxyInner {
 }
 
 async fn upstream_to_client_loop(
+    rule_name: String,
+    upstream: Arc<UdpSocket>,
+    frontend: Arc<UdpSocket>,
+    client_addr: SocketAddr,
+    cancel: CancellationToken,
+    shard: Arc<DashMap<SocketAddr, Arc<FlowEntry>>>,
+    accounting: FlowAccounting,
+) {
+    // Try the batched path first. On Linux + a healthy `recvmmsg` syscall
+    // (default on modern kernels) we drain up to `UPSTREAM_BATCH` datagrams
+    // per wake-up. On non-Linux, on ENOSYS / EPERM (kernel too old or
+    // seccomp-filtered), or when the AsyncFd registration fails, we fall
+    // through to the single-recv path that matches the pre-batching
+    // behaviour byte-for-byte.
+    #[cfg(target_os = "linux")]
+    {
+        use recvmmsg_linux::{BatchBuf, BatchReader};
+        use sendmmsg_linux::BatchSender;
+        const UPSTREAM_BATCH: usize = 16;
+
+        match BatchReader::from_udp_socket(&upstream) {
+            Ok(reader) => {
+                let mut buf = BatchBuf::new(UPSTREAM_BATCH);
+                // The frontend BatchSender is best-effort: if it can't
+                // register (e.g. seccomp policy on AsyncFd), we keep
+                // the receive batching and fall back to per-datagram
+                // `send_to` on the send side.
+                let sender = match BatchSender::from_udp_socket(&frontend) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::debug!(
+                            rule = %rule_name,
+                            client = %client_addr,
+                            error = %e,
+                            "sendmmsg unavailable; using per-datagram send_to on frontend"
+                        );
+                        None
+                    }
+                };
+                upstream_to_client_loop_batched(
+                    &rule_name,
+                    &frontend,
+                    client_addr,
+                    cancel,
+                    &shard,
+                    &accounting,
+                    reader,
+                    &mut buf,
+                    sender.as_ref(),
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                // One-time fallback to per-datagram recv. Most likely
+                // cause is a seccomp policy or an unusually old kernel.
+                tracing::debug!(
+                    rule = %rule_name,
+                    client = %client_addr,
+                    error = %e,
+                    "recvmmsg unavailable; falling back to per-datagram recv on upstream"
+                );
+            }
+        }
+    }
+
+    upstream_to_client_loop_single(
+        rule_name,
+        upstream,
+        frontend,
+        client_addr,
+        cancel,
+        shard,
+        accounting,
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn upstream_to_client_loop_batched(
+    rule_name: &str,
+    frontend: &UdpSocket,
+    client_addr: SocketAddr,
+    cancel: CancellationToken,
+    shard: &DashMap<SocketAddr, Arc<FlowEntry>>,
+    accounting: &FlowAccounting,
+    reader: recvmmsg_linux::BatchReader,
+    buf: &mut recvmmsg_linux::BatchBuf,
+    sender: Option<&sendmmsg_linux::BatchSender>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            res = reader.recv_batch(buf) => {
+                let n = match res {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::debug!(
+                            rule = %rule_name,
+                            client = %client_addr,
+                            error = %e,
+                            "upstream recvmmsg failed; flow ending"
+                        );
+                        if shard.remove(&client_addr).is_some() {
+                            accounting.flow_count.fetch_sub(1, Ordering::AcqRel);
+                            set_udp_active_flows(rule_name, accounting.worker_id, shard.len());
+                        }
+                        return;
+                    }
+                };
+                if n == 0 {
+                    continue;
+                }
+
+                // Pick the send socket once per batch. The same flow's
+                // frontend never changes mid-batch, so this is correct.
+                // Fallback to the caller-provided `frontend` when the
+                // flow has been concurrently removed (rare; we'll exit
+                // next iteration via the cancel arm).
+                let frontend_arc = shard
+                    .get(&client_addr)
+                    .map(|entry| entry.frontend.clone());
+                let send_target: &UdpSocket = frontend_arc
+                    .as_deref()
+                    .unwrap_or(frontend);
+
+                // Try sendmmsg first when available. The caller wires
+                // the BatchSender to the per-rule frontend socket; if
+                // the flow's `frontend_arc` differs (which would only
+                // happen across rule reloads — currently rare), we
+                // fall through to per-datagram `send_to`.
+                let mut total_bytes = 0usize;
+                let mut send_errs = 0usize;
+                let used_sendmmsg = if let Some(sender) = sender {
+                    if std::ptr::eq(send_target, frontend) {
+                        // Collect payload slices for the batch send.
+                        let dgrams: Vec<recvmmsg_linux::Datagram<'_>> =
+                            recvmmsg_linux::iter_received(buf, n).collect();
+                        let payloads: Vec<&[u8]> =
+                            dgrams.iter().map(|d| d.payload).collect();
+                        match sender.send_batch(&payloads, client_addr).await {
+                            Ok(sent) => {
+                                for d in &dgrams[..sent] {
+                                    total_bytes += d.payload.len();
+                                }
+                                // Any unsent tail: fall through to
+                                // per-datagram for those (rare under
+                                // healthy buffer pressure).
+                                for d in &dgrams[sent..] {
+                                    match send_target
+                                        .send_to(d.payload, client_addr)
+                                        .await
+                                    {
+                                        Ok(_) => total_bytes += d.payload.len(),
+                                        Err(_) => send_errs += 1,
+                                    }
+                                }
+                                true
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    rule = %rule_name,
+                                    client = %client_addr,
+                                    error = %e,
+                                    "sendmmsg batch failed; falling back to per-datagram for this batch"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !used_sendmmsg {
+                    for dgram in recvmmsg_linux::iter_received(buf, n) {
+                        match send_target.send_to(dgram.payload, client_addr).await {
+                            Ok(_) => total_bytes += dgram.payload.len(),
+                            Err(e) => {
+                                send_errs += 1;
+                                tracing::debug!(
+                                    rule = %rule_name,
+                                    client = %client_addr,
+                                    error = %e,
+                                    "frontend send_to client failed"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if total_bytes > 0 {
+                    increment_udp_bytes(
+                        rule_name,
+                        accounting.worker_id,
+                        "upstream_to_client",
+                        total_bytes,
+                    );
+                }
+                for _ in 0..send_errs {
+                    increment_udp_send_errors(
+                        rule_name,
+                        accounting.worker_id,
+                        "upstream_to_client",
+                    );
+                }
+
+                // Touch last_seen once per batch (not per datagram) —
+                // the batch is small enough that the in-batch tail
+                // bias is negligible, and the savings are real on
+                // flows with many datagrams per wake-up.
+                if let Some(entry) = shard.get(&client_addr) {
+                    let now_ms = accounting.start.elapsed().as_millis() as u64;
+                    entry.last_seen_ms.store(now_ms, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+async fn upstream_to_client_loop_single(
     rule_name: String,
     upstream: Arc<UdpSocket>,
     frontend: Arc<UdpSocket>,
