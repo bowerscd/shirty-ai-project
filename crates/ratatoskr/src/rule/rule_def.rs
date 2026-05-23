@@ -56,11 +56,6 @@ pub struct Rule {
     /// Default applied at load time (see [`Rule::resolved_idle_timeout`]).
     #[serde(default, with = "humantime_serde::option")]
     pub idle_timeout: Option<Duration>,
-    /// UDP only: per-rule frontend worker-count override. `None` inherits from
-    /// `[server].udp_workers`; `Some(0)` is rejected. Setting this on a non-UDP
-    /// rule is rejected because it is only meaningful when `protocol = "udp"`.
-    #[serde(default)]
-    pub udp_workers: Option<usize>,
     /// TCP only: emit a PROXY-protocol header to the upstream before forwarding.
     /// Rejected when `target_addr` or `target_host` is set (terminal rules
     /// must not synthesise PROXY-protocol headers; relay-written headers pass
@@ -116,12 +111,6 @@ impl Rule {
         if self.listen.port() == 0 {
             return Err(Error::InvalidRule(format!(
                 "rule {:?}: listen port must be non-zero",
-                self.name
-            )));
-        }
-        if matches!(self.udp_workers, Some(0)) {
-            return Err(Error::InvalidRule(format!(
-                "rule {:?}: udp_workers must be >= 1 when set",
                 self.name
             )));
         }
@@ -222,12 +211,6 @@ impl Rule {
                         self.name
                     )));
                 }
-                if self.udp_workers.is_some() {
-                    return Err(Error::InvalidRule(format!(
-                        "rule {:?}: udp_workers is only meaningful for UDP rules",
-                        self.name
-                    )));
-                }
             }
             Protocol::Udp => {
                 if self.proxy_protocol.is_some() {
@@ -276,12 +259,6 @@ impl Rule {
         if self.idle_timeout.is_some() {
             return Err(Error::InvalidRule(format!(
                 "rule {:?}: `idle_timeout` is only valid for udp rules",
-                self.name
-            )));
-        }
-        if self.udp_workers.is_some() {
-            return Err(Error::InvalidRule(format!(
-                "rule {:?}: udp_workers is only meaningful for UDP rules",
                 self.name
             )));
         }

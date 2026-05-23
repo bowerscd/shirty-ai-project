@@ -1,10 +1,13 @@
 //! Per-rule TCP proxy.
 //!
-//! Each [`TcpProxy`] owns one `tokio::net::TcpListener` bound to
-//! `rule.listen`, an accept loop running on its own task, and a
-//! [`CancellationToken`] for clean shutdown.
+//! Each [`TcpProxy`] owns `workers` `tokio::net::TcpListener`s bound to
+//! `rule.listen` via `SO_REUSEADDR + SO_REUSEPORT` (the same primitive
+//! `proxy/udp/mod.rs` uses for UDP frontend fan-out), one accept loop
+//! per listener, and a single [`CancellationToken`] cascade for clean
+//! shutdown. With `workers = 1` the proxy short-circuits to a single
+//! plain bind — the SO_REUSEPORT machinery only kicks in for `> 1`.
 //!
-//! Per-connection lifecycle:
+//! Per-connection lifecycle (unchanged regardless of worker count):
 //!
 //! 1. `accept()` returns `(client, client_addr)`.
 //! 2. Resolve the current dial target via [`UpstreamResolver::current_target`].
@@ -28,7 +31,7 @@
 use std::io;
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -38,54 +41,100 @@ use ratatoskr::rule::Rule;
 use super::proxy_protocol;
 use super::resolver::UpstreamResolver;
 
+/// Per-listener backlog. 1024 is the default Linux `somaxconn`; higher
+/// values are silently capped by the kernel unless the operator raises
+/// `net.core.somaxconn`. Matches what tokio's `TcpListener::bind` requests.
+const LISTEN_BACKLOG: i32 = 1024;
+
 /// Handle to a running per-rule TCP proxy. Drop to stop (the cancellation
-/// token cascade aborts the listener task and lets in-flight connections
+/// token cascade aborts the accept loops and lets in-flight connections
 /// finish naturally).
 pub struct TcpProxy {
     rule: Rule,
     cancel: CancellationToken,
     local_addr: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
+    /// One handle per accept worker. `stop()` awaits all of them.
+    worker_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl TcpProxy {
-    /// Bind the listener and spawn the accept loop. Returns once the socket
-    /// is listening so callers can rely on connect attempts succeeding
-    /// immediately after this resolves.
-    pub async fn spawn(rule: Rule, resolver: UpstreamResolver) -> Result<Self> {
-        let listener = TcpListener::bind(rule.listen).await.with_context(|| {
-            format!(
-                "bind TCP listener for rule {:?} on {}",
-                rule.name, rule.listen
-            )
-        })?;
-        let local_addr = listener
+    /// Bind `workers` listeners (via SO_REUSEPORT when `workers > 1`) and
+    /// spawn one accept loop per listener. Returns once every socket is
+    /// listening, so callers can rely on connect attempts succeeding
+    /// immediately after this resolves. `workers == 0` is rejected.
+    pub async fn spawn(rule: Rule, resolver: UpstreamResolver, workers: usize) -> Result<Self> {
+        ensure!(workers > 0, "TCP worker count must be >= 1");
+
+        let requested_workers = workers;
+        #[cfg(unix)]
+        let effective_workers = requested_workers;
+        #[cfg(not(unix))]
+        let effective_workers = if requested_workers > 1 {
+            tracing::warn!(
+                rule = %rule.name,
+                requested_workers,
+                "TCP SO_REUSEPORT is unavailable on this platform; using one worker"
+            );
+            1
+        } else {
+            requested_workers
+        };
+
+        let listeners = build_tcp_listener_sockets(rule.listen, effective_workers)
+            .await
+            .with_context(|| {
+                format!(
+                    "bind TCP listener for rule {:?} on {}",
+                    rule.name, rule.listen
+                )
+            })?;
+        debug_assert_eq!(listeners.len(), effective_workers);
+        let local_addr = listeners[0]
             .local_addr()
             .context("read TcpListener local_addr")?;
 
         let cancel = CancellationToken::new();
-        let task_cancel = cancel.clone();
-        let task_rule = rule.clone();
-        let task_resolver = resolver.clone();
-        let task_local = local_addr;
-
-        let handle = tokio::spawn(async move {
-            run_accept_loop(task_rule, task_resolver, listener, task_local, task_cancel).await;
-        });
+        let mut worker_handles = Vec::with_capacity(effective_workers);
+        for (worker_id, listener) in listeners.into_iter().enumerate() {
+            let task_cancel = cancel.clone();
+            let task_rule = rule.clone();
+            let task_resolver = resolver.clone();
+            let task_local = local_addr;
+            let handle = tokio::spawn(async move {
+                run_accept_loop(
+                    task_rule,
+                    task_resolver,
+                    listener,
+                    task_local,
+                    worker_id,
+                    task_cancel,
+                )
+                .await;
+            });
+            worker_handles.push(handle);
+        }
 
         tracing::info!(
             rule = %rule.name,
             listen = %local_addr,
             upstream = %resolver.describe(),
             proxy_protocol = ?rule.proxy_protocol,
+            workers = effective_workers,
             "TCP rule listening"
         );
+
+        metrics::gauge!(
+            "yggdrasil_workers",
+            "rule" => rule.name.clone(),
+            "protocol" => "tcp",
+        )
+        .set(effective_workers as f64);
 
         Ok(Self {
             rule,
             cancel,
             local_addr,
-            handle,
+            worker_handles,
         })
     }
 
@@ -97,19 +146,20 @@ impl TcpProxy {
         self.local_addr
     }
 
-    /// Trigger shutdown. Does NOT wait for in-flight connections — drop the
-    /// handle (which awaits the task on Drop indirectly via JoinHandle) or
-    /// call [`TcpProxy::stop`] to await full shutdown.
+    /// Trigger shutdown. Does NOT wait for in-flight connections — call
+    /// [`TcpProxy::stop`] to await full shutdown of the accept loops.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
 
-    /// Cancel and wait for the accept loop to exit. In-flight per-connection
-    /// tasks are also cancelled via the cancellation cascade and given a
-    /// chance to drain, but this method does not wait for them.
+    /// Cancel and wait for every accept loop to exit. In-flight
+    /// per-connection tasks are cancelled via the same cascade and given
+    /// a chance to drain, but this method does not wait for them.
     pub async fn stop(self) {
         self.cancel.cancel();
-        let _ = self.handle.await;
+        for handle in self.worker_handles {
+            let _ = handle.await;
+        }
     }
 }
 
@@ -118,13 +168,14 @@ async fn run_accept_loop(
     resolver: UpstreamResolver,
     listener: TcpListener,
     local_addr: SocketAddr,
+    worker_id: usize,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                tracing::debug!(rule = %rule.name, "TCP accept loop received cancel");
+                tracing::debug!(rule = %rule.name, worker = worker_id, "TCP accept loop received cancel");
                 return;
             }
             res = listener.accept() => {
@@ -135,7 +186,7 @@ async fn run_accept_loop(
                         // peer reset before accept(). Log + continue —
                         // bringing down the listener over a single EBADF
                         // would amplify whatever caused the error.
-                        tracing::warn!(rule = %rule.name, error = %e, "TCP accept failed");
+                        tracing::warn!(rule = %rule.name, worker = worker_id, error = %e, "TCP accept failed");
                         continue;
                     }
                 };
@@ -147,6 +198,7 @@ async fn run_accept_loop(
                         // always return Some.)
                         tracing::debug!(
                             rule = %rule.name,
+                            worker = worker_id,
                             client = %client_addr,
                             "drop connection: upstream not yet resolvable (no heartbeat received)"
                         );
@@ -170,6 +222,45 @@ async fn run_accept_loop(
             }
         }
     }
+}
+
+/// Bind `workers` TCP listeners on `addr`. With `workers == 1` falls back
+/// to a single `TcpListener::bind` (no SO_REUSEPORT setup, matches the
+/// pre-fan-out behaviour byte-for-byte). With `workers > 1` uses
+/// `socket2` to set `SO_REUSEADDR + SO_REUSEPORT` on each socket so the
+/// kernel hash-distributes incoming SYNs across them.
+async fn build_tcp_listener_sockets(
+    addr: SocketAddr,
+    workers: usize,
+) -> io::Result<Vec<TcpListener>> {
+    debug_assert!(workers > 0);
+    if workers == 1 {
+        return TcpListener::bind(addr).await.map(|l| vec![l]);
+    }
+
+    let mut listeners = Vec::with_capacity(workers);
+    let first = build_tcp_listener_socket(addr)?;
+    let bind_addr = first.local_addr()?;
+    listeners.push(first);
+    for _ in 1..workers {
+        listeners.push(build_tcp_listener_socket(bind_addr)?);
+    }
+    Ok(listeners)
+}
+
+fn build_tcp_listener_socket(addr: SocketAddr) -> io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = Domain::for_address(addr);
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(LISTEN_BACKLOG)?;
+    let std_sock: std::net::TcpListener = sock.into();
+    TcpListener::from_std(std_sock)
 }
 
 async fn handle_connection(
@@ -356,6 +447,7 @@ mod tests {
         let proxy = TcpProxy::spawn(
             rule("echo", upstream.port(), None),
             dynamic_resolver(peer, upstream.port()),
+            1,
         )
         .await
         .unwrap();
@@ -379,6 +471,7 @@ mod tests {
         let proxy = TcpProxy::spawn(
             rule("nopeer", upstream.port(), None),
             dynamic_resolver(peer, upstream.port()),
+            1,
         )
         .await
         .unwrap();
@@ -443,6 +536,7 @@ mod tests {
         let proxy = TcpProxy::spawn(
             rule("v1head", target_addr.port(), Some(ProxyProto::V1)),
             dynamic_resolver(peer, target_addr.port()),
+            1,
         )
         .await
         .unwrap();
@@ -468,7 +562,7 @@ mod tests {
         let peer = PeerState::new([0u8; 32]);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         // Port 1 is reserved and won't have anything listening on a normal box.
-        let proxy = TcpProxy::spawn(rule("noupstream", 1, None), dynamic_resolver(peer, 1))
+        let proxy = TcpProxy::spawn(rule("noupstream", 1, None), dynamic_resolver(peer, 1), 1)
             .await
             .unwrap();
         let listen = proxy.local_addr();
@@ -501,6 +595,7 @@ mod tests {
         let proxy = TcpProxy::spawn(
             rule("cancel", upstream.port(), None),
             dynamic_resolver(peer, upstream.port()),
+            1,
         )
         .await
         .unwrap();
@@ -532,5 +627,43 @@ mod tests {
                 e.kind()
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn fan_out_distributes_accepts_across_workers() {
+        // With workers > 1, the four sockets all bind the same (addr, port)
+        // via SO_REUSEPORT and the kernel hash-distributes incoming SYNs
+        // across them. We don't try to assert *which* worker sees a given
+        // connect (that depends on the kernel hash); we just confirm:
+        //   1. spawn(workers=4) succeeds (proves four reuseport-binds
+        //      worked on the same port);
+        //   2. echo round-trips still succeed after fan-out;
+        //   3. stop() awaits all worker tasks.
+        let (upstream, _us) = echo_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
+
+        let proxy = TcpProxy::spawn(
+            rule("fanout", upstream.port(), None),
+            dynamic_resolver(peer, upstream.port()),
+            4,
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        // Sixteen sequential connect+echo cycles; with reuseport, SYNs land
+        // across the four worker accept queues. The test only cares that
+        // every cycle round-trips, not which worker handled which.
+        for i in 0..16u8 {
+            let mut client = TcpStream::connect(listen).await.unwrap();
+            let payload = [i, i.wrapping_add(1), i.wrapping_add(2), i.wrapping_add(3)];
+            client.write_all(&payload).await.unwrap();
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, payload, "round-trip mismatch on iteration {i}");
+        }
+
+        proxy.stop().await;
     }
 }

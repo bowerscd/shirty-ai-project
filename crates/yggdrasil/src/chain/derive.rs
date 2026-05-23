@@ -319,7 +319,6 @@ fn rule_from_predicate_l4(p: &Predicate, cfg: &DeriveConfig) -> Rule {
         target_addr: None,
         target_host: None,
         idle_timeout,
-        udp_workers: None,
         proxy_protocol,
         routes: None,
         cert_dir: None,
@@ -349,7 +348,6 @@ fn rule_from_https_predicate(
         target_addr: None,
         target_host: None,
         idle_timeout,
-        udp_workers: None,
         proxy_protocol: None,
         routes: None,
         cert_dir: None,
@@ -452,7 +450,6 @@ mod tests {
             target_addr: None,
             target_host: None,
             idle_timeout: None,
-            udp_workers: None,
             proxy_protocol: None,
             routes: Some(vec![HttpRoute {
                 hostname: format!("{name}.localhost"),

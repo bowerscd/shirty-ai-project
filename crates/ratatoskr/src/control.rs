@@ -725,7 +725,6 @@ mod tests {
                 target_port: None,
                 target_host: None,
                 idle_timeout: None,
-                udp_workers: None,
                 proxy_protocol: None,
                 routes: None,
                 cert_dir: None,

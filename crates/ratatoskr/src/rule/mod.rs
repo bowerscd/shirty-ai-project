@@ -86,7 +86,6 @@
 //! * `name` is non-empty and contains no whitespace or control characters.
 //! * `idle_timeout` is only meaningful for UDP; setting it on a TCP or
 //!   HTTPS rule is rejected.
-//! * `udp_workers` is only meaningful for UDP; `Some(0)` is rejected.
 //! * `proxy_protocol` is only meaningful for TCP; setting it on a UDP or
 //!   HTTPS rule is rejected.
 //! * `http3` and `alt_svc` are only meaningful for HTTPS; setting either on
@@ -103,7 +102,7 @@
 //!   passes through verbatim).
 //! * For `protocol = "https"`: `routes` is present and non-empty;
 //!   `target_port` / `target_addr` / `target_host` / `proxy_protocol`
-//!   / `idle_timeout` / `udp_workers` are all absent. Per-route invariants:
+//!   / `idle_timeout` are all absent. Per-route invariants:
 //!   hostname is a syntactically valid DNS name (no duplicates within the rule); `target` URL scheme
 //!   is `"http"` with explicit host + port; `cert` as a path requires `key`
 //!   alongside; `cert = "ephemeral"` requires the hostname to match

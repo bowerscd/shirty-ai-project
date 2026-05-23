@@ -34,7 +34,7 @@ pub(super) async fn supervisor_loop(
     current_set_tx: watch::Sender<RuleSet>,
     resolver_factory: ResolverFactory,
     default_bind: Option<IpAddr>,
-    default_udp_workers: Option<usize>,
+    default_workers: Option<usize>,
     cert_config: CertConfig,
     cert_store: Arc<CertStore>,
     cert_watcher: Arc<CertWatcher>,
@@ -83,7 +83,7 @@ pub(super) async fn supervisor_loop(
                             "file_watcher",
                             &resolver_factory,
                             default_bind,
-                            default_udp_workers,
+                            default_workers,
                             &cert_config,
                             &cert_store,
                             &cert_watcher,
@@ -114,7 +114,7 @@ pub(super) async fn supervisor_loop(
                             "external_push",
                             &resolver_factory,
                             default_bind,
-                            default_udp_workers,
+                            default_workers,
                             &cert_config,
                             &cert_store,
                             &cert_watcher,
@@ -159,7 +159,7 @@ async fn apply_set(
     source: &'static str,
     resolver_factory: &ResolverFactory,
     default_bind: Option<IpAddr>,
-    default_udp_workers: Option<usize>,
+    default_workers: Option<usize>,
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
@@ -184,7 +184,7 @@ async fn apply_set(
         RuleUpdate { set, diff },
         resolver_factory,
         default_bind,
-        default_udp_workers,
+        default_workers,
         cert_config,
         cert_store,
         cert_watcher,
@@ -201,7 +201,7 @@ async fn apply_update(
     update: RuleUpdate,
     resolver_factory: &ResolverFactory,
     default_bind: Option<IpAddr>,
-    default_udp_workers: Option<usize>,
+    default_workers: Option<usize>,
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
@@ -258,7 +258,7 @@ async fn apply_update(
             change.new.clone(),
             resolver_factory,
             default_bind,
-            default_udp_workers,
+            default_workers,
             cert_config,
             cert_store,
             cert_watcher,
@@ -287,7 +287,7 @@ async fn apply_update(
             added.clone(),
             resolver_factory,
             default_bind,
-            default_udp_workers,
+            default_workers,
             cert_config,
             cert_store,
             cert_watcher,
@@ -364,7 +364,7 @@ async fn spawn_proxy_for_rule(
     rule: Rule,
     resolver_factory: &ResolverFactory,
     default_bind: Option<IpAddr>,
-    default_udp_workers: Option<usize>,
+    default_workers: Option<usize>,
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
@@ -412,15 +412,13 @@ async fn spawn_proxy_for_rule(
                 .build(&rule)
                 .with_context(|| format!("build resolver for rule {:?}", rule.name))?;
             let upstream_description = resolver.describe();
+            let workers = resolve_workers(default_workers);
             let handle = match rule.protocol {
-                Protocol::Tcp => ProxyHandle::Tcp(TcpProxy::spawn(rule, resolver).await?),
-                Protocol::Udp => {
-                    let workers = resolve_workers(&rule, default_udp_workers);
-                    ProxyHandle::Udp(
-                        UdpProxy::spawn_with(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT, workers)
-                            .await?,
-                    )
-                }
+                Protocol::Tcp => ProxyHandle::Tcp(TcpProxy::spawn(rule, resolver, workers).await?),
+                Protocol::Udp => ProxyHandle::Udp(
+                    UdpProxy::spawn_with(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT, workers)
+                        .await?,
+                ),
                 Protocol::Https => unreachable!(),
             };
             Ok(ActiveProxy {

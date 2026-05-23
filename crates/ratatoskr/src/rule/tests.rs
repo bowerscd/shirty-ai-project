@@ -34,7 +34,6 @@ fn parses_minimal_tcp_rule() {
     assert_eq!(r.target_port, Some(22));
     assert_eq!(r.target_addr, None);
     assert_eq!(r.idle_timeout, None);
-    assert_eq!(r.udp_workers, None);
     assert_eq!(r.proxy_protocol, None);
     f.validate_each().unwrap();
 }
@@ -118,64 +117,6 @@ fn parses_tcp_rule_with_proxy_protocol() {
     .unwrap();
     assert_eq!(f.rule[0].proxy_protocol, Some(ProxyProto::V2));
     f.validate_each().unwrap();
-}
-
-#[test]
-fn parses_udp_rule_with_udp_workers() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "dns"
-            listen = "0.0.0.0:53"
-            protocol = "udp"
-            target_port = 53
-            udp_workers = 4
-            "#,
-    )
-    .unwrap();
-    f.validate_each().unwrap();
-    assert_eq!(f.rule[0].udp_workers, Some(4));
-
-    let toml = toml::to_string(&f).unwrap();
-    let back = parse(&toml).unwrap();
-    back.validate_each().unwrap();
-    assert_eq!(back.rule[0].udp_workers, Some(4));
-}
-
-#[test]
-fn rejects_zero_udp_workers() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "dns"
-            listen = "0.0.0.0:53"
-            protocol = "udp"
-            target_port = 53
-            udp_workers = 0
-            "#,
-    )
-    .unwrap();
-    let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s))
-            if s.contains("udp_workers must be >= 1 when set")));
-}
-
-#[test]
-fn rejects_udp_workers_on_tcp_rule() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "ssh"
-            listen = "0.0.0.0:22"
-            protocol = "tcp"
-            target_port = 22
-            udp_workers = 4
-            "#,
-    )
-    .unwrap();
-    let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s))
-            if s.contains("udp_workers is only meaningful for UDP rules")));
 }
 
 #[test]
@@ -696,7 +637,6 @@ fn idle_timeout_default_for_udp() {
     )
     .unwrap();
     assert_eq!(f.rule[0].idle_timeout, None);
-    assert_eq!(f.rule[0].udp_workers, None);
     assert_eq!(f.rule[0].resolved_idle_timeout(), DEFAULT_UDP_IDLE_TIMEOUT);
 }
 
@@ -1531,7 +1471,6 @@ fn https_h3_options_toml_round_trip() {
         target_addr: None,
         target_host: None,
         idle_timeout: None,
-        udp_workers: None,
         proxy_protocol: None,
         routes: Some(vec![HttpRoute {
             hostname: "app.local".to_string(),

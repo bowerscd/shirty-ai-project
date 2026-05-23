@@ -45,7 +45,6 @@ fn terminal_rule(name: &str, listen_port: u16, target: &str) -> Rule {
         target_addr: Some(target.parse().unwrap()),
         target_host: None,
         idle_timeout: None,
-        udp_workers: None,
         proxy_protocol: None,
         routes: None,
         cert_dir: None,

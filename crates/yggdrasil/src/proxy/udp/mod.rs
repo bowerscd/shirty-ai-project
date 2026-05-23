@@ -62,9 +62,15 @@ pub const MAX_FLOWS_PER_RULE_DEFAULT: usize = 65_536;
 /// arrive intact will not be truncated by us.
 const RECV_BUFFER_LEN: usize = 65_535;
 
-pub(crate) fn resolve_workers(rule: &Rule, server_default: Option<usize>) -> usize {
-    rule.udp_workers
-        .or(server_default)
+/// Resolve the SO_REUSEPORT worker count from the daemon-wide
+/// `[server].workers` setting. `None` falls back to
+/// `available_parallelism()`. Per-rule overrides are not exposed;
+/// fan-out is a kernel-level concern (the kernel hash-distributes
+/// incoming traffic across the workers sharing an `addr:port`), so a
+/// per-rule knob would buy nothing a global default doesn't already
+/// provide.
+pub(crate) fn resolve_workers(server_default: Option<usize>) -> usize {
+    server_default
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -98,10 +104,10 @@ pub struct UdpProxy {
 impl UdpProxy {
     /// Bind frontend sockets and spawn the proxy tasks.
     ///
-    /// Default workers come from `rule.udp_workers`, falling back to
-    /// `available_parallelism()`; flow cap is [`MAX_FLOWS_PER_RULE_DEFAULT`].
+    /// Default workers fall back to `available_parallelism()`; flow
+    /// cap is [`MAX_FLOWS_PER_RULE_DEFAULT`].
     pub async fn spawn(rule: Rule, resolver: UpstreamResolver) -> Result<Self> {
-        let workers = resolve_workers(&rule, None);
+        let workers = resolve_workers(None);
         Self::spawn_with(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT, workers).await
     }
 
@@ -113,7 +119,7 @@ impl UdpProxy {
         resolver: UpstreamResolver,
         max_flows: usize,
     ) -> Result<Self> {
-        let workers = resolve_workers(&rule, None);
+        let workers = resolve_workers(None);
         Self::spawn_with(rule, resolver, max_flows, workers).await
     }
 
@@ -179,8 +185,12 @@ impl UdpProxy {
 
         let main_handle = tokio::spawn(inner.run());
 
-        metrics::gauge!("yggdrasil_udp_workers", "rule" => rule.name.clone())
-            .set(effective_workers as f64);
+        metrics::gauge!(
+            "yggdrasil_workers",
+            "rule" => rule.name.clone(),
+            "protocol" => "udp",
+        )
+        .set(effective_workers as f64);
         for worker_id in 0..effective_workers {
             set_udp_active_flows(&rule.name, worker_id, 0);
         }

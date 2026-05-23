@@ -97,12 +97,17 @@ pub struct ServerSection {
     /// config across hosts with different network interfaces.
     #[serde(default)]
     pub default_bind: Option<IpAddr>,
-    /// Per-host default UDP frontend worker count. `None` means resolve to
+    /// Per-host default frontend worker count for SO_REUSEPORT fan-out
+    /// across the daemon's accept paths (TCP listeners and UDP frontend
+    /// sockets alike). `None` means resolve to
     /// `std::thread::available_parallelism()` when a proxy is spawned;
-    /// `Some(n)` overrides every UDP rule that does not set its own value.
-    /// `Some(0)` is rejected during validation.
+    /// `Some(n)` overrides that. `Some(0)` is rejected during validation.
+    /// Applies daemon-wide — fan-out is a kernel-level concern (the
+    /// kernel hash-distributes incoming SYNs / datagrams across the
+    /// workers sharing an `addr:port`), so a per-rule override would
+    /// not buy anything that a global default doesn't already provide.
     #[serde(default)]
-    pub udp_workers: Option<usize>,
+    pub workers: Option<usize>,
     /// Per-host state directory (TOFU staging, runtime markers).
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
@@ -298,9 +303,9 @@ impl ServerConfig {
         let _ = self.derived_mode()?;
 
         // ---- [server] sanity ----
-        if matches!(self.server.udp_workers, Some(0)) {
+        if matches!(self.server.workers, Some(0)) {
             return Err(ConfigError::Invalid(
-                "[server].udp_workers must be >= 1 when set".into(),
+                "[server].workers must be >= 1 when set".into(),
             ));
         }
 
@@ -539,17 +544,17 @@ mod tests {
     }
 
     #[test]
-    fn udp_workers_defaults_to_none() {
+    fn workers_defaults_to_none() {
         let cfg = parse(relay_minimal_toml()).unwrap();
-        assert_eq!(cfg.server.udp_workers, None);
+        assert_eq!(cfg.server.workers, None);
     }
 
     #[test]
-    fn udp_workers_override_parses() {
+    fn workers_override_parses() {
         let cfg = parse(
             r#"
             [server]
-            udp_workers = 4
+            workers = 4
 
             [accept]
             pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -557,15 +562,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.server.udp_workers, Some(4));
+        assert_eq!(cfg.server.workers, Some(4));
     }
 
     #[test]
-    fn udp_workers_zero_is_rejected() {
+    fn workers_zero_is_rejected() {
         let err = parse(
             r#"
             [server]
-            udp_workers = 0
+            workers = 0
 
             [accept]
             pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -575,7 +580,7 @@ mod tests {
         .err()
         .unwrap();
         assert!(matches!(err, ConfigError::Invalid(s)
-                if s.contains("[server].udp_workers must be >= 1 when set")));
+                if s.contains("[server].workers must be >= 1 when set")));
     }
 
     #[test]

@@ -260,7 +260,15 @@ predicate set on the relay) becomes one `ProxyHandle` owned by
 
 ### TCP (`proxy/tcp.rs`)
 
-Plain async accept loop. On each new client connection:
+Each TCP rule runs N accept loops (defaulting to
+`available_parallelism()`, configurable via `[server].workers`). With
+`N > 1`, every worker binds its own `TcpListener` to `(ip, port)` with
+`SO_REUSEADDR + SO_REUSEPORT`, and the kernel hash-distributes
+incoming SYNs across the workers so a single rule scales accept
+throughput linearly with cores. With `N = 1` the rule short-circuits
+to a single plain bind (no SO_REUSEPORT machinery).
+
+On each new accept:
 
 1. Resolve the dial target. Relay mode: snapshot
    `peer_state.current_ip()` (drop the socket immediately if `None`),
@@ -280,7 +288,10 @@ benefit and bulk-byte workloads are unaffected.
 The interesting one — UDP has no inherent connection, so we build one.
 
 * Each UDP rule runs N workers (defaulting to `available_parallelism()`,
-  configurable via `[server].udp_workers` global or per-rule `udp_workers`).
+  configurable via the same daemon-wide `[server].workers` knob that
+  controls TCP accept fan-out — there's no per-rule override because
+  fan-out is a kernel-level concern and a per-rule knob would buy
+  nothing a global default doesn't already provide).
   For multi-worker fan-out, each worker binds its own `UdpSocket` to
   `(ip, port)` with `SO_REUSEADDR + SO_REUSEPORT`; the kernel hashes inbound
   4-tuples consistently across the workers so a given client always lands on

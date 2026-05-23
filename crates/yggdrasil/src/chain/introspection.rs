@@ -144,7 +144,6 @@ mod tests {
             target_addr: Some("127.0.0.1:9100".parse().unwrap()),
             target_host: None,
             idle_timeout: None,
-            udp_workers: None,
             proxy_protocol: None,
             routes: None,
             cert_dir: None,

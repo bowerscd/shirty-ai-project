@@ -82,7 +82,7 @@ type, labels, meaning.
 
 | Metric                                            | Type      | Labels                          | Notes                                                                 |
 | ------------------------------------------------- | --------- | ------------------------------- | --------------------------------------------------------------------- |
-| `yggdrasil_udp_workers`                           | gauge     | `rule`                          | Configured UDP frontend worker count for each rule.                    |
+| `yggdrasil_workers`                               | gauge     | `rule`, `protocol`              | Configured SO_REUSEPORT worker count for each rule's accept path (`protocol="tcp"` or `protocol="udp"`).               |
 | `yggdrasil_udp_datagrams_received_total`          | counter   | `rule`, `worker`                | Frontend datagrams received by each zero-based UDP worker.             |
 | `yggdrasil_udp_active_flows`                      | gauge     | `rule`, `worker`                | Active UDP flows currently held by each zero-based worker shard.       |
 | `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | `rule`, `worker`                | UDP flows torn down per worker because the downstream IP changed.      |
