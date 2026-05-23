@@ -28,6 +28,56 @@ ensure_results_dir() {
     mkdir -p "$(bench_results_dir)"
 }
 
+# ---------- subject selection ----------
+#
+# Every scenario benches one or more "subjects" — `direct` (no proxy),
+# `yggdrasil-terminal`, `nginx`, etc. The set varies per protocol family
+# (HAProxy has no UDP L4 mode; traefik-chain TCP has an unresolved
+# config interaction that collapses connrate to <200 c/s, so it's
+# excluded from TCP defaults until that's debugged).
+#
+# `bench_subjects_for tcp|udp` is the canonical accessor. Operators
+# can override either the list (`BENCH_SUBJECTS="a b c"`) or the order
+# (`BENCH_SHUFFLE=1`, optionally with `BENCH_SHUFFLE_SEED=N` for
+# reproducibility). The rotated harness in `bench/run-rotated.sh`
+# uses these knobs to average out run-order bias across multiple runs.
+
+bench_subjects_for() {
+    local family="$1"
+    python3 - "$family" "${BENCH_SHUFFLE:-0}" "${BENCH_SHUFFLE_SEED:-}" "${BENCH_SUBJECTS:-}" <<'PY'
+import sys, random
+family, shuffle, seed, override = sys.argv[1:5]
+SUBJECTS = {
+    "tcp": [
+        "direct",
+        "yggdrasil-terminal", "yggdrasil-chain",
+        "nginx", "nginx-chain",
+        "haproxy", "haproxy-chain",
+        "traefik",
+        # "traefik-chain" — known-broken in the harness on TCP
+        # (collapses to <200 c/s, doesn't reflect a real traefik
+        # property). Set BENCH_SUBJECTS to include it explicitly if
+        # you're debugging the chain config.
+    ],
+    "udp": [
+        "direct",
+        "yggdrasil-terminal", "yggdrasil-chain",
+        "nginx", "nginx-chain",
+        "traefik", "traefik-chain",
+    ],
+}
+if family not in SUBJECTS:
+    sys.stderr.write(f"bench_subjects_for: unknown family {family!r}\n")
+    sys.exit(1)
+subjects = override.split() if override else list(SUBJECTS[family])
+if shuffle == "1":
+    if seed:
+        random.seed(int(seed))
+    random.shuffle(subjects)
+print("\n".join(subjects))
+PY
+}
+
 # ---------- logging ----------
 
 log()  { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -273,7 +323,7 @@ target_addr = "127.0.0.1:$upstream_port"
 $extra
 EOF
 
-    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format pretty run --config "$tm_cfg"
+    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format json run --config "$tm_cfg"
 
     if [[ "$proto" == "tcp" ]]; then
         bench_wait_listen_tcp "$tm_bind" "$listen_port" 5
@@ -373,8 +423,8 @@ target_addr = "127.0.0.1:$upstream_port"
 $extra
 EOF
 
-    bench_spawn YGG_GW_PID "$tmp/logs/gateway.log"  -- "$ygg_bin" --log-format pretty run --config "$gw_cfg"
-    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format pretty run --config "$tm_cfg"
+    bench_spawn YGG_GW_PID "$tmp/logs/gateway.log"  -- "$ygg_bin" --log-format json run --config "$gw_cfg"
+    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- "$ygg_bin" --log-format json run --config "$tm_cfg"
 
     if [[ "$proto" == "tcp" ]]; then
         bench_wait_listen_tcp "$gw_bind" "$listen_port" 5
@@ -815,6 +865,14 @@ EOF
 # ---------- loadgen invocation ----------
 #
 # bench_run_loadgen <subject> <out_json_path> <args...>
+#
+# Each scenario script sets a top-level `SCENARIO=...` constant before
+# calling this helper. We forward it to loadgen as
+# `--scenario-name $SCENARIO` so the JSON report's `scenario` field
+# matches the filename (and disambiguates udp-pps vs udp-flows, which
+# share the same loadgen subcommand). Without this, multiple scenarios
+# would land under the same `(scenario, subject)` key in compare.py's
+# aggregator and silently overwrite each other.
 
 bench_run_loadgen() {
     local subject="$1"; local out="$2"; shift 2
@@ -822,6 +880,10 @@ bench_run_loadgen() {
     root="$(bench_workspace_root)"
     local lg="$root/target/release/loadgen"
     [[ -x "$lg" ]] || die "missing $lg — run: cargo build --release -p bench-tools"
+    local scenario_arg=()
+    if [[ -n "${SCENARIO:-}" ]]; then
+        scenario_arg=( --scenario-name "$SCENARIO" )
+    fi
     log "loadgen subject=$subject out=$(basename "$out") args: $*"
-    "$lg" --subject "$subject" --report-json "$out" "$@"
+    "$lg" --subject "$subject" --report-json "$out" "${scenario_arg[@]}" "$@"
 }

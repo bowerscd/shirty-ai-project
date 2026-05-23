@@ -104,6 +104,36 @@ bench/udp-pps.sh
 bench/tcp-throughput.sh
 ```
 
+### Rotated runs (recommended for any cross-proxy claim)
+
+The bench is sensitive to run-order on a contended host: the first
+subject in each scenario's list gets a structural advantage of
+25-70% from cleaner kernel state (TIME_WAIT pressure, scheduler
+bias, thermal headroom). A single `run-all.sh` invocation is fine
+for *regression detection* (does yggdrasil get slower commit over
+commit?) but **not** for fair cross-proxy comparison.
+
+For comparison work, use the rotated harness:
+
+```bash
+# Run the full matrix N=5 times with subject order shuffled per run.
+# Each rotation lands in bench/results/<sha>-rotN/.
+BENCH_ROTATIONS=5 bench/run-rotated.sh
+
+# Aggregate into a position-corrected view (mean ± stdev, with high-
+# variance cells flagged). Also runs symmetric SLO checks on the
+# means — both "yggdrasil within X% of nginx" AND "nginx within X% of
+# yggdrasil", so an apparent yggdrasil 'win' that's actually a
+# run-order artifact gets caught as a reverse-direction failure.
+python3 bench/compare.py --rotations bench/results/<sha>-rot*
+```
+
+A 5-rotation aggregate takes 5× longer than `run-all.sh` but produces
+numbers you can publish without misleading anyone. The per-cell
+`*high-variance` marker (coefficient of variation >20%) is the signal
+that "the bench isn't measuring what you think it's measuring on this
+machine in this run."
+
 ### Criterion microbenches
 
 Workspace Criterion benches live under `crates/*/benches/`. `crates/yggdrasil/benches/flow_table.rs` compares UDP flow-table insertion through the old single shared shard against the current per-worker-shard layout used by `UdpProxy`. `crates/yggdrasil/benches/h3_forward.rs` tracks HTTP/3 request-rewrite CPU cost (forwarding header strip/inject, URI rewrite, and HSTS injection).
@@ -194,7 +224,10 @@ For each non-direct subject, the harness:
 
 ## Known caveats
 
+- **Run-order bias is real.** First-position subjects get +25–70% on contended hosts. **A single `run-all.sh` invocation is regression-detection only**, not a fair cross-proxy comparison. Use `bench/run-rotated.sh` (see above) for any number you intend to publish.
 - 127.0.0.1 loopback bypasses the NIC entirely, so we are measuring per-packet overhead, scheduling, and userspace cost — *not* anything network-stack-bound. To exercise the NIC, replace `127.0.0.1` targets with a host on a separate kernel and rerun.
+- The `bench-echo` backend is the bottleneck at ~14k accept/s for `tcp-connrate`. Any proxy result ≥14k c/s is hitting the *backend* ceiling, not the proxy ceiling — interpret single-hop connrate numbers accordingly.
+- `traefik-chain` is excluded from TCP scenarios by default (single-hop traefik runs ~20k c/s; chained collapses to <200 c/s, which doesn't reflect a real traefik property — it's an unresolved harness config interaction). Set `BENCH_SUBJECTS` to include it explicitly if you're debugging.
 - `bench/collect-env.sh` records governor + sysctls but does **not** refuse to run on a misconfigured host. Check `env.json` before trusting the numbers.
 - For chain subjects, `tcp-idle-conns.peak_established_conns` ~doubles because each TCP connection has an ESTABLISHED entry at each hop. The `proxy_rss_kib` PSS sum is the meaningful per-connection memory number — it's measured across both hops' process trees.
 
@@ -202,5 +235,6 @@ For each non-direct subject, the harness:
 
 1. Copy the closest existing script (e.g. `bench/tcp-latency.sh`) to `bench/<new>.sh`.
 2. Adjust `SCENARIO=`, the loadgen subcommand, and any tunables.
-3. Add the scenario name to the `SCENARIOS` array in `bench/run-all.sh`.
-4. If the metric needs a new comparison rule, extend `HIGHER_BETTER`/`LOWER_BETTER`/`NGINX_DELTA_BUDGET`/`HAPROXY_DELTA_BUDGET`/`TRAEFIK_DELTA_BUDGET` in `bench/compare.py`.
+3. Use `mapfile -t SUBJECTS < <(bench_subjects_for tcp)` (or `udp`) to pick up the canonical subject list and inherit shuffle support automatically.
+4. Add the scenario name to the `SCENARIOS` array in `bench/run-all.sh`.
+5. If the metric needs a new comparison rule, extend `HIGHER_BETTER`/`LOWER_BETTER`/`NGINX_DELTA_BUDGET`/`HAPROXY_DELTA_BUDGET`/`TRAEFIK_DELTA_BUDGET` in `bench/compare.py`.

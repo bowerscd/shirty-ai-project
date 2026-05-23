@@ -112,7 +112,7 @@ pub async fn run_tcp(subject: &str, args: TcpArgs) -> Result<Report> {
     params.insert("message_size".into(), json!(message_size));
     params.insert("warmup_s".into(), json!(warmup.as_secs_f64()));
     Ok(build_report(
-        "tcp",
+        "tcp-latency",
         subject,
         &target.to_string(),
         params,

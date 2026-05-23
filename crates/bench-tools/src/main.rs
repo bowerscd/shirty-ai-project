@@ -46,6 +46,17 @@ struct Cli {
     #[arg(long, global = true)]
     report_json: Option<PathBuf>,
 
+    /// Override the scenario name in the JSON report. By default each
+    /// mode picks its own (`tcp-latency`, `tcp-throughput`,
+    /// `tcp-connrate`, `tcp-idle`, `udp-pps`, `udp-churn`). The
+    /// generic `udp` mode is shared by `udp-pps` and `udp-flows` —
+    /// the latter passes `--scenario-name udp-flows` to disambiguate.
+    /// Reports landing in the same results directory must have unique
+    /// (scenario, subject) pairs or `compare.py`'s aggregator will
+    /// silently collapse them.
+    #[arg(long, global = true)]
+    scenario_name: Option<String>,
+
     #[command(subcommand)]
     mode: Mode,
 }
@@ -184,7 +195,7 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let report = match cli.mode {
+    let mut report = match cli.mode {
         Mode::Udp(args) => udp::run_udp(&cli.subject, args).await?,
         Mode::UdpChurn(args) => udp::run_udp_churn(&cli.subject, args).await?,
         Mode::Tcp(args) => tcp::run_tcp(&cli.subject, args).await?,
@@ -192,6 +203,9 @@ async fn run(cli: Cli) -> Result<()> {
         Mode::TcpConnrate(args) => tcp::run_tcp_connrate(&cli.subject, args).await?,
         Mode::TcpIdle(args) => tcp::run_tcp_idle(&cli.subject, args).await?,
     };
+    if let Some(name) = cli.scenario_name {
+        report.scenario = name;
+    }
     let text = serde_json::to_string_pretty(&report).context("serialise report")?;
     match cli.report_json {
         Some(path) => std::fs::write(&path, text)

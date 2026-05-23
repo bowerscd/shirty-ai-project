@@ -79,7 +79,9 @@ run_subject() {
     bench_leg_teardown
 }
 
-for s in direct yggdrasil-terminal yggdrasil-chain nginx nginx-chain traefik traefik-chain; do
+mapfile -t SUBJECTS < <(bench_subjects_for udp)
+log "$SCENARIO subject order: ${SUBJECTS[*]}"
+for s in "${SUBJECTS[@]}"; do
     log "$SCENARIO/$s: starting"
     run_subject "$s"
 done
