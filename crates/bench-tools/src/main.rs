@@ -65,6 +65,13 @@ struct Cli {
 enum Mode {
     /// Open N concurrent UDP flows and send echo-RTT-measured packets.
     Udp(UdpArgs),
+    /// Bidirectional UDP: client sends at tx-pps; bench-echo (started
+    /// with matching `--originate-pps`) also pushes an independent
+    /// server-originated stream. Reports both round-trip latency (for
+    /// the echo half) and one-way latency (for the originate half).
+    /// The matching peer is `bench-echo udp --originate-pps N
+    /// --originate-bytes M`.
+    UdpDuplex(UdpDuplexArgs),
     /// Repeatedly open fresh UDP flows; measure new-flow/sec capacity.
     UdpChurn(UdpChurnArgs),
     /// Open N TCP connections, ping-pong fixed messages, measure RTT.
@@ -111,6 +118,29 @@ struct UdpChurnArgs {
     /// Total run duration.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "10s")]
     duration: Duration,
+}
+
+#[derive(Debug, clap::Args)]
+struct UdpDuplexArgs {
+    /// Target address (host:port).
+    #[arg(long)]
+    target: String,
+    /// Number of concurrent flows (each gets its own source port).
+    #[arg(long, default_value_t = 1)]
+    flows: u32,
+    /// Aggregate **client → server** send rate across all flows.
+    #[arg(long, default_value_t = 100_000)]
+    tx_pps: u64,
+    /// UDP payload size in bytes (>= 9; first 9 bytes are the
+    /// type+timestamp header).
+    #[arg(long, default_value_t = 64)]
+    packet_size: usize,
+    /// Total run duration.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "10s")]
+    duration: Duration,
+    /// Warmup duration excluded from the reported stats.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "1s")]
+    warmup: Duration,
 }
 
 #[derive(Debug, clap::Args)]
@@ -197,6 +227,7 @@ fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     let mut report = match cli.mode {
         Mode::Udp(args) => udp::run_udp(&cli.subject, args).await?,
+        Mode::UdpDuplex(args) => udp::run_udp_duplex(&cli.subject, args).await?,
         Mode::UdpChurn(args) => udp::run_udp_churn(&cli.subject, args).await?,
         Mode::Tcp(args) => tcp::run_tcp(&cli.subject, args).await?,
         Mode::TcpThroughput(args) => tcp::run_tcp_throughput(&cli.subject, args).await?,

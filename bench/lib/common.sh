@@ -221,6 +221,30 @@ bench_spawn_udp_echo() {
     bench_wait_listen_udp 127.0.0.1 "$port" 3
 }
 
+# Spawn a UDP echo on 127.0.0.1:$port that ALSO originates an
+# independent server→client stream at `$originate_pps` per source
+# address. Pairs with `loadgen udp-duplex` to exercise both
+# directions of a proxy's UDP data plane under independent load.
+#
+# `$originate_max_sources` caps how many distinct source-port
+# originator tasks the echo will spin up. This matters when a proxy
+# (notably nginx in stream mode) presents many upstream source
+# ports — without a cap, bench-echo would spawn one originator per
+# new source and end up sending N× the configured per-source rate.
+# The bench passes `$BENCH_FLOWS` here so the originate aggregate
+# stays comparable across subjects.
+bench_spawn_udp_echo_duplex() {
+    local __pidvar="$1" port="$2" logfile="$3" originate_pps="$4"
+    local originate_bytes="${5:-64}" originate_max_sources="${6:-32}"
+    local bin
+    bin="$(bench_echo_binary)"
+    bench_spawn "$__pidvar" "$logfile" -- "$bin" udp "$port" \
+        --originate-pps "$originate_pps" \
+        --originate-bytes "$originate_bytes" \
+        --originate-max-sources "$originate_max_sources"
+    bench_wait_listen_udp 127.0.0.1 "$port" 3
+}
+
 # Spawn a TCP echo on 127.0.0.1:$port. Writes PID into named var.
 bench_spawn_tcp_echo() {
     local __pidvar="$1" port="$2" logfile="$3"

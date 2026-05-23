@@ -26,3 +26,4 @@ hdrhistogram = { workspace = true }
 humantime-serde = { workspace = true }
 humantime    = { workspace = true }
 socket2      = { workspace = true }
+dashmap      = { workspace = true }

@@ -22,6 +22,7 @@ declare -a SCENARIOS=(
     udp-pps
     udp-flows
     udp-flowchurn
+    udp-duplex
     tcp-latency
     tcp-throughput
     tcp-connrate

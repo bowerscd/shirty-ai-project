@@ -12,7 +12,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use crate::report::{build_report, finalize_stats, unix_ms_now, LatencySummary, Report, Stats};
-use crate::{UdpArgs, UdpChurnArgs};
+use crate::{UdpArgs, UdpChurnArgs, UdpDuplexArgs};
 
 /// Echo-RTT loadgen: open N flows, send packets at the target aggregate pps,
 /// expect the proxy/echo to bounce them back, capture round-trip latency.
@@ -282,6 +282,250 @@ pub async fn run_udp_churn(subject: &str, args: UdpChurnArgs) -> Result<Report> 
         ts_start,
         ts_end,
     ))
+}
+
+/// Bidirectional UDP loadgen.
+///
+/// Each flow is one socket. Two concurrent loops per flow:
+///
+/// * **TX loop** — sends `tx_pps / flows` packets per second with a
+///   `(type=0, timestamp)` header. The matching peer (typically
+///   `bench-echo udp --originate-pps M`) is expected to **echo**
+///   these back (preserving the type=0 byte) and **also** originate
+///   its own datagrams independently (with type=1 + its own
+///   timestamp).
+/// * **RX loop** — reads incoming. Distinguishes by the first byte:
+///   * `0` → an echo of one of our sends, RTT histogram entry.
+///   * `1` → server-originated, one-way-latency histogram entry
+///     (loopback clocks are loosely synchronised within microseconds,
+///     more than precise enough for proxy-overhead measurement).
+///
+/// Reported fields:
+/// * `tx_packets` / `rx_packets` / `tx_bytes` / `rx_bytes`
+/// * `errors`
+/// * `latency_us` — the **echo (RTT)** histogram, for compatibility
+///   with the existing `compare.py` analytics.
+/// * `params.originate_latency_us_p50/p99/p999/mean` — the one-way
+///   originate histogram, surfaced as scalar quantiles rather than
+///   a second `latency_us` because the JSON schema currently allows
+///   only one. Set `--rotations` aware analytics will pick these up.
+pub async fn run_udp_duplex(subject: &str, args: UdpDuplexArgs) -> Result<Report> {
+    let target: SocketAddr = args
+        .target
+        .parse()
+        .with_context(|| format!("parse target {}", args.target))?;
+    let UdpDuplexArgs {
+        target: _,
+        flows,
+        tx_pps,
+        packet_size,
+        duration,
+        warmup,
+    } = args;
+    if packet_size < 9 {
+        anyhow::bail!("udp-duplex --packet-size must be >= 9 (header is type+timestamp)");
+    }
+
+    let mut flow_socks: Vec<Arc<UdpSocket>> = Vec::with_capacity(flows as usize);
+    for _ in 0..flows {
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind UDP flow")?;
+        sock.connect(target).await.context("connect UDP flow")?;
+        flow_socks.push(Arc::new(sock));
+    }
+
+    let rtt_hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
+    ));
+    let oneway_hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
+    ));
+    let tx_packets = Arc::new(AtomicU64::new(0));
+    let rx_packets = Arc::new(AtomicU64::new(0));
+    let echo_packets = Arc::new(AtomicU64::new(0));
+    let originate_packets = Arc::new(AtomicU64::new(0));
+    let tx_bytes = Arc::new(AtomicU64::new(0));
+    let rx_bytes = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(AtomicU64::new(0));
+
+    // Spawn one RX loop per flow.
+    let recv_handles: Vec<_> = flow_socks
+        .iter()
+        .cloned()
+        .map(|sock| {
+            let rtt_hist = rtt_hist.clone();
+            let oneway_hist = oneway_hist.clone();
+            let rx_packets = rx_packets.clone();
+            let echo_packets = echo_packets.clone();
+            let originate_packets = originate_packets.clone();
+            let rx_bytes = rx_bytes.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65_535];
+                loop {
+                    match sock.recv(&mut buf).await {
+                        Ok(n) => {
+                            if n < 9 {
+                                continue;
+                            }
+                            let kind = buf[0];
+                            let sent_ns = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                            let now = now_ns();
+                            let delta_us = (now.saturating_sub(sent_ns)) / 1_000;
+                            match kind {
+                                0 => {
+                                    rtt_hist.lock().await.saturating_record(delta_us.max(1));
+                                    echo_packets.fetch_add(1, Ordering::Relaxed);
+                                }
+                                1 => {
+                                    oneway_hist.lock().await.saturating_record(delta_us.max(1));
+                                    originate_packets.fetch_add(1, Ordering::Relaxed);
+                                }
+                                _ => {
+                                    // Unknown marker; count it but don't
+                                    // record into either histogram.
+                                }
+                            }
+                            rx_packets.fetch_add(1, Ordering::Relaxed);
+                            rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // TX loop.
+    let per_flow_pps = (tx_pps as f64 / flows.max(1) as f64).max(1.0);
+    let interval = Duration::from_secs_f64(1.0 / per_flow_pps);
+
+    // Warmup — same send shape, stats not counted.
+    if !warmup.is_zero() {
+        run_duplex_send_loop(
+            &flow_socks,
+            packet_size,
+            interval,
+            warmup,
+            None,
+            None,
+            errors.clone(),
+        )
+        .await;
+    }
+
+    let ts_start = unix_ms_now();
+    let started = Instant::now();
+    run_duplex_send_loop(
+        &flow_socks,
+        packet_size,
+        interval,
+        duration,
+        Some(tx_packets.clone()),
+        Some(tx_bytes.clone()),
+        errors.clone(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let ts_end = unix_ms_now();
+
+    for h in recv_handles {
+        h.abort();
+    }
+
+    let mut stats = Stats {
+        tx_packets: tx_packets.load(Ordering::Relaxed),
+        rx_packets: rx_packets.load(Ordering::Relaxed),
+        tx_bytes: tx_bytes.load(Ordering::Relaxed),
+        rx_bytes: rx_bytes.load(Ordering::Relaxed),
+        errors: errors.load(Ordering::Relaxed),
+        ..Stats::default()
+    };
+    finalize_stats(&mut stats, elapsed);
+    stats.latency_us = Some(LatencySummary::from_hist(&*rtt_hist.lock().await));
+
+    let oneway = LatencySummary::from_hist(&*oneway_hist.lock().await);
+    let mut params = serde_json::Map::new();
+    params.insert("flows".into(), json!(flows));
+    params.insert("tx_pps".into(), json!(tx_pps));
+    params.insert("packet_size".into(), json!(packet_size));
+    params.insert("warmup_s".into(), json!(warmup.as_secs_f64()));
+    params.insert(
+        "echo_packets".into(),
+        json!(echo_packets.load(Ordering::Relaxed)),
+    );
+    params.insert(
+        "originate_packets".into(),
+        json!(originate_packets.load(Ordering::Relaxed)),
+    );
+    // One-way latency exposed as a separate object so dashboards can
+    // chart it alongside the (already-present) RTT histogram.
+    params.insert(
+        "oneway_latency_us".into(),
+        json!({
+            "samples": oneway.samples,
+            "min":  oneway.min,
+            "p50":  oneway.p50,
+            "p90":  oneway.p90,
+            "p99":  oneway.p99,
+            "p999": oneway.p999,
+            "max":  oneway.max,
+            "mean": oneway.mean,
+        }),
+    );
+
+    Ok(build_report(
+        "udp-duplex",
+        subject,
+        &target.to_string(),
+        params,
+        stats,
+        ts_start,
+        ts_end,
+    ))
+}
+
+async fn run_duplex_send_loop(
+    flow_socks: &[Arc<UdpSocket>],
+    packet_size: usize,
+    interval: Duration,
+    duration: Duration,
+    tx_packets: Option<Arc<AtomicU64>>,
+    tx_bytes: Option<Arc<AtomicU64>>,
+    errors: Arc<AtomicU64>,
+) {
+    let deadline = Instant::now() + duration;
+    let mut buf = vec![0u8; packet_size];
+    // Type byte 0 = client-initiated (echo expected).
+    buf[0] = 0;
+    while Instant::now() < deadline {
+        let send_at = Instant::now();
+        for sock in flow_socks {
+            let ts = now_ns().to_le_bytes();
+            buf[1..9].copy_from_slice(&ts);
+            match sock.try_send(&buf) {
+                Ok(sent) => {
+                    if let Some(tp) = &tx_packets {
+                        tp.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(tb) = &tx_bytes {
+                        tb.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let now = Instant::now();
+        let wakeup = send_at + interval;
+        if wakeup > now && wakeup <= deadline {
+            tokio::time::sleep_until(wakeup.into()).await;
+        }
+    }
 }
 
 fn now_ns() -> u64 {
