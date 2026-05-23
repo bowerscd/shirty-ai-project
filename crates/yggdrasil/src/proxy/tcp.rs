@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
-use tokio::io::copy_bidirectional;
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +46,17 @@ use super::resolver::UpstreamResolver;
 /// values are silently capped by the kernel unless the operator raises
 /// `net.core.somaxconn`. Matches what tokio's `TcpListener::bind` requests.
 const LISTEN_BACKLOG: i32 = 1024;
+
+/// Per-direction forwarding buffer used by [`copy_bidirectional_with_sizes`].
+/// Tokio's plain [`copy_bidirectional`] defaults to 8 KiB; nginx's `stream`
+/// module's `proxy_buffer_size` defaults to 16 KiB. 32 KiB halves syscall
+/// rate vs nginx on bulk TCP transfers (the dominant overhead on
+/// loopback throughput benches) while still fitting two buffers per
+/// connection in a 64 KiB L1d on most modern CPUs. Empirically chosen
+/// over 64 KiB because the marginal syscall savings beyond 32 KiB are
+/// small and the extra working set hurts cache locality on hosts with
+/// many concurrent connections.
+const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Handle to a running per-rule TCP proxy. Drop to stop (the cancellation
 /// token cascade aborts the accept loops and lets in-flight connections
@@ -363,7 +374,12 @@ async fn handle_connection(
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
 
-    let pumping = copy_bidirectional(&mut client, &mut upstream);
+    let pumping = copy_bidirectional_with_sizes(
+        &mut client,
+        &mut upstream,
+        FORWARD_BUFFER_SIZE,
+        FORWARD_BUFFER_SIZE,
+    );
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
