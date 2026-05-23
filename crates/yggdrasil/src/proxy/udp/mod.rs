@@ -578,7 +578,12 @@ impl UdpWorker {
         // Per-flow upstream→client task.
         let task_us = upstream_sock.clone();
         let task_frontend = self.frontend.clone();
-        let task_cancel = self.cancel.child_token();
+        // Use a plain `Arc` clone (= one atomic increment) rather than a
+        // child token (= linked-list bookkeeping in the parent registry
+        // + a drop hook per flow). Nothing cancels an individual flow
+        // independently of the worker, so the child-token semantics are
+        // unused — they're pure per-flow overhead.
+        let task_cancel = self.cancel.clone();
         let task_rule_name = self.rule.name.clone();
         let task_shard = Arc::clone(&self.flows);
         let task_accounting = FlowAccounting {

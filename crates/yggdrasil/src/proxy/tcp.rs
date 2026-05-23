@@ -30,6 +30,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use tokio::io::copy_bidirectional;
@@ -50,7 +51,7 @@ const LISTEN_BACKLOG: i32 = 1024;
 /// token cascade aborts the accept loops and lets in-flight connections
 /// finish naturally).
 pub struct TcpProxy {
-    rule: Rule,
+    rule: Arc<Rule>,
     cancel: CancellationToken,
     local_addr: SocketAddr,
     /// One handle per accept worker. `stop()` awaits all of them.
@@ -93,11 +94,19 @@ impl TcpProxy {
             .local_addr()
             .context("read TcpListener local_addr")?;
 
+        // Share the rule across every accepted connection via `Arc` so
+        // the per-accept hot path doesn't deep-clone the rule (which
+        // would allocate the `name` String and chase every Option /
+        // Vec field). The accept loop clones the `Arc` — a single
+        // atomic increment — and passes that into the spawned
+        // per-connection task.
+        let rule_arc = Arc::new(rule);
+
         let cancel = CancellationToken::new();
         let mut worker_handles = Vec::with_capacity(effective_workers);
         for (worker_id, listener) in listeners.into_iter().enumerate() {
             let task_cancel = cancel.clone();
-            let task_rule = rule.clone();
+            let task_rule = Arc::clone(&rule_arc);
             let task_resolver = resolver.clone();
             let task_local = local_addr;
             let handle = tokio::spawn(async move {
@@ -115,23 +124,23 @@ impl TcpProxy {
         }
 
         tracing::info!(
-            rule = %rule.name,
+            rule = %rule_arc.name,
             listen = %local_addr,
             upstream = %resolver.describe(),
-            proxy_protocol = ?rule.proxy_protocol,
+            proxy_protocol = ?rule_arc.proxy_protocol,
             workers = effective_workers,
             "TCP rule listening"
         );
 
         metrics::gauge!(
             "yggdrasil_workers",
-            "rule" => rule.name.clone(),
+            "rule" => rule_arc.name.clone(),
             "protocol" => "tcp",
         )
         .set(effective_workers as f64);
 
         Ok(Self {
-            rule,
+            rule: rule_arc,
             cancel,
             local_addr,
             worker_handles,
@@ -164,7 +173,7 @@ impl TcpProxy {
 }
 
 async fn run_accept_loop(
-    rule: Rule,
+    rule: Arc<Rule>,
     resolver: UpstreamResolver,
     listener: TcpListener,
     local_addr: SocketAddr,
@@ -206,8 +215,14 @@ async fn run_accept_loop(
                         continue;
                     }
                 };
-                let conn_rule = rule.clone();
-                let conn_cancel = cancel.child_token();
+                // Cheap clones: `Arc::clone` is a single atomic increment,
+                // and `CancellationToken::clone` is also an `Arc` clone (no
+                // child-token registration, which would add a parent-side
+                // linked-list entry + drop hook per connection — pure
+                // overhead for our use case since nothing cancels an
+                // individual connection independently of the worker).
+                let conn_rule = Arc::clone(&rule);
+                let conn_cancel = cancel.clone();
                 tokio::spawn(async move {
                     handle_connection(
                         conn_rule,
@@ -264,7 +279,7 @@ fn build_tcp_listener_socket(addr: SocketAddr) -> io::Result<TcpListener> {
 }
 
 async fn handle_connection(
-    rule: Rule,
+    rule: Arc<Rule>,
     mut client: TcpStream,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
