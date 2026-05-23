@@ -279,6 +279,53 @@ fn increment_udp_datagrams_received(rule: &str, worker_id: usize, count: usize) 
     .increment(count as u64);
 }
 
+fn increment_udp_bytes(rule: &str, worker_id: usize, direction: &'static str, count: usize) {
+    metrics::counter!(
+        "yggdrasil_udp_bytes_total",
+        "rule" => rule.to_owned(),
+        "worker" => worker_id.to_string(),
+        "direction" => direction,
+    )
+    .increment(count as u64);
+}
+
+fn increment_udp_flows_admitted(rule: &str, worker_id: usize) {
+    metrics::counter!(
+        "yggdrasil_udp_flows_admitted_total",
+        "rule" => rule.to_owned(),
+        "worker" => worker_id.to_string(),
+    )
+    .increment(1);
+}
+
+fn increment_udp_send_errors(rule: &str, worker_id: usize, direction: &'static str) {
+    metrics::counter!(
+        "yggdrasil_udp_send_errors_total",
+        "rule" => rule.to_owned(),
+        "worker" => worker_id.to_string(),
+        "direction" => direction,
+    )
+    .increment(1);
+}
+
+fn increment_udp_dropped_no_peer(rule: &str, worker_id: usize) {
+    metrics::counter!(
+        "yggdrasil_udp_dropped_no_peer_total",
+        "rule" => rule.to_owned(),
+        "worker" => worker_id.to_string(),
+    )
+    .increment(1);
+}
+
+fn record_udp_upstream_bind_seconds(rule: &str, result: &'static str, secs: f64) {
+    metrics::histogram!(
+        "yggdrasil_udp_upstream_bind_seconds",
+        "rule" => rule.to_owned(),
+        "result" => result,
+    )
+    .record(secs);
+}
+
 fn increment_udp_flows_rejected(rule: &str, worker_id: usize, reason: &'static str) {
     metrics::counter!(
         "yggdrasil_udp_flows_rejected_total",
@@ -490,19 +537,35 @@ impl UdpWorker {
         // Fast path: existing flow.
         if let Some(entry) = self.flows.get(&client_addr) {
             entry.last_seen_ms.store(self.now_ms(), Ordering::Relaxed);
-            if let Err(e) = entry.upstream_sock.send(payload).await {
-                tracing::debug!(
-                    rule = %self.rule.name,
-                    client = %client_addr,
-                    error = %e,
-                    "upstream send failed; flow may be stale (will be reaped)"
-                );
+            match entry.upstream_sock.send(payload).await {
+                Ok(_) => {
+                    increment_udp_bytes(
+                        &self.rule.name,
+                        self.worker_id,
+                        "client_to_upstream",
+                        payload.len(),
+                    );
+                }
+                Err(e) => {
+                    increment_udp_send_errors(
+                        &self.rule.name,
+                        self.worker_id,
+                        "client_to_upstream",
+                    );
+                    tracing::debug!(
+                        rule = %self.rule.name,
+                        client = %client_addr,
+                        error = %e,
+                        "upstream send failed; flow may be stale (will be reaped)"
+                    );
+                }
             }
             return;
         }
 
         // No flow yet. Need a resolved dial target and capacity.
         let Some(target_addr) = self.resolver.current_target() else {
+            increment_udp_dropped_no_peer(&self.rule.name, self.worker_id);
             tracing::debug!(
                 rule = %self.rule.name,
                 client = %client_addr,
@@ -527,16 +590,27 @@ impl UdpWorker {
             None => return,
         };
 
-        if let Err(e) = entry.upstream_sock.send(payload).await {
-            tracing::debug!(
-                rule = %self.rule.name,
-                client = %client_addr,
-                upstream = %target_addr,
-                error = %e,
-                "first upstream send on new flow failed"
-            );
-            // Don't tear the flow down — recv loops may still be useful and
-            // the reaper will clean up if it stays idle.
+        match entry.upstream_sock.send(payload).await {
+            Ok(_) => {
+                increment_udp_bytes(
+                    &self.rule.name,
+                    self.worker_id,
+                    "client_to_upstream",
+                    payload.len(),
+                );
+            }
+            Err(e) => {
+                increment_udp_send_errors(&self.rule.name, self.worker_id, "client_to_upstream");
+                tracing::debug!(
+                    rule = %self.rule.name,
+                    client = %client_addr,
+                    upstream = %target_addr,
+                    error = %e,
+                    "first upstream send on new flow failed"
+                );
+                // Don't tear the flow down — recv loops may still be useful and
+                // the reaper will clean up if it stays idle.
+            }
         }
     }
 
@@ -551,9 +625,15 @@ impl UdpWorker {
             IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             IpAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
+        let bind_start = Instant::now();
         let sock = match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
             Err(e) => {
+                record_udp_upstream_bind_seconds(
+                    &self.rule.name,
+                    "error",
+                    bind_start.elapsed().as_secs_f64(),
+                );
                 tracing::warn!(
                     rule = %self.rule.name,
                     client = %client_addr,
@@ -564,6 +644,11 @@ impl UdpWorker {
             }
         };
         if let Err(e) = sock.connect(target_addr).await {
+            record_udp_upstream_bind_seconds(
+                &self.rule.name,
+                "error",
+                bind_start.elapsed().as_secs_f64(),
+            );
             tracing::warn!(
                 rule = %self.rule.name,
                 client = %client_addr,
@@ -573,6 +658,7 @@ impl UdpWorker {
             );
             return None;
         }
+        record_udp_upstream_bind_seconds(&self.rule.name, "ok", bind_start.elapsed().as_secs_f64());
         let upstream_sock = Arc::new(sock);
 
         // Per-flow upstream→client task.
@@ -639,6 +725,7 @@ impl UdpWorker {
                     "new UDP flow"
                 );
                 v.insert(entry.clone());
+                increment_udp_flows_admitted(&self.rule.name, self.worker_id);
                 set_udp_active_flows(&self.rule.name, self.worker_id, self.flows.len());
                 Some(entry)
             }
@@ -782,14 +869,29 @@ async fn upstream_to_client_loop(
                     .get(&client_addr)
                     .map(|entry| entry.frontend.clone())
                     .unwrap_or_else(|| frontend.clone());
-                if let Err(e) = send_frontend.send_to(&buf[..n], client_addr).await {
-                    tracing::debug!(
-                        rule = %rule_name,
-                        client = %client_addr,
-                        error = %e,
-                        "frontend send_to client failed"
-                    );
-                    continue;
+                match send_frontend.send_to(&buf[..n], client_addr).await {
+                    Ok(_) => {
+                        increment_udp_bytes(
+                            &rule_name,
+                            accounting.worker_id,
+                            "upstream_to_client",
+                            n,
+                        );
+                    }
+                    Err(e) => {
+                        increment_udp_send_errors(
+                            &rule_name,
+                            accounting.worker_id,
+                            "upstream_to_client",
+                        );
+                        tracing::debug!(
+                            rule = %rule_name,
+                            client = %client_addr,
+                            error = %e,
+                            "frontend send_to client failed"
+                        );
+                        continue;
+                    }
                 }
                 // Touch last_seen for the return-traffic direction too.
                 if let Some(entry) = shard.get(&client_addr) {
