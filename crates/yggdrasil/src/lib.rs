@@ -23,6 +23,7 @@ pub mod heartbeat;
 pub mod log;
 pub mod metrics;
 pub mod pending_peers;
+pub mod profile;
 pub mod proxy;
 pub mod rules;
 pub mod systemd;
@@ -319,7 +320,10 @@ pub async fn run_relay(
 
     let sighup_join = spawn_sighup_handler(supervisor.reload_trigger(), shutdown.clone());
 
-    wait_for_shutdown().await;
+    let profiler =
+        profile::Profiler::start_if_configured(shutdown.clone()).context("activate profiler")?;
+
+    select_shutdown_or_profile(&profiler).await;
     tracing::info!("yggdrasil shutting down");
     shutdown.cancel();
     control.stop().await;
@@ -330,6 +334,11 @@ pub async fn run_relay(
     }
     if let Some(handle) = chain_client_join {
         let _ = handle.await;
+    }
+    if let Some(p) = profiler {
+        if let Err(e) = p.flush() {
+            tracing::warn!(error = %e, "profiler flush failed");
+        }
     }
     Ok(())
 }
@@ -507,7 +516,10 @@ pub async fn run_terminal(
 
     let sighup_join = spawn_sighup_handler(supervisor.reload_trigger(), shutdown.clone());
 
-    wait_for_shutdown().await;
+    let profiler =
+        profile::Profiler::start_if_configured(shutdown.clone()).context("activate profiler")?;
+
+    select_shutdown_or_profile(&profiler).await;
     tracing::info!("yggdrasil shutting down");
     shutdown.cancel();
     control.stop().await;
@@ -518,6 +530,11 @@ pub async fn run_terminal(
     }
     if let Some(handle) = chain_client_join {
         let _ = handle.await;
+    }
+    if let Some(p) = profiler {
+        if let Err(e) = p.flush() {
+            tracing::warn!(error = %e, "profiler flush failed");
+        }
     }
     Ok(())
 }
@@ -607,6 +624,25 @@ async fn wait_for_shutdown() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
         _ = sigterm.recv()          => tracing::info!("received SIGTERM"),
+    }
+}
+
+/// Either wait for a real shutdown signal, or — if `YGGDRASIL_PROFILE_DURATION`
+/// fired before that — return as soon as the profiler hits its deadline.
+/// In the latter case the daemon still proceeds through the normal shutdown
+/// sequence; we just don't keep it running forever for the sake of a
+/// finite-duration profile capture.
+async fn select_shutdown_or_profile(profiler: &Option<profile::Profiler>) {
+    match profiler {
+        Some(p) => {
+            tokio::select! {
+                _ = wait_for_shutdown() => {}
+                _ = p.wait_for_deadline() => {
+                    tracing::info!("profile deadline elapsed; initiating shutdown");
+                }
+            }
+        }
+        None => wait_for_shutdown().await,
     }
 }
 

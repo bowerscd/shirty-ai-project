@@ -25,6 +25,7 @@ toml        = { workspace = true }
 hex         = { workspace = true }
 base64      = { workspace = true }
 humantime-serde = { workspace = true }
+humantime   = { workspace = true }
 postcard    = { workspace = true }
 
 thiserror   = { workspace = true }
@@ -74,6 +75,19 @@ reqwest         = { workspace = true }
 hickory-resolver = { workspace = true }
 x509-parser     = { workspace = true }
 async-trait     = { workspace = true }
+
+# CPU profiling (dev-only, opt-in via `--features profile`). The
+# production build has zero overhead from this — `pprof` is gated
+# behind the `profile` feature and the module that uses it is
+# `#[cfg(feature = "profile")]`. The feature exists for bench-time
+# investigation: capture a flamegraph or pprof file during a bench
+# run, inspect with `inferno`/`go tool pprof` to see where the
+# accept loop / copy_bidirectional path is actually spending time.
+pprof           = { version = "0.13", features = ["flamegraph", "prost-codec"], optional = true }
+
+[features]
+default = []
+profile = ["dep:pprof"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

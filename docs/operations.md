@@ -83,6 +83,12 @@ type, labels, meaning.
 | Metric                                            | Type      | Labels                          | Notes                                                                 |
 | ------------------------------------------------- | --------- | ------------------------------- | --------------------------------------------------------------------- |
 | `yggdrasil_workers`                               | gauge     | `rule`, `protocol`              | Configured SO_REUSEPORT worker count for each rule's accept path (`protocol="tcp"` or `protocol="udp"`).               |
+| `yggdrasil_tcp_accept_total`                      | counter   | `rule`, `worker`                | TCP accepts per zero-based worker. Divide by `yggdrasil_tcp_bytes_total` to get per-connection byte cost.              |
+| `yggdrasil_tcp_accept_errors_total`               | counter   | `rule`, `worker`                | Transient TCP accept errors (EBADF, EMFILE, etc.) per worker.          |
+| `yggdrasil_tcp_dropped_no_peer_total`             | counter   | `rule`                          | Relay-mode TCP connections dropped because no heartbeat had arrived yet (downstream IP unknown). |
+| `yggdrasil_tcp_upstream_connect_seconds`          | histogram | `rule`, `result`                | Time spent in `TcpStream::connect()` to the resolved upstream, success/error broken out. The relay's IP-change path shows up as a wider distribution here than the terminal's static-resolver path. |
+| `yggdrasil_tcp_upstream_connect_errors_total`     | counter   | `rule`                          | Upstream-connect failures (after `accept()` succeeded). Distinct from `accept_errors_total`, which is downstream-side. |
+| `yggdrasil_tcp_bytes_total`                       | counter   | `rule`, `direction`             | Bytes forwarded per direction (`client_to_upstream`/`upstream_to_client`). Counted on connection close, so streaming-but-not-closed connections aren't visible until they finish. |
 | `yggdrasil_udp_datagrams_received_total`          | counter   | `rule`, `worker`                | Frontend datagrams received by each zero-based UDP worker.             |
 | `yggdrasil_udp_active_flows`                      | gauge     | `rule`, `worker`                | Active UDP flows currently held by each zero-based worker shard.       |
 | `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | `rule`, `worker`                | UDP flows torn down per worker because the downstream IP changed.      |
@@ -290,6 +296,55 @@ The chain is essentially a linked list — each hop only knows about its
 immediate upstream and immediate downstream.
 
 ## Troubleshooting
+
+### Profiling the hot path (dev-only)
+
+For "where does CPU time actually go inside yggdrasil under workload X"
+questions, the daemon supports an opt-in in-process CPU profiler.
+**This is not enabled in production binaries** — it's behind the
+`profile` Cargo feature so a release build without `--features
+profile` has zero overhead from this path.
+
+The fast workflow is the bench wrapper:
+
+```bash
+# Capture a 30-second flamegraph during the tcp-connrate scenario
+# against yggdrasil-terminal. Output lands at
+# bench/results/<sha>-profile/tcp-connrate.svg, openable in any browser.
+bench/profile.sh tcp-connrate --duration 30s
+
+# Same workflow but emit a pprof binary instead:
+bench/profile.sh tcp-connrate --pprof
+# Inspect with: go tool pprof bench/results/<sha>-profile/tcp-connrate.pb
+```
+
+The wrapper rebuilds the daemon with `--features profile` plus
+`RUSTFLAGS="-C force-frame-pointers=yes"` for the run, then rebuilds
+without the feature so subsequent bench runs use the unmodified
+production binary.
+
+Direct invocation (for ad-hoc profiling outside the bench harness):
+
+```bash
+cargo build --release -p yggdrasil --features profile
+YGGDRASIL_PROFILE_OUTPUT=/tmp/yggd.svg \
+YGGDRASIL_PROFILE_FREQUENCY=99 \
+YGGDRASIL_PROFILE_DURATION=30s \
+  target/release/yggdrasil run --config /etc/yggdrasil/config.toml
+# Daemon emits the flamegraph on SIGTERM or at the configured duration.
+```
+
+**Known limitation:** pprof-rs's signal-based unwinder produces
+shallow flamegraphs on tokio worker threads (the depth-2 `all →
+tokio-rt-worker` shape). The samples are still useful as a
+per-thread sample-count distribution, but the call graph beneath the
+worker entry doesn't unwind. When the flamegraph isn't deep enough,
+the fine-grained `yggdrasil_tcp_*` Prometheus metrics
+(`accept_total`, `upstream_connect_seconds`, `bytes_total`, etc.)
+give an alternative diagnostic path — counts and timings of the
+hot-path operations without a flamegraph at all. For deeper
+analysis, a developer with root + `perf` on a Linux host can use
+`perf record -g -p <pid>` against the same profile-feature build.
 
 ### Turning up verbose logging on a live daemon
 

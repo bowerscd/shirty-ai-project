@@ -196,9 +196,21 @@ async fn run_accept_loop(
                         // bringing down the listener over a single EBADF
                         // would amplify whatever caused the error.
                         tracing::warn!(rule = %rule.name, worker = worker_id, error = %e, "TCP accept failed");
+                        metrics::counter!(
+                            "yggdrasil_tcp_accept_errors_total",
+                            "rule" => rule.name.clone(),
+                            "worker" => worker_id.to_string(),
+                        )
+                        .increment(1);
                         continue;
                     }
                 };
+                metrics::counter!(
+                    "yggdrasil_tcp_accept_total",
+                    "rule" => rule.name.clone(),
+                    "worker" => worker_id.to_string(),
+                )
+                .increment(1);
 
                 let target_addr = match resolver.current_target() {
                     Some(addr) => addr,
@@ -211,6 +223,11 @@ async fn run_accept_loop(
                             client = %client_addr,
                             "drop connection: upstream not yet resolvable (no heartbeat received)"
                         );
+                        metrics::counter!(
+                            "yggdrasil_tcp_dropped_no_peer_total",
+                            "rule" => rule.name.clone(),
+                        )
+                        .increment(1);
                         // Tokio drops `client` here → socket close.
                         continue;
                     }
@@ -288,9 +305,29 @@ async fn handle_connection(
 ) {
     // Connect to upstream first. If this fails, close the client without
     // sending anything (no PROXY-protocol header, no half-open).
+    let connect_start = std::time::Instant::now();
     let mut upstream = match TcpStream::connect(target_addr).await {
-        Ok(s) => s,
+        Ok(s) => {
+            metrics::histogram!(
+                "yggdrasil_tcp_upstream_connect_seconds",
+                "rule" => rule.name.clone(),
+                "result" => "ok",
+            )
+            .record(connect_start.elapsed().as_secs_f64());
+            s
+        }
         Err(e) => {
+            metrics::histogram!(
+                "yggdrasil_tcp_upstream_connect_seconds",
+                "rule" => rule.name.clone(),
+                "result" => "error",
+            )
+            .record(connect_start.elapsed().as_secs_f64());
+            metrics::counter!(
+                "yggdrasil_tcp_upstream_connect_errors_total",
+                "rule" => rule.name.clone(),
+            )
+            .increment(1);
             tracing::warn!(
                 rule = %rule.name,
                 client = %client_addr,
@@ -338,6 +375,18 @@ async fn handle_connection(
         }
         res = pumping => match res {
             Ok((c2u, u2c)) => {
+                metrics::counter!(
+                    "yggdrasil_tcp_bytes_total",
+                    "rule" => rule.name.clone(),
+                    "direction" => "client_to_upstream",
+                )
+                .increment(c2u);
+                metrics::counter!(
+                    "yggdrasil_tcp_bytes_total",
+                    "rule" => rule.name.clone(),
+                    "direction" => "upstream_to_client",
+                )
+                .increment(u2c);
                 tracing::debug!(
                     rule = %rule.name,
                     client = %client_addr,
