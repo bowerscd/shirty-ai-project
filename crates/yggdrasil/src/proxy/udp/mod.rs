@@ -571,47 +571,66 @@ impl UdpWorker {
         let mut recv = batch_recv::BatchRecv::new(Arc::clone(&self.frontend));
         let mut scratch = batch_recv::BatchScratch::new();
         loop {
-            tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => {
-                    tracing::debug!(
+            // Phase 1: wait for the next batch. Most of this section
+            // is spent parked on epoll readiness; the time recorded
+            // here is wall-clock until recv.recv() returns.
+            let res = {
+                let _g = crate::profile::section("udp", "frontend_wait");
+                tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        tracing::debug!(
+                            rule = %self.rule.name,
+                            worker_id = self.worker_id,
+                            "UDP frontend loop received cancel"
+                        );
+                        return;
+                    }
+                    res = recv.recv(&mut scratch) => res,
+                }
+            };
+
+            // Phase 2: copy + dispatch the batch.
+            let _g = crate::profile::section("udp", "frontend_process_batch");
+            let n = match res {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
                         rule = %self.rule.name,
                         worker_id = self.worker_id,
-                        "UDP frontend loop received cancel"
+                        error = %e,
+                        "UDP batch recv failed"
                     );
-                    return;
+                    continue;
                 }
-                res = recv.recv(&mut scratch) => {
-                    let n = match res {
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::warn!(
-                                rule = %self.rule.name,
-                                worker_id = self.worker_id,
-                                error = %e,
-                                "UDP batch recv failed"
-                            );
-                            continue;
-                        }
-                    };
-                    increment_udp_datagrams_received(&self.rule.name, self.worker_id, n);
-                    let owned: Vec<(Vec<u8>, SocketAddr)> = recv
-                        .iter(&scratch, n)
-                        .map(|d| (d.payload.to_vec(), d.from))
-                        .collect();
-                    for (payload, client_addr) in owned {
-                        self.handle_inbound(&payload, client_addr).await;
-                    }
-                }
+            };
+            increment_udp_datagrams_received(&self.rule.name, self.worker_id, n);
+            let owned: Vec<(Vec<u8>, SocketAddr)> = {
+                let _g = crate::profile::section("udp", "frontend_copy_owned");
+                recv.iter(&scratch, n)
+                    .map(|d| (d.payload.to_vec(), d.from))
+                    .collect()
+            };
+            for (payload, client_addr) in owned {
+                self.handle_inbound(&payload, client_addr).await;
             }
         }
     }
 
     async fn handle_inbound(&self, payload: &[u8], client_addr: SocketAddr) {
+        let _g = crate::profile::section("udp", "handle_inbound");
         // Fast path: existing flow.
-        if let Some(entry) = self.flows.get(&client_addr) {
+        let lookup_result = {
+            let _g = crate::profile::section("udp", "flow_lookup");
+            self.flows.get(&client_addr).map(|e| e.clone())
+        };
+        if let Some(entry) = lookup_result {
             entry.last_seen_ms.store(self.now_ms(), Ordering::Relaxed);
-            match entry.upstream_sock.send(payload).await {
+            let send_result = {
+                let _g = crate::profile::section("udp", "upstream_send");
+                entry.upstream_sock.send(payload).await
+            };
+            match send_result {
                 Ok(_) => {
                     increment_udp_bytes(
                         &self.rule.name,
@@ -999,42 +1018,48 @@ async fn upstream_to_client_loop_batched(
     sender: Option<&sendmmsg_linux::BatchSender>,
 ) {
     loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return,
-            res = reader.recv_batch(buf) => {
-                let n = match res {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::debug!(
-                            rule = %rule_name,
-                            client = %client_addr,
-                            error = %e,
-                            "upstream recvmmsg failed; flow ending"
-                        );
-                        if shard.remove(&client_addr).is_some() {
-                            accounting.flow_count.fetch_sub(1, Ordering::AcqRel);
-                            set_udp_active_flows(rule_name, accounting.worker_id, shard.len());
-                        }
-                        return;
-                    }
-                };
-                if n == 0 {
-                    continue;
-                }
-                upstream_batch_forward(
-                    rule_name,
-                    frontend,
-                    client_addr,
-                    shard,
-                    accounting,
-                    buf,
-                    n,
-                    sender,
-                )
-                .await;
+        // Phase 1: wait for the upstream to deliver a batch. Most of
+        // this section is spent parked on epoll readiness.
+        let res = {
+            let _g = crate::profile::section("udp", "upstream_wait");
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                res = reader.recv_batch(buf) => res,
             }
+        };
+        // Phase 2: forward the batch back to the client.
+        let _g = crate::profile::section("udp", "upstream_process_batch");
+        let n = match res {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(
+                    rule = %rule_name,
+                    client = %client_addr,
+                    error = %e,
+                    "upstream recvmmsg failed; flow ending"
+                );
+                if shard.remove(&client_addr).is_some() {
+                    accounting.flow_count.fetch_sub(1, Ordering::AcqRel);
+                    set_udp_active_flows(rule_name, accounting.worker_id, shard.len());
+                }
+                return;
+            }
+        };
+        if n == 0 {
+            continue;
         }
+        upstream_batch_forward(
+            rule_name,
+            frontend,
+            client_addr,
+            shard,
+            accounting,
+            buf,
+            n,
+            sender,
+        )
+        .await;
     }
 }
 
@@ -1054,6 +1079,7 @@ async fn upstream_batch_forward(
     n: usize,
     sender: Option<&sendmmsg_linux::BatchSender>,
 ) {
+    let _g = crate::profile::section("udp", "upstream_batch_forward");
     // Pick the send socket once per batch. The same flow's
     // frontend never changes mid-batch, so this is correct.
     // Fallback to the caller-provided `frontend` when the
@@ -1075,7 +1101,11 @@ async fn upstream_batch_forward(
             let dgrams: Vec<recvmmsg_linux::Datagram<'_>> =
                 recvmmsg_linux::iter_received(buf, n).collect();
             let payloads: Vec<&[u8]> = dgrams.iter().map(|d| d.payload).collect();
-            match sender.send_batch(&payloads, client_addr).await {
+            let send_result = {
+                let _g = crate::profile::section("udp", "sendmmsg_to_client");
+                sender.send_batch(&payloads, client_addr).await
+            };
+            match send_result {
                 Ok(sent) => {
                     for d in &dgrams[..sent] {
                         total_bytes += d.payload.len();

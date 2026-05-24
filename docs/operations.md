@@ -104,6 +104,7 @@ type, labels, meaning.
 | `yggdrasil_acme_expiry_seconds`                   | gauge     | `hostname`                      | Unix-epoch `not_after` of each ACME-managed cert; useful for "renewal stuck" alerts. |
 | `yggdrasil_http_requests_total`                   | counter   | `rule`, `route`, …              | Requests routed by the HTTPS frontend.                                |
 | `yggdrasil_http_request_duration_seconds`         | histogram | `rule`, `route`                 | Per-route HTTPS request latency.                                       |
+| `yggdrasil_hot_section_seconds`                   | histogram | `subsystem`, `section`          | **Dev-only** (requires `--features profile`). Wall-clock duration of named hot-path sections — see [profile](#profiling) for usage. `subsystem` is `udp` / `tcp` / `http`; `section` is a stable identifier like `frontend_wait`, `handle_inbound`, `flow_lookup`, `upstream_send`, `sendmmsg_to_client`. Not emitted in production builds. |
 
 To roll up UDP counters across workers, use Prometheus
 `sum by (rule) (yggdrasil_udp_datagrams_received_total)`.
@@ -339,16 +340,23 @@ YGGDRASIL_PROFILE_DURATION=30s \
 # Daemon emits the flamegraph on SIGTERM or at the configured duration.
 ```
 
-**Known limitation:** pprof-rs's signal-based unwinder produces
-shallow flamegraphs on tokio worker threads (the depth-2 `all →
-tokio-rt-worker` shape). The samples are still useful as a
-per-thread sample-count distribution, but the call graph beneath the
-worker entry doesn't unwind. When the flamegraph isn't deep enough,
-the fine-grained `yggdrasil_tcp_*` Prometheus metrics
-(`accept_total`, `upstream_connect_seconds`, `bytes_total`, etc.)
-give an alternative diagnostic path — counts and timings of the
-hot-path operations without a flamegraph at all. For deeper
-analysis, a developer with root + `perf` on a Linux host can use
+**Stack depth caveat:** pprof-rs's signal-based unwinder reliably
+attributes each sample to the **leaf** function (typically a libc
+syscall like `epoll_wait` / `recvmmsg` / `sendmmsg` — useful for the
+"what syscall is eating cycles" question), but doesn't always walk
+back into the calling Rust frames. SIGPROF often lands while a
+thread is inside a syscall, where `%rbp` is kernel-managed and the
+unwinder gives up after the leaf.
+
+For "which **Rust function** called the syscall" the daemon emits
+the **`yggdrasil_hot_section_seconds` histogram** alongside the
+flamegraph (also gated behind the `profile` feature). Sections are
+named code blocks bracketed with `crate::profile::section(subsystem,
+name)` — e.g. `frontend_wait`, `handle_inbound`, `flow_lookup`,
+`upstream_send`, `sendmmsg_to_client`. Scrape the control socket's
+`/metrics` during or after the bench and you get a per-section
+duration quantile breakdown without re-running. For deeper
+analysis a developer with root + `perf` on a Linux host can use
 `perf record -g -p <pid>` against the same profile-feature build.
 
 ### Turning up verbose logging on a live daemon

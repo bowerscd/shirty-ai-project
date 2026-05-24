@@ -252,3 +252,131 @@ pub use real::Profiler;
 
 #[cfg(not(feature = "profile"))]
 pub use stub::Profiler;
+
+// ---------------------------------------------------------------------------
+// Generic per-section timing helper.
+//
+// Daemon-wide mechanism for measuring how long a specific block of code
+// takes. Gated behind the same `profile` Cargo feature as the SIGPROF
+// sampler: builds with `--features profile` get real `Instant::now()`
+// timing and a Prometheus histogram per section; production builds get
+// a zero-sized stub that compiles away entirely.
+//
+// The CPU profiler answers "which leaf syscall is eating cycles". This
+// helper answers the complementary "which block of *our* code is eating
+// wall-clock time" — i.e. which Rust function called the syscall, how
+// many microseconds the userspace path between syscalls took, etc.
+// Intended for the hot paths in `proxy/tcp.rs`, `proxy/udp/mod.rs`,
+// `proxy/http_frontend/*` — any subsystem where the profiler's
+// leaf-only stacks don't tell us enough.
+//
+// Records into the `yggdrasil_hot_section_seconds` histogram with two
+// labels: `subsystem` (`"udp"` / `"tcp"` / `"http"` / …) and `section`
+// (a stable identifier for the code block, e.g. `"frontend_recv"`,
+// `"upstream_send"`, `"flow_lookup"`). Scraping the control socket's
+// `/metrics` after a bench run gives a quantile breakdown per section
+// without needing to re-run with extra instrumentation.
+//
+// Usage:
+//
+// ```ignore
+// {
+//     let _g = profile::section("udp", "frontend_recv");
+//     recv.recv(&mut scratch).await?;
+// }   // <- _g drops here, records elapsed time into the histogram
+// ```
+//
+// Or with the convenience macro for the common case of measuring an
+// entire scope:
+//
+// ```ignore
+// fn do_work() {
+//     profile::section_scope!("udp", "frontend_recv");
+//     // ... function body ...
+// }
+// ```
+//
+// Both forms are zero cost when the `profile` feature is disabled:
+// `SectionGuard::new` returns a unit struct and `Instant::now()` is
+// not called.
+
+#[cfg(feature = "profile")]
+mod section {
+    use std::time::Instant;
+
+    /// RAII timer that records its elapsed lifetime to a Prometheus
+    /// histogram on drop. Construct via [`section()`] or
+    /// [`crate::profile::section_scope!`]; let it drop at the end of
+    /// the block you want to measure.
+    pub struct SectionGuard {
+        start: Instant,
+        subsystem: &'static str,
+        section: &'static str,
+    }
+
+    impl SectionGuard {
+        #[inline(always)]
+        pub fn new(subsystem: &'static str, section: &'static str) -> Self {
+            Self {
+                start: Instant::now(),
+                subsystem,
+                section,
+            }
+        }
+    }
+
+    impl Drop for SectionGuard {
+        fn drop(&mut self) {
+            metrics::histogram!(
+                "yggdrasil_hot_section_seconds",
+                "subsystem" => self.subsystem,
+                "section" => self.section,
+            )
+            .record(self.start.elapsed().as_secs_f64());
+        }
+    }
+}
+
+#[cfg(not(feature = "profile"))]
+mod section {
+    /// Zero-sized stub; production builds (no `profile` feature) get
+    /// this and the surrounding code optimises away to nothing.
+    pub struct SectionGuard;
+
+    impl SectionGuard {
+        #[inline(always)]
+        pub fn new(_subsystem: &'static str, _section: &'static str) -> Self {
+            Self
+        }
+    }
+}
+
+pub use section::SectionGuard;
+
+/// Start timing a code section. The returned guard records its
+/// lifetime as a histogram sample on drop. Bind it to a `_g`-named
+/// local for explicit-scope timing, or use [`section_scope!`] for
+/// the common case of timing a whole function body.
+#[inline(always)]
+pub fn section(subsystem: &'static str, section: &'static str) -> SectionGuard {
+    SectionGuard::new(subsystem, section)
+}
+
+/// Convenience macro: bind a `SectionGuard` named `_section_guard`
+/// in the current scope. Use at the top of a function or block to
+/// measure its entire body without needing to name the guard.
+///
+/// ```ignore
+/// fn handle_inbound(&self, ...) {
+///     $crate::profile::section_scope!("udp", "handle_inbound");
+///     // ... function body ...
+/// }
+/// ```
+#[macro_export]
+macro_rules! section_scope {
+    ($subsystem:expr, $section:expr) => {
+        let _section_guard = $crate::profile::section($subsystem, $section);
+    };
+}
+
+pub use crate::section_scope;
