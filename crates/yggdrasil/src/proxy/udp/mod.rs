@@ -64,48 +64,6 @@ pub const MAX_FLOWS_PER_RULE_DEFAULT: usize = 65_536;
 /// arrive intact will not be truncated by us.
 const RECV_BUFFER_LEN: usize = 65_535;
 
-/// `SO_BUSY_POLL` budget (microseconds) applied to every UDP socket the
-/// proxy creates — both per-worker frontend listeners and per-flow
-/// upstream sockets. When set, `recvmsg`/`recvmmsg` spin in the kernel
-/// for up to this many microseconds waiting for a datagram before
-/// returning `EAGAIN`. On loopback / low-latency NIC paths this lets
-/// us deliver the next datagram inline (avoiding the
-/// `epoll_wait → futex(wake) → re-poll` round-trip that otherwise
-/// adds ~5–10 µs per datagram).
-///
-/// 50 µs is the value the kernel docs recommend as a safe starting
-/// point: high enough to absorb back-to-back packet bursts on most
-/// 1–10 GbE links, low enough that idle sockets don't burn detectable
-/// CPU. Best-effort: setsockopt failures (EPERM on locked-down kernels,
-/// ENOPROTOOPT on non-Linux/old kernels) are logged at `debug` and
-/// otherwise ignored — the proxy still works without busy-poll.
-#[cfg(target_os = "linux")]
-const BUSY_POLL_US: u32 = 50;
-
-/// Apply `SO_BUSY_POLL` to a raw socket fd. See [`BUSY_POLL_US`] for the
-/// rationale. Returns `Ok(())` on success or any non-fatal error (we
-/// gracefully degrade rather than failing socket creation).
-#[cfg(target_os = "linux")]
-fn set_busy_poll_best_effort(fd: std::os::fd::RawFd) {
-    let val: u32 = BUSY_POLL_US;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BUSY_POLL,
-            &val as *const u32 as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::debug!(
-            error = %err,
-            "SO_BUSY_POLL setsockopt failed; continuing without busy-poll"
-        );
-    }
-}
-
 /// Resolve the SO_REUSEPORT worker count from the daemon-wide
 /// `[server].workers` setting. `None` falls back to
 /// `available_parallelism()`. Per-rule overrides are not exposed;
@@ -398,11 +356,6 @@ fn build_frontend_std_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpS
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        set_busy_poll_best_effort(sock.as_raw_fd());
-    }
     Ok(sock.into())
 }
 
@@ -778,11 +731,6 @@ impl UdpWorker {
                 "connect upstream UDP socket failed"
             );
             return None;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            set_busy_poll_best_effort(sock.as_raw_fd());
         }
         record_udp_upstream_bind_seconds(&self.rule.name, "ok", bind_start.elapsed().as_secs_f64());
         let upstream_sock = Arc::new(sock);
