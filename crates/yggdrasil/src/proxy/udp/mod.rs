@@ -64,6 +64,48 @@ pub const MAX_FLOWS_PER_RULE_DEFAULT: usize = 65_536;
 /// arrive intact will not be truncated by us.
 const RECV_BUFFER_LEN: usize = 65_535;
 
+/// `SO_BUSY_POLL` budget (microseconds) applied to every UDP socket the
+/// proxy creates — both per-worker frontend listeners and per-flow
+/// upstream sockets. When set, `recvmsg`/`recvmmsg` spin in the kernel
+/// for up to this many microseconds waiting for a datagram before
+/// returning `EAGAIN`. On loopback / low-latency NIC paths this lets
+/// us deliver the next datagram inline (avoiding the
+/// `epoll_wait → futex(wake) → re-poll` round-trip that otherwise
+/// adds ~5–10 µs per datagram).
+///
+/// 50 µs is the value the kernel docs recommend as a safe starting
+/// point: high enough to absorb back-to-back packet bursts on most
+/// 1–10 GbE links, low enough that idle sockets don't burn detectable
+/// CPU. Best-effort: setsockopt failures (EPERM on locked-down kernels,
+/// ENOPROTOOPT on non-Linux/old kernels) are logged at `debug` and
+/// otherwise ignored — the proxy still works without busy-poll.
+#[cfg(target_os = "linux")]
+const BUSY_POLL_US: u32 = 50;
+
+/// Apply `SO_BUSY_POLL` to a raw socket fd. See [`BUSY_POLL_US`] for the
+/// rationale. Returns `Ok(())` on success or any non-fatal error (we
+/// gracefully degrade rather than failing socket creation).
+#[cfg(target_os = "linux")]
+fn set_busy_poll_best_effort(fd: std::os::fd::RawFd) {
+    let val: u32 = BUSY_POLL_US;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &val as *const u32 as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::debug!(
+            error = %err,
+            "SO_BUSY_POLL setsockopt failed; continuing without busy-poll"
+        );
+    }
+}
+
 /// Resolve the SO_REUSEPORT worker count from the daemon-wide
 /// `[server].workers` setting. `None` falls back to
 /// `available_parallelism()`. Per-rule overrides are not exposed;
@@ -127,6 +169,20 @@ impl UdpProxy {
 
     /// Bind frontend sockets and spawn the proxy tasks with explicit flow cap
     /// and worker count. `workers == 0` is rejected.
+    ///
+    /// ## Threading model
+    ///
+    /// Each worker runs on its own dedicated OS thread, hosting its own
+    /// `tokio::runtime::Builder::new_current_thread()` runtime. The
+    /// frontend `recvmmsg` loop and every per-flow `upstream_to_client`
+    /// task spawned by that worker stay pinned to that thread — no
+    /// cross-thread tokio task migration, no cross-worker futex
+    /// notifications on the hot path. The orchestrator tasks (reaper +
+    /// IP-change watcher) and everything else in the daemon continue
+    /// to run on the global multi-thread runtime the daemon was
+    /// started with. This mirrors nginx's per-worker event-loop shape
+    /// (the udp-measure-out strace data identified cross-worker
+    /// futex calls as the dominant UDP overhead).
     pub async fn spawn_with(
         rule: Rule,
         resolver: UpstreamResolver,
@@ -150,20 +206,24 @@ impl UdpProxy {
             requested_workers
         };
 
-        let frontends = build_frontend_sockets(rule.listen, effective_workers)
-            .await
+        // Bind the frontend sockets synchronously as `std::net::UdpSocket`s.
+        // Each one is moved into its worker thread, which calls
+        // `tokio::net::UdpSocket::from_std` inside its own runtime so the
+        // socket is registered with that runtime's reactor (and only
+        // that one). Building tokio sockets here would tie them to the
+        // global runtime's reactor and defeat the per-worker pinning.
+        let frontend_stds = build_frontend_std_sockets(rule.listen, effective_workers)
             .with_context(|| {
                 format!(
                     "bind {effective_workers} UDP frontend worker(s) for rule {:?} on {}",
                     rule.name, rule.listen
                 )
             })?;
-        let local_addr = frontends
+        let local_addr = frontend_stds
             .first()
             .context("no UDP frontend sockets built")?
             .local_addr()
             .context("read UdpSocket local_addr")?;
-        let frontends: Vec<Arc<UdpSocket>> = frontends.into_iter().map(Arc::new).collect();
 
         let cancel = CancellationToken::new();
         let shards: Vec<Arc<DashMap<SocketAddr, Arc<FlowEntry>>>> = (0..effective_workers)
@@ -173,9 +233,71 @@ impl UdpProxy {
         let start = Instant::now();
         let idle_timeout = rule.resolved_idle_timeout();
 
+        // Spawn one OS thread per worker. Each thread builds a
+        // `current_thread` tokio runtime, registers its frontend socket
+        // with that runtime, and runs the worker's frontend loop —
+        // which in turn spawns one per-flow upstream task per active
+        // flow, all on the same single-threaded runtime.
+        let mut worker_threads = Vec::with_capacity(effective_workers);
+        for (worker_id, std_sock) in frontend_stds.into_iter().enumerate() {
+            let cancel_t = cancel.clone();
+            let rule_t = rule.clone();
+            let resolver_t = resolver.clone();
+            let shard_t = Arc::clone(&shards[worker_id]);
+            let flow_count_t = Arc::clone(&flow_count);
+            let max_flows_t = max_flows;
+            let thread_name = format!("ygg-udp-{}-{}", rule.name, worker_id);
+            let handle = std::thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::error!(
+                                rule = %rule_t.name,
+                                worker_id,
+                                error = %e,
+                                "UDP worker: failed to build current_thread runtime; worker exiting"
+                            );
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        let frontend = match UdpSocket::from_std(std_sock) {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                tracing::error!(
+                                    rule = %rule_t.name,
+                                    worker_id,
+                                    error = %e,
+                                    "UDP worker: UdpSocket::from_std failed; worker exiting"
+                                );
+                                return;
+                            }
+                        };
+                        let worker = UdpWorker {
+                            worker_id,
+                            frontend,
+                            rule: rule_t,
+                            resolver: resolver_t,
+                            flows: shard_t,
+                            flow_count: flow_count_t,
+                            cancel: cancel_t,
+                            start,
+                            max_flows: max_flows_t,
+                        };
+                        worker.frontend_loop().await;
+                    });
+                })
+                .context("spawn UDP worker OS thread")?;
+            worker_threads.push(handle);
+        }
+
         let inner = UdpProxyInner {
             rule: rule.clone(),
-            frontends,
             resolver: resolver.clone(),
             shards: shards.clone(),
             flow_count: Arc::clone(&flow_count),
@@ -185,7 +307,7 @@ impl UdpProxy {
             idle_timeout,
         };
 
-        let main_handle = tokio::spawn(inner.run());
+        let main_handle = tokio::spawn(inner.run(worker_threads));
 
         metrics::gauge!(
             "yggdrasil_workers",
@@ -239,26 +361,34 @@ impl UdpProxy {
     }
 }
 
-async fn build_frontend_sockets(
+/// Synchronously bind `workers` UDP frontend sockets on `addr`, returning
+/// them as plain `std::net::UdpSocket`s. Each socket has `SO_REUSEADDR`,
+/// `SO_REUSEPORT` (Unix), and `SO_BUSY_POLL` (Linux best-effort) set; the
+/// caller is responsible for converting them into tokio `UdpSocket`s on
+/// the appropriate per-worker runtime.
+///
+/// We use the std type rather than tokio's because each socket needs to
+/// be registered with the **worker's** runtime reactor (not the global
+/// daemon runtime). Tokio's `UdpSocket::bind` would tie the socket to
+/// whichever runtime called this function — defeating the per-worker
+/// pinning the spawn path is built around.
+fn build_frontend_std_sockets(
     addr: SocketAddr,
     workers: usize,
-) -> std::io::Result<Vec<UdpSocket>> {
+) -> std::io::Result<Vec<std::net::UdpSocket>> {
     debug_assert!(workers > 0);
-    if workers == 1 {
-        return UdpSocket::bind(addr).await.map(|socket| vec![socket]);
-    }
 
     let mut sockets = Vec::with_capacity(workers);
-    let first = build_frontend_socket(addr)?;
+    let first = build_frontend_std_socket(addr)?;
     let bind_addr = first.local_addr()?;
     sockets.push(first);
     for _ in 1..workers {
-        sockets.push(build_frontend_socket(bind_addr)?);
+        sockets.push(build_frontend_std_socket(bind_addr)?);
     }
     Ok(sockets)
 }
 
-fn build_frontend_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+fn build_frontend_std_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let domain = Domain::for_address(addr);
@@ -268,8 +398,12 @@ fn build_frontend_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
-    let std_sock: std::net::UdpSocket = sock.into();
-    UdpSocket::from_std(std_sock)
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        set_busy_poll_best_effort(sock.as_raw_fd());
+    }
+    Ok(sock.into())
 }
 
 fn increment_udp_datagrams_received(rule: &str, worker_id: usize, count: usize) {
@@ -358,7 +492,6 @@ fn set_udp_active_flows(rule: &str, worker_id: usize, active: usize) {
 
 struct UdpProxyInner {
     rule: Rule,
-    frontends: Vec<Arc<UdpSocket>>,
     resolver: UpstreamResolver,
     shards: Vec<Arc<DashMap<SocketAddr, Arc<FlowEntry>>>>,
     flow_count: Arc<AtomicUsize>,
@@ -387,19 +520,11 @@ struct FlowAccounting {
 }
 
 impl UdpProxyInner {
-    async fn run(self) {
-        let frontend_tasks: Vec<_> = self
-            .frontends
-            .iter()
-            .enumerate()
-            .map(|(worker_id, frontend)| {
-                let worker = self.worker_ctx(worker_id, frontend.clone());
-                tokio::spawn(async move { worker.frontend_loop().await })
-            })
-            .collect();
-        let frontend_task = tokio::spawn(async move {
-            let _ = futures::future::join_all(frontend_tasks).await;
-        });
+    /// Orchestrate the proxy's non-worker tasks (reaper + IP-change
+    /// watcher) on the daemon's global runtime, and wait for the
+    /// per-worker OS threads to join. Cancellation is propagated
+    /// through `self.cancel`, which every worker thread observes.
+    async fn run(self, worker_threads: Vec<std::thread::JoinHandle<()>>) {
         let reaper_task = {
             let s = self.clone_ctx();
             tokio::spawn(async move { s.reaper_loop().await })
@@ -414,14 +539,23 @@ impl UdpProxyInner {
             None
         };
 
+        // Per-worker OS threads exit when `self.cancel` is fired. We
+        // wait for them via `spawn_blocking` so we don't block a
+        // multi-thread runtime worker on `JoinHandle::join`.
+        let worker_joins: Vec<_> = worker_threads
+            .into_iter()
+            .map(|h| tokio::task::spawn_blocking(move || h.join()))
+            .collect();
+        let _ = futures::future::join_all(worker_joins).await;
+
         // Cancellation propagates to all spawned tasks via the shared
         // token. Wait for them to wind down before returning.
         match ipchange_task {
             Some(ipc) => {
-                let _ = tokio::join!(frontend_task, reaper_task, ipc);
+                let _ = tokio::join!(reaper_task, ipc);
             }
             None => {
-                let _ = tokio::join!(frontend_task, reaper_task);
+                let _ = reaper_task.await;
             }
         }
 
@@ -442,7 +576,6 @@ impl UdpProxyInner {
     fn clone_ctx(&self) -> Self {
         Self {
             rule: self.rule.clone(),
-            frontends: self.frontends.clone(),
             resolver: self.resolver.clone(),
             shards: self.shards.clone(),
             flow_count: Arc::clone(&self.flow_count),
@@ -450,20 +583,6 @@ impl UdpProxyInner {
             start: self.start,
             max_flows: self.max_flows,
             idle_timeout: self.idle_timeout,
-        }
-    }
-
-    fn worker_ctx(&self, worker_id: usize, frontend: Arc<UdpSocket>) -> UdpWorker {
-        UdpWorker {
-            worker_id,
-            frontend,
-            rule: self.rule.clone(),
-            resolver: self.resolver.clone(),
-            flows: Arc::clone(&self.shards[worker_id]),
-            flow_count: Arc::clone(&self.flow_count),
-            cancel: self.cancel.clone(),
-            start: self.start,
-            max_flows: self.max_flows,
         }
     }
 
@@ -659,6 +778,11 @@ impl UdpWorker {
                 "connect upstream UDP socket failed"
             );
             return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            set_busy_poll_best_effort(sock.as_raw_fd());
         }
         record_udp_upstream_bind_seconds(&self.rule.name, "ok", bind_start.elapsed().as_secs_f64());
         let upstream_sock = Arc::new(sock);
@@ -950,112 +1074,128 @@ async fn upstream_to_client_loop_batched(
                 if n == 0 {
                     continue;
                 }
+                upstream_batch_forward(
+                    rule_name,
+                    frontend,
+                    client_addr,
+                    shard,
+                    accounting,
+                    buf,
+                    n,
+                    sender,
+                )
+                .await;
+            }
+        }
+    }
+}
 
-                // Pick the send socket once per batch. The same flow's
-                // frontend never changes mid-batch, so this is correct.
-                // Fallback to the caller-provided `frontend` when the
-                // flow has been concurrently removed (rare; we'll exit
-                // next iteration via the cancel arm).
-                let frontend_arc = shard
-                    .get(&client_addr)
-                    .map(|entry| entry.frontend.clone());
-                let send_target: &UdpSocket = frontend_arc
-                    .as_deref()
-                    .unwrap_or(frontend);
+/// Shared body of [`upstream_to_client_loop_batched`]'s fast and slow
+/// recv paths: take `n` datagrams sitting in `buf`, forward them to
+/// `client_addr` via `sendmmsg` (or `send_to` fallback), update
+/// per-direction byte counters, and refresh `last_seen_ms`.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn upstream_batch_forward(
+    rule_name: &str,
+    frontend: &UdpSocket,
+    client_addr: SocketAddr,
+    shard: &DashMap<SocketAddr, Arc<FlowEntry>>,
+    accounting: &FlowAccounting,
+    buf: &recvmmsg_linux::BatchBuf,
+    n: usize,
+    sender: Option<&sendmmsg_linux::BatchSender>,
+) {
+    // Pick the send socket once per batch. The same flow's
+    // frontend never changes mid-batch, so this is correct.
+    // Fallback to the caller-provided `frontend` when the
+    // flow has been concurrently removed (rare; we'll exit
+    // next iteration via the cancel arm).
+    let frontend_arc = shard.get(&client_addr).map(|entry| entry.frontend.clone());
+    let send_target: &UdpSocket = frontend_arc.as_deref().unwrap_or(frontend);
 
-                // Try sendmmsg first when available. The caller wires
-                // the BatchSender to the per-rule frontend socket; if
-                // the flow's `frontend_arc` differs (which would only
-                // happen across rule reloads — currently rare), we
-                // fall through to per-datagram `send_to`.
-                let mut total_bytes = 0usize;
-                let mut send_errs = 0usize;
-                let used_sendmmsg = if let Some(sender) = sender {
-                    if std::ptr::eq(send_target, frontend) {
-                        // Collect payload slices for the batch send.
-                        let dgrams: Vec<recvmmsg_linux::Datagram<'_>> =
-                            recvmmsg_linux::iter_received(buf, n).collect();
-                        let payloads: Vec<&[u8]> =
-                            dgrams.iter().map(|d| d.payload).collect();
-                        match sender.send_batch(&payloads, client_addr).await {
-                            Ok(sent) => {
-                                for d in &dgrams[..sent] {
-                                    total_bytes += d.payload.len();
-                                }
-                                // Any unsent tail: fall through to
-                                // per-datagram for those (rare under
-                                // healthy buffer pressure).
-                                for d in &dgrams[sent..] {
-                                    match send_target
-                                        .send_to(d.payload, client_addr)
-                                        .await
-                                    {
-                                        Ok(_) => total_bytes += d.payload.len(),
-                                        Err(_) => send_errs += 1,
-                                    }
-                                }
-                                true
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    rule = %rule_name,
-                                    client = %client_addr,
-                                    error = %e,
-                                    "sendmmsg batch failed; falling back to per-datagram for this batch"
-                                );
-                                false
-                            }
-                        }
-                    } else {
-                        false
+    // Try sendmmsg first when available. The caller wires
+    // the BatchSender to the per-rule frontend socket; if
+    // the flow's `frontend_arc` differs (which would only
+    // happen across rule reloads — currently rare), we
+    // fall through to per-datagram `send_to`.
+    let mut total_bytes = 0usize;
+    let mut send_errs = 0usize;
+    let used_sendmmsg = if let Some(sender) = sender {
+        if std::ptr::eq(send_target, frontend) {
+            // Collect payload slices for the batch send.
+            let dgrams: Vec<recvmmsg_linux::Datagram<'_>> =
+                recvmmsg_linux::iter_received(buf, n).collect();
+            let payloads: Vec<&[u8]> = dgrams.iter().map(|d| d.payload).collect();
+            match sender.send_batch(&payloads, client_addr).await {
+                Ok(sent) => {
+                    for d in &dgrams[..sent] {
+                        total_bytes += d.payload.len();
                     }
-                } else {
+                    // Any unsent tail: fall through to
+                    // per-datagram for those (rare under
+                    // healthy buffer pressure).
+                    for d in &dgrams[sent..] {
+                        match send_target.send_to(d.payload, client_addr).await {
+                            Ok(_) => total_bytes += d.payload.len(),
+                            Err(_) => send_errs += 1,
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        rule = %rule_name,
+                        client = %client_addr,
+                        error = %e,
+                        "sendmmsg batch failed; falling back to per-datagram for this batch"
+                    );
                     false
-                };
-
-                if !used_sendmmsg {
-                    for dgram in recvmmsg_linux::iter_received(buf, n) {
-                        match send_target.send_to(dgram.payload, client_addr).await {
-                            Ok(_) => total_bytes += dgram.payload.len(),
-                            Err(e) => {
-                                send_errs += 1;
-                                tracing::debug!(
-                                    rule = %rule_name,
-                                    client = %client_addr,
-                                    error = %e,
-                                    "frontend send_to client failed"
-                                );
-                            }
-                        }
-                    }
                 }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
-                if total_bytes > 0 {
-                    increment_udp_bytes(
-                        rule_name,
-                        accounting.worker_id,
-                        "upstream_to_client",
-                        total_bytes,
+    if !used_sendmmsg {
+        for dgram in recvmmsg_linux::iter_received(buf, n) {
+            match send_target.send_to(dgram.payload, client_addr).await {
+                Ok(_) => total_bytes += dgram.payload.len(),
+                Err(e) => {
+                    send_errs += 1;
+                    tracing::debug!(
+                        rule = %rule_name,
+                        client = %client_addr,
+                        error = %e,
+                        "frontend send_to client failed"
                     );
-                }
-                for _ in 0..send_errs {
-                    increment_udp_send_errors(
-                        rule_name,
-                        accounting.worker_id,
-                        "upstream_to_client",
-                    );
-                }
-
-                // Touch last_seen once per batch (not per datagram) —
-                // the batch is small enough that the in-batch tail
-                // bias is negligible, and the savings are real on
-                // flows with many datagrams per wake-up.
-                if let Some(entry) = shard.get(&client_addr) {
-                    let now_ms = accounting.start.elapsed().as_millis() as u64;
-                    entry.last_seen_ms.store(now_ms, Ordering::Relaxed);
                 }
             }
         }
+    }
+
+    if total_bytes > 0 {
+        increment_udp_bytes(
+            rule_name,
+            accounting.worker_id,
+            "upstream_to_client",
+            total_bytes,
+        );
+    }
+    for _ in 0..send_errs {
+        increment_udp_send_errors(rule_name, accounting.worker_id, "upstream_to_client");
+    }
+
+    // Touch last_seen once per batch (not per datagram) —
+    // the batch is small enough that the in-batch tail
+    // bias is negligible, and the savings are real on
+    // flows with many datagrams per wake-up.
+    if let Some(entry) = shard.get(&client_addr) {
+        let now_ms = accounting.start.elapsed().as_millis() as u64;
+        entry.last_seen_ms.store(now_ms, Ordering::Relaxed);
     }
 }
 
