@@ -34,26 +34,29 @@
 //!   instead of waiting for shutdown. Useful when you want to bound
 //!   profile size on a long-running daemon.
 //!
-//! ## Known limitation: shallow stacks
+//! ## Stack depth caveat
 //!
-//! pprof-rs 0.13's default unwinder (`backtrace-rs` over libgcc's
-//! `_Unwind`) consistently produces depth-2 stacks (`all` →
-//! `tokio-rt-worker`) for yggdrasil's accept-loop workers. The
-//! samples are correctly attributed by *count* and *thread*, but the
-//! call graph beneath the worker entry point doesn't appear in the
-//! flamegraph. Enabling the `frame-pointer` cargo feature on `pprof`
-//! together with `RUSTFLAGS="-C force-frame-pointers=yes"` produces
-//! a denser sample population but the same shallow stacks.
+//! pprof-rs's signal-based unwinder (we enable the `frame-pointer`
+//! feature so it walks `%rbp` chains directly rather than going
+//! through libgcc's `_Unwind_Backtrace`) reliably attributes each
+//! sample to the leaf function — typically a libc syscall name
+//! like `epoll_wait` / `recvmmsg` / `sendmmsg` — but does not
+//! always walk back into the calling Rust frames. SIGPROF often
+//! lands while the thread is inside a syscall, where `%rbp` is
+//! kernel-managed and the unwinder gives up after one frame.
 //!
-//! When the flamegraph isn't deep enough, the fine-grained
-//! Prometheus metrics added alongside (`yggdrasil_tcp_accept_total`,
-//! `yggdrasil_tcp_upstream_connect_seconds`,
-//! `yggdrasil_tcp_bytes_total`) give an alternative diagnostic
-//! path — they tell you the rate and timing of the hot-path
-//! operations without needing a flamegraph at all. For deeper
-//! analysis, a developer with root and `perf` access on a Linux
-//! host can fall back to `perf record -g -p <pid>` against a
-//! profile-feature build (frame pointers help perf too).
+//! In practice this is enough for the "where is CPU going by
+//! syscall mix" question (the leaf is informative on its own and
+//! tells you e.g. "20 % of CPU is in epoll_wait"). For
+//! "which Rust function called this syscall" you'll want either
+//! per-section `Instant::now()` instrumentation in the hot path
+//! or `perf record -g` on a host with a permissive
+//! `kernel.perf_event_paranoid`.
+//!
+//! Build with `cargo build --release -p yggdrasil --features profile`.
+//! Frame pointers are emitted by default for the `profile` build via
+//! `bench/profile.sh` (which sets
+//! `RUSTFLAGS="-C force-frame-pointers=yes"`).
 //!
 //! ## What is NOT in scope
 //!
@@ -113,9 +116,6 @@ mod real {
 
             let guard = pprof::ProfilerGuardBuilder::default()
                 .frequency(frequency)
-                // Blocklist: don't sample inside libc/vdso — those
-                // frames have no symbols and just bloat the output.
-                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
                 .build()
                 .context("build pprof::ProfilerGuard")?;
 

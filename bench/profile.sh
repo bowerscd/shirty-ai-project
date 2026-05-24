@@ -53,13 +53,13 @@ profile_output="$profile_dir/${scenario}.${format}"
 profile_output="$(readlink -f "$profile_output" 2>/dev/null || echo "$profile_output")"
 
 log "building yggdrasil with --features profile + frame pointers"
-# Without `force-frame-pointers=yes`, pprof-rs's signal-based unwinder
-# is unable to walk through Rust release builds' optimized stack
-# layout. Even with the flag, pprof on tokio workers tends to
-# produce shallow flamegraphs (see crates/yggdrasil/src/profile.rs
-# "Known limitation: shallow stacks"). The flamegraph is still
-# useful as a sample-count distribution per thread; pair it with the
-# `yggdrasil_tcp_*` metrics for richer hot-path diagnosis.
+# `force-frame-pointers=yes` is required: pprof-rs's signal-based
+# unwinder (we use the `frame-pointer` feature) walks `%rbp` chains
+# directly. Without it, release optimisations omit the frame pointer
+# and the unwinder gives up after the leaf frame. With it, leaf
+# attribution (`epoll_wait` / `recvmmsg` / `sendmmsg` / …) is
+# reliable; deeper Rust frames are best-effort and may still be
+# missing for samples that land inside a syscall.
 ( cd "$root" && RUSTFLAGS="-C force-frame-pointers=yes" \
     cargo build --release -p yggdrasil --features profile ) >&2
 
