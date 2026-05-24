@@ -353,6 +353,7 @@ def aggregate_rotations(dirs: List[Path]) -> int:
         ("latency.p50",       "us"),
         ("latency.p99",       "us"),
         ("latency.p999",      "us"),
+        ("proxy_rss_kib",     "KiB"),
     ]
 
     # Group output by scenario for readability.

@@ -230,6 +230,7 @@ For each non-direct subject, the harness:
 - `traefik-chain` is excluded from TCP scenarios by default (single-hop traefik runs ~20k c/s; chained collapses to <200 c/s, which doesn't reflect a real traefik property — it's an unresolved harness config interaction). Set `BENCH_SUBJECTS` to include it explicitly if you're debugging.
 - `bench/collect-env.sh` records governor + sysctls but does **not** refuse to run on a misconfigured host. Check `env.json` before trusting the numbers.
 - For chain subjects, `tcp-idle-conns.peak_established_conns` ~doubles because each TCP connection has an ESTABLISHED entry at each hop. The `proxy_rss_kib` PSS sum is the meaningful per-connection memory number — it's measured across both hops' process trees.
+- `tcp-idle-conns` reports `direct` as missing because there's no proxy process to sample PSS against — the `direct` subject sends straight to bench-echo. The other subjects produce comparable numbers; expect per-connection PSS roughly in the range 4–20 KiB depending on the proxy's per-connection state model (haproxy: thin per-conn struct; nginx: medium event-loop slot; yggdrasil: tokio task + two copy-buffer slots).
 
 ## Adding a new scenario
 
