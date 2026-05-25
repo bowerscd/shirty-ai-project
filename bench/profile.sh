@@ -60,8 +60,27 @@ log "building yggdrasil with --features profile + frame pointers"
 # attribution (`epoll_wait` / `recvmmsg` / `sendmmsg` / …) is
 # reliable; deeper Rust frames are best-effort and may still be
 # missing for samples that land inside a syscall.
-( cd "$root" && RUSTFLAGS="-C force-frame-pointers=yes" \
+#
+# `CARGO_TARGET_DIR=bench/target-profile` isolates the `--features
+# profile` build (which pulls `pprof` + its transitive crates into the
+# dep graph) so it never lands in the main `target/release/deps/`.
+# Without this, toggling the feature on for profile.sh and off again
+# at the end leaves *both* dep graphs alive in `target/`, and a
+# regularly-profiled checkout grows to 100+ GB over time. See
+# .github/copilot-instructions.md ("Disk-space guardrails") for the
+# rationale.
+profile_target_dir="$root/bench/target-profile"
+( cd "$root" && \
+    CARGO_TARGET_DIR="$profile_target_dir" \
+    RUSTFLAGS="-C force-frame-pointers=yes" \
     cargo build --release -p yggdrasil --features profile ) >&2
+
+# Stage the profile-enabled binary at the standard location so the
+# bench scenario helpers (which hardcode $root/target/release/yggdrasil)
+# pick it up. The post-rebuild step at the bottom of this script
+# restores the no-feature binary at the same path.
+mkdir -p "$root/target/release"
+cp "$profile_target_dir/release/yggdrasil" "$root/target/release/yggdrasil"
 
 log "profiling target: $profile_output"
 log "running scenario: $scenario"
@@ -98,6 +117,8 @@ else
 fi
 
 # Rebuild without the feature so subsequent non-profiled bench runs
-# don't accidentally carry the SIGPROF handler.
+# don't accidentally carry the SIGPROF handler. Goes to the main
+# target/, *not* bench/target-profile/ — the isolated profile target
+# dir only exists for the feature-on build above.
 log "rebuilding yggdrasil without --features profile (restore default binary)"
 ( cd "$root" && cargo build --release -p yggdrasil ) >&2

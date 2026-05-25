@@ -18,3 +18,8 @@ identity.key
 
 # Benchmark output trees (per-sha results dirs from bench/run-all.sh)
 /bench/results/
+
+# Isolated CARGO_TARGET_DIR used by bench/profile.sh for `--features
+# profile` builds. Keeps pprof + its transitive dep graph out of the
+# main /target/ — see .github/copilot-instructions.md for rationale.
+/bench/target-profile/
