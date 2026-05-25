@@ -1,0 +1,36 @@
+# yggdrasil.install — pacman scriptlet hooks for the yggdrasil package.
+#
+# pacman invokes these functions around install / upgrade / remove
+# events. systemd integration (daemon-reload, sysusers, tmpfiles) is
+# already handled by pacman's built-in libalpm hooks shipped with
+# systemd, so the scriptlet here only deals with concerns that pacman
+# can't infer automatically: stopping a running service before its
+# files vanish, and (on full removal) tidying up daemon-managed
+# runtime state under /var/lib/yggdrasil.
+
+pre_remove() {
+    # About to remove the package files. If the service is up, stop
+    # it gracefully — otherwise the daemon would keep running with
+    # newly-missing binaries until somebody noticed.
+    if [ -d /run/systemd/system ]; then
+        systemctl stop yggdrasil.service >/dev/null 2>&1 || :
+        systemctl disable yggdrasil.service >/dev/null 2>&1 || :
+    fi
+}
+
+post_remove() {
+    # Final uninstall. Clean up daemon-managed runtime state. We
+    # deliberately leave /etc/yggdrasil intact so the operator can
+    # preserve identity.key and rules across a reinstall — pacman
+    # itself won't touch /etc files we didn't own.
+    rm -rf /var/lib/yggdrasil
+
+    # Remove the system user/group created by sysusers.d. systemd's
+    # sysusers framework does not auto-remove on package uninstall.
+    if getent passwd yggdrasil >/dev/null; then
+        userdel yggdrasil >/dev/null 2>&1 || :
+    fi
+    if getent group yggdrasil >/dev/null; then
+        groupdel yggdrasil >/dev/null 2>&1 || :
+    fi
+}

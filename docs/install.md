@@ -71,71 +71,48 @@ daemon), run `yggdrasilctl identity rotate`.
 
 ### systemd — `yggdrasil.service`
 
-The same unit works in relay and terminal modes. The mode is derived
-from `/etc/yggdrasil/config.toml` shape (`[dial]` only => terminal,
-`[accept]` present => relay).
+The canonical unit file lives at
+[`contrib/systemd/yggdrasil.service`](../contrib/systemd/yggdrasil.service)
+and is installed automatically by the distro packages. For
+source-build deployments that don't use a package:
 
-```ini
-# /etc/systemd/system/yggdrasil.service
-[Unit]
-Description=yggdrasil chain control / reverse proxy
-After=network-online.target
-Wants=network-online.target
+```bash
+# Create the unprivileged user + state dirs the unit expects.
+sudo install -m 0644 contrib/sysusers.d/yggdrasil.conf /etc/sysusers.d/
+sudo install -m 0644 contrib/tmpfiles.d/yggdrasil.conf /etc/tmpfiles.d/
+sudo systemd-sysusers
+sudo systemd-tmpfiles --create
 
-[Service]
-# `notify-reload` (paired with sd_notify(READY=1) in yggdrasil) means
-# `is-active` reports `active` only after the chain listener (if any),
-# proxy supervisor, and control socket have all bound — not just after
-# the process forked. The `-reload` half also wires `systemctl reload
-# yggdrasil` (default action: SIGHUP) to an authoritative rule rescan:
-# the daemon emits RELOADING=1 / MONOTONIC_USEC before the watcher
-# drains the trigger, then READY=1 once the supervisor has reconciled
-# the new set, so systemd knows the reload settled before returning to
-# the operator.
-Type=notify-reload
-NotifyAccess=main
-ExecStart=/usr/local/bin/yggdrasil run
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=2s
+# Install the unit and (optionally) the example config.
+sudo install -m 0644 contrib/systemd/yggdrasil.service /etc/systemd/system/
+sudo install -m 0644 contrib/config/config.toml.example /etc/yggdrasil/config.toml.example
 
-# Hardening — yggdrasil only needs CAP_NET_BIND_SERVICE if any derived
-# rule listens on a port below 1024 (e.g. 0.0.0.0:443). If all your rule
-# listens are >= 1024, drop both lines below entirely.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-ReadWritePaths=/var/lib/yggdrasil /run/yggdrasil
-ReadOnlyPaths=/etc/yggdrasil
-
-# yggdrasil expects /run/yggdrasil to exist for the control socket.
-RuntimeDirectory=yggdrasil
-RuntimeDirectoryMode=0750
-# Group=yggdrasil-admin
-
-# Log handler — JSON to journald is the default.
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
+# Wire up.
+sudo systemctl daemon-reload
 ```
+
+The same unit works in terminal, gateway, and relay modes — the mode
+is derived from `/etc/yggdrasil/config.toml` shape (`[dial]` only =>
+terminal, `[accept]` only => gateway, both => relay).
+
+The unit runs the daemon as the dedicated `yggdrasil` user with
+`CAP_NET_BIND_SERVICE` so it can bind low ports (e.g. `0.0.0.0:443`
+for HTTPS rules). Every hardening flag from
+[docs/security.md → Operational hardening](security.md#operational-hardening)
+is on by default. Drop `AmbientCapabilities` /
+`CapabilityBoundingSet` via `systemctl edit yggdrasil` if every rule
+binds a port ≥ 1024.
+
+To restrict the control socket to a dedicated admin group (recommended),
+add the operator login(s) to the `yggdrasil` group — the socket lands
+at `/run/yggdrasil/control.sock` with mode `0660` and group ownership
+inherited from `RuntimeDirectory=`.
 
 Enable + start:
 
 ```bash
-sudo systemctl daemon-reload
 sudo systemctl enable --now yggdrasil
 ```
-
-If you set `Group=yggdrasil-admin` (recommended), the control socket ends
-up `root:yggdrasil-admin 0660` — add your operator login to that group
-to run `yggdrasilctl` without sudo.
 
 ## Firewall
 

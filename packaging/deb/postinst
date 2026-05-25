@@ -1,0 +1,42 @@
+#!/bin/sh
+# postinst — runs after the package files are unpacked.
+#
+# Bookkeeping:
+#   1. Create the `yggdrasil` system user/group via sysusers.d.
+#   2. Create /var/lib/yggdrasil with the right ownership via tmpfiles.d.
+#   3. Reload systemd so it picks up the new unit file.
+#
+# We deliberately do NOT enable or start the service. The operator
+# needs to provision identity (`yggdrasilctl identity rotate`) and a
+# real /etc/yggdrasil/config.toml before the service can usefully
+# come up.
+#
+# All commands are no-ops outside an active systemd boot
+# (`/run/systemd/system` not present) so the package installs cleanly
+# inside chroots and containers without systemd.
+
+set -e
+
+case "$1" in
+    configure)
+        if [ -d /run/systemd/system ]; then
+            if [ -x /usr/lib/systemd/systemd-sysusers ] || command -v systemd-sysusers >/dev/null 2>&1; then
+                systemd-sysusers /usr/lib/sysusers.d/yggdrasil.conf
+            fi
+            if command -v systemd-tmpfiles >/dev/null 2>&1; then
+                systemd-tmpfiles --create /usr/lib/tmpfiles.d/yggdrasil.conf || true
+            fi
+            systemctl daemon-reload || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,47 @@
+#!/bin/sh
+# postrm — runs AFTER the package files have been removed.
+#
+# On `remove`: just reload systemd so it forgets the unit.
+# On `purge`: also remove the yggdrasil system user/group and
+#             any leftover state under /var/lib/yggdrasil. We
+#             leave /etc/yggdrasil alone — the operator may want
+#             to keep identity.key and rules for a future reinstall.
+
+set -e
+
+case "$1" in
+    remove|upgrade|abort-install|abort-upgrade|disappear)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+
+    purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        # Remove daemon-managed state — TOFU candidates, runtime markers.
+        # Identity / config live under /etc/yggdrasil and are NOT removed
+        # here; that matches Debian policy ("conffile") and avoids
+        # destroying enrollment ceremony state on accidental purge.
+        rm -rf /var/lib/yggdrasil
+        # System user/group cleanup. deluser ships with adduser, which
+        # is essential on every Debian/Ubuntu install.
+        if command -v deluser >/dev/null 2>&1; then
+            deluser --system --quiet yggdrasil 2>/dev/null || true
+        fi
+        if command -v delgroup >/dev/null 2>&1; then
+            delgroup --system --quiet yggdrasil 2>/dev/null || true
+        fi
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

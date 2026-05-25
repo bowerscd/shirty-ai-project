@@ -1,0 +1,89 @@
+# /etc/yggdrasil/config.toml — example configuration.
+#
+# Copy this file to /etc/yggdrasil/config.toml, uncomment ONE of the
+# three "Mode" blocks below (terminal, root relay, or mid-chain relay),
+# and fill in the placeholders. The daemon refuses to start if neither
+# `[dial]` nor `[accept]` is present.
+#
+# Run `yggdrasilctl validate` to dry-run this file against the daemon's
+# own loader and validators.
+#
+# Every key documented at https://github.com/bowerscd/yggdrasil/blob/main/docs/configuration.md
+# Every value here is the daemon's built-in default unless noted.
+
+# ============================================================ [server]
+#
+# Required on every node. The keys below are all optional — the
+# defaults match a /etc/yggdrasil layout installed by the distro
+# package.
+
+[server]
+# rules_dir          = "/etc/yggdrasil/conf.d"
+# state_dir          = "/var/lib/yggdrasil"
+# identity_file      = "/etc/yggdrasil/identity.key"
+# cert_dir           = "/etc/yggdrasil/certs"
+# workers            = 0                   # 0 / unset → available_parallelism()
+# default_bind       = "0.0.0.0"           # rewrites every rule's listen IP
+# default_cert       = "/etc/yggdrasil/certs/default/fullchain.pem"
+# default_key        = "/etc/yggdrasil/certs/default/privkey.pem"
+# http_redirect_port = 80                  # HTTPS rules' HTTP→HTTPS redirect
+# graceful_drain_timeout = "30s"           # SIGTERM grace before forcing close
+
+# =========================================================== [control]
+#
+# Unix socket for `yggdrasilctl`. Restrict access via filesystem
+# permissions — add operators to the `yggdrasil` group (or a separate
+# admin group of your choosing).
+
+# [control]
+# socket = "/run/yggdrasil/control.sock"
+
+
+# =============================================================== MODE
+#
+# Pick exactly ONE of the three blocks below.
+
+# ------------------------------ Terminal (home box / chain leaf) -----
+#
+# Dials an upstream relay; never accepts inbound chain traffic. Rules
+# live in /etc/yggdrasil/conf.d/*.toml and the predicate publisher
+# pushes them upstream so the relay derives matching listeners.
+
+# [dial]
+# pubkey             = "x25519:REPLACE_WITH_RELAY_PUBKEY"
+# endpoint           = "relay.example.net:51820"
+# heartbeat_interval = "5s"
+# rekey_interval     = "1h"
+
+# ------------------------------ Root relay (public-facing VPS) -------
+#
+# Accepts inbound chain traffic from a single enrolled downstream;
+# does not dial upstream. Derive its rule set from the downstream's
+# published predicates.
+
+# [accept]
+# listen         = "0.0.0.0:51820"
+# pubkey         = "x25519:REPLACE_WITH_DOWNSTREAM_PUBKEY"
+# rekey_interval = "1h"
+
+# ------------------------------ Mid-chain relay ----------------------
+#
+# Both dials upstream AND accepts a downstream. Combine the [dial]
+# block from "Terminal" above with the [accept] block from "Root relay".
+
+
+# ================================================================ ACME
+#
+# Terminal-only. Required if any [[rule.route]] declares
+# `cert = "acme"`. See docs/configuration.md for the full DNS-01
+# provider matrix; HTTP-01 needs no provider sub-table.
+
+# [acme]
+# directory_url           = "https://acme-v02.api.letsencrypt.org/directory"
+# contact_email           = "admin@example.com"
+# terms_of_service_agreed = true
+# renew_before            = "30d"
+# renew_jitter            = "12h"
+
+# [acme.dns.cloudflare]
+# api_token_env = "CLOUDFLARE_API_TOKEN"

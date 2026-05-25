@@ -1,0 +1,84 @@
+# Maintainer: yggdrasil maintainers <https://github.com/bowerscd/yggdrasil/issues>
+#
+# yggdrasil — residential reverse proxy with a chain control plane.
+#
+# This PKGBUILD is AUR-ready: `source=` points at a tagged GitHub
+# release tarball and `sha256sums` validates it. For local smoke
+# testing before a tag exists, override `source` to a local archive:
+#
+#   makepkg -p PKGBUILD --skipinteg \
+#       --config <(printf 'PACKAGER="local <local@host>"\n')
+#
+# or build a fake tarball in /tmp and run `updpkgsums` against it.
+
+pkgname=yggdrasil
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Residential reverse proxy with a chain control plane'
+arch=('x86_64' 'aarch64')
+url='https://github.com/bowerscd/yggdrasil'
+license=('MIT')
+
+depends=(
+    'glibc'      # libc.so.6
+    'gcc-libs'   # libgcc_s.so.1
+    'systemd'    # systemd-sysusers, systemd-tmpfiles, systemctl
+)
+
+makedepends=(
+    'cmake'      # >= 3.20; drives the build and CPack
+    'rust'       # rustc + cargo (toolchain version pinned by rust-toolchain.toml)
+)
+
+# Optional: when present, pacman runs them on install/upgrade/remove.
+backup=('etc/yggdrasil/config.toml.example')
+
+# The install scriptlet handles service stop on remove. sysusers /
+# tmpfiles / daemon-reload are driven by pacman's built-in
+# `30-systemd-sysusers.hook` / `30-systemd-tmpfiles.hook` /
+# `30-systemd-update.hook` — no need to invoke them here.
+install="${pkgname}.install"
+
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
+# Replace with the real checksum after tagging the release. Until
+# then, makepkg --skipinteg is the local-test path.
+sha256sums=('SKIP')
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    # makepkg.conf's hardening CFLAGS / LDFLAGS (notably `-fno-plt`
+    # and `-Wl,--as-needed`) interfere with the `ring` crate's
+    # build.rs, which compiles hand-written x86_64 assembly: the
+    # resulting .o files end up missing strong defs for symbols
+    # like `ring_core_0_*__x25519_sc_mask`, and the final rustc link
+    # fails with "undefined symbol". Clear the C/linker flag
+    # environment so cargo/rustc pick up the defaults rust + ring
+    # expect. Rust's [profile.release] in Cargo.toml already enables
+    # thin LTO + strip, which is what Arch's RUSTFLAGS would have
+    # done anyway.
+    unset CFLAGS CPPFLAGS LDFLAGS
+
+    cmake -B build -S . \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCARGO_LOCKED=ON \
+        -Wno-dev
+
+    cmake --build build --parallel
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    DESTDIR="${pkgdir}" cmake --install build
+
+    # Install the LICENSE file at the standard Arch convention path.
+    # The CMake script only ships it under /usr/share/doc/yggdrasil/;
+    # namcap warns when a package declares license=('MIT') without a
+    # file under /usr/share/licenses/<pkg>/.
+    if [ -f LICENSE ]; then
+        install -Dm644 LICENSE \
+            "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    fi
+}

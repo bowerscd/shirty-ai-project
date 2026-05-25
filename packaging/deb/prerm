@@ -1,0 +1,27 @@
+#!/bin/sh
+# prerm — runs BEFORE the package files are removed (or before an
+# upgrade replaces them). Stops the service so we don't leave a
+# zombie daemon running with files mid-swap.
+#
+# Idempotent: silently no-ops when systemd isn't running (chroots,
+# containers) or the unit isn't active.
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop yggdrasil.service >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
