@@ -124,6 +124,14 @@ To roll up UDP counters across workers, use Prometheus
 * `yggdrasilctl chain health` returning a non-zero exit code (run from
   any hop) means at least one hop is `degraded` or `down`; pair with
   `chain ping` to localise the slow/unreachable hop.
+* `yggdrasil_nat_state{state="backoff"} == 1` (sustained ≥ 5 min) on
+  a daemon with `nat_traversal != "off"` means the gateway has gone
+  unresponsive. Mappings expire naturally on the router; new rule
+  pushes won't get forwarded. Inspect `local status` for `last_error`.
+* `rate(yggdrasil_nat_epoch_resets_total[1h]) > 1` means the router
+  is repeatedly losing its mapping table (likely buggy firmware or
+  thermal reset loop). Each reset triggers a full mapping rebuild —
+  benign in itself but indicates router instability.
 
 ## Common runbook tasks
 
@@ -425,6 +433,55 @@ their downstream terminals' predicate sets upward, so each hop's
 `predicate_origin` is the terminal it serves. Cross-boundary, the
 origins legitimately differ. The `chain diff` output flags this as a
 non-error.
+
+### NAT traversal won't establish or keeps backing off
+
+Run `yggdrasilctl local status` and look at the **NAT traversal**
+block. The interesting fields:
+
+* `state: backoff` — the router doesn't speak PCP / NAT-PMP, or
+  drops the requests on the floor. `last_error` says which. Three
+  actions, in priority order:
+  1. Check the router admin UI. Most consumer routers ship with PCP
+     and / or NAT-PMP disabled by default. Enable one. PCP is
+     preferred (longer lifetimes, IPv6 hooks even though we don't
+     use them yet); NAT-PMP is a fine fallback.
+  2. If the router does speak PCP / NAT-PMP but the daemon still
+     can't reach it, the discovery heuristic picked the wrong source
+     interface (rare; usually only on multi-NIC hosts). v1 has no
+     override knob — verify with `cat /proc/net/route` that the
+     default route points at the LAN gateway you expect, and that
+     the source-IP probe (a `connect()` UDP socket to 192.0.2.1)
+     resolves to an interface that can reach that gateway.
+  3. Set `nat_traversal = "off"` and forward ports manually in the
+     router UI. The daemon serves traffic identically; only the
+     auto-mapping convenience goes away.
+
+* `state: active` but no external reachability — the router accepted
+  the mapping but isn't actually forwarding traffic. Walk:
+  1. `external IP` matches your real public IP per
+     `curl https://ifconfig.me`? If not, you're behind CGNAT and
+     PCP can't help (see `docs/architecture.md`).
+  2. Try the mapping from another network. `nmap -p <external_port>
+     <external_ip>`. If filtered, the router has a buggy firewall.
+
+* `state: discovering` for more than a few seconds — the gateway
+  isn't responding at all. Same as the `backoff` recovery flow but
+  earlier in the timeline.
+
+* `last error: AddressMismatch` — PCP §11.2: your internal bind IP
+  and the IP the router thinks you have don't match. Most commonly
+  because the host has multiple NICs and the daemon's rule is on
+  one NIC while the default route is on another. v1 has no
+  per-interface override; this is a deployment constraint.
+
+Metrics worth scraping:
+
+* `rate(yggdrasil_nat_epoch_resets_total[1h])` — should be ~0.
+* `rate(yggdrasil_nat_mappings_created_total{result_code!="success"}[5m])` —
+  failed mapping creates. Per-protocol, per-origin breakdown.
+* `yggdrasil_nat_active_mappings` — should match the count of
+  rules + accept + redirect listeners on a home-hosted node.
 
 ## Backups
 

@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
-    error_codes, DownstreamResponse, HealthResponse, MetricsResponse, PendingResponse, Request,
-    Response, RuleInfo, RulesResponse, StatusResponse,
+    error_codes, DownstreamResponse, HealthResponse, MetricsResponse, NatMappingEntry, NatStatus,
+    PendingResponse, Request, Response, RuleInfo, RulesResponse, StatusResponse,
 };
 use ratatoskr::pubkey::PubKey;
 
@@ -80,6 +80,7 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                 default_cert_path,
                 default_cert_loaded_age_secs,
                 ephemeral_cert_count,
+                nat: state.nat.as_ref().map(project_nat_status),
             })
         }
         Request::RulesList => {
@@ -202,5 +203,44 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                       hoisted by handle_connection)"
                 .to_string(),
         },
+    }
+}
+
+/// Project a [`crate::nat::NatMapperHandle`] snapshot into the
+/// wire-shaped [`NatStatus`] surfaced via `Request::Status`.
+///
+/// The wire form uses `String` rather than enum variants so adding
+/// new mapper states or protocols on the daemon side doesn't break
+/// older `yggdrasilctl` builds: they parse and render the unknown
+/// string verbatim.
+fn project_nat_status(handle: &crate::nat::NatMapperHandle) -> NatStatus {
+    let snap = handle.snapshot();
+    let now = tokio::time::Instant::now();
+    let mappings = snap
+        .active_mappings
+        .iter()
+        .map(|m| NatMappingEntry {
+            origin: m.target.origin.as_token(),
+            protocol: m.target.protocol.as_str().to_string(),
+            internal_port: m.target.internal_port,
+            external_port: m.external_port,
+            assigned_lifetime_secs: m.assigned_lifetime.as_secs().min(u32::MAX as u64) as u32,
+            renew_in_secs: m
+                .renew_at
+                .saturating_duration_since(now)
+                .as_secs()
+                .min(u32::MAX as u64) as u32,
+        })
+        .collect::<Vec<_>>();
+    let active_mapping_count = mappings.len();
+    NatStatus {
+        mode: snap.mode.as_str().to_string(),
+        state: snap.state.as_str().to_string(),
+        gateway: snap.gateway.map(std::net::IpAddr::V4),
+        external_ip: snap.external_ip.map(std::net::IpAddr::V4),
+        protocol: snap.protocol.map(|p| p.as_str().to_string()),
+        active_mapping_count,
+        last_error: snap.last_error.clone(),
+        mappings,
     }
 }

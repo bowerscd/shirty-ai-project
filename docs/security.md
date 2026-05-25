@@ -219,6 +219,47 @@ addresses, ports, byte counts, and timing.
 * **Outbound UDP** to the upstream's `[dial].endpoint`. Don't
   block it at your residential router.
 
+### Home-hosted node accepting inbound traffic
+
+If the daemon hosts rule listeners or `[accept].listen` on a
+residential line (standalone-terminal-at-home, gateway-at-home,
+or relay-at-home), every such listener needs an inbound port
+forward on the residential router. The operator can either:
+
+* Forward each port manually in the router admin UI, or
+* Set `[server].nat_traversal = "auto"` and let the daemon ask the
+  router via PCP (RFC 6887) or NAT-PMP (RFC 6886).
+
+Security properties of the auto-mapping path:
+
+* **Daemon-initiated only.** The router gets no say in *what* gets
+  forwarded; the daemon enumerates ports from `rules.toml` and
+  `[accept].listen`, full stop. There is no UPnP-IGD "subscribe to
+  service announcements", no SSDP multicast listening, no SOAP/XML
+  parser. The attack surface is two fixed-layout binary
+  request/response frames.
+* **Operator-authorised ports only.** The mapper never auto-
+  discovers what to expose. If a port isn't in your config, the
+  daemon never asks for it to be forwarded.
+* **No weakening of `[accept].listen` auth.** A publicly-reachable
+  chain listener already only completes Noise_IK handshakes from
+  enrolled peers; whether the router NAT-forwards the port doesn't
+  change that. The mapping just removes the manual port-forward
+  step.
+* **Released on `SIGTERM`.** The daemon sends a `lifetime=0`
+  release for each active mapping during graceful shutdown,
+  bounded by a 3s internal deadline. On `SIGKILL`, mappings expire
+  naturally on the router within their assigned lifetime (typically
+  ≤ 1 hour on consumer routers).
+
+UPnP-IGD is intentionally not supported. SSDP multicast + SOAP
+parsing has historically been a fertile source of CVEs in home-
+gateway implementations, and adding an XML parser to a daemon that
+otherwise forbids unsafe code and avoids string-based protocols
+across the board would be a substantial departure from this
+project's values. PCP and NAT-PMP cover every consumer router
+worth supporting.
+
 ## Operational hardening
 
 * Run yggdrasil under the systemd hardening flags in

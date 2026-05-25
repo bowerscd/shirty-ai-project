@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod nat_gateway;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

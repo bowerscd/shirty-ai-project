@@ -281,6 +281,79 @@ pub struct StatusResponse {
     /// the store. Always `0` on a daemon without HTTPS rules.
     #[serde(default)]
     pub ephemeral_cert_count: usize,
+    /// NAT-traversal subsystem state. `None` when
+    /// `[server].nat_traversal = "off"` (the default) or when the
+    /// gateway-discovery probe failed on startup. The field is
+    /// omitted from JSON in that case for backwards compatibility
+    /// with older `yggdrasilctl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat: Option<NatStatus>,
+}
+
+/// NAT-traversal subsystem state surfaced under
+/// [`StatusResponse::nat`]. Strings are used for `mode`, `state`,
+/// `protocol`, and `MappingEntry::origin` so that adding new variants
+/// (e.g. a hypothetical future `pq` algorithm or `relay-mode-only`
+/// state) on the daemon side doesn't break older `yggdrasilctl`
+/// builds: they just see an unknown string and render it verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NatStatus {
+    /// One of `"off"` / `"pcp"` / `"natpmp"` / `"auto"`. Echoes the
+    /// operator-configured `[server].nat_traversal`. `"off"` is only
+    /// observable on this field when the subsystem was started and
+    /// later disabled at runtime — at config time `off` produces a
+    /// `None` parent field, which is omitted from the JSON.
+    pub mode: String,
+    /// One of `"discovering"` / `"active"` / `"backoff"` /
+    /// `"disabled"`.
+    pub state: String,
+    /// Gateway IP (default route's next-hop) the mapper is talking
+    /// to. `None` while gateway discovery is still in flight or has
+    /// failed.
+    pub gateway: Option<IpAddr>,
+    /// External IP the gateway reported in the most recent
+    /// successful map response. `None` until the first map succeeds.
+    /// NAT-PMP-only deployments require a separate "external
+    /// address" request to learn this; we may not have made one yet.
+    pub external_ip: Option<IpAddr>,
+    /// Protocol currently in use. `Some("pcp")` after the first
+    /// successful PCP response; `Some("natpmp")` after the first
+    /// successful NAT-PMP response; `None` while we're still
+    /// probing.
+    pub protocol: Option<String>,
+    /// Number of mappings currently held. Always equal to
+    /// `mappings.len()` — exposed separately so older clients that
+    /// don't parse `mappings` can still display a useful summary.
+    pub active_mapping_count: usize,
+    /// Most recent error surfaced by the mapper, if any. Cleared on
+    /// next successful operation.
+    pub last_error: Option<String>,
+    /// Per-mapping detail. Bounded by the number of listeners the
+    /// daemon has — typically O(rules) plus the one accept listener
+    /// plus one redirect listener per HTTPS bind IP.
+    #[serde(default)]
+    pub mappings: Vec<NatMappingEntry>,
+}
+
+/// Single mapping entry within [`NatStatus::mappings`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NatMappingEntry {
+    /// Human-readable origin tag: `"rule:<name>"` / `"accept"` /
+    /// `"redirect:<ip>"` / `"http3:<name>"`. Stable across renewals;
+    /// the daemon documents the format in
+    /// `crate::nat::MappingOrigin::as_token`.
+    pub origin: String,
+    /// `"tcp"` or `"udp"`.
+    pub protocol: String,
+    pub internal_port: u16,
+    pub external_port: u16,
+    /// Assigned lifetime the gateway returned. Renewal is at
+    /// `assigned_lifetime_secs / 2`; if the value drops to a low
+    /// number we're on a router that caps mappings aggressively.
+    pub assigned_lifetime_secs: u32,
+    /// Time until the daemon will next renew this mapping. `0`
+    /// means "right now" (the daemon will renew on its next tick).
+    pub renew_in_secs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -587,6 +660,7 @@ mod tests {
             default_cert_path: None,
             default_cert_loaded_age_secs: None,
             ephemeral_cert_count: 0,
+            nat: None,
         });
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
@@ -644,11 +718,108 @@ mod tests {
             default_cert_path: None,
             default_cert_loaded_age_secs: None,
             ephemeral_cert_count: 0,
+            nat: None,
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"mode\":\"terminal\""), "got: {s}");
         let back: Response = serde_json::from_str(&s).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn status_response_nat_field_round_trip() {
+        let resp = Response::Status(StatusResponse {
+            version: "0.1.0".into(),
+            mode: Mode::Terminal,
+            downstream_ip: None,
+            last_heartbeat_age_ms: None,
+            rule_count: 1,
+            uptime_secs: 12,
+            downstream_enrolled: false,
+            default_cert_path: None,
+            default_cert_loaded_age_secs: None,
+            ephemeral_cert_count: 0,
+            nat: Some(NatStatus {
+                mode: "auto".into(),
+                state: "active".into(),
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                external_ip: Some("203.0.113.7".parse().unwrap()),
+                protocol: Some("pcp".into()),
+                active_mapping_count: 2,
+                last_error: None,
+                mappings: vec![
+                    NatMappingEntry {
+                        origin: "rule:ssh".into(),
+                        protocol: "tcp".into(),
+                        internal_port: 22,
+                        external_port: 22,
+                        assigned_lifetime_secs: 7200,
+                        renew_in_secs: 3600,
+                    },
+                    NatMappingEntry {
+                        origin: "accept".into(),
+                        protocol: "udp".into(),
+                        internal_port: 51820,
+                        external_port: 51820,
+                        assigned_lifetime_secs: 7200,
+                        renew_in_secs: 3590,
+                    },
+                ],
+            }),
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains("\"nat\""), "nat field should be present: {s}");
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn status_response_nat_none_is_omitted_from_json() {
+        // Backwards-compat invariant: when nat is None, the field
+        // must not appear in the serialised form. Older yggdrasilctl
+        // parsing a daemon with nat=None should see exactly the
+        // pre-NAT shape.
+        let resp = Response::Status(StatusResponse {
+            version: "0.1.0".into(),
+            mode: Mode::Relay,
+            downstream_ip: None,
+            last_heartbeat_age_ms: None,
+            rule_count: 0,
+            uptime_secs: 0,
+            downstream_enrolled: false,
+            default_cert_path: None,
+            default_cert_loaded_age_secs: None,
+            ephemeral_cert_count: 0,
+            nat: None,
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains("\"nat\""), "nat must be omitted when None: {s}");
+    }
+
+    #[test]
+    fn status_response_parses_legacy_payload_without_nat() {
+        // Forwards-compat invariant: a newer yggdrasilctl parsing an
+        // older daemon's status payload (no `nat` field) must succeed
+        // and see `nat = None`.
+        let s = serde_json::json!({
+            "kind": "status",
+            "version": "0.1.0",
+            "mode": "terminal",
+            "downstream_ip": null,
+            "last_heartbeat_age_ms": null,
+            "rule_count": 0,
+            "uptime_secs": 0,
+            "downstream_enrolled": false,
+            "default_cert_path": null,
+            "default_cert_loaded_age_secs": null,
+            "ephemeral_cert_count": 0,
+        })
+        .to_string();
+        let parsed: Response = serde_json::from_str(&s).unwrap();
+        match parsed {
+            Response::Status(st) => assert!(st.nat.is_none()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

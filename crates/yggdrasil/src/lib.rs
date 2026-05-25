@@ -22,6 +22,7 @@ pub mod health;
 pub mod heartbeat;
 pub mod log;
 pub mod metrics;
+pub mod nat;
 pub mod pending_peers;
 pub mod profile;
 pub mod proxy;
@@ -289,7 +290,22 @@ pub async fn run_relay(
     };
     let has_chain_upstream = config.dial.is_some();
 
-    // 7. UDS control surface for `yggdrasilctl`.
+    // 7. Optional NAT-traversal mapper. Opt-in via
+    //    `[server].nat_traversal`; default off, in which case the
+    //    helper returns `None` without holding any resources. When
+    //    enabled, the mapper observes the supervisor's `current_set`
+    //    watch plus the chain `[accept].listen` socket, and asks the
+    //    residential gateway (PCP or NAT-PMP, per config) to forward
+    //    inbound traffic to each operator-declared listener.
+    let nat_mapper = spawn_nat_mapper(
+        config.server.nat_traversal,
+        config.accept.as_ref().map(|a| a.listen),
+        supervisor.handle(),
+        shutdown.clone(),
+    )
+    .await;
+
+    // 8. UDS control surface for `yggdrasilctl`.
     let control = ControlServer::bind(
         config.control.socket.clone(),
         wire_mode,
@@ -302,6 +318,7 @@ pub async fn run_relay(
         Some(introspection_state.clone()),
         chain_client_handle.clone(),
         None, // relay nodes never wire an AcmeManager (no HTTPS rules)
+        nat_mapper.as_ref().map(|m| m.handle()),
         shutdown.clone(),
     )
     .await
@@ -335,6 +352,9 @@ pub async fn run_relay(
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
+    if let Some(mapper) = nat_mapper {
+        mapper.shutdown().await;
+    }
     let _ = sighup_join.await;
     if let Some(handle) = hb_handle {
         let _ = handle.await;
@@ -470,6 +490,18 @@ pub async fn run_terminal(
         supervisor.handle(),
     );
 
+    // 4c. Optional NAT-traversal mapper. Terminals never set
+    //     `[accept]`, so the only listeners we can map are the rule
+    //     ones — but home-hosted terminals are the most common case
+    //     for needing this.
+    let nat_mapper = spawn_nat_mapper(
+        config.server.nat_traversal,
+        None,
+        supervisor.handle(),
+        shutdown.clone(),
+    )
+    .await;
+
     // 5. UDS control surface. Terminal mode has no downstream identity, so
     //    peer-related endpoints return `not_supported_in_terminal_mode`.
     let control = ControlServer::bind(
@@ -484,6 +516,7 @@ pub async fn run_terminal(
         Some(introspection_state.clone()),
         chain_client_handle.clone(),
         acme_manager.clone(),
+        nat_mapper.as_ref().map(|m| m.handle()),
         shutdown.clone(),
     )
     .await
@@ -538,6 +571,9 @@ pub async fn run_terminal(
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
+    if let Some(mapper) = nat_mapper {
+        mapper.shutdown().await;
+    }
     let _ = sighup_join.await;
     if let Some(handle) = predicate_publisher_join {
         let _ = handle.await;
@@ -624,6 +660,52 @@ fn build_chain_client(
     let client = ChainClient::new(cfg, shutdown);
     let handle = client.handle();
     Some(BuiltChainClient { client, handle })
+}
+
+/// Spawn the NAT-traversal mapper if it is enabled in config.
+///
+/// Discovery failures (no default route, /proc/net/route unreadable)
+/// are logged as warnings and downgraded to a `None` return: the
+/// daemon continues to run with the mapper effectively disabled.
+/// Operators can fix the network situation and restart, or simply
+/// configure port forwarding manually.
+async fn spawn_nat_mapper(
+    mode: nat::NatTraversalMode,
+    accept_listen: Option<std::net::SocketAddr>,
+    supervisor: crate::proxy::supervisor::SupervisorHandle,
+    shutdown: CancellationToken,
+) -> Option<nat::NatMapper> {
+    if !mode.is_enabled() {
+        return None;
+    }
+    let params = nat::NatMapperParams {
+        mode,
+        accept_listen,
+        rule_set_rx: supervisor.current_set_rx(),
+        shutdown,
+        gateway_override: None,
+        shutdown_release_timeout: None,
+    };
+    match nat::NatMapper::spawn(params).await {
+        Ok(m) => {
+            tracing::info!(
+                target: "yggdrasil::nat",
+                mode = mode.as_str(),
+                "NAT-traversal mapper running"
+            );
+            Some(m)
+        }
+        Err(nat::mapper::MapperSpawnError::Disabled) => None,
+        Err(nat::mapper::MapperSpawnError::Discovery(reason)) => {
+            tracing::warn!(
+                target: "yggdrasil::nat",
+                mode = mode.as_str(),
+                error = %reason,
+                "NAT-traversal mapper could not discover a default gateway; continuing without it"
+            );
+            None
+        }
+    }
 }
 
 async fn wait_for_shutdown() {

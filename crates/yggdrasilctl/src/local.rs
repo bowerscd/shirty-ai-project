@@ -149,6 +149,35 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                 };
                 println!("{cert_part}; ephemeral certs: {}", s.ephemeral_cert_count);
             }
+            // NAT-traversal block: present only when the daemon's
+            // `[server].nat_traversal` is something other than `off`
+            // *and* the mapper successfully bound a socket. Older
+            // daemons that don't know about NAT serialize this field
+            // as absent → `None` here → block elided.
+            if let Some(nat) = &s.nat {
+                println!("NAT traversal:");
+                println!("  mode:        {}", nat.mode);
+                println!("  state:       {}", nat.state);
+                if let Some(p) = &nat.protocol {
+                    println!("  protocol:    {p}");
+                }
+                if let Some(g) = nat.gateway {
+                    println!("  gateway:     {g}");
+                }
+                if let Some(ext) = nat.external_ip {
+                    println!("  external IP: {ext}");
+                }
+                println!("  mappings:    {} active", nat.active_mapping_count);
+                for m in &nat.mappings {
+                    println!(
+                        "    {:<24} {} {:<5} -> ext {:<5} (renew in {}s)",
+                        m.origin, m.protocol, m.internal_port, m.external_port, m.renew_in_secs,
+                    );
+                }
+                if let Some(err) = &nat.last_error {
+                    println!("  last error:  {err}");
+                }
+            }
         }
         Response::Rules(b) => {
             if b.rules.is_empty() {

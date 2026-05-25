@@ -155,6 +155,16 @@ pub struct ServerSection {
     /// the daemon is `SIGKILL`-ed regardless of this setting.
     #[serde(default, with = "humantime_serde::option")]
     pub graceful_drain_timeout: Option<Duration>,
+    /// Opt-in NAT port-mapping for rule listeners, `[accept].listen`,
+    /// HTTPS redirect, and HTTP/3 endpoints. `"auto"` tries PCP
+    /// (RFC 6887) and falls back to NAT-PMP (RFC 6886) on
+    /// unsupported-version / timeout. UPnP-IGD is intentionally not
+    /// supported (SSDP multicast + SOAP/XML is a values mismatch).
+    /// IPv4 only. Default `"off"` keeps zero-config deployments
+    /// unaffected. See `docs/configuration.md` for the operator-
+    /// facing behaviour matrix and CGNAT caveat.
+    #[serde(default)]
+    pub nat_traversal: crate::nat::NatTraversalMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +620,119 @@ mod tests {
         .unwrap();
         assert!(matches!(err, ConfigError::Invalid(s)
                 if s.contains("[server].workers must be >= 1 when set")));
+    }
+
+    // ---- [server].nat_traversal ----
+
+    #[test]
+    fn nat_traversal_defaults_to_off_when_absent() {
+        let cfg = parse(relay_minimal_toml()).unwrap();
+        assert_eq!(cfg.server.nat_traversal, crate::nat::NatTraversalMode::Off);
+    }
+
+    #[test]
+    fn nat_traversal_parses_off() {
+        let cfg = parse(
+            r#"
+            [server]
+            nat_traversal = "off"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.nat_traversal, crate::nat::NatTraversalMode::Off);
+    }
+
+    #[test]
+    fn nat_traversal_parses_pcp() {
+        let cfg = parse(
+            r#"
+            [server]
+            nat_traversal = "pcp"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.nat_traversal, crate::nat::NatTraversalMode::Pcp);
+    }
+
+    #[test]
+    fn nat_traversal_parses_natpmp() {
+        let cfg = parse(
+            r#"
+            [server]
+            nat_traversal = "natpmp"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.nat_traversal,
+            crate::nat::NatTraversalMode::NatPmp
+        );
+    }
+
+    #[test]
+    fn nat_traversal_parses_auto() {
+        let cfg = parse(
+            r#"
+            [server]
+            nat_traversal = "auto"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.nat_traversal, crate::nat::NatTraversalMode::Auto);
+    }
+
+    #[test]
+    fn nat_traversal_rejects_unknown_variant() {
+        // UPnP is intentionally not a valid variant; we want misuse
+        // to fail loudly at config-load time rather than silently
+        // disable the feature.
+        let err = parse(
+            r#"
+            [server]
+            nat_traversal = "upnp"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Proto(_)));
+    }
+
+    #[test]
+    fn nat_traversal_is_case_sensitive() {
+        // serde rename_all = "lowercase" — uppercase must be rejected.
+        let err = parse(
+            r#"
+            [server]
+            nat_traversal = "Off"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ConfigError::Proto(_)));
     }
 
     #[test]

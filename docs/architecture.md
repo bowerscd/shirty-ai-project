@@ -107,6 +107,42 @@ next hop. This means `vps` in the three-hop diagram above runs zero rules
 legitimately report drift at the top hop. Predicate aggregation across
 intermediate hops is a deliberate v2 deferral.
 
+### Home-hosted deployments and NAT traversal
+
+The canonical shape (terminal-at-home dials VPS-relay) avoids needing
+inbound ports on the residential side: the chain client is purely
+outbound. But three other shapes are legitimate and do need inbound
+reachability on a home-hosted node:
+
+1. **Standalone home terminal** — no upstream, the terminal's own
+   rule listeners are the public surface.
+2. **Home gateway** — a root relay with `[accept]` on a residential
+   line, dialed by some downstream terminal also at home.
+3. **Mid-chain home relay** — `[dial]` + `[accept]` where the
+   `[accept]` side faces a downstream that can't reach the VPS
+   directly.
+
+For all three, the operator can either forward ports manually in the
+router admin UI or set `[server].nat_traversal = "auto"` to have the
+daemon ask the router via PCP (RFC 6887) or NAT-PMP (RFC 6886). The
+mapper subscribes to the supervisor's `current_set` watch and the
+chain `[accept].listen` socket, derives the inventory of
+`(protocol, internal_port)` triples it needs forwarded, reconciles
+that against the gateway, and renews at half-lifetime. See
+`docs/configuration.md` for the operator-facing knob and
+`docs/operations.md` for diagnosis.
+
+This does **not** bypass CGNAT. If your ISP gives you a
+100.64.0.0/10 address, no NAT-mapping protocol works — your router
+cannot forward a port on an IP it doesn't own. Use a VPS for the
+public-facing role and let `[dial]` connect outward from home.
+
+UPnP-IGD is intentionally not supported: SSDP multicast + SOAP/XML
+is a values mismatch with the project's `#![forbid(unsafe_code)]`
+and minimum-attack-surface posture. PCP and NAT-PMP are
+fixed-layout binary protocols that fit the project's no-XML / no-
+discovery-protocol ethos.
+
 ## Crypto: Noise_IK
 
 The chain control channel uses **Noise_IK_25519_ChaChaPoly_BLAKE2s** via

@@ -98,6 +98,7 @@ async fn bind_relay_control(
         None,
         None,
         None,
+        None,
         shutdown,
     )
     .await
@@ -558,6 +559,7 @@ async fn derived_rules_endpoint_returns_snapshot_when_introspection_wired() {
         false,
         crate::metrics::detached_handle_for_tests(),
         Some(introspection),
+        None,
         None,
         None,
         shutdown.clone(),

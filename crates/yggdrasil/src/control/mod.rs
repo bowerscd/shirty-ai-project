@@ -113,6 +113,14 @@ pub(in crate::control) struct ControlState {
     /// Optional ACME manager. `None` when `[acme]` is unconfigured.
     /// Used by `Request::AcmeList` / `Request::AcmeRenew`.
     pub(in crate::control) acme: Option<crate::proxy::acme::AcmeManager>,
+    /// Optional NAT-traversal mapper handle. `None` when
+    /// `[server].nat_traversal = "off"` (the default) or when the
+    /// mapper's startup discovery failed. Used by `Request::Status`
+    /// to surface the NAT block when the subsystem is live.
+    // Read by the dispatcher in `dispatch.rs` once the
+    // `nat-status-handler` phase wires the projection up.
+    #[allow(dead_code)]
+    pub(in crate::control) nat: Option<crate::nat::NatMapperHandle>,
 }
 
 impl ControlServer {
@@ -133,6 +141,11 @@ impl ControlServer {
     /// `acme` is the optional ACME manager; only terminal-mode
     /// daemons with `[acme]` set wire one. When `None`, the
     /// `acme list` / `acme renew` verbs return empty / not_configured.
+    ///
+    /// `nat` is the optional NAT-traversal mapper handle. `None`
+    /// when `[server].nat_traversal = "off"` or when the mapper
+    /// failed startup discovery; the `local status` rendering then
+    /// omits the NAT block entirely.
     #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         socket_path: impl Into<PathBuf>,
@@ -146,6 +159,7 @@ impl ControlServer {
         introspection: Option<Arc<crate::chain::IntrospectionState>>,
         chain_client_handle: Option<ChainClientHandle>,
         acme: Option<crate::proxy::acme::AcmeManager>,
+        nat: Option<crate::nat::NatMapperHandle>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -193,6 +207,7 @@ impl ControlServer {
             introspection,
             chain_client_handle,
             acme,
+            nat,
         });
 
         let main_cancel = cancel.clone();

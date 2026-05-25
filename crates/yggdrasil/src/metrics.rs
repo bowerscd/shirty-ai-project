@@ -42,6 +42,44 @@
 //!   (no heartbeat path) and until the first heartbeat lands in relay mode.
 //!   Alert primitive: `time() - yggdrasil_last_heartbeat_timestamp_seconds
 //!   > N`.
+//!
+//! ### NAT traversal (opt-in, `[server].nat_traversal != "off"`)
+//!
+//! Emitted only when the daemon's NAT mapper is running. When the
+//! mapper is off, none of these series appear.
+//!
+//! Counters:
+//! - `yggdrasil_nat_mappings_created_total{protocol,origin,result_code}`
+//!   — every initial MAP request the mapper sent. `protocol` is `"pcp"`
+//!   or `"natpmp"`. `origin` is one of `"rule:<name>" |
+//!   "accept" | "redirect:<ip>" | "http3:<name>"`. `result_code` is
+//!   `"success"` on the happy path, otherwise the protocol's error
+//!   code stringified (`"network_failure"`, `"no_resources"`, ...).
+//! - `yggdrasil_nat_renewals_total{protocol,origin,result_code}` —
+//!   the half-lifetime renewal path. Separated from creates so
+//!   dashboards can show "are renewals failing while creates succeed?"
+//! - `yggdrasil_nat_mappings_released_total{protocol,origin}` —
+//!   explicit `lifetime = 0` unmaps issued during reconciliation (a
+//!   rule was removed) or shutdown (every mapping released).
+//! - `yggdrasil_nat_epoch_resets_total` — gateway epoch went
+//!   backwards; every increment means the mapper rebuilt the entire
+//!   mapping table from scratch per RFC 6887 §8.5.
+//! - `yggdrasil_nat_mapping_skipped_total{reason}` — listener filtered
+//!   out before mapping. `reason ∈ {loopback, link_local,
+//!   public_internal, ipv6}`. Incremented once per (listener, reason)
+//!   tuple for the daemon's lifetime; re-pushes of the same config do
+//!   not re-increment.
+//!
+//! Gauges:
+//! - `yggdrasil_nat_active_mappings` — current size of the active
+//!   mapping table.
+//! - `yggdrasil_nat_state{state}` — set to `1` for the current
+//!   mapper state (`"discovering"` / `"active"` / `"backoff"`),
+//!   `0` for the others. Useful for alerting: `max by () (
+//!   yggdrasil_nat_state{state="backoff"}) == 1` fires when the
+//!   gateway has gone unresponsive.
+//! - `yggdrasil_nat_external_ip_known` — `1` once the gateway has
+//!   told us its external IP, `0` otherwise.
 
 use anyhow::{Context, Result};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};

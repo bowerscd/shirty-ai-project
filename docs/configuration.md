@@ -35,6 +35,7 @@ hex is rejected on parse.
 | `default_key`      | path                   | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
 | `http_redirect_port` | optional u16         | unset (`None` → `80`)            | HTTPS only. Port for the per-IP HTTP→HTTPS redirect listener the supervisor auto-spawns. Default `80`. Set to a non-privileged port when running unprivileged (no `CAP_NET_BIND_SERVICE`), or to `0` for an ephemeral kernel-assigned port (useful in containers / dev / bench harnesses). |
 | `graceful_drain_timeout` | optional humantime duration | unset                            | When set, on `SIGTERM` the daemon stops accepting new TCP / HTTPS connections immediately but waits up to this duration for in-flight conversations to finish naturally before cancelling them. UDP is per-datagram and unaffected. systemd users should pair this with a matching `TimeoutStopSec=` in the unit file. Default unset = preserve the historical abrupt-cancel behaviour (in-flight conns die when the runtime drops them). |
+| `nat_traversal`    | enum (`off` / `pcp` / `natpmp` / `auto`) | `off`                  | Opt-in NAT port-mapping for home-hosted gateways / relays / standalone terminals. See [NAT traversal](#nat-traversal) below. |
 
 Mode is derived from section presence:
 
@@ -135,6 +136,71 @@ While the first issuance is in flight, the daemon serves an
 in-memory ephemeral self-signed cert as a stand-in. Browsers will
 warn until the renewer writes the real PEM and `CertStore::reload_host`
 swaps it in.
+
+### NAT traversal
+
+When the daemon is hosted behind a consumer router (home gateway,
+home-hosted standalone terminal, home-hosted mid-chain relay), every
+listener it spawns — rule listeners, the chain `[accept].listen`
+socket, the HTTPS redirect listener on port 80, and the HTTP/3 UDP
+companion of each HTTPS rule — needs an inbound port forward on the
+router. Setting `[server].nat_traversal` opts the daemon into asking
+the router for those forwards automatically via the standard IETF
+binary protocols:
+
+| Value      | Behaviour                                                                    |
+| ---------- | ---------------------------------------------------------------------------- |
+| `"off"`    | Default. No port-mapping requests are emitted. The operator forwards ports manually in their router admin UI. |
+| `"pcp"`    | RFC 6887 PCP only. Use when you know the router speaks PCP and want to avoid leaking NAT-PMP probes on networks that don't. |
+| `"natpmp"` | RFC 6886 NAT-PMP only. Use for older routers that don't speak PCP. |
+| `"auto"`   | Try PCP first; on `UnsuppVersion` or socket timeout per RFC 6887 §9, retry with NAT-PMP. Recommended default for unknown networks. |
+
+**What gets mapped.** Every TCP / UDP / HTTPS rule's `listen.port()`,
+plus port 80 (or `[server].http_redirect_port`) for the HTTPS
+redirect listener (one per unique bind IP — multiple HTTPS rules on
+the same IP share one redirect mapping), plus the HTTP/3 UDP
+companion port of every HTTPS rule whose `http3` field is not
+`false`, plus the `[accept].listen` port on relay / gateway nodes.
+Listeners bound to loopback, link-local, or a publicly-routable
+address are filtered out (they don't need NAT, and mapping a public
+IP confuses CGNAT-traversal routers).
+
+**Lifetime and renewal.** The daemon asks for a 2-hour mapping;
+consumer routers typically clamp this to 1 hour. The daemon renews
+each mapping at half the gateway-assigned lifetime and tracks the
+gateway's `epoch_time` (PCP §8.5): a backwards jump means the
+router rebooted or factory-reset, and the daemon re-establishes
+every mapping immediately.
+
+**Shutdown.** On `SIGTERM`, the daemon sends a `lifetime = 0`
+release for each active mapping, bounded by a 3-second internal
+deadline so a dead gateway can't hold up the process exit.
+Mappings that don't get cleanly released expire naturally on the
+router within the assigned lifetime.
+
+**IPv4 only.** NAT-PMP is v4-only by protocol; IPv6 generally
+doesn't need NAT in the first place (firewalls do "pinholing"
+but the residential firewall stories vary so much that v1 punts).
+IPv6 listeners are filtered out and counted under
+`yggdrasil_nat_mapping_skipped_total{reason="ipv6"}`.
+
+**CGNAT.** If your ISP gives you a 100.64.0.0/10 address, *no*
+NAT-mapping protocol can punch out — your router cannot map a port
+on an IP it doesn't own. Use a VPS for the public-facing role and
+let `[dial]` connect outward from home.
+
+**Observability.** `yggdrasilctl local status` prints a "NAT
+traversal:" block with the current state, gateway IP, external IP,
+and per-mapping detail. Prometheus series under `yggdrasil_nat_*`
+expose counters for mapping creation / renewal / release / failure
+and gauges for the current mapper state and active mapping count.
+See `docs/operations.md` for the alert primitives.
+
+UPnP-IGD is intentionally **not** supported: SSDP multicast +
+SOAP/XML is a values mismatch with the project's `#![forbid(unsafe_
+code)]` and minimum-attack-surface posture. PCP and NAT-PMP cover
+every consumer router worth supporting; for routers that speak
+neither, manual port forwarding remains the path.
 
 ### Complete example (root relay)
 
