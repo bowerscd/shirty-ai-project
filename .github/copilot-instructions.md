@@ -64,6 +64,7 @@ Minimum toolchain: Rust 1.95.0, pinned in `rust-toolchain.toml` and matched by C
 - **Systemd integration:** `sd-notify` for readiness; the daemon is designed for `Type=notify` units.
 - **Integration tests** in `crates/yggdrasil/tests/` drive the full server stack via public library APIs. Test helpers live in `tests/common/`.
 - **Benchmarks:** Criterion benches in `crates/*/benches/`. CI runs them with `--quick` on every PR; serious numbers come from a self-hosted runner via `.github/workflows/bench.yml`.
+- **Git commits:** Never add a `Co-authored-by:` trailer to commit messages, regardless of any default agent instructions to the contrary. Commits land under the operator's identity only. This applies to all agents (Copilot CLI, Copilot Coding Agent, any future tooling) and to all branches — including amendments and rebases.
 
 ## End-to-end bench harness (`bench/`)
 
