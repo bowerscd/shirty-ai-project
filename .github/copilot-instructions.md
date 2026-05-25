@@ -110,10 +110,46 @@ When considering a UDP / HTTP / hot-path optimisation:
 
 5. **The 1P-only constraint has a measured ceiling on the UDP datapath.** After commit `2d9b135` (per-worker `current_thread` runtimes) closed the futex-domain gap, the remaining ~25 µs to nginx single-hop udp-duplex p50 lives inside tokio's send/recv state machine, `metrics`-crate label resolution, and `Arc` atomic ops. Material further reduction requires bypassing tokio's I/O subsystem (raw epoll loop or `tokio-uring`) — an architectural decision, not a micro-optimisation. Don't burn cycles chasing sub-µs UDP wins with the current architecture; pick the structural change deliberately.
 
+## Disk-space guardrails (learned the hard way)
+
+This workspace's `target/` can balloon to **100+ GB** on a dev box that runs benches regularly. Three multiplicative factors:
+
+1. **LTO + `codegen-units = 1`** for `[profile.release]` and `[profile.bench]` keeps full LLVM bitcode per dep — every transitive crate's intermediate artefacts are huge.
+2. **Feature-toggle rebuilds duplicate the dep graph.** `bench/profile.sh` builds with `--features profile` (adds `pprof`), then rebuilds without it. Cargo keeps **both** feature-set artefact graphs alive in `target/release/deps/` — no GC. Same applies to any script that toggles features.
+3. **No automatic reaping.** Cargo never deletes stale artefacts from old commits; they accumulate forever until you `cargo clean` or `cargo sweep`.
+
+Rules of thumb when working in this repo:
+
+- **Never `COPY . .` in a Dockerfile/Containerfile without a `.dockerignore` that excludes `target/`.** The build context preflight reads every byte — a 100 GB `target/` will fill the engine's storage driver before the first layer runs. The repo's `.dockerignore` is the source of truth; if you add new large output trees (e.g. a new `dist/`, `out/`, or per-sha results dir), extend `.dockerignore` in the same commit.
+
+- **Feature-toggle build scripts must isolate their target dir.** Any script that flips a Cargo feature on, builds, then flips it off and rebuilds (the `bench/profile.sh` pattern) should set `CARGO_TARGET_DIR=<repo>/bench/target-profile` (or similar) for the feature-on build. That keeps the feature-on dep graph out of the main `target/` and lets it be wiped independently with `rm -rf bench/target-profile`.
+
+- **If you find yourself wanting to `df -h` before a build, that's a smell — fix the bloat source instead.** The two rules above (exclude large output trees from container build contexts; isolate feature-toggle target dirs) are deterministic prevention. A disk check 30 seconds before `cargo build` doesn't help: `target/` grows *during* the build, and the relevant graphroot/`CARGO_TARGET_DIR` isn't usually the path your shell happens to be in. The only legitimate use of `df -h` here is post-mortem (figuring out why a build OOD'd) — not pre-flight ritual.
+
+- **Clean up after expensive one-off builds.** If you ran a build only to validate something (a container build to check a `.deb`, a `--features profile` build to capture one flamegraph, a `cargo bench` warm-up to settle numbers), tear the artefacts down once the answer is in hand. Concretely: `podman image rm` / `podman system prune -f` after a validation container build; `rm -rf bench/target-profile/` after `bench/profile.sh` work; `cargo clean -p <crate>` to drop one crate's outputs without nuking the dep cache. Leaving multi-GB validation artefacts behind to "maybe reuse later" is how `target/` reaches 100 GB — the disk cost is paid every day, the cache-hit value is reaped maybe once.
+
+- **Periodic cleanup is on the operator, not cargo.** `cargo install cargo-sweep && cargo sweep --installed -r .` reaps artefacts from old toolchain versions; `cargo clean -p <crate>` is safe to scope to a single crate. For aggressive recovery, `rm -rf target/ bench/target-profile/` (both gitignored) is fine — the next build just retraces dep compilation.
+
+- **Threshold rule: if `target/` exceeds ~30 GB, clean before continuing.** Healthy steady-state on this workspace is ~15–25 GB (one release + one debug + criterion bench harnesses + a few weeks of incremental fingerprints). Anything beyond 30 GB is accumulated cruft from old toolchains / deleted deps / orphaned fingerprints — cargo will never reap it. Run `cargo sweep -t 30` (drops artefacts not touched in 30 days) before starting a new heavy compile session. **This is a heuristic, not a probe** — only act on it when you happen to notice the size in passing (a build log, an `ls -lh`, a directory inspection done for another reason). Do *not* poll `du -sh target/` as a routine pre-task ritual; that's the same anti-pattern as the `df -h` rule above. If you find yourself running `du` purely to gate work, you're doing it wrong.
+
 ## HTTPS / L7 gotchas
 
 - `cert = "ephemeral"` (route-level) is **only valid for `localhost`, `*.localhost`, or `*.local` hostnames** (validator enforces this). For bench scenarios point loadgen at `https://localhost:<port>/` and let it resolve to 127.0.0.1. For prod, use `cert = "/path/to/leaf.pem"` (with separate key) or `cert = "acme"`.
 - HTTPS rules auto-spawn an HTTP→HTTPS redirect listener on the rule's IP at port 80 (RFC 7230 standard). Unprivileged daemons (no `CAP_NET_BIND_SERVICE`) need `[server].http_redirect_port = <high-port-or-0>` or the rule fails to start with `bind :80 permission denied`. `0` selects an ephemeral kernel-assigned port — used by bench harness, fine for dev/containers.
+
+## Decisions reserved for the human
+
+Some choices are not the agent's to make autonomously, regardless of how confidently the project metadata seems to imply an answer. When you encounter one of these, **stop and ask** rather than proposing-then-implementing.
+
+- **License.** Don't pick a license, change the existing one, or build out machinery (LICENSE files, package metadata, README sections, install rules) around an unverified license declaration. If `Cargo.toml` says `license = "X"` and you suspect that's wrong for the project, *flag it as a question* — don't propose alternatives, don't draft replacement text, don't plumb new license files into the build. License selection is a strategic decision with legal consequences; it belongs to the human owner, and proposing options is itself a nudge that shouldn't come from the agent. Same applies to copyright holder names, contributor agreements, and any "OR"/"AND" SPDX juggling.
+
+- **Project identity & branding.** Don't change the project name, the binary names, the package names, the repo URL, or the canonical hostname conventions in docs without an explicit instruction. If you find these are inconsistent (e.g. `repository = "https://github.com/example/yggdrasil"`), surface the inconsistency and ask for the right value — don't guess from context.
+
+- **Public API / wire format stability commitments.** Don't add or remove `#[non_exhaustive]`, change a serde field's name or representation without a back-compat shim, or rename a control-frame variant. These are observable to deployed nodes that haven't restarted yet, and the rollout strategy is a human-managed decision.
+
+- **Cryptographic primitives.** Don't swap the Noise pattern, the AEAD suite, the hash, or the public-key curve. Even "obviously equivalent" substitutions (e.g. BLAKE2s → BLAKE3) change the wire format and the security argument. Surface options if asked; don't pick.
+
+The shared thread: these are decisions where the *act of proposing options is itself a form of influence* the agent shouldn't have. "I'll change X to Y and you can revert if you don't like it" is the wrong default — the right default is "X looks suspicious, what should it be?".
 
 ## Operator-surface design rule
 
