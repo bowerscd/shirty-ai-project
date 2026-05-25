@@ -126,6 +126,15 @@ pub struct ServerSection {
     /// Default TLS private key (PEM) paired with `default_cert`.
     #[serde(default)]
     pub default_key: Option<PathBuf>,
+    /// Port for the per-IP HTTP→HTTPS redirect listener that the daemon
+    /// auto-spawns for every `protocol = "https"` rule. Defaults to
+    /// 80 (the standard). Set to a non-privileged port when the
+    /// daemon is run without `CAP_NET_BIND_SERVICE` (typical for
+    /// dev / bench / containerised deployments where binding to
+    /// 80 isn't desired or possible). Set to `0` for an ephemeral
+    /// (kernel-assigned) port — useful for integration tests.
+    #[serde(default)]
+    pub http_redirect_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

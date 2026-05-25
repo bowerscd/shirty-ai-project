@@ -22,12 +22,20 @@
 //! one new knob, `--workers`, defaults to available_parallelism so the
 //! echo is never the bottleneck without the operator opting into it.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -36,7 +44,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 #[command(
     name = "bench-echo",
     version,
-    about = "TCP/UDP echo backend for the yggdrasil bench harness"
+    about = "TCP/UDP/HTTP echo backend for the yggdrasil bench harness"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -50,6 +58,13 @@ enum Mode {
     /// Echo UDP datagrams to their sender, optionally also pushing an
     /// independent server-originated stream.
     Udp(UdpArgs),
+    /// Serve plain HTTP/1.1 + HTTP/2 (h2c). Every request returns
+    /// `200 OK` with a fixed-size body. Intended as the upstream for
+    /// L7 proxy benchmarks where the proxy under test terminates
+    /// TLS and forwards plain HTTP — having a tokio + hyper backend
+    /// (rather than a Python/scripted server) keeps the echo from
+    /// becoming the bottleneck on RPS-heavy scenarios.
+    Http(HttpArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -94,6 +109,17 @@ struct UdpArgs {
     originate_max_sources: usize,
 }
 
+#[derive(Debug, clap::Args)]
+struct HttpArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Size in bytes of the response body returned for every request.
+    /// The body is filled with the byte `'x'`; the bench harness only
+    /// cares about throughput / RPS, not contents.
+    #[arg(long, default_value_t = 64)]
+    body_size: usize,
+}
+
 fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -110,6 +136,7 @@ fn main() -> Result<()> {
         match cli.mode {
             Mode::Tcp(args) => run_tcp(args).await,
             Mode::Udp(args) => run_udp(args).await,
+            Mode::Http(args) => run_http(args).await,
         }
     })
 }
@@ -190,6 +217,67 @@ async fn serve_tcp(mut stream: TcpStream) {
         if wr.write_all(&buf[..n]).await.is_err() {
             break;
         }
+    }
+}
+
+async fn run_http(args: HttpArgs) -> Result<()> {
+    let addr = resolve_bind(&args.common)?;
+    let workers = args.common.workers.max(1);
+    let body_size = args.body_size;
+    // Shared response body. Wrap in Arc so each worker / connection /
+    // request clones a cheap Bytes reference rather than re-allocating.
+    let body: Arc<Bytes> = Arc::new(Bytes::from(vec![b'x'; body_size]));
+    let mut handles = Vec::with_capacity(workers);
+    for worker_id in 0..workers {
+        let sock = make_reuseport_socket(addr, false)?;
+        let std_listener: std::net::TcpListener = sock.into();
+        let listener = TcpListener::from_std(std_listener)
+            .with_context(|| format!("adopt TCP listener (HTTP worker {worker_id})"))?;
+        let body = Arc::clone(&body);
+        handles.push(tokio::spawn(async move {
+            accept_http_loop(listener, body).await;
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(())
+}
+
+async fn accept_http_loop(listener: TcpListener, body: Arc<Bytes>) {
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let body = Arc::clone(&body);
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            // `auto::Builder` negotiates between HTTP/1.1 and HTTP/2
+            // (h2c, no ALPN) based on the preface bytes. Yggdrasil's
+            // HTTP/1.1 forward + HTTP/2 forward both reach this echo
+            // via the same socket; the builder picks the right mode
+            // per connection.
+            let svc = service_fn(move |_req: Request<Incoming>| {
+                let body = Arc::clone(&body);
+                async move {
+                    let resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-length", body.len())
+                        .header("content-type", "application/octet-stream")
+                        .body(Full::new(body.as_ref().clone()))
+                        .expect("response builder");
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+            let _ = ServerBuilder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
     }
 }
 

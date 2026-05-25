@@ -33,6 +33,7 @@ hex is rejected on parse.
 | `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the convention cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). |
 | `default_cert`     | path                   | unset                            | HTTPS only. Wildcard / fallback certificate PEM. Must be set together with `default_key`.       |
 | `default_key`      | path                   | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
+| `http_redirect_port` | optional u16         | unset (`None` → `80`)            | HTTPS only. Port for the per-IP HTTP→HTTPS redirect listener the supervisor auto-spawns. Default `80`. Set to a non-privileged port when running unprivileged (no `CAP_NET_BIND_SERVICE`), or to `0` for an ephemeral kernel-assigned port (useful in containers / dev / bench harnesses). |
 
 Mode is derived from section presence:
 

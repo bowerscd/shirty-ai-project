@@ -37,12 +37,13 @@ impl CertConfig {
         cert_dir: PathBuf,
         default_cert: Option<PathBuf>,
         default_key: Option<PathBuf>,
+        http_redirect_port: Option<u16>,
     ) -> Self {
         Self {
             cert_dir,
             default_cert,
             default_key,
-            redirect_port: None,
+            redirect_port: http_redirect_port,
             acme: None,
         }
     }

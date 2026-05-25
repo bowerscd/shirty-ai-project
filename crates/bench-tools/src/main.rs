@@ -30,6 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod http;
 mod report;
 mod tcp;
 mod udp;
@@ -83,6 +84,13 @@ enum Mode {
     /// Open N idle TCP connections, hold them, then close. Used to
     /// characterise per-connection memory cost of the subject.
     TcpIdle(TcpIdleArgs),
+    /// HTTP/HTTPS request-rate scenario: open N persistent HTTP/1.1
+    /// keep-alive connections, issue GETs as fast as each connection
+    /// allows, measure RPS + per-request latency. Supports both
+    /// plain HTTP (target `http://h:p/`) and HTTPS (`https://h:p/`)
+    /// — the latter uses rustls with permissive cert verification
+    /// since bench scenarios use self-signed ephemeral certs.
+    HttpRps(HttpRpsArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -209,6 +217,31 @@ struct TcpIdleArgs {
     hold: Duration,
 }
 
+#[derive(Debug, clap::Args)]
+pub(crate) struct HttpRpsArgs {
+    /// Target URL. Examples: `http://127.0.0.1:8080/`, `https://api.example.com/healthz`.
+    /// Path defaults to `/` if omitted. Plain HTTP and HTTPS are both supported;
+    /// HTTPS uses a permissive `ServerCertVerifier` so bench scenarios can use
+    /// self-signed ephemeral certs without bootstrap fuss.
+    #[arg(long)]
+    pub target: String,
+    /// Number of persistent HTTP/1.1 connections to open in parallel.
+    /// Each connection drives requests sequentially (one inflight at
+    /// a time) — pick this high enough to keep the proxy / backend
+    /// saturated, low enough to keep the loadgen itself off the
+    /// critical path.
+    #[arg(long, default_value_t = 64)]
+    pub concurrency: u32,
+    /// Total run duration (warmup + measurement).
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "10s")]
+    pub duration: Duration,
+    /// Warmup window excluded from the reported stats. Keep ≥ 1s so
+    /// connection establishment, TLS handshake, and JIT-induced
+    /// first-request spikes don't perturb the steady-state numbers.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "1s")]
+    pub warmup: Duration,
+}
+
 fn main() -> Result<()> {
     // Dedicated tokio runtime so we can keep loadgen single-threaded for
     // single-core SLO measurements; switchable via env var if desired.
@@ -233,6 +266,7 @@ async fn run(cli: Cli) -> Result<()> {
         Mode::TcpThroughput(args) => tcp::run_tcp_throughput(&cli.subject, args).await?,
         Mode::TcpConnrate(args) => tcp::run_tcp_connrate(&cli.subject, args).await?,
         Mode::TcpIdle(args) => tcp::run_tcp_idle(&cli.subject, args).await?,
+        Mode::HttpRps(args) => http::run_http_rps(&cli.subject, args).await?,
     };
     if let Some(name) = cli.scenario_name {
         report.scenario = name;

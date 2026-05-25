@@ -27,3 +27,13 @@ humantime-serde = { workspace = true }
 humantime    = { workspace = true }
 socket2      = { workspace = true }
 dashmap      = { workspace = true }
+
+# HTTP/HTTPS bench support (loadgen http-rps + bench-echo http).
+hyper          = { workspace = true }
+hyper-util     = { workspace = true }
+http           = { workspace = true }
+http-body-util = { workspace = true }
+bytes          = { workspace = true }
+rustls         = { workspace = true }
+tokio-rustls   = { workspace = true }
+rustls-pemfile = { workspace = true }

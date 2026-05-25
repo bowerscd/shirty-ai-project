@@ -65,6 +65,20 @@ SUBJECTS = {
         "nginx", "nginx-chain",
         "traefik", "traefik-chain",
     ],
+    # L7 HTTPS comparison. `direct` here means "loadgen → bench-echo
+    # http with no proxy in front" — plain HTTP, no TLS — to give a
+    # ceiling for what the backend can do. The proxy subjects all do
+    # the same shape: terminate TLS on $listen_port and forward plain
+    # HTTP to $upstream_port. No haproxy: haproxy's HTTP mode is a
+    # separate beast (it's L7 but routes by host rather than SNI,
+    # and the bench harness's stream-only common path doesn't cover
+    # it). No chain variants on the first pass — single-hop only.
+    "http": [
+        "direct",
+        "yggdrasil-terminal",
+        "nginx",
+        "traefik",
+    ],
 }
 if family not in SUBJECTS:
     sys.stderr.write(f"bench_subjects_for: unknown family {family!r}\n")
@@ -910,4 +924,217 @@ bench_run_loadgen() {
     fi
     log "loadgen subject=$subject out=$(basename "$out") args: $*"
     "$lg" --subject "$subject" --report-json "$out" "${scenario_arg[@]}" "$@"
+}
+
+# ---------- L7 HTTPS bench helpers ----------
+#
+# bench_spawn_http_echo <pidvar> <port> <logfile> [body_size]
+#
+# Spawn `bench-echo http` on 127.0.0.1:$port serving a fixed body. Used
+# as the upstream backend for HTTPS L7 scenarios so the proxy under
+# test terminates TLS in front of a real hyper backend.
+bench_spawn_http_echo() {
+    local __pidvar="$1" port="$2" logfile="$3"
+    local body="${4:-100}"
+    local bin
+    bin="$(bench_echo_binary)"
+    bench_spawn "$__pidvar" "$logfile" -- "$bin" http "$port" --body-size "$body"
+    bench_wait_listen_tcp 127.0.0.1 "$port" 5
+}
+
+# bench_spin_yggdrasil_https <tmp> <listen_port> <upstream_port>
+#
+# Single yggdrasil terminal-mode daemon with one `protocol = "https"`
+# rule. Cert is `ephemeral` — yggdrasil generates a fresh self-signed
+# cert at startup (no external openssl/rcgen needed). The route's
+# `hostname` is `127.0.0.1` so the loadgen's SNI matches; loadgen uses
+# a permissive `ServerCertVerifier` so chain validation passes trivially.
+bench_spin_yggdrasil_https() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"
+    local root
+    root="$(bench_workspace_root)"
+
+    local ygg_bin="$root/target/release/yggdrasil"
+    local ctl_bin="$root/target/release/yggdrasilctl"
+    [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
+    [[ -x "$ctl_bin" ]] || die "missing $ctl_bin — run: cargo build --release -p yggdrasilctl"
+
+    mkdir -p "$tmp"/{terminal,rules,tm-state,tm-run,certs,logs}
+    local tm_bind="127.0.0.1"
+
+    # Synthesise a [dial] section so the validator accepts a
+    # standalone terminal config — same trick as bench_spin_yggdrasil_terminal.
+    local fake_upstream_key="$tmp/fake-upstream.key"
+    "$ctl_bin" identity rotate --identity-file "$fake_upstream_key" --force >/dev/null
+    local fake_pubkey
+    fake_pubkey=$("$ctl_bin" identity show --identity-file "$fake_upstream_key" 2>/dev/null \
+        | awk '/^pubkey:/ {print $2; exit}')
+    [[ -n "$fake_pubkey" ]] || die "failed to extract fake upstream pubkey"
+
+    local tm_cfg="$tmp/terminal/config.toml"
+    local tm_key="$tmp/terminal/identity.key"
+    cat > "$tm_cfg" <<EOF
+[server]
+rules_dir     = "$tmp/rules"
+state_dir     = "$tmp/tm-state"
+identity_file = "$tm_key"
+default_bind  = "$tm_bind"
+cert_dir      = "$tmp/certs"
+http_redirect_port = 0
+
+[control]
+socket = "$tmp/tm-run/control.sock"
+
+[dial]
+pubkey   = "$fake_pubkey"
+endpoint = "127.0.0.1:1"
+EOF
+
+    "$ctl_bin" --config "$tm_cfg" identity rotate \
+        --identity-file "$tm_key" --force >/dev/null
+
+    cat > "$tmp/rules/scenario.toml" <<EOF
+[[rule]]
+name     = "bench-https"
+protocol = "https"
+listen   = "$tm_bind:$listen_port"
+
+[[rule.route]]
+hostname = "localhost"
+target   = "http://127.0.0.1:$upstream_port"
+cert     = "ephemeral"
+EOF
+
+    bench_spawn YGG_TM_PID "$tmp/logs/terminal.log" -- \
+        "$ygg_bin" --log-format json run --config "$tm_cfg"
+
+    bench_wait_listen_tcp "$tm_bind" "$listen_port" 10
+    # Give the ephemeral cert generation a beat to complete before
+    # the loadgen starts hammering the handshake path.
+    sleep 0.5
+
+    export YGG_LISTEN_PORT="$listen_port"
+    export YGG_LISTEN_ADDR="$tm_bind"
+    export YGG_CTRL_SOCK="$tmp/tm-run/control.sock"
+    export YGG_CONFIG="$tm_cfg"
+}
+
+# bench_spin_nginx_https <tmp> <listen_port> <upstream_port>
+#
+# Terminate TLS on $listen_port via nginx's stock `ssl_*` directives and
+# proxy plain HTTP to `127.0.0.1:$upstream_port`. Generates a one-shot
+# self-signed cert via openssl into $tmp/nginx/cert.pem so the harness
+# is self-contained.
+bench_spin_nginx_https() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"
+    local nginx_bin
+    nginx_bin="${BENCH_NGINX:-$(command -v nginx || true)}"
+    [[ -x "$nginx_bin" ]] || die "nginx binary not found; set BENCH_NGINX=/path/to/nginx or install nginx"
+
+    mkdir -p "$tmp/nginx/logs"
+
+    # Self-signed cert. Valid for 127.0.0.1; SAN covers the IP so
+    # the rustls client (which puts the IP in SNI as `127.0.0.1`)
+    # is happy. The harness doesn't validate chains anyway, but we
+    # need the cert to be syntactically valid for nginx to load it.
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$tmp/nginx/key.pem" -out "$tmp/nginx/cert.pem" \
+        -days 1 -subj "/CN=127.0.0.1" \
+        -addext "subjectAltName=IP:127.0.0.1" \
+        >/dev/null 2>&1 || die "openssl req failed (is openssl installed?)"
+
+    cat > "$tmp/nginx/nginx.conf" <<EOF
+worker_processes auto;
+pid $tmp/nginx/nginx.pid;
+error_log $tmp/nginx/error.log warn;
+events { worker_connections 4096; }
+http {
+    access_log off;
+    client_body_temp_path $tmp/nginx/client_body_temp;
+    proxy_temp_path $tmp/nginx/proxy_temp;
+    fastcgi_temp_path $tmp/nginx/fastcgi_temp;
+    uwsgi_temp_path $tmp/nginx/uwsgi_temp;
+    scgi_temp_path $tmp/nginx/scgi_temp;
+    keepalive_timeout 65s;
+    keepalive_requests 1000000;
+    upstream backend {
+        server 127.0.0.1:$upstream_port;
+        keepalive 256;
+        keepalive_requests 1000000;
+        keepalive_timeout 65s;
+    }
+    server {
+        listen 127.0.0.1:$listen_port ssl;
+        http2 on;
+        ssl_certificate $tmp/nginx/cert.pem;
+        ssl_certificate_key $tmp/nginx/key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_cache shared:SSL:10m;
+        location / {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host \$host;
+        }
+    }
+}
+EOF
+    bench_spawn NGINX_PID "$tmp/nginx/spawn.log" -- \
+        "$nginx_bin" -p "$tmp/nginx" -c "$tmp/nginx/nginx.conf" -g "daemon off;"
+    bench_wait_listen_tcp 127.0.0.1 "$listen_port" 5
+}
+
+# bench_spin_traefik_https <tmp> <listen_port> <upstream_port>
+#
+# Same shape as bench_spin_nginx_https but using traefik's file
+# provider. The cert is the same self-signed leaf openssl produces.
+bench_spin_traefik_https() {
+    local tmp="$1"; local listen_port="$2"; local upstream_port="$3"
+    local traefik_bin
+    traefik_bin="${BENCH_TRAEFIK:-$(command -v traefik || true)}"
+    [[ -x "$traefik_bin" ]] || die "traefik binary not found; set BENCH_TRAEFIK=/path/to/traefik or install traefik"
+
+    mkdir -p "$tmp/traefik"
+
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$tmp/traefik/key.pem" -out "$tmp/traefik/cert.pem" \
+        -days 1 -subj "/CN=127.0.0.1" \
+        -addext "subjectAltName=IP:127.0.0.1" \
+        >/dev/null 2>&1 || die "openssl req failed (is openssl installed?)"
+
+    cat > "$tmp/traefik/traefik.toml" <<EOF
+[entryPoints.websecure]
+address = "127.0.0.1:$listen_port"
+
+[providers.file]
+filename = "$tmp/traefik/dynamic.toml"
+
+[log]
+level = "WARN"
+filePath = "$tmp/traefik/traefik.log"
+
+[accessLog]
+filePath = "/dev/null"
+EOF
+
+    cat > "$tmp/traefik/dynamic.toml" <<EOF
+[http.routers.bench]
+rule = "HostSNI(\`*\`)"
+entryPoints = ["websecure"]
+service = "bench"
+
+[http.routers.bench.tls]
+
+[tls.certificates]]
+certFile = "$tmp/traefik/cert.pem"
+keyFile = "$tmp/traefik/key.pem"
+
+[http.services.bench.loadBalancer]
+[[http.services.bench.loadBalancer.servers]]
+url = "http://127.0.0.1:$upstream_port"
+EOF
+
+    bench_spawn TRAEFIK_PID "$tmp/traefik/spawn.log" -- \
+        "$traefik_bin" --configFile="$tmp/traefik/traefik.toml"
+    bench_wait_listen_tcp 127.0.0.1 "$listen_port" 10
 }

@@ -245,15 +245,23 @@ name = "bench-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "dashmap",
  "hdrhistogram",
+ "http",
+ "http-body-util",
  "humantime",
  "humantime-serde",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
 ]
 

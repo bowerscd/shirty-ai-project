@@ -166,6 +166,7 @@ pub async fn run_relay(
             config.server.cert_dir.clone(),
             config.server.default_cert.clone(),
             config.server.default_key.clone(),
+            config.server.http_redirect_port,
         ),
         shutdown.clone(),
     )
@@ -430,6 +431,7 @@ pub async fn run_terminal(
         config.server.cert_dir.clone(),
         config.server.default_cert.clone(),
         config.server.default_key.clone(),
+        config.server.http_redirect_port,
     );
     if let Some(acme_mgr) = acme_manager.clone() {
         cert_config = cert_config.with_acme(acme_mgr);
