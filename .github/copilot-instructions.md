@@ -114,3 +114,40 @@ When considering a UDP / HTTP / hot-path optimisation:
 
 - `cert = "ephemeral"` (route-level) is **only valid for `localhost`, `*.localhost`, or `*.local` hostnames** (validator enforces this). For bench scenarios point loadgen at `https://localhost:<port>/` and let it resolve to 127.0.0.1. For prod, use `cert = "/path/to/leaf.pem"` (with separate key) or `cert = "acme"`.
 - HTTPS rules auto-spawn an HTTP→HTTPS redirect listener on the rule's IP at port 80 (RFC 7230 standard). Unprivileged daemons (no `CAP_NET_BIND_SERVICE`) need `[server].http_redirect_port = <high-port-or-0>` or the rule fails to start with `bind :80 permission denied`. `0` selects an ephemeral kernel-assigned port — used by bench harness, fine for dev/containers.
+
+## Operator-surface design rule
+
+Runtime-state operations belong in the **signal-handler path**, not on `yggdrasilctl`. The CLI is for:
+
+- **Introspection** (read-only): `local status`, `local metrics`, `local health`, `local derived-rules`, `chain summary / ping / health / diff`.
+- **One-shot config-file mutations** (operator-managed state, not daemon runtime): `identity rotate`, `accept approve`, `accept pending`.
+
+Things that affect what the running daemon is doing should hook signals:
+
+| signal   | semantics                                                                    | example handlers                                                        |
+|----------|------------------------------------------------------------------------------|-------------------------------------------------------------------------|
+| `SIGTERM` / `SIGINT` | Stop the daemon (optionally with `[server].graceful_drain_timeout`). | Existing: shutdown. Future-friendly: any "drain X before quitting" knob goes through here, not a `yggdrasilctl drain` command. |
+| `SIGHUP` | Reload runtime config / rules. Already wired to the rule-watcher reload path; the same handler is the right place for any future hot-reloadable setting (live key rotation, drain-timeout adjustment, log-level reset). |
+
+Why: `systemctl stop yggdrasil` is the operator's existing exit path; making graceful drain a *property* of that signal means the operator doesn't have to remember a separate runbook step. The TOML knob is the only operator-facing surface. Don't add CLI commands for things that should "just work" on Unix process lifecycle.
+
+## Two-token shutdown pattern (for new proxies / acceptors)
+
+When adding a new component with accept-loop + per-connection tasks (e.g. a future protocol frontend), implement graceful drain with **two `CancellationToken`s plus a `tokio_util::task::TaskTracker`**:
+
+| token / type   | observed by                                          | semantics                                                    |
+|----------------|------------------------------------------------------|--------------------------------------------------------------|
+| `accept_cancel: CancellationToken` | accept loop's `tokio::select!`         | "stop accepting new connections"                             |
+| `conn_cancel: CancellationToken`   | per-connection task's `tokio::select!` | "tear down in-flight conversation"                           |
+| `conn_tracker: TaskTracker`        | parent `stop()` method                 | Counts in-flight per-connection tasks for the drain wait     |
+
+A single cancel token *does not work* — the per-connection task observing the same cancel as the accept loop means cancelling accept also instantly kills in-flight conversations, defeating drain entirely. See `proxy/tcp.rs::TcpProxy::stop` for the canonical implementation:
+
+1. `accept_cancel.cancel()` — accept loops exit immediately.
+2. Await accept-worker join handles.
+3. `conn_tracker.close()` (so `wait()` can resolve when count hits 0).
+4. `tokio::time::timeout(drain_timeout, conn_tracker.wait())` — drain naturally up to budget.
+5. If the timeout fired: `conn_cancel.cancel()` plus a short final `timeout(_, tracker.wait())` for cancelled tasks to wind down.
+6. With `drain_timeout = None`: skip steps 4–5 and fire `conn_cancel` immediately — preserves the historical abrupt-stop behaviour byte-for-byte.
+
+`tokio_util` is already a workspace dep with the `rt` feature, so `TaskTracker` is available everywhere proxy code lives.
