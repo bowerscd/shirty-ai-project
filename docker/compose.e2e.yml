@@ -38,7 +38,7 @@
 x-yggdrasil-image: &yggdrasil-image
   build:
     context: ..
-    dockerfile: docker/Dockerfile
+    dockerfile: docker/Dockerfile.e2e
 
 networks:
   wan:

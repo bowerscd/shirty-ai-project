@@ -1,0 +1,41 @@
+# Build outputs (the 100+ GB tree that filled the disk last time).
+target/
+bench/target-profile/
+
+# VCS / dev metadata not needed inside the image.
+.git/
+.gitignore
+.gitattributes
+.github/
+.vscode/
+
+# Bench harness output trees — per-sha results from bench/run-all.sh.
+# Container builds never need these and they grow without bound.
+bench/results/
+
+# E2E test artifacts — created by tests/e2e/run*.sh.
+tests/e2e/output/
+/tmp/yggbench.*
+
+# The Dockerfile / .dockerignore themselves and other compose
+# context files are already in the image's COPY contract; excluding
+# them keeps the build context minimal.
+.dockerignore
+Dockerfile
+**/Dockerfile
+
+# Editor / OS scratch.
+*.swp
+*.swo
+.DS_Store
+
+# Local secrets accidentally generated during dev. Never bake these
+# into an image — the daemon refuses to start on a non-personal key.
+identity.key
+*.identity
+*.token
+
+# Generated Python caches from bench/ helpers.
+__pycache__/
+*.pyc
+*.pyo

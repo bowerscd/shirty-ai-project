@@ -1,9 +1,21 @@
-# Multi-stage build that produces a single small runtime image containing
-# yggdrasil and yggdrasilctl. compose.e2e.yml picks the right binary per
-# service via `command:` overrides.
+# Production OCI image for yggdrasil.
 #
-# Plain Dockerfile (OCI) syntax — no BuildKit-only directives — so the build
-# runs cleanly under `podman build` (and `docker build` if you ever need it).
+# Two-stage build:
+#
+#   1. **builder** — installs the rust toolchain + cmake, runs the
+#      same CMake/CPack flow used by bare-metal distro packaging,
+#      and emits a Debian .deb.
+#
+#   2. **runtime** — clean `debian:bookworm-slim` that `apt install`s
+#      the .deb. The image consumes the same artefact bare-metal
+#      operators get, so the install layout is byte-identical between
+#      bare-metal, containerised, and Kubernetes deployments.
+#
+# Plain Dockerfile (OCI) syntax — no BuildKit-only directives — so it
+# builds cleanly under `podman build` and `docker build` alike.
+#
+# For e2e testing with python echo backends and bash helpers, see
+# `docker/Dockerfile.e2e` instead.
 
 ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
@@ -11,28 +23,36 @@ ARG DEBIAN_RELEASE=bookworm
 # ---------------------------------------------------------------- builder
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_RELEASE} AS builder
 
-# Pinned versions live in Cargo.lock; nothing to install beyond what the
-# slim image already has (gcc, libc-dev). pkg-config + libssl would be
-# needed if we used the rustls/native-tls features — we don't.
+# cmake / build-essential needed for the CMake+CPack frontend, dpkg-dev
+# for the .deb shlibdeps autodetection, file for CPackDeb's
+# CPACK_DEBIAN_PACKAGE_SHLIBDEPS detection (uses `file` to identify ELF
+# objects before running dpkg-shlibdeps on them).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        cmake \
+        make \
+        build-essential \
+        dpkg-dev \
+        file \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 
-# Copy manifests first for layer caching. crate Cargo.toml files are
+# Copy manifests first for layer caching. Crate Cargo.toml files are
 # enumerated explicitly so a single-crate edit doesn't bust the whole
 # dependency cache.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/ratatoskr/Cargo.toml       crates/ratatoskr/Cargo.toml
-COPY crates/yggdrasil/Cargo.toml       crates/yggdrasil/Cargo.toml
-COPY crates/yggdrasilctl/Cargo.toml    crates/yggdrasilctl/Cargo.toml
-COPY crates/bench-tools/Cargo.toml     crates/bench-tools/Cargo.toml
+COPY crates/ratatoskr/Cargo.toml     crates/ratatoskr/Cargo.toml
+COPY crates/yggdrasil/Cargo.toml     crates/yggdrasil/Cargo.toml
+COPY crates/yggdrasilctl/Cargo.toml  crates/yggdrasilctl/Cargo.toml
+COPY crates/bench-tools/Cargo.toml   crates/bench-tools/Cargo.toml
+COPY crates/cli-defs/Cargo.toml      crates/cli-defs/Cargo.toml
 
-# Stub sources for the dep-cache layer. cargo builds and caches all deps
-# against these placeholders; the next stage replaces the sources and
-# only the workspace crates need recompiling.
-#
-# Crates declaring `[[bench]]` (harness=false) also need a stub bench
-# source file or cargo refuses to parse the manifest.
+# Stub sources for the dep-cache layer. Cargo builds and caches all
+# deps against these placeholders; the next stage replaces the
+# sources and only the workspace crates need recompiling.
 RUN set -eux; \
-    for crate in ratatoskr bench-tools; do \
+    for crate in ratatoskr bench-tools cli-defs; do \
         mkdir -p crates/$crate/src; \
         echo "pub fn _stub() {}" > crates/$crate/src/lib.rs; \
     done; \
@@ -40,65 +60,84 @@ RUN set -eux; \
         mkdir -p crates/$bin/src; \
         echo "fn main() {}" > crates/$bin/src/main.rs; \
     done; \
-    # `yggdrasil` crate is bin+lib, give it a stub lib too.
     echo "pub fn _stub() {}" > crates/yggdrasil/src/lib.rs; \
     # Stubs for [[bench]] entries — names match crates/*/Cargo.toml.
     mkdir -p crates/ratatoskr/benches crates/yggdrasil/benches; \
     echo "fn main() {}" > crates/ratatoskr/benches/noise.rs; \
     echo "fn main() {}" > crates/ratatoskr/benches/rule_parse.rs; \
-    echo "fn main() {}" > crates/yggdrasil/benches/flow_table.rs
+    echo "fn main() {}" > crates/yggdrasil/benches/flow_table.rs; \
+    echo "fn main() {}" > crates/yggdrasil/benches/h3_forward.rs
 
+# Warm the cargo dep cache against stubbed sources. Build via cargo
+# directly here (not CMake) because we don't have the real CMakeLists.txt
+# in the layer yet — installing it with real sources keeps the
+# CMake-driven build identical to bare-metal packaging.
 RUN cargo build --release --workspace \
-        --bin yggdrasil --bin yggdrasilctl
+        --bin yggdrasil --bin yggdrasilctl --locked
 
-# Now real sources.
-COPY crates/ crates/
+# Now the real sources, including the CMake / CPack frontend.
+COPY . .
 
-# Touch the entrypoints so cargo notices the new sources after the stub layer.
+# Re-touch sources so cargo notices them after the stub-cache layer.
 RUN find crates -name '*.rs' -exec touch {} +
 
+# Build via the same CMake/CPack flow distro packagers use.
+# CARGO_LOCKED=ON enforces Cargo.lock — keep production reproducible.
 RUN set -eux; \
-    cargo build --release --workspace \
-        --bin yggdrasil --bin yggdrasilctl; \
+    cmake -B build -S . \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCARGO_LOCKED=ON \
+        -Wno-dev; \
+    cmake --build build --parallel; \
+    cd build; \
+    cpack -G DEB; \
     mkdir -p /out; \
-    cp target/release/yggdrasil    /out/yggdrasil; \
-    cp target/release/yggdrasilctl /out/yggdrasilctl
+    cp yggdrasil_*.deb /out/yggdrasil.deb
 
 # ---------------------------------------------------------------- runtime
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 
+# Minimal runtime deps:
+#   - ca-certificates: ACME / Let's Encrypt issuance via reqwest+rustls.
+#   - systemd: provides systemd-sysusers / systemd-tmpfiles binaries
+#     the .deb's postinst would call. The package's postinst guards
+#     on `[ -d /run/systemd/system ]` so it no-ops inside a non-systemd
+#     container — we run sysusers / tmpfiles ourselves below.
+#   - tini: reaps zombie processes when yggdrasil receives signals.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
-        openssl \
-        python3 \
+        systemd \
         tini \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /out/yggdrasil    /usr/local/bin/yggdrasil
-COPY --from=builder /out/yggdrasilctl /usr/local/bin/yggdrasilctl
+COPY --from=builder /out/yggdrasil.deb /tmp/yggdrasil.deb
 
-# Helper scripts for the compose e2e topology.
-COPY docker/bootstrap.sh                       /usr/local/bin/bootstrap.sh
-COPY docker/home-entrypoint.sh                 /usr/local/bin/home-entrypoint.sh
-COPY docker/echo-server.py                     /usr/local/bin/echo-server.py
-# Chain (3-level) e2e helpers — used by compose.e2e.chain.yml. Shipped
-# inside the same image so a single `docker build` covers both stacks.
-COPY docker/bootstrap-chain.sh                 /usr/local/bin/bootstrap-chain.sh
-COPY docker/chain-loopback-echo-entrypoint.sh  /usr/local/bin/chain-loopback-echo-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/bootstrap.sh \
-               /usr/local/bin/home-entrypoint.sh \
-               /usr/local/bin/echo-server.py \
-               /usr/local/bin/bootstrap-chain.sh \
-               /usr/local/bin/chain-loopback-echo-entrypoint.sh
+# Install the .deb. `apt-get install ./` resolves runtime deps;
+# --no-install-recommends keeps the image lean.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends /tmp/yggdrasil.deb \
+ && rm /tmp/yggdrasil.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && systemd-sysusers /usr/lib/sysusers.d/yggdrasil.conf \
+ && systemd-tmpfiles --create /usr/lib/tmpfiles.d/yggdrasil.conf || true
 
-# Create runtime directories. The compose file mounts volumes over the
-# *contents* of these so each container has its own isolated state.
-RUN mkdir -p /etc/yggdrasil/rules /etc/yggdrasil/certs \
-             /var/lib/yggdrasil /run/yggdrasil \
- && chmod 0750 /run/yggdrasil /etc/yggdrasil/certs
+# Containers don't run systemd; create the runtime dir for the
+# control socket manually with the right ownership.
+RUN mkdir -p /run/yggdrasil \
+ && chown yggdrasil:yggdrasil /run/yggdrasil \
+ && chmod 0750 /run/yggdrasil
 
-# tini reaps zombies cleanly when sidecar processes (e.g. the python echo
-# backend in the `home` service) get killed.
+# Drop to the unprivileged service user. Operators who need to bind
+# privileged ports inside the container should override at run time
+# with --user 0:0 + --cap-add NET_BIND_SERVICE.
+USER yggdrasil
+
+# Operators MUST mount /etc/yggdrasil/config.toml (and conf.d/, certs/,
+# identity.key) at run time — the package ships only the .example
+# config and refuses to start without a real one.
+EXPOSE 51820/udp 80/tcp 443/tcp 443/udp
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["yggdrasil", "--help"]
+CMD ["yggdrasil", "run"]
