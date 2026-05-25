@@ -168,6 +168,7 @@ pub async fn run_relay(
             config.server.default_key.clone(),
             config.server.http_redirect_port,
         ),
+        config.server.graceful_drain_timeout,
         shutdown.clone(),
     )
     .await
@@ -326,6 +327,11 @@ pub async fn run_relay(
 
     select_shutdown_or_profile(&profiler).await;
     tracing::info!("yggdrasil shutting down");
+    if let Some(t) = config.server.graceful_drain_timeout {
+        systemd::notify_stopping(&format!("Draining ({}s budget)", t.as_secs()));
+    } else {
+        systemd::notify_stopping("Stopping");
+    }
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;
@@ -445,6 +451,7 @@ pub async fn run_terminal(
         config.server.workers,
         cert_config,
         cert_store,
+        config.server.graceful_drain_timeout,
         shutdown.clone(),
     )
     .await
@@ -523,6 +530,11 @@ pub async fn run_terminal(
 
     select_shutdown_or_profile(&profiler).await;
     tracing::info!("yggdrasil shutting down");
+    if let Some(t) = config.server.graceful_drain_timeout {
+        systemd::notify_stopping(&format!("Draining ({}s budget)", t.as_secs()));
+    } else {
+        systemd::notify_stopping("Stopping");
+    }
     shutdown.cancel();
     control.stop().await;
     supervisor.stop().await;

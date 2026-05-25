@@ -5,6 +5,7 @@
 //! (notably `reconcile.rs`) but not to external callers.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use ratatoskr::rule::Rule;
 
@@ -48,16 +49,16 @@ impl ProxyHandle {
         }
     }
 
-    pub(super) async fn stop(self) {
+    pub(super) async fn stop(self, drain_timeout: Option<Duration>) {
         match self {
-            Self::Tcp(p) => p.stop().await,
+            Self::Tcp(p) => p.stop(drain_timeout).await,
             Self::Udp(p) => p.stop().await,
             Self::Https(h) => {
                 let HttpsHandle { frontend, h3, .. } = *h;
                 if let Some(q) = h3 {
-                    q.stop().await;
+                    q.stop(drain_timeout).await;
                 }
-                frontend.stop().await;
+                frontend.stop(drain_timeout).await;
             }
         }
     }

@@ -229,7 +229,7 @@ async fn h3_get_round_trip() {
     assert!(body.contains("xri=127.0.0.1"), "body missing xri: {body}");
     assert!(body.contains("xfh=localhost"), "body missing xfh: {body}");
 
-    frontend.stop().await;
+    frontend.stop(None).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -247,7 +247,7 @@ async fn h3_unknown_host_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(body, "no route\n");
 
-    frontend.stop().await;
+    frontend.stop(None).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -271,5 +271,5 @@ async fn h3_connect_returns_websocket_fallback_501() {
     );
     assert!(body.contains("fall back"), "got body: {body}");
 
-    frontend.stop().await;
+    frontend.stop(None).await;
 }

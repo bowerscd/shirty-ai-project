@@ -49,6 +49,7 @@ async fn reload_emits_reloading_then_ready_when_notify_socket_set() {
         None,
         None,
         CertConfig::default(),
+        None,
         shutdown.clone(),
     )
     .await

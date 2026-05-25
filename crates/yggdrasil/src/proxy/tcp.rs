@@ -31,11 +31,13 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use ratatoskr::rule::Rule;
 
@@ -63,10 +65,27 @@ const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
 /// finish naturally).
 pub struct TcpProxy {
     rule: Arc<Rule>,
-    cancel: CancellationToken,
+    /// Cancels the accept loops only. Firing it stops new connections
+    /// from being accepted but leaves in-flight per-connection tasks
+    /// alone — they continue until `conn_cancel` fires (the drain
+    /// timeout backstop, or `cancel()` for legacy abrupt-stop).
+    accept_cancel: CancellationToken,
+    /// Cancels every in-flight per-connection task. Per-task
+    /// `tokio::select!` arms observe this and tear `copy_bidirectional`
+    /// down on cancel. Kept separate from `accept_cancel` so the
+    /// drain path can stop accepting without instantly aborting
+    /// in-flight conversations.
+    conn_cancel: CancellationToken,
     local_addr: SocketAddr,
     /// One handle per accept worker. `stop()` awaits all of them.
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Tracks every per-connection task spawned by the accept loops.
+    /// On graceful drain (`stop(Some(timeout))`), the accept loops are
+    /// cancelled first (no new spawns), then we wait on the tracker
+    /// for in-flight connections to finish naturally — bounded by the
+    /// caller's timeout. Any task still alive when the timeout fires
+    /// is then explicitly cancelled via `conn_cancel`.
+    conn_tracker: TaskTracker,
 }
 
 impl TcpProxy {
@@ -113,13 +132,17 @@ impl TcpProxy {
         // per-connection task.
         let rule_arc = Arc::new(rule);
 
-        let cancel = CancellationToken::new();
+        let accept_cancel = CancellationToken::new();
+        let conn_cancel = CancellationToken::new();
+        let conn_tracker = TaskTracker::new();
         let mut worker_handles = Vec::with_capacity(effective_workers);
         for (worker_id, listener) in listeners.into_iter().enumerate() {
-            let task_cancel = cancel.clone();
+            let task_accept_cancel = accept_cancel.clone();
+            let task_conn_cancel = conn_cancel.clone();
             let task_rule = Arc::clone(&rule_arc);
             let task_resolver = resolver.clone();
             let task_local = local_addr;
+            let task_tracker = conn_tracker.clone();
             let handle = tokio::spawn(async move {
                 run_accept_loop(
                     task_rule,
@@ -127,7 +150,9 @@ impl TcpProxy {
                     listener,
                     task_local,
                     worker_id,
-                    task_cancel,
+                    task_accept_cancel,
+                    task_conn_cancel,
+                    task_tracker,
                 )
                 .await;
             });
@@ -152,9 +177,11 @@ impl TcpProxy {
 
         Ok(Self {
             rule: rule_arc,
-            cancel,
+            accept_cancel,
+            conn_cancel,
             local_addr,
             worker_handles,
+            conn_tracker,
         })
     }
 
@@ -166,35 +193,92 @@ impl TcpProxy {
         self.local_addr
     }
 
-    /// Trigger shutdown. Does NOT wait for in-flight connections — call
-    /// [`TcpProxy::stop`] to await full shutdown of the accept loops.
+    /// Trigger abrupt shutdown — equivalent to `stop(None)` shape:
+    /// fires both the accept-loop cancel and the in-flight
+    /// connection cancel, then returns. Does NOT await; call
+    /// [`TcpProxy::stop`] to actually wait for tasks to wind down.
     pub fn cancel(&self) {
-        self.cancel.cancel();
+        self.accept_cancel.cancel();
+        self.conn_cancel.cancel();
     }
 
-    /// Cancel and wait for every accept loop to exit. In-flight
-    /// per-connection tasks are cancelled via the same cascade and given
-    /// a chance to drain, but this method does not wait for them.
-    pub async fn stop(self) {
-        self.cancel.cancel();
+    /// Cancel the accept loops and wait for them to exit. With
+    /// `drain_timeout = Some(t)`, additionally wait up to `t` for
+    /// in-flight per-connection tasks to finish naturally before
+    /// cancelling them (zero-downtime graceful drain). With `None`
+    /// (the historical default), both accept loops and per-conn
+    /// tasks are cancelled together — preserves the pre-drain
+    /// abrupt-stop behaviour byte-for-byte.
+    ///
+    /// In-flight TCP connections in the drain window proceed
+    /// undisturbed: their `tokio::select!` arm observes
+    /// `conn_cancel`, not `accept_cancel`. Only after the drain
+    /// timeout fires (or `None` was passed) does `conn_cancel`
+    /// trigger, at which point `copy_bidirectional` is torn down.
+    pub async fn stop(self, drain_timeout: Option<Duration>) {
+        self.accept_cancel.cancel();
         for handle in self.worker_handles {
             let _ = handle.await;
+        }
+        // Close the tracker before waiting (TaskTracker contract: wait
+        // only resolves once `close` has been called AND the in-flight
+        // count is zero). Closing is safe here because the accept loops
+        // have already exited above, so no new spawns can land.
+        self.conn_tracker.close();
+        match drain_timeout {
+            Some(t) if !t.is_zero() => {
+                let drained = tokio::time::timeout(t, self.conn_tracker.wait()).await;
+                let remaining = self.conn_tracker.len();
+                match drained {
+                    Ok(()) => {
+                        tracing::debug!(
+                            rule = %self.rule.name,
+                            "TCP graceful drain complete: all connections finished naturally"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            rule = %self.rule.name,
+                            timeout_secs = t.as_secs(),
+                            remaining,
+                            "TCP graceful drain timeout expired; cancelling surviving connections"
+                        );
+                        self.conn_cancel.cancel();
+                        // Short final wait to let the now-cancelled
+                        // tasks observe the signal and exit cleanly.
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            self.conn_tracker.wait(),
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ => {
+                // Legacy behaviour: tear in-flight connections down
+                // immediately so the runtime drop on exit doesn't
+                // have to abort them.
+                self.conn_cancel.cancel();
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     rule: Arc<Rule>,
     resolver: UpstreamResolver,
     listener: TcpListener,
     local_addr: SocketAddr,
     worker_id: usize,
-    cancel: CancellationToken,
+    accept_cancel: CancellationToken,
+    conn_cancel: CancellationToken,
+    conn_tracker: TaskTracker,
 ) {
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
+            _ = accept_cancel.cancelled() => {
                 tracing::debug!(rule = %rule.name, worker = worker_id, "TCP accept loop received cancel");
                 return;
             }
@@ -249,16 +333,26 @@ async fn run_accept_loop(
                 // linked-list entry + drop hook per connection — pure
                 // overhead for our use case since nothing cancels an
                 // individual connection independently of the worker).
+                //
+                // Per-connection tasks observe `conn_cancel`, NOT the
+                // accept loop's cancel — so the drain path can stop
+                // accepting without instantly aborting in-flight
+                // conversations.
                 let conn_rule = Arc::clone(&rule);
-                let conn_cancel = cancel.clone();
-                tokio::spawn(async move {
+                let task_conn_cancel = conn_cancel.clone();
+                // Spawn through the TaskTracker so the parent TcpProxy
+                // can wait on the in-flight set during graceful drain.
+                // Tracker tracking is a single atomic counter
+                // increment+decrement per spawn; no per-task linked
+                // list or registration.
+                conn_tracker.spawn(async move {
                     handle_connection(
                         conn_rule,
                         client,
                         client_addr,
                         target_addr,
                         local_addr,
-                        conn_cancel,
+                        task_conn_cancel,
                     )
                     .await;
                 });
@@ -539,7 +633,7 @@ mod tests {
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
 
-        proxy.stop().await;
+        proxy.stop(None).await;
     }
 
     #[tokio::test]
@@ -581,7 +675,7 @@ mod tests {
                 );
             }
         }
-        proxy.stop().await;
+        proxy.stop(None).await;
     }
 
     #[tokio::test]
@@ -634,7 +728,7 @@ mod tests {
         );
         assert!(s.ends_with("\r\n"));
 
-        proxy.stop().await;
+        proxy.stop(None).await;
     }
 
     #[tokio::test]
@@ -664,7 +758,7 @@ mod tests {
                 e.kind()
             ),
         }
-        proxy.stop().await;
+        proxy.stop(None).await;
     }
 
     #[tokio::test]
@@ -688,7 +782,7 @@ mod tests {
         // Stop the proxy. The accept loop exits; the existing connection
         // task receives cancellation (it was a child token of the loop's
         // cancellation token).
-        proxy.stop().await;
+        proxy.stop(None).await;
 
         // The client connection should EOF promptly.
         let mut buf = [0u8; 1];
@@ -744,6 +838,91 @@ mod tests {
             assert_eq!(buf, payload, "round-trip mismatch on iteration {i}");
         }
 
-        proxy.stop().await;
+        proxy.stop(None).await;
+    }
+
+    /// Graceful-drain happy path: an in-flight bidirectional copy
+    /// completes naturally during `stop(Some(timeout))`, and `stop`
+    /// returns once the connection finishes — well within the
+    /// timeout budget.
+    #[tokio::test]
+    async fn graceful_drain_lets_inflight_connection_finish() {
+        let (upstream, _us) = echo_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
+
+        let proxy = TcpProxy::spawn(
+            rule("echo", upstream.port(), None),
+            dynamic_resolver(peer, upstream.port()),
+            1,
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hi");
+
+        // Close the client's write side so the proxy's `copy_bidirectional`
+        // sees EOF and terminates. Without this nudge the connection task
+        // would hang on the kernel forever and the drain timeout would
+        // fire instead — that's covered by the next test.
+        client.shutdown().await.unwrap();
+
+        let stop_start = std::time::Instant::now();
+        proxy.stop(Some(Duration::from_secs(5))).await;
+        let elapsed = stop_start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "graceful drain should return promptly when conn finishes; took {elapsed:?}"
+        );
+    }
+
+    /// Graceful-drain timeout path: an in-flight connection is
+    /// deliberately stuck (peer never sends EOF and never reads),
+    /// so the drain window expires. `stop(Some(timeout))` must
+    /// return within `timeout` rather than waiting indefinitely.
+    #[tokio::test]
+    async fn graceful_drain_returns_when_timeout_expires() {
+        let (upstream, _us) = echo_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
+
+        let proxy = TcpProxy::spawn(
+            rule("echo", upstream.port(), None),
+            dynamic_resolver(peer, upstream.port()),
+            1,
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        // Open a connection and keep both ends parked. We don't
+        // write anything; the proxy task is blocked in
+        // copy_bidirectional waiting for bytes that never come.
+        let client = TcpStream::connect(listen).await.unwrap();
+        // Give the accept loop a moment to actually spawn the per-conn
+        // task — otherwise stop() races and the tracker may be empty
+        // when we drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let drain_budget = Duration::from_millis(250);
+        let stop_start = std::time::Instant::now();
+        proxy.stop(Some(drain_budget)).await;
+        let elapsed = stop_start.elapsed();
+        // Must have waited at least the drain window before giving up.
+        assert!(
+            elapsed >= drain_budget,
+            "stop returned too fast ({elapsed:?}); should have waited at least {drain_budget:?}"
+        );
+        // Must NOT have waited multiples of the window (no hang).
+        assert!(
+            elapsed < drain_budget * 4,
+            "stop hung past the drain budget ({elapsed:?} vs budget {drain_budget:?})"
+        );
+        drop(client);
     }
 }

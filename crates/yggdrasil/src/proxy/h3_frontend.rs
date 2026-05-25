@@ -37,6 +37,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use ratatoskr::rule::Rule;
@@ -65,6 +66,10 @@ pub struct H3Frontend {
     local_addr: SocketAddr,
     cancel: CancellationToken,
     handle: JoinHandle<()>,
+    /// In-flight QUIC connection tasks, for graceful drain. See
+    /// [`crate::proxy::http_frontend::HttpFrontend`] for the
+    /// symmetric shape on the TCP TLS path.
+    conn_tracker: TaskTracker,
 }
 
 impl H3Frontend {
@@ -109,11 +114,13 @@ impl H3Frontend {
         let backend_client = build_backend_client();
 
         let cancel = CancellationToken::new();
+        let conn_tracker = TaskTracker::new();
         let task_cancel = cancel.clone();
         let task_rule = rule.clone();
         let task_endpoint = endpoint.clone();
         let task_routes = Arc::clone(&route_table);
         let task_client = backend_client.clone();
+        let task_tracker = conn_tracker.clone();
         let handle = tokio::spawn(async move {
             run_accept_loop(
                 task_rule,
@@ -121,6 +128,7 @@ impl H3Frontend {
                 task_routes,
                 task_client,
                 task_cancel,
+                task_tracker,
             )
             .await;
         });
@@ -140,6 +148,7 @@ impl H3Frontend {
             local_addr,
             cancel,
             handle,
+            conn_tracker,
         })
     }
 
@@ -151,9 +160,35 @@ impl H3Frontend {
         self.local_addr
     }
 
-    pub async fn stop(self) {
+    /// Cancel the accept loop and wait for it to exit. With
+    /// `drain_timeout = Some(t)`, additionally bound the QUIC
+    /// `endpoint.wait_idle()` call (which the accept loop runs on
+    /// cancel) to at most `t`. QUIC's protocol-level graceful close
+    /// (CONNECTION_CLOSE frame on `endpoint.close`) is the
+    /// equivalent of the TLS/HTTP "stop accepting + drain" sequence
+    /// on the TCP side, so once the accept loop's handle resolves
+    /// we know every in-flight QUIC conversation has either
+    /// finished or been told to terminate.
+    pub async fn stop(self, drain_timeout: Option<Duration>) {
         self.cancel.cancel();
-        let _ = self.handle.await;
+        match drain_timeout {
+            Some(t) if !t.is_zero() => {
+                if tokio::time::timeout(t, self.handle).await.is_err() {
+                    tracing::warn!(
+                        rule = %self.rule.name,
+                        timeout_secs = t.as_secs(),
+                        "h3 graceful drain timeout expired during endpoint.wait_idle"
+                    );
+                }
+            }
+            _ => {
+                let _ = self.handle.await;
+            }
+        }
+        self.conn_tracker.close();
+        // Short final wait for any per-stream tasks the accept loop
+        // spawned to observe the closed endpoint and exit.
+        let _ = tokio::time::timeout(Duration::from_millis(250), self.conn_tracker.wait()).await;
     }
 }
 
@@ -163,6 +198,7 @@ async fn run_accept_loop(
     routes: Arc<RouteTable>,
     client: BackendClient,
     cancel: CancellationToken,
+    conn_tracker: TaskTracker,
 ) {
     loop {
         tokio::select! {
@@ -181,7 +217,7 @@ async fn run_accept_loop(
                 let task_rule = rule.clone();
                 let task_routes = Arc::clone(&routes);
                 let task_client = client.clone();
-                tokio::spawn(async move {
+                conn_tracker.spawn(async move {
                     let quic_conn = match incoming.await {
                         Ok(c) => c,
                         Err(e) => {
@@ -511,7 +547,7 @@ mod tests {
             .await
             .expect("spawn h3 endpoint");
         assert!(q.local_addr().port() != 0);
-        q.stop().await;
+        q.stop(None).await;
     }
 
     #[tokio::test]
@@ -534,7 +570,7 @@ mod tests {
             .await
             .expect("spawn h3 endpoint");
         assert!(q.local_addr().port() != 0);
-        q.stop().await;
+        q.stop(None).await;
     }
 
     #[tokio::test]

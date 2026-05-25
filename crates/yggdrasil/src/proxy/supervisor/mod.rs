@@ -157,9 +157,15 @@ impl ProxySupervisor {
     /// `shutdown` is observed cooperatively: cancelling it stops the
     /// supervisor and all child proxies.
     ///
+    /// `graceful_drain_timeout` (sourced from `[server].graceful_drain_timeout`)
+    /// is consulted on shutdown only — hot rule-reload always stops the
+    /// affected proxy instantly so the new rule set can take effect. See
+    /// [`crate::proxy::tcp::TcpProxy::stop`] for the per-proxy mechanics.
+    ///
     /// Equivalent to [`ProxySupervisor::spawn_with_cert_store`] with a
     /// freshly-built empty store; callers that need to share the store
     /// with an `AcmeManager` use the explicit form.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         rules_dir: impl Into<PathBuf>,
         debounce: Duration,
@@ -167,6 +173,7 @@ impl ProxySupervisor {
         default_bind: Option<IpAddr>,
         default_workers: Option<usize>,
         cert_config: CertConfig,
+        graceful_drain_timeout: Option<Duration>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         Self::spawn_with_cert_store(
@@ -177,6 +184,7 @@ impl ProxySupervisor {
             default_workers,
             cert_config,
             Arc::new(CertStore::new()),
+            graceful_drain_timeout,
             shutdown,
         )
         .await
@@ -195,6 +203,7 @@ impl ProxySupervisor {
         default_workers: Option<usize>,
         cert_config: CertConfig,
         cert_store: Arc<CertStore>,
+        graceful_drain_timeout: Option<Duration>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let rules_dir: PathBuf = rules_dir.into();
@@ -230,6 +239,7 @@ impl ProxySupervisor {
             cert_config,
             Arc::clone(&cert_store),
             Arc::clone(&cert_watcher),
+            graceful_drain_timeout,
             main_cancel,
             snapshot_tx,
         ));
@@ -411,6 +421,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown.clone(),
         )
         .await
@@ -445,6 +456,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown.clone(),
         )
         .await
@@ -491,6 +503,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown.clone(),
         )
         .await
@@ -531,6 +544,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown.clone(),
         )
         .await
@@ -624,6 +638,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown.clone(),
         )
         .await
@@ -670,6 +685,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown,
         )
         .await;
@@ -693,6 +709,7 @@ mod tests {
             None,
             None,
             CertConfig::default(),
+            None,
             shutdown.clone(),
         )
         .await

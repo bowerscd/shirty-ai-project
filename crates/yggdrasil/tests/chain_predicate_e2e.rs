@@ -83,6 +83,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
         Some("127.0.0.1".parse().unwrap()),
         None,
         CertConfig::default(),
+        None,
         cancel.clone(),
     )
     .await
@@ -227,6 +228,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
         Some("127.0.0.1".parse().unwrap()),
         None,
         CertConfig::default(),
+        None,
         cancel.clone(),
     )
     .await

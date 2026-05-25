@@ -135,6 +135,26 @@ pub struct ServerSection {
     /// (kernel-assigned) port — useful for integration tests.
     #[serde(default)]
     pub http_redirect_port: Option<u16>,
+    /// Maximum wall-clock time the daemon will wait, after receiving
+    /// `SIGTERM`, for in-flight TCP connections / HTTPS requests to
+    /// complete naturally before letting the tokio runtime abort
+    /// them. UDP is per-datagram and not subject to drain.
+    ///
+    /// Default unset (`None`) preserves the historical behaviour:
+    /// accept loops cancel immediately, in-flight tasks die when the
+    /// runtime drops them. Set to a positive humantime value (e.g.
+    /// `"30s"`) when you've drained external traffic out of yggdrasil
+    /// at an upstream layer (DNS rotation, load-balancer health
+    /// check) and want the daemon to finish whatever's still in
+    /// flight before exiting — zero-downtime rolling restarts.
+    ///
+    /// Cooperates with systemd: while draining, the daemon emits
+    /// `STOPPING=1` + `STATUS=Draining (...)` via `sd_notify` so
+    /// `systemctl status` reflects what's happening. systemd's own
+    /// `TimeoutStopSec=` is the outer bound — if it expires first
+    /// the daemon is `SIGKILL`-ed regardless of this setting.
+    #[serde(default, with = "humantime_serde::option")]
+    pub graceful_drain_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

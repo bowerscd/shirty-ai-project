@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
@@ -38,6 +39,7 @@ pub(super) async fn supervisor_loop(
     cert_config: CertConfig,
     cert_store: Arc<CertStore>,
     cert_watcher: Arc<CertWatcher>,
+    graceful_drain_timeout: Option<Duration>,
     cancel: CancellationToken,
     snapshot_tx: tokio::sync::watch::Sender<Vec<ProxySnapshot>>,
 ) {
@@ -136,10 +138,15 @@ pub(super) async fn supervisor_loop(
         }
     }
 
-    // Shutdown: stop every active proxy concurrently. Drain the snapshot
-    // last so observers see the empty set on the way out.
+    // Shutdown: stop every active proxy concurrently. Honour the
+    // operator's [server].graceful_drain_timeout — in-flight TCP
+    // connections / HTTPS requests get up to that window to finish
+    // naturally before the runtime drops them. UDP is per-datagram
+    // and unaffected.
     let active_drained: Vec<ActiveProxy> = active.drain().map(|(_, p)| p).collect();
-    let stops = active_drained.into_iter().map(|p| p.handle.stop());
+    let stops = active_drained
+        .into_iter()
+        .map(|p| p.handle.stop(graceful_drain_timeout));
     futures::future::join_all(stops).await;
     // Tear down any leftover redirect listeners.
     let redirect_drained: Vec<RedirectListener> =
@@ -230,7 +237,11 @@ async fn apply_update(
             // Unregister this rule's routes from the cert store and the
             // cert watcher's path index.
             unload_rule_from_cert_store(cert_store, cert_watcher, removed);
-            ap.handle.stop().await;
+            // Hot-reload removes pass `None`: the operator just took
+            // this rule out of the config and expects new connections
+            // to be rejected immediately. Long drains on rule churn
+            // would block subsequent reloads.
+            ap.handle.stop(None).await;
         }
     }
 
@@ -252,7 +263,10 @@ async fn apply_update(
                 }
             }
             unload_rule_from_cert_store(cert_store, cert_watcher, &change.old);
-            old.handle.stop().await;
+            // Hot-reload swap: instant stop so the new bind can take
+            // the same listen address without contending with the
+            // old listener.
+            old.handle.stop(None).await;
         }
         match spawn_proxy_for_rule(
             change.new.clone(),

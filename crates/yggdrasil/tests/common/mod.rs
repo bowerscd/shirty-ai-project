@@ -235,6 +235,7 @@ pub async fn spawn_supervisor(
         None,
         None,
         CertConfig::default(),
+        None,
         shutdown,
     )
     .await
@@ -256,6 +257,7 @@ pub async fn spawn_terminal_supervisor(
         None,
         None,
         CertConfig::default(),
+        None,
         shutdown,
     )
     .await
@@ -278,6 +280,7 @@ pub async fn spawn_terminal_supervisor_with_certs(
         None,
         None,
         cert_config,
+        None,
         shutdown,
     )
     .await

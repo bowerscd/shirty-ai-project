@@ -17,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, warn};
 
 use ratatoskr::rule::Rule;
@@ -36,12 +37,14 @@ pub(super) async fn accept_loop(
     acceptor: TlsAcceptor,
     routes: Arc<RouteTable>,
     client: BackendClient,
-    cancel: CancellationToken,
+    accept_cancel: CancellationToken,
+    conn_cancel: CancellationToken,
+    conn_tracker: TaskTracker,
 ) {
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
+            _ = accept_cancel.cancelled() => {
                 debug!(rule = %rule_name, "HTTPS accept loop received cancel");
                 return;
             }
@@ -62,8 +65,14 @@ pub(super) async fn accept_loop(
                 let conn_acceptor = acceptor.clone();
                 let conn_routes = Arc::clone(&routes);
                 let conn_client = client.clone();
-                let conn_cancel = cancel.child_token();
-                tokio::spawn(async move {
+                // Per-connection task observes `conn_cancel` (the drain
+                // backstop), NOT `accept_cancel`. See `HttpFrontend::stop`
+                // for the rationale.
+                let task_conn_cancel = conn_cancel.child_token();
+                // Spawn through the tracker so HttpFrontend::stop can
+                // wait on the in-flight TLS-connection set during
+                // graceful drain.
+                conn_tracker.spawn(async move {
                     if let Err(e) = handle_tcp_connection(
                         conn_rule_name,
                         conn_rule,
@@ -73,7 +82,7 @@ pub(super) async fn accept_loop(
                         conn_acceptor,
                         conn_routes,
                         conn_client,
-                        conn_cancel,
+                        task_conn_cancel,
                     )
                     .await
                     {

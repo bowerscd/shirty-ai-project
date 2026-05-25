@@ -102,6 +102,30 @@ pub fn notify_ready_after_reload() {
     }
 }
 
+/// Send `STOPPING=1` plus a human-readable `STATUS=...` to systemd at
+/// the start of a graceful-drain shutdown. Operators running
+/// `systemctl status yggdrasil` then see e.g.
+/// `Status: "Draining (30s budget)"` rather than the stale ready-status
+/// while the daemon waits for in-flight connections to finish.
+///
+/// `unset_env = false` because we may still emit further notifications
+/// (e.g. a future `STATUS=...` update with remaining time) before
+/// exiting. The kernel cleans up the inherited socket on process exit.
+///
+/// No-op when `NOTIFY_SOCKET` is unset.
+pub fn notify_stopping(status: &str) {
+    match sd_notify::notify(
+        false,
+        &[
+            sd_notify::NotifyState::Stopping,
+            sd_notify::NotifyState::Status(status),
+        ],
+    ) {
+        Ok(()) => tracing::debug!(status, "sent sd_notify STOPPING=1 + STATUS"),
+        Err(e) => tracing::warn!(error = %e, "sd_notify STOPPING=1 failed; continuing"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +146,6 @@ mod tests {
         notify_ready_with_status("mode=relay, accept=yes, dial=no");
         notify_reloading();
         notify_ready_after_reload();
+        notify_stopping("Draining (30s budget)");
     }
 }

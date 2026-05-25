@@ -76,6 +76,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
         Some("127.0.0.1".parse().unwrap()),
         None,
         CertConfig::default(),
+        None,
         cancel.clone(),
     )
     .await

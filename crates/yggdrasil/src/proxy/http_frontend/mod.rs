@@ -76,12 +76,14 @@ pub(crate) use crate::proxy::forward::build_upstream_uri;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::info;
 
 use ratatoskr::rule::Rule;
@@ -118,8 +120,19 @@ pub(crate) fn build_rustls_server_config(
 pub struct HttpFrontend {
     rule_name: String,
     local_addr: SocketAddr,
-    cancel: CancellationToken,
+    /// Cancels the TLS accept loop only. In-flight TLS connections /
+    /// HTTP requests do NOT observe this — see [`conn_cancel`].
+    accept_cancel: CancellationToken,
+    /// Cancels in-flight TLS connection tasks (the per-connection
+    /// `handle_tcp_connection` future). Kept separate from
+    /// [`accept_cancel`] so the drain path can stop accepting
+    /// without instantly tearing down active HTTP request handlers.
+    conn_cancel: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+    /// Tracks every per-TLS-connection task spawned by the accept
+    /// loop. See [`crate::proxy::tcp::TcpProxy::conn_tracker`] for
+    /// the symmetric rationale on graceful drain.
+    conn_tracker: TaskTracker,
 }
 
 impl std::fmt::Debug for HttpFrontend {
@@ -170,16 +183,20 @@ impl HttpFrontend {
             .local_addr()
             .context("read HTTPS TcpListener local_addr")?;
 
-        let cancel = parent.child_token();
+        let accept_cancel = parent.child_token();
+        let conn_cancel = CancellationToken::new();
         let backend_client = build_backend_client();
+        let conn_tracker = TaskTracker::new();
 
         let task_rule = Arc::new(rule.clone());
         let task_rule_name = rule.name.clone();
-        let task_cancel = cancel.clone();
+        let task_accept_cancel = accept_cancel.clone();
+        let task_conn_cancel = conn_cancel.clone();
         let task_routes = Arc::clone(&route_table);
         let task_acceptor = acceptor.clone();
         let task_client = backend_client.clone();
         let task_local = local_addr;
+        let task_tracker = conn_tracker.clone();
 
         let handle = tokio::spawn(async move {
             acceptor::accept_loop(
@@ -190,7 +207,9 @@ impl HttpFrontend {
                 task_acceptor,
                 task_routes,
                 task_client,
-                task_cancel,
+                task_accept_cancel,
+                task_conn_cancel,
+                task_tracker,
             )
             .await;
         });
@@ -205,8 +224,10 @@ impl HttpFrontend {
         Ok(Self {
             rule_name: rule.name.clone(),
             local_addr,
-            cancel,
+            accept_cancel,
+            conn_cancel,
             handle,
+            conn_tracker,
         })
     }
 
@@ -219,12 +240,52 @@ impl HttpFrontend {
     }
 
     pub fn cancel(&self) {
-        self.cancel.cancel();
+        self.accept_cancel.cancel();
+        self.conn_cancel.cancel();
     }
 
-    pub async fn stop(self) {
-        self.cancel.cancel();
+    /// Cancel the accept loop and wait for it to exit. With
+    /// `drain_timeout = Some(t)`, additionally wait up to `t` for
+    /// in-flight TLS connections (and the HTTP/1.1 + HTTP/2
+    /// requests served on them) to finish naturally before
+    /// cancelling them. See
+    /// [`crate::proxy::tcp::TcpProxy::stop`] for the matching shape
+    /// on the L4 side.
+    pub async fn stop(self, drain_timeout: Option<Duration>) {
+        self.accept_cancel.cancel();
         let _ = self.handle.await;
+        self.conn_tracker.close();
+        match drain_timeout {
+            Some(t) if !t.is_zero() => {
+                let drained = tokio::time::timeout(t, self.conn_tracker.wait()).await;
+                let remaining = self.conn_tracker.len();
+                match drained {
+                    Ok(()) => {
+                        tracing::debug!(
+                            rule = %self.rule_name,
+                            "HTTPS graceful drain complete: all TLS connections finished naturally"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            rule = %self.rule_name,
+                            timeout_secs = t.as_secs(),
+                            remaining,
+                            "HTTPS graceful drain timeout expired; cancelling surviving TLS connections"
+                        );
+                        self.conn_cancel.cancel();
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            self.conn_tracker.wait(),
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ => {
+                self.conn_cancel.cancel();
+            }
+        }
     }
 }
 

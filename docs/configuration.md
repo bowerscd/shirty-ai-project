@@ -34,6 +34,7 @@ hex is rejected on parse.
 | `default_cert`     | path                   | unset                            | HTTPS only. Wildcard / fallback certificate PEM. Must be set together with `default_key`.       |
 | `default_key`      | path                   | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
 | `http_redirect_port` | optional u16         | unset (`None` → `80`)            | HTTPS only. Port for the per-IP HTTP→HTTPS redirect listener the supervisor auto-spawns. Default `80`. Set to a non-privileged port when running unprivileged (no `CAP_NET_BIND_SERVICE`), or to `0` for an ephemeral kernel-assigned port (useful in containers / dev / bench harnesses). |
+| `graceful_drain_timeout` | optional humantime duration | unset                            | When set, on `SIGTERM` the daemon stops accepting new TCP / HTTPS connections immediately but waits up to this duration for in-flight conversations to finish naturally before cancelling them. UDP is per-datagram and unaffected. systemd users should pair this with a matching `TimeoutStopSec=` in the unit file. Default unset = preserve the historical abrupt-cancel behaviour (in-flight conns die when the runtime drops them). |
 
 Mode is derived from section presence:
 

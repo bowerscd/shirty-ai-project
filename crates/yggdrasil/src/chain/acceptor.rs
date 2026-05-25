@@ -729,6 +729,7 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             None,
             CertConfig::default(),
+            None,
             cancel,
         )
         .await

@@ -41,6 +41,7 @@ async fn make_supervisor_with_enrolled(
         None,
         None,
         CertConfig::default(),
+        None,
         shutdown.clone(),
     )
     .await
