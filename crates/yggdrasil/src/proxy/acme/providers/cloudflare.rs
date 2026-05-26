@@ -11,8 +11,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, CLOUDFLARE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -247,19 +248,27 @@ impl DnsProvider for CloudflareProvider {
         Box::pin(async move {
             // Cloudflare's anycasted authoritative resolvers, queried
             // directly so we bypass any recursive cache's TTL.
-            let cf_ns = NameServerConfigGroup::cloudflare();
-            let cfg = ResolverConfig::from_parts(None, vec![], cf_ns);
-            let opts = ResolverOpts::default();
-            let resolver = Arc::new(TokioAsyncResolver::tokio(cfg, opts));
+            let resolver = TokioResolver::builder_with_config(
+                ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+                TokioRuntimeProvider::default(),
+            )
+            .build()
+            .map_err(|e| AcmeError::Dns {
+                host: fqdn.into(),
+                detail: format!("build Cloudflare DNS resolver: {e}"),
+            })?;
+            let resolver = Arc::new(resolver);
 
             let started = std::time::Instant::now();
             while started.elapsed() < PROPAGATION_DEADLINE {
                 if let Ok(txt) = resolver.txt_lookup(fqdn).await {
-                    for record in txt.iter() {
-                        for chunk in record.txt_data() {
-                            if let Ok(s) = std::str::from_utf8(chunk) {
-                                if s == value {
-                                    return Ok(());
+                    for record in txt.answers() {
+                        if let hickory_resolver::proto::rr::RData::TXT(t) = &record.data {
+                            for chunk in t.txt_data.iter() {
+                                if let Ok(s) = std::str::from_utf8(chunk) {
+                                    if s == value {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }

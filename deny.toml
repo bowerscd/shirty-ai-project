@@ -56,15 +56,6 @@ version = 2
 # upstream.
 yanked = "deny"
 ignore = [
-    # hickory-proto 0.24.x CPU-exhaustion DoS (RUSTSEC-2025-XXXX-ish).
-    # Fix requires upgrading the workspace dep to `hickory-resolver
-    # 0.26+` and reworking the ACME DNS-01 resolver code path against
-    # the major-version API change. Tracked as separate work; the
-    # current daemon's ACME DNS path is unaffected by the DoS in
-    # practice (the resolver only talks to operator-configured upstream
-    # DNS, not arbitrary internet servers), so the operational risk is
-    # low pending the bump.
-    "RUSTSEC-2026-0119",
     # rustls-pemfile is archived upstream and superseded by
     # `rustls-pki-types::PemObject`. Migration is a small refactor
     # touching the cert-loader code. Tracked separately.
