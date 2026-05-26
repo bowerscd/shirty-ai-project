@@ -304,7 +304,7 @@ fn compute_close_matches(
 
 /// Run the TCP probe: connect, write token prefix, then bidirectionally
 /// send timestamped chunks until `duration` elapses, recording
-/// per-direction throughput + latency.
+/// round-trip latency on echoed chunks.
 async fn run_tcp_probe(
     rule_listen: SocketAddr,
     token: &[u8; CANARY_TOKEN_LEN],
@@ -332,16 +332,15 @@ async fn run_tcp_probe(
     const CHUNK_SIZE: usize = 8192;
     let interval = Duration::from_millis(((CHUNK_SIZE as u64 * 1000) / rate_bps.max(1)).max(1));
 
-    let mut hist_c_to_s = Histogram::<u64>::new(3).expect("hdrhistogram::new(3) infallible");
-    let mut hist_s_to_c = Histogram::<u64>::new(3).expect("hdrhistogram::new(3) infallible");
+    let mut hist = Histogram::<u64>::new(3).expect("hdrhistogram::new(3) infallible");
     let mut bytes_sent: u64 = 0;
     let mut bytes_received: u64 = 0;
     let mut next_seq: u64 = 0;
-    // Reuse the same scratch buffers across iterations.
     let mut send_buf = vec![0u8; CHUNK_SIZE];
     let mut recv_buf = vec![0u8; CHUNK_SIZE];
 
-    let deadline = Instant::now() + duration;
+    let probe_started = Instant::now();
+    let deadline = probe_started + duration;
     let mut send_ticker = tokio::time::interval(interval);
     send_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -359,7 +358,6 @@ async fn run_tcp_probe(
                     break;
                 }
                 bytes_sent = bytes_sent.saturating_add(send_buf.len() as u64);
-                hist_c_to_s.record(0).ok();
                 next_seq = next_seq.wrapping_add(1);
             }
             // Read whatever the echo loop sends back. The echo
@@ -379,7 +377,7 @@ async fn run_tcp_probe(
                                 .map(|d| d.as_micros() as u64)
                                 .unwrap_or(0);
                             let rtt = now_micros.saturating_sub(send_micros);
-                            hist_s_to_c.record(rtt).ok();
+                            hist.record(rtt).ok();
                         }
                     }
                     Err(_) => break,
@@ -388,31 +386,58 @@ async fn run_tcp_probe(
         }
     }
 
+    // Brief drain: keep reading echoed bytes for a short window so
+    // chunks in flight at probe-end aren't counted as truncation.
+    let drain_deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut recv_buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                bytes_received = bytes_received.saturating_add(n as u64);
+                if n >= 16 {
+                    let send_micros = u64::from_be_bytes(recv_buf[8..16].try_into().unwrap());
+                    let now_micros = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    let rtt = now_micros.saturating_sub(send_micros);
+                    hist.record(rtt).ok();
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+    let probe_duration = probe_started.elapsed();
+
     let _ = stream.shutdown().await;
 
-    let secs = duration.as_secs_f64().max(0.001);
+    let secs = probe_duration.as_secs_f64().max(0.001);
+    // For TCP the echo preserves bytes, so the "received at the echo
+    // terminus" upper bound is whatever we read back. If the chain
+    // dies mid-probe and bytes_received < bytes_sent, this surfaces
+    // the truncation honestly instead of papering it over.
+    let c_to_s_received = bytes_received.min(bytes_sent);
     Ok(ProbeResults {
         c_to_s: DirectionStats {
             sent: bytes_sent,
-            received: bytes_sent, // TCP is reliable; loss is binary at the connection level
+            received: c_to_s_received,
             throughput_bps: ((bytes_sent as f64 * 8.0) / secs) as u64,
-            latency_p50_micros: hist_s_to_c.value_at_quantile(0.5),
-            latency_p99_micros: hist_s_to_c.value_at_quantile(0.99),
         },
         s_to_c: DirectionStats {
             sent: bytes_received,
             received: bytes_received,
             throughput_bps: ((bytes_received as f64 * 8.0) / secs) as u64,
-            latency_p50_micros: hist_s_to_c.value_at_quantile(0.5),
-            latency_p99_micros: hist_s_to_c.value_at_quantile(0.99),
         },
+        round_trip_p50_micros: hist.value_at_quantile(0.5),
+        round_trip_p99_micros: hist.value_at_quantile(0.99),
+        duration_micros: probe_duration.as_micros() as u64,
         connection_rtt_micros: connect_rtt_micros,
     })
 }
 
 /// Run the UDP probe: bind a local socket, send token-prefixed
 /// timestamped datagrams at the configured rate, read echoes,
-/// record per-direction loss + latency.
+/// record per-flow loss + round-trip latency.
 async fn run_udp_probe(
     rule_listen: SocketAddr,
     token: &[u8; CANARY_TOKEN_LEN],
@@ -448,7 +473,8 @@ async fn run_udp_probe(
     send_buf[..CANARY_TOKEN_LEN].copy_from_slice(token);
     let mut recv_buf = vec![0u8; payload.max(2048)];
 
-    let deadline = Instant::now() + duration;
+    let probe_started = Instant::now();
+    let deadline = probe_started + duration;
     let mut send_ticker = tokio::time::interval(interval);
     send_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -511,23 +537,23 @@ async fn run_udp_probe(
             _ => break,
         }
     }
+    let probe_duration = probe_started.elapsed();
 
-    let secs = duration.as_secs_f64().max(0.001);
+    let secs = probe_duration.as_secs_f64().max(0.001);
     Ok(ProbeResults {
         c_to_s: DirectionStats {
             sent,
             received,
             throughput_bps: ((sent as f64 * payload as f64 * 8.0) / secs) as u64,
-            latency_p50_micros: hist.value_at_quantile(0.5),
-            latency_p99_micros: hist.value_at_quantile(0.99),
         },
         s_to_c: DirectionStats {
             sent: received,
             received,
             throughput_bps: ((received as f64 * payload as f64 * 8.0) / secs) as u64,
-            latency_p50_micros: hist.value_at_quantile(0.5),
-            latency_p99_micros: hist.value_at_quantile(0.99),
         },
+        round_trip_p50_micros: hist.value_at_quantile(0.5),
+        round_trip_p99_micros: hist.value_at_quantile(0.99),
+        duration_micros: probe_duration.as_micros() as u64,
         connection_rtt_micros: None,
     })
 }
@@ -543,9 +569,7 @@ fn classify(p: &ProbeResults, protocol: Protocol) -> CanaryStatus {
             return CanaryStatus::Degraded;
         }
     }
-    if p.s_to_c.latency_p99_micros > DEGRADED_P99_MICROS
-        || p.c_to_s.latency_p99_micros > DEGRADED_P99_MICROS
-    {
+    if p.round_trip_p99_micros > DEGRADED_P99_MICROS {
         return CanaryStatus::Degraded;
     }
     // Probe ran for nominally `duration` seconds; if neither side
@@ -575,16 +599,15 @@ mod tests {
                 sent: 1024,
                 received: 1024,
                 throughput_bps: 8192,
-                latency_p50_micros: 100,
-                latency_p99_micros: 200,
             },
             s_to_c: DirectionStats {
                 sent: 1024,
                 received: 1024,
                 throughput_bps: 8192,
-                latency_p50_micros: 100,
-                latency_p99_micros: 200,
             },
+            round_trip_p50_micros: 100,
+            round_trip_p99_micros: 200,
+            duration_micros: 1_000_000,
             connection_rtt_micros: Some(50),
         };
         assert_eq!(classify(&p, Protocol::Tcp), CanaryStatus::Ok);
@@ -597,16 +620,15 @@ mod tests {
                 sent: 1000,
                 received: 900, // 10% loss
                 throughput_bps: 0,
-                latency_p50_micros: 100,
-                latency_p99_micros: 200,
             },
             s_to_c: DirectionStats {
                 sent: 900,
                 received: 900,
                 throughput_bps: 0,
-                latency_p50_micros: 100,
-                latency_p99_micros: 200,
             },
+            round_trip_p50_micros: 100,
+            round_trip_p99_micros: 200,
+            duration_micros: 1_000_000,
             connection_rtt_micros: None,
         };
         assert_eq!(classify(&p, Protocol::Udp), CanaryStatus::Degraded);
@@ -619,16 +641,15 @@ mod tests {
                 sent: 1000,
                 received: 1000,
                 throughput_bps: 0,
-                latency_p50_micros: 100,
-                latency_p99_micros: 100_000, // 100ms p99
             },
             s_to_c: DirectionStats {
                 sent: 1000,
                 received: 1000,
                 throughput_bps: 0,
-                latency_p50_micros: 100,
-                latency_p99_micros: 100_000,
             },
+            round_trip_p50_micros: 100,
+            round_trip_p99_micros: 100_000, // 100ms p99
+            duration_micros: 1_000_000,
             connection_rtt_micros: None,
         };
         assert_eq!(classify(&p, Protocol::Tcp), CanaryStatus::Degraded);
@@ -641,16 +662,15 @@ mod tests {
                 sent: 0,
                 received: 0,
                 throughput_bps: 0,
-                latency_p50_micros: 0,
-                latency_p99_micros: 0,
             },
             s_to_c: DirectionStats {
                 sent: 0,
                 received: 0,
                 throughput_bps: 0,
-                latency_p50_micros: 0,
-                latency_p99_micros: 0,
             },
+            round_trip_p50_micros: 0,
+            round_trip_p99_micros: 0,
+            duration_micros: 1_000_000,
             connection_rtt_micros: None,
         };
         assert_eq!(classify(&p, Protocol::Tcp), CanaryStatus::Degraded);

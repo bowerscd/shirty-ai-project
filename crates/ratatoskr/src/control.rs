@@ -648,38 +648,47 @@ pub enum CanaryStatus {
 /// originator from observations on its own end of the probe
 /// connection; no per-hop accounting is needed because the data phase
 /// rides the rule's existing L4 forwarding code.
+///
+/// **Latency lives on [`ProbeResults`], not here.** A single
+/// originator-only viewpoint can't separate c→s from s→c latency
+/// without out-of-band time synchronisation, and pretending to do so
+/// in two parallel fields produced misleading output. The round-trip
+/// number on `ProbeResults` is the only honestly measurable quantity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectionStats {
     /// Total bytes (TCP) or datagrams (UDP) emitted by this side
     /// during the probe.
     pub sent: u64,
     /// Total bytes / datagrams received back from the echo. For TCP
-    /// this is equal to `sent` unless the chain broke mid-probe; for
-    /// UDP it reflects per-flow loss.
+    /// `received` is bounded by `min(sent, bytes_read)` so a chain
+    /// that fails mid-probe shows a truthful gap; for UDP it reflects
+    /// per-flow loss measured at the originator.
     pub received: u64,
     /// Sustained throughput in bits per second.
     pub throughput_bps: u64,
-    /// Per-direction latency percentile at p50, in microseconds. For
-    /// TCP this is round-trip; for UDP it's the one-way send → echo →
-    /// receive observed at the originator (i.e. round-trip, same
-    /// semantics for the operator).
-    pub latency_p50_micros: u64,
-    /// Per-direction latency percentile at p99, in microseconds. See
-    /// `latency_p50_micros`.
-    pub latency_p99_micros: u64,
 }
 
 /// Aggregate probe results returned alongside [`CanaryStatus::Ok`]
 /// or [`CanaryStatus::Degraded`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProbeResults {
-    /// Client → server direction (originator's send path through the
-    /// chain, echoed back from the terminal hop's intercept).
+    /// Client → server direction: throughput + bytes/datagrams sent
+    /// and (best-effort) received at the echo terminus.
     pub c_to_s: DirectionStats,
-    /// Server → client direction (terminal's echo path back to the
-    /// originator). For symmetric probes the numbers should mirror
-    /// `c_to_s`; asymmetry is real diagnostic signal.
+    /// Server → client direction: throughput + bytes/datagrams echoed
+    /// from the terminal and received at the originator.
     pub s_to_c: DirectionStats,
+    /// Round-trip latency p50 in microseconds, measured at the
+    /// originator as `recv_time - send_time` for echoed chunks /
+    /// datagrams. This is the only honestly per-end-only-observable
+    /// latency value.
+    pub round_trip_p50_micros: u64,
+    /// Round-trip latency p99 in microseconds. See `round_trip_p50_micros`.
+    pub round_trip_p99_micros: u64,
+    /// Actual wall-clock probe duration in microseconds. Set by the
+    /// daemon to the elapsed time spent in the probe send/recv loop;
+    /// renderers use this when reporting "probe: duration X ms".
+    pub duration_micros: u64,
     /// Connection-establishment RTT in microseconds, TCP only. `None`
     /// for UDP and for chains that didn't get past the arm phase.
     pub connection_rtt_micros: Option<u64>,

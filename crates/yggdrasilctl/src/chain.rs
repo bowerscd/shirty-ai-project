@@ -1295,20 +1295,15 @@ fn print_chain_header(c: &ChainCanaryResponse, proto_str: &str, listen: std::net
 }
 
 fn render_probe_table(p: &ProbeResultsAlias, proto: Protocol) {
-    let is_tcp = matches!(proto, Protocol::Tcp);
-    if is_tcp {
-        println!(
-            "probe:  duration {} ms, TCP byte-stream",
-            p.c_to_s.throughput_bps / 8 / 1024,
-        );
-    } else {
-        println!("probe:  duration {} ms, UDP datagrams", 0);
-    }
+    let proto_str = match proto {
+        Protocol::Tcp => "TCP byte-stream",
+        Protocol::Udp => "UDP datagrams",
+        Protocol::Https => "HTTPS",
+    };
+    let duration_ms = p.duration_micros / 1_000;
+    println!("probe:  duration {duration_ms} ms, {proto_str}");
     println!();
-    println!(
-        "{:<18}  {:>12}  {:>10}  {:>12}  {:>12}",
-        "direction", "throughput", "loss", "p50 latency", "p99 latency",
-    );
+    println!("{:<18}  {:>12}  {:>10}", "direction", "throughput", "loss",);
     let rows = [
         ("client → server", &p.c_to_s),
         ("server → client", &p.s_to_c),
@@ -1320,17 +1315,14 @@ fn render_probe_table(p: &ProbeResultsAlias, proto: Protocol) {
             1.0 - (d.received as f64 / d.sent as f64).min(1.0)
         };
         let mbps = (d.throughput_bps as f64) / 1_000_000.0;
-        println!(
-            "{:<18}  {:>10.2} Mbps  {:>7.2} %  {:>9} µs  {:>9} µs",
-            name,
-            mbps,
-            loss * 100.0,
-            d.latency_p50_micros,
-            d.latency_p99_micros,
-        );
+        println!("{:<18}  {:>10.2} Mbps  {:>7.2} %", name, mbps, loss * 100.0,);
     }
+    println!();
+    println!(
+        "round-trip latency  p50 {} µs   p99 {} µs",
+        p.round_trip_p50_micros, p.round_trip_p99_micros,
+    );
     if let Some(rtt) = p.connection_rtt_micros {
-        println!();
         println!("connection establish: {rtt} µs");
     }
 }
