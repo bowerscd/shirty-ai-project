@@ -340,6 +340,28 @@ pub struct StatusResponse {
     /// with older `yggdrasilctl`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nat: Option<NatStatus>,
+    /// Resolved `lan_cidrs` set, in CIDR-string form, used by the
+    /// per-IP companion listener to gate cert-less route serving on
+    /// `:80`. Empty when the daemon has no HTTPS rules loaded (the
+    /// resolved set still has a value, but the operator-facing
+    /// renderer suppresses the block when [`Self::certless_route_count`]
+    /// is zero — same pattern as the existing cert summary). Older
+    /// `yggdrasilctl` builds default this to an empty Vec via
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub lan_cidrs: Vec<String>,
+    /// Source of [`Self::lan_cidrs`]: `"default"` (no operator
+    /// override, hard-coded set in use) or `"override"` (operator set
+    /// `[server].lan_cidrs`).
+    #[serde(default)]
+    pub lan_cidrs_source: String,
+    /// Count of routes currently served via the per-IP companion
+    /// listener's plaintext path (no cert source resolved). The
+    /// `yggdrasilctl local status` renderer prints the `lan_cidrs`
+    /// block only when this is non-zero, matching the cert-summary
+    /// "only when applicable" pattern.
+    #[serde(default)]
+    pub certless_route_count: usize,
 }
 
 /// NAT-traversal subsystem state surfaced under
@@ -845,6 +867,9 @@ mod tests {
             default_cert_loaded_age_secs: None,
             ephemeral_cert_count: 0,
             nat: None,
+            lan_cidrs: vec![],
+            lan_cidrs_source: String::new(),
+            certless_route_count: 0,
         });
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
@@ -903,6 +928,9 @@ mod tests {
             default_cert_loaded_age_secs: None,
             ephemeral_cert_count: 0,
             nat: None,
+            lan_cidrs: vec![],
+            lan_cidrs_source: String::new(),
+            certless_route_count: 0,
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"mode\":\"terminal\""), "got: {s}");
@@ -950,6 +978,9 @@ mod tests {
                     },
                 ],
             }),
+            lan_cidrs: vec![],
+            lan_cidrs_source: String::new(),
+            certless_route_count: 0,
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"nat\""), "nat field should be present: {s}");
@@ -975,6 +1006,9 @@ mod tests {
             default_cert_loaded_age_secs: None,
             ephemeral_cert_count: 0,
             nat: None,
+            lan_cidrs: vec![],
+            lan_cidrs_source: String::new(),
+            certless_route_count: 0,
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(!s.contains("\"nat\""), "nat must be omitted when None: {s}");

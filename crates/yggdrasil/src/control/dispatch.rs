@@ -69,6 +69,15 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                     _ => {}
                 }
             }
+            // Cert-less route count: sum each HTTPS rule's
+            // contribution recorded in ProxySnapshot. Set by the
+            // supervisor's reconcile step (cert-less routes are
+            // never inserted into the cert store; their count is
+            // tracked directly on ActiveProxy / ProxySnapshot).
+            let mut certless_route_count: usize = 0;
+            for snap in state.snapshot_rx.borrow().iter() {
+                certless_route_count += snap.cert_less_route_count;
+            }
             Response::Status(StatusResponse {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 mode: state.mode,
@@ -81,6 +90,9 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                 default_cert_loaded_age_secs,
                 ephemeral_cert_count,
                 nat: state.nat.as_ref().map(project_nat_status),
+                lan_cidrs: state.lan_cidrs.as_strings(),
+                lan_cidrs_source: state.lan_cidrs.source().as_str().to_string(),
+                certless_route_count,
             })
         }
         Request::RulesList => {

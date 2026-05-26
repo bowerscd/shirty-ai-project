@@ -101,6 +101,7 @@ async fn bind_relay_control(
         None,
         None,
         std::sync::Arc::new(crate::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(crate::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs")),
         shutdown,
     )
     .await
@@ -566,6 +567,7 @@ async fn derived_rules_endpoint_returns_snapshot_when_introspection_wired() {
         None,
         None,
         std::sync::Arc::new(crate::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(crate::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs")),
         shutdown.clone(),
     )
     .await

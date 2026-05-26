@@ -178,6 +178,23 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                     println!("  last error:  {err}");
                 }
             }
+            // Cert-less route + lan_cidrs block: present only when
+            // the daemon has at least one cert-less route loaded.
+            // Older daemons that don't know about the feature
+            // serialise `certless_route_count` as 0 (#[serde(default)])
+            // → block elided.
+            if s.certless_route_count > 0 {
+                println!("cert-less routes: {}", s.certless_route_count);
+                let label = if s.lan_cidrs_source == "override" {
+                    "override"
+                } else {
+                    "default"
+                };
+                println!("lan_cidrs ({label}):");
+                for cidr in &s.lan_cidrs {
+                    println!("  {cidr}");
+                }
+            }
         }
         Response::Rules(b) => {
             if b.rules.is_empty() {

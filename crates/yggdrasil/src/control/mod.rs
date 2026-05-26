@@ -133,6 +133,11 @@ pub(in crate::control) struct ControlState {
     /// it on completion. Always present on daemons that ran through
     /// `run_relay` / `run_terminal`.
     pub(in crate::control) canary_arm_table: Arc<crate::proxy::canary::CanaryArmTable>,
+    /// Resolved `[server].lan_cidrs` snapshot. Surfaced verbatim in
+    /// [`ratatoskr::control::StatusResponse::lan_cidrs`] +
+    /// [`ratatoskr::control::StatusResponse::lan_cidrs_source`] so
+    /// `yggdrasilctl local status` can render the resolved set.
+    pub(in crate::control) lan_cidrs: Arc<crate::lan_cidrs::LanCidrs>,
 }
 
 impl ControlServer {
@@ -174,6 +179,7 @@ impl ControlServer {
         acme: Option<crate::proxy::acme::AcmeManager>,
         nat: Option<crate::nat::NatMapperHandle>,
         canary_arm_table: Arc<crate::proxy::canary::CanaryArmTable>,
+        lan_cidrs: Arc<crate::lan_cidrs::LanCidrs>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -224,6 +230,7 @@ impl ControlServer {
             acme,
             nat,
             canary_arm_table,
+            lan_cidrs,
         });
 
         let main_cancel = cancel.clone();
