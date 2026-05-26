@@ -1162,6 +1162,91 @@ fn https_rule_rejects_key_without_cert() {
 }
 
 #[test]
+fn https_rule_accepts_cert_less_route() {
+    // No cert source → cert-less route. Permitted at the schema layer
+    // (the supervisor partitions it to the :80 companion listener).
+    let r = parse_one(
+        r#"
+            [[rule]]
+            name = "h"
+            listen = "0.0.0.0:443"
+            protocol = "https"
+
+              [[rule.route]]
+              hostname = "subnautica.janus.local"
+              target = "http://192.168.156.7:8080"
+
+              [[rule.route]]
+              hostname = "app.localhost"
+              target = "http://127.0.0.1:8080"
+              cert = "ephemeral"
+            "#,
+    )
+    .unwrap();
+    let routes = r.routes.as_ref().expect("routes present");
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0].hostname, "subnautica.janus.local");
+    assert_eq!(routes[0].cert, None, "first route is cert-less");
+    assert_eq!(routes[0].key, None);
+    assert_eq!(routes[0].hsts, None);
+    assert_eq!(routes[1].cert, Some(CertSource::Ephemeral));
+    r.validate()
+        .expect("mixed cert'd + cert-less rule is schema-valid");
+}
+
+#[test]
+fn https_rule_rejects_hsts_on_cert_less_route() {
+    // HSTS over plain HTTP is undefined per RFC 6797 §8.1; a cert-less
+    // route serves only on :80, so setting `hsts` would be a silent
+    // operator error. Reject explicitly.
+    let err = parse_one(
+        r#"
+            [[rule]]
+            name = "h"
+            listen = "0.0.0.0:443"
+            protocol = "https"
+
+              [[rule.route]]
+              hostname = "subnautica.janus.local"
+              target = "http://192.168.156.7:8080"
+              hsts = true
+            "#,
+    )
+    .unwrap()
+    .validate()
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidRule(s) if s.contains("`hsts` requires a cert source")),
+        "expected hsts-on-cert-less rejection"
+    );
+}
+
+#[test]
+fn https_rule_rejects_hsts_table_on_cert_less_route() {
+    // Same constraint, table form of hsts.
+    let err = parse_one(
+        r#"
+            [[rule]]
+            name = "h"
+            listen = "0.0.0.0:443"
+            protocol = "https"
+
+              [[rule.route]]
+              hostname = "internal.janus.local"
+              target = "http://192.168.156.10:80"
+              hsts = { max_age = 15552000, include_subdomains = true }
+            "#,
+    )
+    .unwrap()
+    .validate()
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidRule(s) if s.contains("`hsts` requires a cert source")),
+        "expected hsts-on-cert-less rejection (table form)"
+    );
+}
+
+#[test]
 fn https_rule_ephemeral_allows_localhost_pattern_hostnames() {
     for host in [
         "localhost",

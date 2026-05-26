@@ -19,6 +19,10 @@ use super::http_route::HttpRoute;
 /// * `cert = Ephemeral` restricts `hostname` to local-only patterns
 ///   (`localhost`, `*.localhost`, `*.local`).
 /// * `key` set without a `Path` `cert` is rejected.
+/// * `cert = None` (cert-less route) is permitted. Cert-less routes live
+///   only on the per-IP companion listener's plaintext `:80` path; the
+///   HTTPS frontend skips them at SNI resolution. `hsts` on a cert-less
+///   route is rejected (HSTS over plain HTTP is undefined per RFC 6797).
 pub(super) fn validate_http_route(rule_name: &str, route: &HttpRoute) -> Result<()> {
     if route.hostname.is_empty() {
         return Err(Error::InvalidRule(format!(
@@ -86,6 +90,20 @@ pub(super) fn validate_http_route(rule_name: &str, route: &HttpRoute) -> Result<
             )));
         }
         _ => {}
+    }
+
+    // HSTS on a cert-less route makes no sense — the only path that
+    // serves the route is plain HTTP on :80, and Strict-Transport-Security
+    // over HTTP is undefined (browsers ignore the header from non-secure
+    // origins per the HSTS RFC). Reject explicitly so operators don't
+    // silently lose the header they thought they were setting.
+    if route.cert.is_none() && route.hsts.is_some() {
+        return Err(Error::InvalidRule(format!(
+            "rule {:?}: route {:?}: `hsts` requires a cert source — \
+             cert-less routes are served as plain HTTP on :80, where HSTS \
+             headers are undefined / ignored by browsers",
+            rule_name, route.hostname
+        )));
     }
 
     if matches!(route.cert, Some(CertSource::Ephemeral)) && !is_local_only_hostname(&route.hostname)

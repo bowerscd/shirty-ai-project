@@ -31,6 +31,12 @@ pub struct HttpRoute {
     /// 3. Convention dir `{rule.cert_dir | server.cert_dir}/{hostname}/`
     ///    containing `fullchain.pem` + `privkey.pem`.
     /// 4. Global `[server].default_cert` / `default_key`.
+    /// 5. `None` ⇒ **cert-less route** — the hostname is never bound to
+    ///    the `:443` SNI table and is served only on the per-IP
+    ///    companion listener's plaintext `:80` path, restricted to peers
+    ///    in `lan_cidrs` (see the daemon's `LanCidrs` resolution). The
+    ///    operator-visible signal is a load-time `WARN` naming the
+    ///    cert-less hostname.
     ///
     /// See the per-rule schema (`Rule::validate`) and `CertStore` (in the
     /// `yggdrasil` crate) for the actual lookup loop. This proto-level
