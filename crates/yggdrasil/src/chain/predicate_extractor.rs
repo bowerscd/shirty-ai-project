@@ -340,4 +340,39 @@ mod tests {
             skipped_https: Vec::new(),
         }
     }
+
+    /// Regression: a mixed cert'd + cert-less HTTPS rule emits exactly
+    /// one HTTPS predicate whose shape is identical to the cert'd-only
+    /// equivalent. Confirms that cert-less routes are *already* invisible
+    /// to predicate emission (the extractor walks rules, not routes;
+    /// HTTPS routes / cert directories are stripped per the module-level
+    /// docs).
+    #[test]
+    fn mixed_cert_and_cert_less_routes_emit_one_predicate() {
+        // Cert'd-only baseline.
+        let baseline = https_rule("web", 443, None);
+        let baseline_out = extract_via_unsorted_rules(vec![baseline.clone()], origin(), 1);
+        assert_eq!(baseline_out.set.predicates.len(), 1);
+        let baseline_pred = baseline_out.set.predicates[0].clone();
+
+        // Mixed: add a cert-less route to the same rule.
+        let mut mixed = baseline;
+        let mut routes = mixed.routes.unwrap();
+        routes[0].cert = Some(ratatoskr::rule::CertSource::Ephemeral);
+        routes.push(HttpRoute {
+            hostname: "internal.janus.local".to_string(),
+            target: Url::parse("http://192.168.156.7:8080").unwrap(),
+            cert: None, // cert-less route
+            key: None,
+            hsts: None,
+        });
+        mixed.routes = Some(routes);
+
+        let mixed_out = extract_via_unsorted_rules(vec![mixed], origin(), 1);
+        assert_eq!(mixed_out.set.predicates.len(), 1);
+        let mixed_pred = &mixed_out.set.predicates[0];
+
+        // Mixed predicate is byte-identical to the cert'd-only baseline.
+        assert_eq!(mixed_pred, &baseline_pred);
+    }
 }
