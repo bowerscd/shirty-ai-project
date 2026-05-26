@@ -173,6 +173,23 @@ pub struct ServerSection {
     /// facing behaviour matrix and CGNAT caveat.
     #[serde(default)]
     pub nat_traversal: crate::nat::NatTraversalMode,
+    /// Override the default "private peer" CIDR set used by the per-IP
+    /// companion listener to gate cert-less HTTPS route serving on
+    /// `:80`. When `None` (the default), the hard-coded set in
+    /// [`crate::lan_cidrs::DEFAULT_LAN_CIDR_STRINGS`] is used —
+    /// loopback + RFC 1918 + RFC 4193, which on a typical home network
+    /// is exactly the set of peers an operator wants to call "LAN".
+    /// When `Some(list)`, the operator's list **replaces** the default
+    /// entirely. `Some([])` means "no peer is local" — cert-less route
+    /// serving is effectively disabled. Each entry must parse as a
+    /// CIDR (e.g. `"192.168.1.0/24"`, `"::1/128"`); malformed entries
+    /// are rejected at config-load time.
+    ///
+    /// This field only takes effect when at least one HTTPS rule has a
+    /// cert-less route loaded — on daemons without any cert-less
+    /// routes, the value is parsed and validated but never consulted.
+    #[serde(default)]
+    pub lan_cidrs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +523,19 @@ impl ServerConfig {
                 ));
             }
             _ => {}
+        }
+
+        // ---- [server].lan_cidrs parse check ----
+        // Only validate the strings here; resolution into the runtime
+        // `LanCidrs` snapshot happens in the supervisor at rule-load
+        // time. We pre-check syntax so a malformed entry fails fast at
+        // config load rather than at first cert-less request.
+        if let Some(list) = &self.server.lan_cidrs {
+            for s in list {
+                if let Err(e) = crate::lan_cidrs::IpCidr::parse(s) {
+                    return Err(ConfigError::Invalid(format!("[server].lan_cidrs: {}", e)));
+                }
+            }
         }
 
         // ---- [acme] sanity ----
@@ -1046,6 +1076,102 @@ mod tests {
         .unwrap();
         assert!(matches!(err, ConfigError::Invalid(s)
                 if s.contains("default_key is set but server.default_cert is not")));
+    }
+
+    // ---- [server].lan_cidrs ----
+
+    #[test]
+    fn lan_cidrs_absent_parses_as_none() {
+        let cfg = parse(
+            r#"
+            [server]
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.server.lan_cidrs.is_none());
+    }
+
+    #[test]
+    fn lan_cidrs_parses_v4_and_v6_mixed() {
+        let cfg = parse(
+            r#"
+            [server]
+            lan_cidrs = ["192.168.1.0/24", "fc00::/7"]
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        let list = cfg.server.lan_cidrs.as_ref().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], "192.168.1.0/24");
+        assert_eq!(list[1], "fc00::/7");
+    }
+
+    #[test]
+    fn lan_cidrs_empty_array_parses() {
+        // [] is the "no peer is local" opt-out, distinct from absent.
+        let cfg = parse(
+            r#"
+            [server]
+            lan_cidrs = []
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        let list = cfg.server.lan_cidrs.as_ref().unwrap();
+        assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn lan_cidrs_malformed_entry_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            lan_cidrs = ["not-a-cidr"]
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(&err, ConfigError::Invalid(s) if s.contains("lan_cidrs")),
+            "expected lan_cidrs parse error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn lan_cidrs_oversized_prefix_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            lan_cidrs = ["10.0.0.0/40"]
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(&err, ConfigError::Invalid(s) if s.contains("lan_cidrs")),
+            "expected lan_cidrs prefix-too-large error, got {:?}",
+            err
+        );
     }
 
     // ---- [dial] ----

@@ -20,6 +20,7 @@ pub mod config;
 pub mod control;
 pub mod health;
 pub mod heartbeat;
+pub mod lan_cidrs;
 pub mod log;
 pub mod metrics;
 pub mod nat;
