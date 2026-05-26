@@ -188,7 +188,9 @@ itself. Full details in [docs/security.md](docs/security.md).
 ## Status
 
 The control protocol, configuration formats, and CLI surface are stable
-enough to deploy in low-stakes self-hosted setups.
+enough to deploy in low-stakes self-hosted setups. New contributors should
+start with [docs/development.md](docs/development.md); contribution
+mechanics live in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

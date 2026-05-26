@@ -19,7 +19,7 @@ rules watcher relies on `inotify`.
 ## Building from source
 
 ```bash
-git clone <repo-url> yggdrasil
+git clone https://github.com/bowerscd/yggdrasil
 cd yggdrasil
 cargo build --release --workspace
 ```
