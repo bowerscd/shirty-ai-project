@@ -1168,3 +1168,242 @@ async fn leaf_fingerprint(frontend_addr: SocketAddr, sni: &str) -> [u8; 32] {
     fp.copy_from_slice(&out);
     fp
 }
+
+// =============================================================================
+// Cert-less HTTPS routes (the per-IP companion listener's plaintext path)
+// =============================================================================
+//
+// These tests cover the four-step pipeline on `:80`:
+//   1. ACME passthrough (regardless of source IP) — already covered by
+//      existing tests in this file under different fixtures.
+//   2. Cert-less route serving to LAN peers — covered by
+//      `cert_less_route_served_to_loopback_peer`.
+//   3. Cert'd-host 301 redirect (regardless of source IP) — covered by
+//      `cert_d_host_still_redirects_when_companion_has_plaintext_routes`.
+//   4. 404 for unknown host — covered by
+//      `unknown_host_yields_404_on_companion`.
+//
+// The tests connect to `127.0.0.1:redirect_port`. Since `127.0.0.1` falls
+// inside the default `lan_cidrs` set (the loopback range), the cert-less
+// branch is reached. Testing the "non-LAN peer denied" path from
+// integration tests would require spoofing the source IP, which the test
+// runner can't do without root + netns. That branch is covered by the
+// `LanCidrs::contains` unit tests + the manual call site review.
+
+fn write_https_rule_with_cert_less_route(
+    rules_dir: &Path,
+    rule_name: &str,
+    listen: SocketAddr,
+    cert_d_host: &str,
+    cert_d_target: &str,
+    cert_less_host: &str,
+    cert_less_target: &str,
+) {
+    let toml = format!(
+        r#"
+[[rule]]
+name = "{rule_name}"
+protocol = "https"
+listen = "{listen}"
+
+[[rule.route]]
+hostname = "{cert_d_host}"
+target = "{cert_d_target}"
+cert = "ephemeral"
+
+[[rule.route]]
+hostname = "{cert_less_host}"
+target = "{cert_less_target}"
+# No cert source — this route is served on :80 plaintext only.
+"#,
+    );
+    std::fs::write(rules_dir.join("https.toml"), toml).unwrap();
+}
+
+struct CertLessFixture {
+    frontend_addr: SocketAddr,
+    redirect_port: u16,
+    cert_d: EchoBackend,
+    cert_less: EchoBackend,
+    cert_d_host: String,
+    cert_less_host: String,
+    shutdown: CancellationToken,
+    _supervisor: yggdrasil::proxy::supervisor::ProxySupervisor,
+    _tmpdir: tempfile::TempDir,
+}
+
+impl CertLessFixture {
+    async fn spawn() -> Self {
+        init_tracing();
+        let suffix: u32 = rand::random();
+        let cert_d_host = format!("secure{suffix}.localhost");
+        let cert_less_host = format!("plain{suffix}.internal");
+
+        let cert_d = EchoBackend::spawn("cert_d").await;
+        let cert_less = EchoBackend::spawn("cert_less").await;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let rules_dir = tmpdir.path().join("rules");
+        let cert_dir = tmpdir.path().join("certs");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::create_dir_all(&cert_dir).unwrap();
+
+        let frontend_port = pick_free_tcp_port().await;
+        let redirect_port = pick_free_tcp_port().await;
+        let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
+
+        write_https_rule_with_cert_less_route(
+            &rules_dir,
+            "front",
+            frontend_addr,
+            &cert_d_host,
+            &cert_d.upstream_url(),
+            &cert_less_host,
+            &cert_less.upstream_url(),
+        );
+
+        let shutdown = CancellationToken::new();
+        let cert_config = CertConfig {
+            cert_dir,
+            default_cert: None,
+            default_key: None,
+            redirect_port: Some(redirect_port),
+            acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
+        };
+        let supervisor = spawn_terminal_supervisor_with_certs(
+            rules_dir,
+            Duration::from_millis(50),
+            cert_config,
+            shutdown.clone(),
+        )
+        .await;
+        assert!(
+            supervisor.wait_for_nonempty(Duration::from_secs(2)).await,
+            "supervisor never spawned its HTTPS proxy"
+        );
+
+        Self {
+            frontend_addr,
+            redirect_port,
+            cert_d,
+            cert_less,
+            cert_d_host,
+            cert_less_host,
+            shutdown,
+            _supervisor: supervisor,
+            _tmpdir: tmpdir,
+        }
+    }
+
+    async fn stop(self) {
+        self.shutdown.cancel();
+        // EchoBackend tasks are leaked by design — they exit when the
+        // shutdown signal cascades through.
+        let _ = self.cert_d;
+        let _ = self.cert_less;
+    }
+}
+
+/// Drive a single plain-HTTP GET request to `:redirect_port` with a given
+/// `Host` header and return the parsed status code + response headers as
+/// raw bytes. Avoids hyper's client to keep the test independent of the
+/// proxy under test.
+async fn raw_http_get(redirect_port: u16, host: &str, path: &str) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{redirect_port}"))
+        .await
+        .expect("connect to companion listener");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write request");
+    let mut buf = Vec::new();
+    let read_fut = stream.read_to_end(&mut buf);
+    tokio::time::timeout(Duration::from_secs(5), read_fut)
+        .await
+        .expect("read response within 5s")
+        .expect("read response");
+    // Status line: "HTTP/1.1 200 OK\r\n"
+    let status_line_end = buf
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .expect("response has a status line");
+    let status_line = std::str::from_utf8(&buf[..status_line_end]).expect("status line is utf8");
+    let mut parts = status_line.split(' ');
+    parts.next(); // HTTP/1.1
+    let code: u16 = parts
+        .next()
+        .expect("status line has a code")
+        .parse()
+        .expect("status code is an integer");
+    (code, buf)
+}
+
+#[tokio::test]
+async fn cert_less_route_served_to_loopback_peer() {
+    let fx = CertLessFixture::spawn().await;
+    // 127.0.0.1 is in default lan_cidrs (loopback range) → cert-less
+    // path is taken → backend serves a 200.
+    let (code, body) = raw_http_get(fx.redirect_port, &fx.cert_less_host, "/").await;
+    assert_eq!(
+        code,
+        200,
+        "cert-less route should serve 200 to loopback peer; body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    // The echo backend echoes its handler label "cert_less" somewhere
+    // in the body — verify the request actually reached it.
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("cert_less"),
+        "expected cert_less backend marker in body; got: {body_str}"
+    );
+    // Also verify X-Forwarded-Proto = "http" was injected (the cert-less
+    // path is plaintext, not TLS).
+    let captured = fx.cert_less.requests.lock().await;
+    let req = captured.first().expect("backend captured a request");
+    let xfp = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-proto"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        xfp, "http",
+        "cert-less path must inject x-forwarded-proto=http, got: {xfp:?}"
+    );
+    drop(captured);
+    fx.stop().await;
+}
+
+#[tokio::test]
+async fn cert_d_host_still_redirects_when_companion_has_plaintext_routes() {
+    let fx = CertLessFixture::spawn().await;
+    // GET on :80 for the cert'd host → 301 to https://...
+    let (code, body) = raw_http_get(fx.redirect_port, &fx.cert_d_host, "/some/path").await;
+    assert_eq!(
+        code,
+        301,
+        "cert'd host on :80 should redirect; body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let body_str = String::from_utf8_lossy(&body);
+    let expected_location = format!("https://{}/some/path", fx.cert_d_host);
+    assert!(
+        body_str.contains(&expected_location),
+        "expected Location: {expected_location}, got body: {body_str}"
+    );
+    let _ = fx.frontend_addr; // suppress unused-field warning if any
+    fx.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_host_yields_404_on_companion() {
+    let fx = CertLessFixture::spawn().await;
+    let (code, _body) = raw_http_get(fx.redirect_port, "unknown.local", "/").await;
+    assert_eq!(code, 404, "unknown host should 404");
+    fx.stop().await;
+}

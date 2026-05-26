@@ -83,6 +83,7 @@ async fn bind_control(
         None,
         None,
         arm_table,
+        Arc::new(yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs")),
         shutdown,
     )
     .await

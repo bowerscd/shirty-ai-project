@@ -394,6 +394,9 @@ async fn terminal_control_status_response_shape() {
         None,
         None,
         std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(
+            yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+        ),
         shutdown.clone(),
     )
     .await
@@ -451,6 +454,9 @@ async fn terminal_control_peer_commands_are_rejected() {
         None,
         None,
         std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(
+            yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+        ),
         shutdown.clone(),
     )
     .await

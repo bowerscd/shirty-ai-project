@@ -95,6 +95,9 @@ async fn terminal_chain_apply_enqueues_and_reports() {
         None,
         None,
         std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(
+            yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+        ),
         shutdown.clone(),
     )
     .await
@@ -193,6 +196,9 @@ async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
         None,
         None,
         std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(
+            yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+        ),
         shutdown.clone(),
     )
     .await
@@ -249,6 +255,9 @@ async fn terminal_chain_apply_rejects_duplicate_names() {
         None,
         None,
         std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(
+            yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+        ),
         shutdown.clone(),
     )
     .await
@@ -323,6 +332,9 @@ async fn terminal_chain_apply_rejects_oversize_predicate_set() {
         None,
         None,
         std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(
+            yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+        ),
         shutdown.clone(),
     )
     .await
