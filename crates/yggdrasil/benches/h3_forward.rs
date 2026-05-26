@@ -54,7 +54,12 @@ fn bench_strip_and_inject(c: &mut Criterion) {
             let mut h = synth_request_headers();
             forward::strip_untrusted_forwarding(black_box(&mut h));
             forward::strip_hop_by_hop(black_box(&mut h));
-            forward::inject_forwarded(black_box(&mut h), client_ip, Some("api.example.com"));
+            forward::inject_forwarded(
+                black_box(&mut h),
+                client_ip,
+                Some("api.example.com"),
+                "https",
+            );
             black_box(&h);
         });
     });
@@ -78,6 +83,7 @@ fn bench_request_rewrite(c: &mut Criterion) {
                 black_box(&mut parts.headers),
                 client_ip,
                 Some(black_box("api.example.com")),
+                "https",
             );
             parts.uri = outbound_uri;
             parts.version = Version::HTTP_11;

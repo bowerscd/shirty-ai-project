@@ -153,12 +153,13 @@ async fn handle_tcp_connection(
         .unwrap_or(false);
 
     let conn_ctx = Arc::new(ConnContext {
-        rule,
+        rule: Some(rule),
         rule_name: rule_name.clone(),
         client_addr,
         local_addr,
         routes: Arc::clone(&routes),
         client: client.clone(),
+        tls: true,
     });
 
     let service = service_fn(move |req: hyper::Request<Incoming>| {

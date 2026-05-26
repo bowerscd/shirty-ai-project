@@ -75,19 +75,25 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// Inject `X-Forwarded-For` + `X-Real-IP` + `X-Forwarded-Proto` +
-/// `X-Forwarded-Host` for an HTTPS request. `client_ip` is the original
-/// client's IP (from PROXY-protocol header on TCP, or the immediate-peer
-/// IP for HTTP/3 until PROXY-over-UDP lands). `host` is the inbound
-/// `Host` header value.
-pub fn inject_forwarded(headers: &mut HeaderMap, client_ip: IpAddr, host: Option<&str>) {
+/// `X-Forwarded-Host` for a forwarded request. `client_ip` is the
+/// original client's IP (from PROXY-protocol header on TCP, or the
+/// immediate-peer IP for HTTP/3 until PROXY-over-UDP lands). `host` is
+/// the inbound `Host` header value. `scheme` is the client-facing
+/// scheme as seen on the wire — `"https"` for the TLS / QUIC frontend,
+/// `"http"` for the companion listener's plaintext path on `:80`.
+pub fn inject_forwarded(
+    headers: &mut HeaderMap,
+    client_ip: IpAddr,
+    host: Option<&str>,
+    scheme: &str,
+) {
     if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
         headers.insert(HeaderName::from_static("x-forwarded-for"), v.clone());
         headers.insert(HeaderName::from_static("x-real-ip"), v);
     }
-    headers.insert(
-        HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static("https"),
-    );
+    if let Ok(v) = HeaderValue::from_str(scheme) {
+        headers.insert(HeaderName::from_static("x-forwarded-proto"), v);
+    }
     if let Some(h) = host {
         if let Ok(v) = HeaderValue::from_str(h) {
             headers.insert(HeaderName::from_static("x-forwarded-host"), v);
@@ -202,7 +208,7 @@ mod tests {
         let mut h = HeaderMap::new();
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
 
-        inject_forwarded(&mut h, ip, Some("api.example.com"));
+        inject_forwarded(&mut h, ip, Some("api.example.com"), "https");
 
         assert_eq!(h.get("x-forwarded-for").unwrap(), "203.0.113.7");
         assert_eq!(h.get("x-real-ip").unwrap(), "203.0.113.7");
@@ -215,12 +221,29 @@ mod tests {
         let mut h = HeaderMap::new();
         let ip: IpAddr = "2001:db8::1".parse().unwrap();
 
-        inject_forwarded(&mut h, ip, Some("api.example.com"));
+        inject_forwarded(&mut h, ip, Some("api.example.com"), "https");
 
         assert_eq!(h.get("x-forwarded-for").unwrap(), "2001:db8::1");
         assert_eq!(h.get("x-real-ip").unwrap(), "2001:db8::1");
         assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
         assert_eq!(h.get("x-forwarded-host").unwrap(), "api.example.com");
+    }
+
+    #[test]
+    fn inject_forwarded_uses_http_scheme_for_plaintext_path() {
+        let mut h = HeaderMap::new();
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+
+        inject_forwarded(&mut h, ip, Some("jellyfin.janus.local"), "http");
+
+        assert_eq!(h.get("x-forwarded-for").unwrap(), "192.168.1.100");
+        assert_eq!(h.get("x-real-ip").unwrap(), "192.168.1.100");
+        assert_eq!(
+            h.get("x-forwarded-proto").unwrap(),
+            "http",
+            "companion listener must inject http, not https"
+        );
+        assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.janus.local");
     }
 
     #[test]

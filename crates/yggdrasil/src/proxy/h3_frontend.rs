@@ -74,7 +74,7 @@ pub struct H3Frontend {
 
 impl H3Frontend {
     pub async fn spawn(rule: Rule, cert_store: Arc<CertStore>) -> Result<Self> {
-        let routes = rule
+        let all_routes = rule
             .routes
             .as_ref()
             .filter(|r| !r.is_empty())
@@ -84,7 +84,24 @@ impl H3Frontend {
                     rule.name,
                 )
             })?;
-        let route_table = Arc::new(RouteTable::build(routes));
+
+        // Cert-less routes don't enter the QUIC SNI table (HTTP/3
+        // requires TLS, so a cert-less hostname has nothing to serve
+        // here). Matches the filter applied by HttpFrontend::spawn.
+        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = all_routes
+            .iter()
+            .filter(|r| r.cert.is_some() || cert_store.contains(&r.hostname))
+            .cloned()
+            .collect();
+
+        if cert_d_routes.is_empty() {
+            anyhow::bail!(
+                "HTTPS rule {:?}: every route is cert-less; nothing to serve on HTTP/3",
+                rule.name
+            );
+        }
+
+        let route_table = Arc::new(RouteTable::build(&cert_d_routes, &rule.name));
 
         let rustls_arc = build_rustls_server_config(cert_store, &[b"h3"]);
         let rustls_inner: rustls::ServerConfig = (*rustls_arc).clone();
@@ -347,7 +364,13 @@ where
 
     let (mut parts, _) = req.into_parts();
     sanitise_request_headers(&mut parts.headers);
-    super::forward::inject_forwarded(&mut parts.headers, peer_addr.ip(), Some(&host));
+    super::forward::inject_forwarded(
+        &mut parts.headers,
+        peer_addr.ip(),
+        Some(&host),
+        // HTTP/3 always runs over QUIC + TLS — clients see https.
+        "https",
+    );
     parts.uri = outbound_uri;
     parts.version = http::Version::HTTP_11;
 

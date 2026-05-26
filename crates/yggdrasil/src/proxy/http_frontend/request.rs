@@ -28,17 +28,42 @@ use crate::proxy::forward::{
 use super::backend::BackendClient;
 use super::route::RouteTable;
 
-pub(super) struct ConnContext {
-    pub(super) rule: Arc<ratatoskr::rule::Rule>,
-    pub(super) rule_name: String,
-    pub(super) client_addr: SocketAddr,
+pub(crate) struct ConnContext {
+    /// Owning [`Rule`] for this connection. Only consulted by the
+    /// alt-svc injection path, which is gated on [`Self::tls`] and so
+    /// never reads `rule` on the companion listener's plaintext path.
+    /// `None` is therefore acceptable when `tls == false`; the
+    /// HTTPS frontend always sets `Some`.
+    pub(crate) rule: Option<Arc<ratatoskr::rule::Rule>>,
+    pub(crate) rule_name: String,
+    pub(crate) client_addr: SocketAddr,
     #[allow(dead_code)]
-    pub(super) local_addr: SocketAddr,
-    pub(super) routes: Arc<RouteTable>,
-    pub(super) client: BackendClient,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) routes: Arc<RouteTable>,
+    pub(crate) client: BackendClient,
+    /// `true` when this connection was accepted on a TLS-terminated
+    /// listener (the HTTPS frontend, also HTTP/3). `false` when accepted
+    /// on the per-IP companion listener's `:80` plaintext path.
+    /// Controls the injected `X-Forwarded-Proto` header and gates the
+    /// `Alt-Svc` advertisement (plaintext responses don't advertise an
+    /// HTTP/3 alternative).
+    pub(crate) tls: bool,
 }
 
-pub(super) async fn serve_request(
+impl ConnContext {
+    /// Client-facing scheme as seen on the wire. Used by
+    /// [`crate::proxy::forward::inject_forwarded`] to fill
+    /// `X-Forwarded-Proto`.
+    pub(crate) fn forwarded_scheme(&self) -> &'static str {
+        if self.tls {
+            "https"
+        } else {
+            "http"
+        }
+    }
+}
+
+pub(crate) async fn serve_request(
     ctx: Arc<ConnContext>,
     req: Request<Incoming>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -62,7 +87,7 @@ pub(super) async fn serve_request(
             // close just the stream without a status, so 400 is the closest
             // honest answer. The connection itself is the caller's choice.
             let mut resp = short_response(StatusCode::BAD_REQUEST, "");
-            maybe_inject_alt_svc(&mut resp, &ctx.rule);
+            maybe_inject_alt_svc(&mut resp, &ctx);
             return resp;
         }
     };
@@ -86,7 +111,7 @@ pub(super) async fn serve_request(
                 "no route for Host; replying 404"
             );
             let mut resp = short_response(StatusCode::NOT_FOUND, "no route\n");
-            maybe_inject_alt_svc(&mut resp, &ctx.rule);
+            maybe_inject_alt_svc(&mut resp, &ctx);
             record_request_metrics(&ctx.rule_name, "_unknown", &resp, started);
             return resp;
         }
@@ -131,7 +156,7 @@ pub(super) async fn serve_request(
     // practice 502s won't be flagged by browsers for HSTS purposes anyway.
     maybe_inject_hsts(resp.headers_mut(), hsts_header.as_ref());
 
-    maybe_inject_alt_svc(&mut resp, &ctx.rule);
+    maybe_inject_alt_svc(&mut resp, &ctx);
     record_request_metrics(&ctx.rule_name, &route_label, &resp, started);
     resp
 }
@@ -176,7 +201,12 @@ async fn forward_normal(
     // Strip untrusted forwarding metadata, strip hop-by-hop, inject our
     // own X-Forwarded-* / X-Real-IP. Preserve the inbound Host header.
     sanitise_request_headers(&mut parts.headers);
-    inject_forwarded(&mut parts.headers, ctx.client_addr.ip(), Some(host));
+    inject_forwarded(
+        &mut parts.headers,
+        ctx.client_addr.ip(),
+        Some(host),
+        ctx.forwarded_scheme(),
+    );
 
     // Rewrite URI authority to the backend.
     let new_uri = build_upstream_uri(&parts.uri, upstream_url)?;
@@ -216,7 +246,12 @@ async fn forward_websocket(
     let client_upgrade =
         hyper::upgrade::on(Request::from_parts(parts.clone(), Empty::<Bytes>::new()));
     sanitise_request_headers_for_websocket(&mut parts.headers);
-    inject_forwarded(&mut parts.headers, ctx.client_addr.ip(), Some(host));
+    inject_forwarded(
+        &mut parts.headers,
+        ctx.client_addr.ip(),
+        Some(host),
+        ctx.forwarded_scheme(),
+    );
 
     let new_uri = build_upstream_uri(&parts.uri, upstream_url)?;
     parts.uri = new_uri;
@@ -317,8 +352,17 @@ pub(crate) fn sanitise_response_headers(headers: &mut HeaderMap) {
 
 /// Append `Alt-Svc: h3=":<port>"; ma=86400` to a TCP HTTPS response when
 /// the rule has HTTP/3 enabled. Idempotent: if the header is already set,
-/// the existing value wins.
-fn maybe_inject_alt_svc<B>(resp: &mut http::Response<B>, rule: &ratatoskr::rule::Rule) {
+/// the existing value wins. Skipped for non-TLS responses (the
+/// companion listener's plaintext `:80` path doesn't advertise an
+/// HTTP/3 alternative because there isn't one — h3 requires TLS) and
+/// for connections lacking a `rule` reference (companion path).
+fn maybe_inject_alt_svc<B>(resp: &mut http::Response<B>, ctx: &ConnContext) {
+    if !ctx.tls {
+        return;
+    }
+    let Some(rule) = ctx.rule.as_ref() else {
+        return;
+    };
     if rule.protocol != ratatoskr::rule::Protocol::Https {
         return;
     }
@@ -340,7 +384,7 @@ fn maybe_inject_alt_svc<B>(resp: &mut http::Response<B>, rule: &ratatoskr::rule:
     }
 }
 
-pub(super) fn extract_host<B>(req: &Request<B>) -> Option<String> {
+pub(crate) fn extract_host<B>(req: &Request<B>) -> Option<String> {
     // HTTP/2: :authority is canonical. HTTP/1.1: Host header.
     if let Some(auth) = req.uri().authority() {
         return Some(auth.as_str().to_string());
@@ -351,7 +395,7 @@ pub(super) fn extract_host<B>(req: &Request<B>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub(super) fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+pub(crate) fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     let upgrade_ws = headers
         .get(UPGRADE)
         .and_then(|v| v.to_str().ok())
@@ -365,7 +409,7 @@ pub(super) fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     upgrade_ws && conn_upgrade
 }
 
-pub(super) fn short_response(
+pub(crate) fn short_response(
     status: StatusCode,
     body: &'static str,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
