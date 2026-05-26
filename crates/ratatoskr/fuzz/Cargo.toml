@@ -1,0 +1,42 @@
+[package]
+name        = "ratatoskr-fuzz"
+description = "Fuzz harness for the ratatoskr protocol library."
+version     = "0.0.0"
+edition     = "2021"
+publish     = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace — this package is excluded from the main workspace
+# (see ../../../Cargo.toml's `workspace.exclude`) and declares itself as
+# its own workspace root so cargo can resolve it cleanly under nightly
+# without conflicting with the stable-pinned root toolchain.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ratatoskr     = { path = ".." }
+
+# Internal helpers; deliberately not derived from the main workspace's
+# [workspace.dependencies] because this package is *outside* the workspace
+# (see ../../Cargo.toml's `exclude` list). Pin tightly so the nightly
+# toolchain pinned in rust-toolchain.toml plus these versions reproduce
+# bit-for-bit.
+[dependencies.postcard]
+version = "1"
+features = ["use-std"]
+
+[dependencies.toml]
+version = "0.8"
+
+# Mark each fuzz target as a binary. cargo-fuzz expects this layout under
+# `fuzz_targets/`. test/doc/bench are off because libfuzzer-sys's
+# `fuzz_target!` macro is not test-compatible.
+
+[[bin]]
+name = "wire_parse"
+path = "fuzz_targets/wire_parse.rs"
+test = false
+doc  = false
+bench = false

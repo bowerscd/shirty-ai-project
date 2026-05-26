@@ -145,3 +145,32 @@ jobs:
           name: criterion-${{ github.sha }}
           path: target/criterion/**/report/index.html
           if-no-files-found: ignore
+
+  fuzz-smoke:
+    # Runs each cargo-fuzz target for a bounded wall-clock budget on every
+    # PR. Catches regressions in the wire/control-frame/predicate parsers
+    # cheaply; not exhaustive coverage. Deep fuzzing happens out of band
+    # (developer workstation now, OSS-Fuzz integration once the repo has a
+    # remote).
+    #
+    # The pinned nightly date matches crates/ratatoskr/fuzz/rust-toolchain.toml.
+    # Bump in lockstep when rotating; the fuzz crate's TOML is the source
+    # of truth — this job mirrors it because dtolnay/rust-toolchain@master
+    # cannot read the per-subdir pin.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/ratatoskr/fuzz
+      - name: install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: fuzz wire_parse (30s smoke)
+        run: |
+          cd crates/ratatoskr/fuzz
+          cargo fuzz run wire_parse -- -max_total_time=30 -runs=100000
+

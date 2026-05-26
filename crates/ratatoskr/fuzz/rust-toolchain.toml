@@ -1,0 +1,11 @@
+[toolchain]
+# cargo-fuzz requires nightly Rust (libfuzzer-sys uses the unstable
+# `#[link]` mechanism and the `fuzz_target!` macro expects nightly-only
+# features). The main workspace stays on stable 1.95.0 via the top-level
+# rust-toolchain.toml; only this subdirectory uses nightly.
+#
+# Pin a specific date rather than bare `nightly` so CI does not
+# spontaneously break when nightly lands a breaking change. Review every
+# ~3 months: bump the date, re-run `cargo fuzz run wire_parse -- -runs=10000`
+# locally, commit.
+channel = "nightly-2026-05-01"

@@ -526,4 +526,70 @@ mod tests {
             PREDICATE_SET_MAX_WIRE_BYTES
         );
     }
+
+    // ---- proptest roundtrip invariants ----
+
+    use proptest::prelude::*;
+
+    fn arb_protocol() -> impl Strategy<Value = Protocol> {
+        prop_oneof![
+            Just(Protocol::Tcp),
+            Just(Protocol::Udp),
+            Just(Protocol::Https),
+        ]
+    }
+
+    fn arb_pubkey() -> impl Strategy<Value = PubKey> {
+        any::<[u8; 32]>().prop_map(PubKey::x25519)
+    }
+
+    fn arb_predicate() -> impl Strategy<Value = Predicate> {
+        (
+            "[a-z][a-z0-9_-]{0,30}",
+            1u16..=u16::MAX,
+            arb_protocol(),
+            proptest::option::of(any::<u64>()),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(name, listen_port, protocol, idle_timeout_ms, h3)| Predicate {
+                    name,
+                    listen_port,
+                    protocol,
+                    idle_timeout_ms,
+                    // Constrain to inputs that satisfy Predicate::validate():
+                    // https_http3 is only meaningful when protocol == Https.
+                    https_http3: protocol == Protocol::Https && h3,
+                },
+            )
+    }
+
+    fn arb_predicate_set() -> impl Strategy<Value = PredicateSet> {
+        (
+            proptest::collection::vec(arb_predicate(), 0..10),
+            any::<u64>(),
+            arb_pubkey(),
+        )
+            .prop_map(|(predicates, version, origin)| PredicateSet {
+                predicates,
+                version,
+                origin,
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_predicate_postcard_roundtrip(p in arb_predicate()) {
+            let bytes = postcard::to_allocvec(&p).unwrap();
+            let back: Predicate = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(p, back);
+        }
+
+        #[test]
+        fn proptest_predicate_set_postcard_roundtrip(set in arb_predicate_set()) {
+            let bytes = postcard::to_allocvec(&set).unwrap();
+            let back: PredicateSet = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(set, back);
+        }
+    }
 }

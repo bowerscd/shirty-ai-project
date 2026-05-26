@@ -168,4 +168,27 @@ mod tests {
         const _: () =
             assert!(CHAIN_HOP_REPLY_MAX_WIRE_BYTES < crate::wire::MAX_CONTROL_PLAINTEXT_LEN);
     }
+
+    // ---- proptest roundtrip invariants ----
+
+    use proptest::prelude::*;
+
+    fn arb_query() -> impl Strategy<Value = ChainHopQuery> {
+        (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
+            |(query_id, depth_budget, deadline_ms)| ChainHopQuery {
+                query_id,
+                depth_budget,
+                deadline_ms,
+            },
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_query_postcard_roundtrip(q in arb_query()) {
+            let bytes = postcard::to_allocvec(&q).unwrap();
+            let back: ChainHopQuery = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(q, back);
+        }
+    }
 }

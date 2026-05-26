@@ -29,6 +29,7 @@ zeroize    = { workspace = true }
 [dev-dependencies]
 anyhow    = { workspace = true }
 criterion = { workspace = true }
+proptest  = { workspace = true }
 
 [[bench]]
 name    = "noise"

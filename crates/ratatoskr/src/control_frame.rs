@@ -248,4 +248,49 @@ mod tests {
         );
         assert!(ControlBodyType::from_byte(0xFF).is_none());
     }
+
+    // ---- proptest roundtrip invariants ----
+
+    use proptest::prelude::*;
+
+    fn arb_ack_status() -> impl Strategy<Value = AckStatus> {
+        prop_oneof![
+            Just(AckStatus::Ok),
+            any::<u16>().prop_map(AckStatus::Reject),
+            Just(AckStatus::Unknown),
+        ]
+    }
+
+    fn arb_envelope() -> impl Strategy<Value = ControlEnvelope> {
+        (
+            any::<u32>(),
+            any::<u8>(),
+            proptest::collection::vec(any::<u8>(), 0..256),
+        )
+            .prop_map(|(seq, body_type, body)| ControlEnvelope {
+                seq,
+                body_type,
+                body,
+            })
+    }
+
+    fn arb_ack() -> impl Strategy<Value = ControlAck> {
+        (any::<u32>(), arb_ack_status()).prop_map(|(seq, status)| ControlAck { seq, status })
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_envelope_postcard_roundtrip(env in arb_envelope()) {
+            let bytes = postcard::to_allocvec(&env).unwrap();
+            let back: ControlEnvelope = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(env, back);
+        }
+
+        #[test]
+        fn proptest_ack_postcard_roundtrip(ack in arb_ack()) {
+            let bytes = postcard::to_allocvec(&ack).unwrap();
+            let back: ControlAck = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(ack, back);
+        }
+    }
 }
