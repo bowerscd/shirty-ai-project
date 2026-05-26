@@ -221,9 +221,9 @@ assert chain[0]["rule_present"] is True, \
 probe = report["probe_results"]
 assert probe is not None, f"missing probe_results: {report}"
 assert probe["c_to_s"]["sent"] > 0, f"no bytes sent: {probe}"
-print(f"[chain-canary] 3 hops armed, probe OK, "
-      f"sent={probe['c_to_s']['sent']} bytes, "
-      f"received={probe['s_to_c']['sent']} bytes")
+sent = probe["c_to_s"]["sent"]
+received = probe["s_to_c"]["sent"]
+print(f"[chain-canary] 3 hops armed, probe OK, sent={sent} bytes, received={received} bytes")
 ' || fail "chain canary --json output did not match expectations"
 
 # -------- done -------------------------------------------------------------

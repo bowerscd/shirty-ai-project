@@ -5,6 +5,13 @@ on:
     branches: [main, master]
   pull_request:
 
+# Cancel an in-flight CI run when a new push lands on the same ref.
+# Saves runner minutes during rebase/fixup churn; the user only cares
+# about the latest commit's CI outcome anyway.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -12,6 +19,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -22,6 +30,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -33,6 +42,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -48,6 +58,7 @@ jobs:
     # match what the build would emit, catching contributors who change
     # the CLI but forget to commit the regenerated docs.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -58,10 +69,66 @@ jobs:
       - name: assert no drift in docs/cli-reference/
         run: git diff --exit-code -- docs/cli-reference/
 
+  docs-rust:
+    # Verify rustdoc builds cleanly across the workspace. Catches
+    # doc-comment syntax errors and rustdoc crashes.
+    #
+    # Tightening to `-D warnings` is deferred: the codebase has ~50
+    # pre-existing intra-doc-link warnings from earlier refactors
+    # (private items linked from public docs, removed-symbol
+    # references). Each is a one-line fix but auditing the full set
+    # is its own work item; until that lands, the job verifies the
+    # docs *build* without gating on warning count.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --document-private-items
+
+  shellcheck:
+    # Static analysis on the bench harness + e2e scripts. Several
+    # hundred lines of bash with non-trivial control flow; shellcheck
+    # routinely catches quoting bugs and unset-variable surprises that
+    # would otherwise fire mid-run on the bench / e2e runners.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck bench + e2e
+        # warning-level: skip info-only style notes (SC1091 sourced-file
+        # tracking, SC2034 unused-vars in compose-pass-through cases).
+        # Error + warning findings are CI-blocking.
+        run: shellcheck -S warning tests/e2e/*.sh bench/*.sh bench/lib/*.sh
+
+  supply-chain:
+    # `cargo deny check` runs all four sub-checks at once: license
+    # allow-list, RustSec advisory DB (CVEs + unmaintained), version-
+    # conflict bans, source registry allow-list. Config lives at
+    # `deny.toml`; advisory ignores there carry sunset notes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.18.6
+      - name: cargo deny check
+        run: cargo deny check
+
   micro-bench:
     # Runs criterion micro-benches on every PR with --quick-mode so the gate is
     # cheap. The serious e2e numbers live in bench.yml on a self-hosted runner.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

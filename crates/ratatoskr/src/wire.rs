@@ -65,11 +65,11 @@ pub const HEARTBEAT_ACK_PT_LEN: usize = 8 + 8;
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// Maximum plaintext length the Noise-AEAD path will accept on a single
-/// packet. Chosen to cover one [`crate::tunnel::TUNNEL_DATA_MAX_PAYLOAD`]
-/// chunk (16 KiB) plus the postcard-encoded envelope overhead with
-/// comfortable margin. Senders should size their encode buffers to at
-/// least [`MAX_PACKET_LEN`]; receivers should size their UDP recv
-/// buffers to the same value so a single datagram never gets truncated.
+/// packet. Sized to cover one ~16 KiB control body chunk plus the
+/// postcard-encoded envelope overhead with comfortable margin. Senders
+/// should size their encode buffers to at least [`MAX_PACKET_LEN`];
+/// receivers should size their UDP recv buffers to the same value so
+/// a single datagram never gets truncated.
 pub const MAX_CONTROL_PLAINTEXT_LEN: usize = 17 * 1024;
 /// Maximum on-wire packet length, including preamble, counter, and the
 /// AEAD ciphertext for a [`MAX_CONTROL_PLAINTEXT_LEN`]-sized plaintext.

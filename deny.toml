@@ -1,0 +1,102 @@
+# `cargo deny check` configuration.
+#
+# Run locally: `cargo install --locked cargo-deny && cargo deny check`.
+# Run in CI:   see `.github/workflows/ci.yml::supply-chain`.
+#
+# The licenses list is seeded from the current dep graph (Rust crates ship
+# permissive licenses by overwhelming default). When a new dep introduces
+# a license not on the allow list, cargo-deny fails closed and the
+# operator decides whether to extend this file or pick a different dep.
+
+[graph]
+# Targets the daemon actually builds for. Restricts the dep graph
+# evaluation to platforms we ship, so platform-only deps (e.g.
+# windows-targets) don't muddy the audit.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+
+# =============================================================================
+# Licenses
+# =============================================================================
+[licenses]
+# All licenses currently in the workspace's transitive graph plus the
+# usual permissive set. New license strings fail closed (CI breaks) so
+# an operator review is forced before a copyleft / proprietary license
+# can ride in via a transitive dep.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# Default 0.8 sometimes flags compound licenses ambiguously; 0.93
+# keeps us strict on per-crate license parsing without forcing manual
+# review of every "Apache-2.0 OR MIT" string.
+confidence-threshold = 0.93
+
+# =============================================================================
+# Advisories — RustSec database hits (CVEs, yanked, unmaintained)
+# =============================================================================
+[advisories]
+# Stay current with the published RustSec DB; using the default-managed
+# git index. `version = 2` opts into the modern format.
+version = 2
+# Fail on any unfixed CVE in the graph. Operators can `ignore` a known
+# advisory ID below with a sunset date if a fix isn't yet released
+# upstream.
+yanked = "deny"
+ignore = [
+    # hickory-proto 0.24.x CPU-exhaustion DoS (RUSTSEC-2025-XXXX-ish).
+    # Fix requires upgrading the workspace dep to `hickory-resolver
+    # 0.26+` and reworking the ACME DNS-01 resolver code path against
+    # the major-version API change. Tracked as separate work; the
+    # current daemon's ACME DNS path is unaffected by the DoS in
+    # practice (the resolver only talks to operator-configured upstream
+    # DNS, not arbitrary internet servers), so the operational risk is
+    # low pending the bump.
+    "RUSTSEC-2026-0119",
+    # rustls-pemfile is archived upstream and superseded by
+    # `rustls-pki-types::PemObject`. Migration is a small refactor
+    # touching the cert-loader code. Tracked separately.
+    "RUSTSEC-2025-0134",
+]
+
+# =============================================================================
+# Bans — duplicate crate versions and explicit blocklist
+# =============================================================================
+[bans]
+# Multiple versions of the same crate are warning-level: real
+# duplication (e.g. `hashbrown 0.13` + `hashbrown 0.14`) costs binary
+# size and means slower compile + worse cache utilisation. Default to
+# warn so it's visible without being a CI-blocking nuisance during
+# routine bumps.
+multiple-versions = "warn"
+# Crates we never want in the graph. Empty for now; populate when a
+# concrete reason exists.
+deny = []
+# Skip multiple-version warnings for crates whose ecosystem
+# legitimately ships several majors at once. Empty for now;
+# populated when CI surfaces unavoidable cases.
+skip = []
+skip-tree = []
+
+# =============================================================================
+# Sources — where crates may come from
+# =============================================================================
+[sources]
+# Only crates-io is allowed. Any git or alternative-registry dep
+# requires explicit allow-list below.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

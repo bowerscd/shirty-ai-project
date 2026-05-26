@@ -21,7 +21,8 @@ readonly WARMUP="${BENCH_WARMUP:-2s}"
 readonly FLOWS="${BENCH_FLOWS:-100000}"
 readonly PPS="${BENCH_PPS:-100000}"
 readonly PACKET_SIZE="${BENCH_PACKET_SIZE:-64}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 run_leg() {
     local subject="$1" target_host="$2" target_port="$3"

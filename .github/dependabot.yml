@@ -1,0 +1,36 @@
+version: 2
+
+# Weekly updates for both surfaces. Cargo bumps are noisier than action
+# bumps, so cap PRs separately to keep the review queue manageable.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "ci"
+      - "dependencies"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+    # The crypto crates pin tightly to specific versions for audit; let
+    # operators decide whether to bump them. Other updates are routine.
+    ignore:
+      - dependency-name: "snow"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ring"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rustls"
+        update-types: ["version-update:semver-major"]

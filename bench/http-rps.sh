@@ -28,7 +28,8 @@ readonly DURATION="${BENCH_DURATION:-10s}"
 readonly WARMUP="${BENCH_WARMUP:-1s}"
 readonly CONCURRENCY="${BENCH_CONCURRENCY:-64}"
 readonly BODY_SIZE="${BENCH_BODY_SIZE:-100}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 run_leg() {
     local subject="$1" target_url="$2"

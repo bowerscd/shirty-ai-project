@@ -17,7 +17,8 @@ ensure_results_dir
 readonly SCENARIO="tcp-connrate"
 readonly DURATION="${BENCH_DURATION:-10s}"
 readonly CONCURRENCY="${BENCH_CONCURRENCY:-256}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 run_leg() {
     local subject="$1" target="$2"

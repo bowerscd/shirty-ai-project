@@ -18,7 +18,8 @@ ensure_results_dir
 readonly SCENARIO="udp-flowchurn"
 readonly DURATION="${BENCH_DURATION:-10s}"
 readonly RATE="${BENCH_RATE:-5000}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 run_leg() {
     local subject="$1" target="$2"

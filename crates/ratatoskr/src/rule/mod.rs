@@ -116,17 +116,17 @@
 //!
 //! ## Module layout (Phase B1 split)
 //!
-//! - [`types`] — `Protocol`, `ProxyProto`, `TargetHost`, `HstsConfig`,
+//! - `types` — `Protocol`, `ProxyProto`, `TargetHost`, `HstsConfig`,
 //!   `DEFAULT_HSTS_MAX_AGE`.
-//! - [`cert_source`] — `CertSource` and its bespoke (de)serialisation.
-//! - [`http_route`] — `HttpRoute` with the HSTS shorthand handling.
-//! - [`rule_def`] — `Rule` struct + per-rule validation,
+//! - `cert_source` — `CertSource` and its bespoke (de)serialisation.
+//! - `http_route` — `HttpRoute` with the HSTS shorthand handling.
+//! - `rule_def` — `Rule` struct + per-rule validation,
 //!   `DEFAULT_UDP_IDLE_TIMEOUT`, `with_bind_override`,
 //!   `resolved_idle_timeout`.
-//! - [`validate`] — shared validation helpers (`validate_http_route`,
+//! - `validate` — shared validation helpers (`validate_http_route`,
 //!   `is_valid_dns_hostname`).
-//! - [`file`] — `RuleFile` and the per-file TOML parser/validator.
-//! - [`set`] — `RuleSet`, `RuleChange`, `RuleDiff`.
+//! - `file` — `RuleFile` and the per-file TOML parser/validator.
+//! - `set` — `RuleSet`, `RuleChange`, `RuleDiff`.
 
 mod cert_source;
 mod file;

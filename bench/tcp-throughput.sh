@@ -17,7 +17,8 @@ readonly SCENARIO="tcp-throughput"
 readonly DURATION="${BENCH_DURATION:-10s}"
 readonly STREAMS="${BENCH_STREAMS:-8}"
 readonly BUFFER="${BENCH_BUFFER:-65536}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 run_leg() {
     local subject="$1" target="$2"

@@ -33,7 +33,8 @@ readonly FLOWS="${BENCH_FLOWS:-32}"
 readonly TX_PPS="${BENCH_TX_PPS:-50000}"
 readonly RX_PPS="${BENCH_RX_PPS:-50000}"
 readonly PACKET_SIZE="${BENCH_PACKET_SIZE:-64}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 run_leg() {
     local subject="$1" target_host="$2" target_port="$3"

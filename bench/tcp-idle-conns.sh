@@ -36,7 +36,8 @@ readonly SCENARIO="tcp-idle-conns"
 readonly CONNECTIONS="${BENCH_IDLE_CONNS:-5000}"
 readonly CONCURRENCY="${BENCH_IDLE_CONCURRENCY:-256}"
 readonly HOLD="${BENCH_IDLE_HOLD:-15s}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 command -v jq >/dev/null || die "jq is required for $SCENARIO post-processing"
 command -v ss >/dev/null || die "ss (iproute2) is required for $SCENARIO"

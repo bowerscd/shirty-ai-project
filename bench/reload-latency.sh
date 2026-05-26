@@ -20,7 +20,8 @@ ensure_results_dir
 
 readonly SCENARIO="reload-latency"
 readonly ITERATIONS="${BENCH_ITERATIONS:-20}"
-readonly OUTDIR="$(bench_results_dir)"
+OUTDIR="$(bench_results_dir)"
+readonly OUTDIR
 
 # A helper: probe a TCP port — return 0 on first successful connect+ping-pong.
 probe_tcp_until_serving() {

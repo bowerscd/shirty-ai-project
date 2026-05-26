@@ -28,8 +28,6 @@ if [[ "${SKIP_ACME_E2E:-0}" == "1" ]]; then
     exit 0
 fi
 
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-
 if command -v podman >/dev/null 2>&1; then
     CRI=podman
 elif command -v docker >/dev/null 2>&1; then
@@ -46,8 +44,8 @@ PEBBLE_NETWORK="yggdrasil-acme-e2e"
 PEBBLE_CONTAINER="pebble-e2e"
 PEBBLE_PORT=14000  # ACME directory port
 PEBBLE_MGMT=15000  # pebble's management API
-CHALLTESTSRV_DNS_PORT=8053
-CHALLTESTSRV_MGMT_PORT=8055
+# challtestsrv ports (8053/dns, 8055/mgmt) are wired into the pebble
+# container via docker run flags below; not referenced from this script.
 
 cleanup() {
     if [[ "${KEEP_STACK:-0}" == "1" ]]; then
