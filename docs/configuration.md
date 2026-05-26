@@ -371,8 +371,17 @@ terminal-only; the relay is L4 passthrough on both transports.
 
 Cert source precedence (per route): explicit `cert` + `key` paths →
 `cert = "ephemeral"` → `<cert_dir>/<hostname>/{fullchain,privkey}.pem`
-convention → `server.default_cert` + `server.default_key` → hard error at
-load time.
+convention → `server.default_cert` + `server.default_key` → **cert-less
+route** (no cert source resolved).
+
+A cert-less route is permitted by design. Its hostname is **not**
+bound to the `:443` SNI table; the per-IP companion listener serves it
+as plain HTTP on `:80` to peers in
+[`[server].lan_cidrs`](#server-lan_cidrs-private-peer-set). This is the
+mechanism for LAN-only hostnames that can't get a public-CA cert
+(`*.local`, internal `*.lan`, etc.). Operators see a `WARN` log line
+per cert-less route at startup naming the consequence; the
+`yggdrasil_certless_routes` gauge tracks the live count.
 
 ```toml
 # /etc/yggdrasil/conf.d/web.toml
@@ -391,8 +400,53 @@ protocol = "https"
   [[rule.route]]
   hostname = "app.example.com"
   target   = "http://10.0.0.11:3000"
-  # No explicit cert — falls through to the cert_dir convention or the default cert.
+  # No explicit cert — falls through to the cert_dir convention or
+  # the default cert. If neither matches, becomes a cert-less route
+  # served on :80 plaintext to lan_cidrs peers only.
+
+  [[rule.route]]
+  hostname = "internal.lan"
+  target   = "http://192.168.1.50:8080"
+  # Intentionally cert-less: served on :80 plaintext to LAN peers
+  # only. `hsts` is rejected on cert-less routes by the validator.
 ```
+
+### `[server].lan_cidrs` (private-peer set)
+
+Optional list of CIDR strings that define which peer IPs are
+considered "local" by the per-IP companion listener's cert-less route
+branch. When unset (the default), yggdrasil uses a hard-coded set
+matching the well-known private-addressing ranges:
+
+| CIDR              | RFC                  |
+| ----------------- | -------------------- |
+| `127.0.0.0/8`     | RFC 1122 §3.2.1.3    |
+| `10.0.0.0/8`      | RFC 1918             |
+| `172.16.0.0/12`   | RFC 1918             |
+| `192.168.0.0/16`  | RFC 1918             |
+| `::1/128`         | RFC 4291 §2.5.3      |
+| `fc00::/7`        | RFC 4193 (ULA)       |
+
+Setting `lan_cidrs` replaces the default set entirely:
+
+```toml
+[server]
+# Narrow to just the home LAN (excludes loopback, docker bridges, ULA, etc.)
+lan_cidrs = ["192.168.1.0/24"]
+
+# Or widen to include Tailscale's CGNAT range (RFC 6598):
+lan_cidrs = ["192.168.0.0/16", "100.64.0.0/10"]
+
+# Or explicitly disable cert-less route serving:
+lan_cidrs = []
+
+# Or expose cert-less routes publicly (explicit footgun):
+lan_cidrs = ["0.0.0.0/0", "::/0"]
+```
+
+The resolved set + source (`default` vs `override`) is logged at
+startup and surfaced by `yggdrasilctl local status` whenever the
+daemon has at least one cert-less route loaded.
 
 ## Environment variables
 

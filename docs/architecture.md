@@ -420,6 +420,41 @@ The TCP HTTPS path injects `Alt-Svc: h3=":<port>"; ma=86400` on every
 response so capable clients upgrade to HTTP/3 on the next request.
 Disabled per-rule via `alt_svc = false`.
 
+#### Cert-less routes and the per-IP companion listener
+
+An HTTPS rule may contain `[[rule.route]]` blocks with no resolvable
+cert source — these are **cert-less routes**, served only on the
+per-IP companion listener's plaintext `:80` path
+(`proxy/http_frontend/redirect.rs`). The companion's pipeline is
+four-step:
+
+1. **ACME HTTP-01** — `GET /.well-known/acme-challenge/<token>` is
+   served regardless of source IP (required by the Let's Encrypt
+   prober).
+2. **Cert-less route serving** — if `peer_addr.ip() ∈ lan_cidrs` and
+   `Host` matches a cert-less route on this IP, proxy plaintext via
+   `serve_request` with `ConnContext { tls: false, .. }`. Reuses
+   the full HTTPS request pipeline (sanitise / inject_forwarded /
+   build_upstream_uri / WebSocket upgrade) with `X-Forwarded-Proto:
+   http` and no `Alt-Svc` injection.
+3. **Cert'd-host 301 redirect** — else if `Host` matches a cert'd
+   hostname in the per-IP `HostSet`, emit
+   `301 Location: https://<host><path>` regardless of source IP.
+4. **404** — else.
+
+Step 2's peer-IP filter is the trust boundary for cert-less routes.
+The default `lan_cidrs` set is loopback + RFC 1918 + RFC 4193 (see
+`crates/yggdrasil/src/lan_cidrs.rs`); operators on multi-tenant
+private networks override it via `[server].lan_cidrs`. See
+[security.md](security.md#cert-less-https-routes--the-lan-only-trust-boundary).
+
+Cert-less routes are filtered out of the `:443` SNI table at
+`HttpFrontend::spawn` time, so a TLS handshake for a cert-less
+hostname fails with `UnrecognizedName` (the right failure mode —
+the hostname genuinely isn't bound on TLS). Predicate emission
+strips routes entirely (`chain/predicate_extractor.rs`), so
+cert-less routes never project upstream.
+
 ## Rules: hot reload (terminal-side)
 
 On the terminal, `[server].rules_dir` is watched via `notify-debouncer-mini`

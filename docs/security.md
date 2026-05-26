@@ -279,6 +279,51 @@ worth supporting.
   technical requirement to do so on any particular schedule, but
   shorter rotation windows shrink the blast radius of a key compromise.
 
+## Cert-less HTTPS routes — the LAN-only trust boundary
+
+A `[[rule.route]]` with no resolvable cert source becomes a
+**cert-less route**: it is never bound to the `:443` SNI table, and
+the per-IP companion listener serves it as plain HTTP on `:80` to
+peers in `[server].lan_cidrs`. See
+[`configuration.md`](configuration.md#serverlan_cidrs-private-peer-set)
+for the configuration knob.
+
+The default `lan_cidrs` set is loopback + RFC 1918 + RFC 4193 — all
+the well-known private-addressing ranges, with RFC citations in the
+implementation (`crates/yggdrasil/src/lan_cidrs.rs`). On a typical
+home network this is exactly correct: the only RFC1918 source IPs
+that reach the daemon are LAN clients. A misconfigured router can't
+cause WAN traffic to *originate* from an RFC1918 address — the
+private ranges are non-routable on the public internet by definition
+([RFC 1918 §3](https://datatracker.ietf.org/doc/html/rfc1918#section-3)).
+
+Operators on multi-tenant private networks (a hosted server reached by
+the hosting provider's RFC1918 management network, an office network
+shared with untrusted clients) **should narrow the set** with an
+explicit `[server].lan_cidrs` override. The `_denied_total` counter
+(`yggdrasil_certless_requests_denied_total{reason="peer_not_in_lan_cidrs"}`)
+surfaces external probes against cert-less hostnames.
+
+Cert-less routes are intentionally invisible to:
+
+* `yggdrasilctl chain diff` / `chain trace` / `local derived-rules` —
+  they're terminal-local and not projected as predicates upstream
+  (the projection in
+  `crates/yggdrasil/src/chain/predicate_extractor.rs::extract()`
+  walks rules, not routes, and strips routes + cert directories
+  from each HTTPS predicate).
+* `yggdrasilctl local acme list` — they have no cert to list.
+
+They are surfaced by:
+
+* A `tracing::warn!` per cert-less route at rule-load time, naming
+  the hostname and `:80` consequence.
+* `yggdrasil_certless_routes{rule,hostname}` gauge (one per cert-less
+  hostname).
+* `yggdrasilctl local status` — when at least one cert-less route is
+  loaded, the status output gains a `cert-less routes: N` line plus
+  the resolved `lan_cidrs` set.
+
 ## Reporting issues
 
 If you find a security issue, do not file a public bug. Email the

@@ -67,7 +67,10 @@ type, labels, meaning.
 | `yggdrasil_build_info`                            | gauge   | `version`                       | Constant `1`. Used to join other metrics with the deployed build.       |
 | `yggdrasil_mode`                                  | gauge   | `mode` (`relay`/`terminal`)     | Constant `1`. Lets dashboards branch on mode.                          |
 | `yggdrasil_rules_loaded`                          | gauge   | (none)                          | Number of rules currently in the live rule set.                         |
-| `yggdrasil_https_routes`                          | gauge   | (none)                          | Number of `[[rule.route]]` entries currently loaded.                    |
+| `yggdrasil_https_routes`                          | gauge   | (none)                          | Number of cert'd `[[rule.route]]` entries currently loaded.             |
+| `yggdrasil_certless_routes`                       | gauge   | `rule`, `hostname`              | One per cert-less route. Constant `1` per live entry.                   |
+| `yggdrasil_certless_requests_total`               | counter | `rule`, `hostname`              | Cert-less route requests served as plaintext on `:80`.                  |
+| `yggdrasil_certless_requests_denied_total`        | counter | `rule`, `reason`                | Cert-less requests denied. `reason` is `peer_not_in_lan_cidrs` or `host_not_in_routes`. Operators alert on this — non-zero rate = external probing. |
 
 ### Chain heartbeat & enrollment
 
