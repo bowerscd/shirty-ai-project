@@ -158,7 +158,16 @@ jobs:
     # of truth — this job mirrors it because dtolnay/rust-toolchain@master
     # cannot read the per-subdir pin.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - wire_parse
+          - control_frame_decode
+          - predicate_decode
+          - chain_query_decode
+          - enrollment_decode
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -169,8 +178,8 @@ jobs:
           workspaces: crates/ratatoskr/fuzz
       - name: install cargo-fuzz
         run: cargo install --locked cargo-fuzz
-      - name: fuzz wire_parse (30s smoke)
+      - name: fuzz ${{ matrix.target }} (30s smoke)
         run: |
           cd crates/ratatoskr/fuzz
-          cargo fuzz run wire_parse -- -max_total_time=30 -runs=100000
+          cargo fuzz run ${{ matrix.target }} -- -max_total_time=30 -runs=100000
 

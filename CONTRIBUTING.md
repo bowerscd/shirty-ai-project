@@ -64,7 +64,8 @@ In rough priority order:
 3. **Documentation drift** — if you changed a config field, did
    `docs/configuration.md` get the update? A CLI flag,
    `docs/cli-reference/`? An engineering convention, the relevant doc
-   section?
+   section? **A new public parser in `ratatoskr`, a fuzz target?** (See
+   [docs/development.md § 6.7](docs/development.md#67-when-to-add-a-fuzz-target).)
 4. **No unrelated cleanups in the same PR.** Pre-existing nits go in
    their own PRs; mixed scope makes review harder than it needs to be.
 

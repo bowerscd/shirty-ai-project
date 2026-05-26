@@ -489,6 +489,64 @@ threads parked in `epoll_wait` more often than not. For "where is time
 going" questions, prefer the profiling workflow in
 [`docs/operations.md`](operations.md) over interactive debugger sessions.
 
+### Running fuzz targets locally
+
+The protocol library (`ratatoskr`) has a [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+harness under [`crates/ratatoskr/fuzz/`](../crates/ratatoskr/fuzz/) covering
+the byte-parsing entry points exposed to untrusted input (wire framing,
+post-Noise control envelopes, predicate pushes, chain query bodies,
+enrollment documents). The harness lives in a separate package outside
+the main workspace because `cargo-fuzz` requires nightly Rust; the
+`fuzz/` subdir has its own `rust-toolchain.toml` pinning a specific
+nightly date so the stable 1.95.0 main workspace toolchain is
+untouched.
+
+One-time setup:
+
+```bash
+cargo install --locked cargo-fuzz
+# Nightly is fetched automatically on first invocation
+# thanks to crates/ratatoskr/fuzz/rust-toolchain.toml.
+```
+
+Day-to-day:
+
+```bash
+cd crates/ratatoskr/fuzz
+
+# List available targets.
+cargo fuzz list
+
+# Run for a fixed iteration cap (CI smoke pattern).
+cargo fuzz run wire_parse -- -max_total_time=30 -runs=100000
+
+# Run unbounded (Ctrl-C to stop). Good when chasing a specific bug.
+cargo fuzz run wire_parse
+```
+
+**Triaging a crash.** libFuzzer writes the offending input to
+`artifacts/<target>/crash-<hash>` and prints the panic backtrace. To
+reproduce against a single input:
+
+```bash
+cargo fuzz run wire_parse artifacts/wire_parse/crash-abc123...
+```
+
+To minimise to the smallest reproducer that still crashes:
+
+```bash
+cargo fuzz tmin wire_parse artifacts/wire_parse/crash-abc123...
+```
+
+Commit minimised reproducers under `corpus/<target>/` as regression
+seeds so future fuzz runs cover the same shape.
+
+In-tree complement: every postcard-encoded type has a `proptest`
+round-trip property in its `tests` module (e.g.
+[`crates/ratatoskr/src/control_frame.rs`](../crates/ratatoskr/src/control_frame.rs)).
+These run as part of `cargo test --package ratatoskr` and catch
+asymmetric encoder/decoder regressions without needing nightly.
+
 ### Disk-space guardrails
 
 The workspace's `target/` directory can balloon to **100+ GB** on a dev
@@ -682,6 +740,33 @@ path. Making graceful drain a *property* of that signal means the operator
 doesn't have to remember a separate runbook step. The TOML knob is the
 only operator-facing surface. Don't add CLI commands for things that
 should "just work" on Unix process lifecycle.
+
+### 6.7 When to add a fuzz target
+
+Any new public byte-parsing entry point added to `ratatoskr` gets a
+[`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html) target
+under [`crates/ratatoskr/fuzz/fuzz_targets/`](../crates/ratatoskr/fuzz/fuzz_targets/)
+**in the same PR**. The bar is "this function takes `&[u8]` (or `&str`)
+from somewhere the project doesn't control" — pre-auth wire frames,
+post-Noise control envelopes, postcard-encoded bodies pushed from peers,
+TOML documents loaded from disk. Internal helpers that only ever see
+trusted in-process input do not need targets.
+
+Each target is small (~20 lines): `fuzz_target!(|data: &[u8]| { let _ =
+your_parser(data); })`. Add the matching `[[bin]]` entry to
+[`crates/ratatoskr/fuzz/Cargo.toml`](../crates/ratatoskr/fuzz/Cargo.toml)
+and extend the `fuzz-smoke` matrix in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) so the new
+target gets the 30-second smoke on every PR.
+
+In-tree complement: postcard-encoded types should also have a
+`proptest` round-trip property in their `tests` module. The pattern is
+in
+[`crates/ratatoskr/src/control_frame.rs`](../crates/ratatoskr/src/control_frame.rs)
+(`proptest_envelope_postcard_roundtrip`,
+`proptest_ack_postcard_roundtrip`). proptest catches asymmetric
+encoder/decoder bugs that libFuzzer's mutation strategy is unlikely to
+hit directly.
 
 ## Further reading
 

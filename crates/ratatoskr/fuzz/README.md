@@ -18,13 +18,16 @@ The workspace's top-level `Cargo.toml` `exclude`s this directory so
 
 ## Targets
 
-| target           | entry                                        | what it covers                                                                         |
-| ---------------- | -------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `wire_parse`     | `ratatoskr::wire::parse(&[u8])`              | Pre-auth wire framing. Anyone with UDP reachability throws bytes at this entry point.   |
+| target                  | entry                                                   | what it covers                                                                                                            |
+| ----------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `wire_parse`            | `ratatoskr::wire::parse(&[u8])`                         | Pre-auth wire framing. Anyone with UDP reachability throws bytes at this entry point — **highest-value target**.           |
+| `control_frame_decode`  | `postcard::from_bytes::<ControlEnvelope \| ControlAck>` | Post-Noise control envelopes. Requires a key-compromised peer to weaponise; defence-in-depth.                              |
+| `predicate_decode`      | `postcard::from_bytes::<PredicateSet>`                  | Predicate-set pushes from a downstream terminal. Relay parses on every successful push.                                    |
+| `chain_query_decode`    | `postcard::from_bytes::<ChainHopQuery \| ChainHopReply>`| Chain summary / ping / diff / health queries routed across hops.                                                           |
+| `enrollment_decode`     | `toml::from_str::<RequestFile \| GrantFile>`            | Out-of-band enrollment documents. Operator-controlled input; lower attack surface but a malformed file shouldn't panic.    |
 
-(More targets land as the harness grows. See
-[`docs/development.md` § Engineering conventions](../../../docs/development.md)
-for the rule on when to add one.)
+(See [`docs/development.md` § Engineering conventions](../../../docs/development.md#6-engineering-conventions)
+for the rule on when to add a new target.)
 
 ## Local workflow
 

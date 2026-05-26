@@ -40,3 +40,31 @@ path = "fuzz_targets/wire_parse.rs"
 test = false
 doc  = false
 bench = false
+
+[[bin]]
+name = "control_frame_decode"
+path = "fuzz_targets/control_frame_decode.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "predicate_decode"
+path = "fuzz_targets/predicate_decode.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "chain_query_decode"
+path = "fuzz_targets/chain_query_decode.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "enrollment_decode"
+path = "fuzz_targets/enrollment_decode.rs"
+test = false
+doc  = false
+bench = false
