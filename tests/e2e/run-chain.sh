@@ -201,7 +201,7 @@ echo "==> [chain-canary] yggdrasilctl chain canary --port 7200 --proto tcp from 
 # test would still pass even if that backend were down.
 canary_json=$(dc_exec home-chain yggdrasilctl \
     --json chain --socket /run/yggdrasil/control.sock \
-    canary --port 7200 --proto tcp --duration 500ms --timeout 5s \
+    canary --port 7200 --proto tcp --timeout 5s \
     || true)
 echo "$canary_json" | python3 -c '
 import json, sys

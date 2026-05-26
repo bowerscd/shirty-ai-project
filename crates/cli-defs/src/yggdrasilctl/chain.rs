@@ -65,32 +65,11 @@ pub struct CanaryArgs {
     /// rule set otherwise.
     #[arg(long, value_enum, value_name = "PROTO")]
     pub proto: Option<ProtoArg>,
-    /// Bind address of the rule's listener. Defaults to whichever
-    /// address the local rule actually binds (typically `0.0.0.0`).
-    #[arg(long, value_name = "IP")]
-    pub bind: Option<std::net::IpAddr>,
-    /// Probe duration. Default 3s; pass a humantime string
-    /// (e.g. `500ms`, `10s`).
-    #[arg(
-        long,
-        value_name = "DURATION",
-        value_parser = humantime::parse_duration,
-        default_value = "3s",
-    )]
-    pub duration: Duration,
-    /// Sustained send rate. For TCP: MiB/s per direction (default 1).
-    /// For UDP: packets per second per direction (default 100).
-    /// Pass `0` to use the daemon's protocol default.
-    #[arg(long, value_name = "RATE", default_value_t = 0)]
-    pub rate: u32,
-    /// UDP-only payload size in bytes (ignored for TCP). Default 1200.
-    /// Pass `0` to use the daemon's default.
-    #[arg(long, value_name = "BYTES", default_value_t = 0)]
-    pub payload: u32,
-    /// Arming-phase deadline. The probe data phase runs for
-    /// `--duration` regardless; this caps how long we wait for the
-    /// chain to walk and install arms before giving up with
-    /// `CHAIN_DEAD`.
+    /// Overall budget for the chain to walk and assemble the arming
+    /// reply. Matches the `--timeout` shape of the other `chain`
+    /// subcommands. Caps how long we wait before giving up with
+    /// `CHAIN_DEAD`; the data probe runs for a fixed daemon-side
+    /// duration regardless.
     #[arg(
         long,
         value_name = "DURATION",
@@ -98,11 +77,6 @@ pub struct CanaryArgs {
         default_value = "5s",
     )]
     pub timeout: Duration,
-    /// Emit a machine-readable JSON object instead of the human-
-    /// readable table. Same field shape as
-    /// [`ratatoskr::control::ChainCanaryResponse`].
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[derive(Debug, Args)]

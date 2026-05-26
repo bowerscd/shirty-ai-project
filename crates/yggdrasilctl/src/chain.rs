@@ -1000,6 +1000,11 @@ const CANARY_EXIT_DEGRADED: i32 = 1;
 const CANARY_EXIT_NO_SUCH_RULE: i32 = 2;
 const CANARY_EXIT_CHAIN_DEAD: i32 = 3;
 
+/// CLI-side default probe duration. Not exposed as a flag — the
+/// daemon's classifier thresholds + the 5 s arming `--timeout` are
+/// the two operator-tunable knobs.
+const CANARY_PROBE_DURATION: Duration = Duration::from_secs(3);
+
 async fn canary(socket: &Path, args: &CanaryArgs, json_output: bool) -> Result<()> {
     // 1. Resolve which rule(s) match the operator's `--port [--proto]`
     //    by pre-fetching the local rule snapshot. This catches the
@@ -1009,18 +1014,13 @@ async fn canary(socket: &Path, args: &CanaryArgs, json_output: bool) -> Result<(
     let matches = derived
         .derived_rules
         .iter()
-        .filter(|r| {
-            r.listen.port() == args.port && args.bind.map(|ip| r.listen.ip() == ip).unwrap_or(true)
-        })
+        .filter(|r| r.listen.port() == args.port)
         .collect::<Vec<_>>();
 
     let probes: Vec<(std::net::SocketAddr, Protocol)> = if matches.is_empty() {
         // No match locally — let the daemon's NO_SUCH_RULE path
         // emit the close-match suggestions.
-        let listen: std::net::SocketAddr = match args.bind {
-            Some(ip) => std::net::SocketAddr::new(ip, args.port),
-            None => format!("0.0.0.0:{}", args.port).parse().unwrap(),
-        };
+        let listen: std::net::SocketAddr = format!("0.0.0.0:{}", args.port).parse().unwrap();
         let proto = match args.proto {
             Some(ProtoArg::Tcp) => Protocol::Tcp,
             Some(ProtoArg::Udp) => Protocol::Udp,
@@ -1038,12 +1038,14 @@ async fn canary(socket: &Path, args: &CanaryArgs, json_output: bool) -> Result<(
         let req = Request::ChainCanary {
             rule_listen: listen,
             rule_protocol: proto,
-            duration_ms: (args.duration.as_millis().min(u32::MAX as u128)) as u32,
-            rate: args.rate,
-            payload_bytes: args.payload,
+            duration_ms: (CANARY_PROBE_DURATION.as_millis().min(u32::MAX as u128)) as u32,
+            // `0` tells the daemon to use the protocol's documented
+            // default rate / payload (see `control/handlers/canary.rs`).
+            rate: 0,
+            payload_bytes: 0,
             timeout_ms: Some((args.timeout.as_millis().min(u32::MAX as u128)) as u32),
         };
-        let resp_timeout = args.timeout + args.duration + Duration::from_secs(5);
+        let resp_timeout = args.timeout + CANARY_PROBE_DURATION + Duration::from_secs(5);
         let response = send_chain_request(socket, &req, resp_timeout).await?;
         let c = match response {
             Response::ChainCanary(c) => c,

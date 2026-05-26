@@ -346,20 +346,9 @@ Exit code: 0=OK, 1=DEGRADED, 2=NO_SUCH_RULE, 3=CHAIN_DEAD, 4=RPC error.
 
   Possible values: `tcp`, `udp`
 
-* `--bind <IP>` — Bind address of the rule's listener. Defaults to whichever address the local rule actually binds (typically `0.0.0.0`)
-* `--duration <DURATION>` — Probe duration. Default 3s; pass a humantime string (e.g. `500ms`, `10s`)
-
-  Default value: `3s`
-* `--rate <RATE>` — Sustained send rate. For TCP: MiB/s per direction (default 1). For UDP: packets per second per direction (default 100). Pass `0` to use the daemon's protocol default
-
-  Default value: `0`
-* `--payload <BYTES>` — UDP-only payload size in bytes (ignored for TCP). Default 1200. Pass `0` to use the daemon's default
-
-  Default value: `0`
-* `--timeout <DURATION>` — Arming-phase deadline. The probe data phase runs for `--duration` regardless; this caps how long we wait for the chain to walk and install arms before giving up with `CHAIN_DEAD`
+* `--timeout <DURATION>` — Overall budget for the chain to walk and assemble the arming reply. Matches the `--timeout` shape of the other `chain` subcommands. Caps how long we wait before giving up with `CHAIN_DEAD`; the data probe runs for a fixed daemon-side duration regardless
 
   Default value: `5s`
-* `--json` — Emit a machine-readable JSON object instead of the human- readable table. Same field shape as [`ratatoskr::control::ChainCanaryResponse`]
 
 
 
