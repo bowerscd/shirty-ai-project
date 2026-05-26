@@ -157,7 +157,7 @@ impl HttpFrontend {
         cert_store: Arc<CertStore>,
         parent: CancellationToken,
     ) -> Result<Self> {
-        let routes = rule
+        let all_routes = rule
             .routes
             .as_ref()
             .filter(|r| !r.is_empty())
@@ -168,7 +168,42 @@ impl HttpFrontend {
                 )
             })?;
 
-        let route_table = Arc::new(RouteTable::build(routes));
+        // Cert-less routes (route.cert == None and no fallback cert
+        // resolved in the cert store) do NOT enter the :443 SNI table.
+        // They live only on the per-IP companion listener's :80
+        // plaintext path (see proxy/http_frontend/redirect.rs).
+        // Filter the route table here so :443 SNI lookups for those
+        // hostnames hit `UnrecognizedName` at TLS handshake time,
+        // which is the right failure mode for "this name isn't served
+        // over TLS".
+        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = all_routes
+            .iter()
+            .filter(|r| {
+                // Belt-and-suspenders: present in TOML *or* resolved
+                // via the cert store (which includes default_cert /
+                // cert_dir convention paths). The supervisor partition
+                // step is the ground truth; this check just keeps the
+                // route table in sync if HttpFrontend::spawn is ever
+                // called without prior partitioning.
+                r.cert.is_some() || cert_store.contains(&r.hostname)
+            })
+            .cloned()
+            .collect();
+
+        if cert_d_routes.is_empty() {
+            // Every route in this rule is cert-less. There is no :443
+            // surface to bind. The supervisor handles this case by
+            // routing every cert-less host onto the companion
+            // listener and skipping HttpFrontend::spawn for this rule
+            // entirely; if we got here regardless, we should not bind
+            // an empty TLS listener.
+            anyhow::bail!(
+                "HTTPS rule {:?}: every route is cert-less; nothing to serve on :443",
+                rule.name
+            );
+        }
+
+        let route_table = Arc::new(RouteTable::build(&cert_d_routes, &rule.name));
 
         let server_config = build_rustls_server_config(cert_store, &[b"h2", b"http/1.1"]);
         let acceptor = TlsAcceptor::from(server_config);
