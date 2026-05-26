@@ -102,6 +102,6 @@ Functional bugs: open an issue. Include the daemon version
 relevant log lines (`journalctl -u yggdrasil` JSON output is ideal).
 
 Security issues: see [docs/security.md](docs/security.md) for the
-project's threat model. For private vulnerability reports, contact the
-maintainer listed in `Cargo.toml`'s `[workspace.package].repository`
+project's threat model. For private vulnerability reports, use GitHub's
+private vulnerability reporting on the repository's **Security** tab
 rather than filing a public issue.

@@ -14,17 +14,16 @@ focuses on the code and the dependencies behind it.
 ### System dependencies
 
 The workspace is pure Rust — no C toolchain, no `bindgen`, no native libs to
-link. The only system-level packages you need are:
+link, no `pkg-config` consumers. The one optional system-level package is:
 
 ```bash
 # Debian / Ubuntu
-sudo apt-get install -y pkg-config podman-compose
+sudo apt-get install -y podman-compose
 
 # Fedora / RHEL
-sudo dnf install -y pkg-config podman-compose
+sudo dnf install -y podman-compose
 ```
 
-`pkg-config` is consulted by a couple of transitive build scripts.
 `podman-compose` is only needed if you want to run the e2e smoke tests under
 [`tests/e2e/`](../tests/e2e/) locally; unit and integration tests don't need
 it.
@@ -106,9 +105,9 @@ up the binary under socket I/O. If you're adding a subsystem, expose it from
 ### Auxiliary build infrastructure
 
 - [`CMakeLists.txt`](../CMakeLists.txt) — **packaging frontend only**, not a
-  development build system. Used by CPack to produce DEB/RPM artefacts in
-  the [release workflow](../.github/workflows/). For day-to-day development
-  use `cargo` directly.
+  development build system. Used by CPack to produce DEB/RPM artefacts; not
+  yet wired into a CI release workflow. For day-to-day development use
+  `cargo` directly.
 - [`bench/`](../bench/) — apples-to-apples e2e benchmark harness against
   nginx / haproxy / traefik. Separate from Criterion micro-benches under
   `crates/*/benches/`. See [`bench/README.md`](../bench/README.md).
@@ -352,14 +351,15 @@ terms (TLS, QUIC, HTTP/3, ACME, SO_REUSEPORT, etc.) are not redefined here.
 - **TOFU candidate** — a pubkey observed but not yet enrolled. A relay
   receiving an inbound handshake from an unknown pubkey records it as a
   candidate in `state_dir`; the operator decides whether to approve it via
-  `yggdrasilctl accept pending` → `accept approve`. TOFU = Trust On First
-  Use; we deliberately surface the choice rather than auto-trusting.
+  `yggdrasilctl local accept pending` → `yggdrasilctl local accept approve`.
+  TOFU = Trust On First Use; we deliberately surface the choice rather than
+  auto-trusting.
 
 - **Heartbeat** — short authenticated UDP packet sent from terminal to
-  relay (and at each subsequent hop) on a short interval (default ~2 s).
-  Updates the relay's *downstream IP* mapping when the residential IP
-  changes. Also the liveness signal — missing heartbeats trigger
-  `degraded` health.
+  relay (and at each subsequent hop) on a short interval (`[dial].heartbeat_interval`,
+  default 5 s). Updates the relay's *downstream IP* mapping when the
+  residential IP changes. Also the liveness signal — missing heartbeats
+  trigger `degraded` health.
 
 - **Rekey** — Noise session rekey, triggered before sequence-number
   exhaustion or on a time/byte budget. Transparent to upper layers.
@@ -448,8 +448,9 @@ sudo journalctl -u yggdrasil --output=cat | jq -r '"\(.timestamp) [\(.level)] \(
 
 You don't need to restart to chase a transient issue — see
 [`docs/operations.md` § Turning up verbose logging on a live daemon](operations.md).
-TL;DR: `yggdrasilctl local log set-filter 'yggdrasil::chain=trace'`,
-revert with `yggdrasilctl local log reset`.
+TL;DR: `yggdrasilctl local trace 'yggdrasil::chain=trace'` to install a new
+directive, `yggdrasilctl local trace --reset` to revert to the daemon's
+startup filter, `yggdrasilctl local trace` with no args to inspect both.
 
 ### rust-analyzer
 
@@ -667,7 +668,7 @@ Runtime-state operations belong on the **signal-handler path**, not in
 - **Introspection** (read-only): `local status`, `local metrics`,
   `local health`, `local derived-rules`, `chain {summary,ping,health,diff}`.
 - **One-shot config-file mutations** (operator-managed state, not daemon
-  runtime): `identity rotate`, `accept approve`, `accept pending`.
+  runtime): `identity rotate`, `local accept approve`, `local accept pending`.
 
 Things that affect what the running daemon is *doing* hook signals:
 
