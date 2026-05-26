@@ -457,6 +457,7 @@ async fn spawn_proxy_for_rule(
             Ok(ActiveProxy {
                 handle,
                 upstream_description,
+                cert_less_route_count: 0,
             })
         }
         Protocol::Https => {
@@ -585,10 +586,12 @@ async fn spawn_https_rule(
         .increment(1);
     }
 
-    // 2. Spawn (or look up) the per-IP redirect listener. Attach the
+    // 2. Spawn (or look up) the per-IP companion listener. Attach the
     //    AcmeManager's HTTP-01 responder on first spawn so
     //    `/.well-known/acme-challenge/<token>` requests get answered
-    //    in-band instead of being 301'd to HTTPS.
+    //    in-band instead of being 301'd to HTTPS. Also plumbs the
+    //    cert-less route subset onto the listener's plaintext_routes
+    //    table and updates its lan_cidrs snapshot.
     let ip = rule.listen.ip();
     if let std::collections::hash_map::Entry::Vacant(e) = redirect_listeners.entry(ip) {
         let port = cert_config.redirect_port.unwrap_or(80);
@@ -598,12 +601,40 @@ async fn spawn_https_rule(
         if let Some(acme) = cert_config.acme.as_ref() {
             rl.set_acme_responder(acme.responder());
         }
+        // Install the resolved LAN-CIDR snapshot so the cert-less
+        // route branch's peer-IP filter is active from the moment
+        // the listener accepts its first connection.
+        rl.set_lan_cidrs(Some(Arc::clone(&cert_config.lan_cidrs)));
         e.insert(rl);
     }
     let rl = redirect_listeners.get(&ip).expect("just inserted");
     let redirect_hosts: Vec<String> = loaded_hosts.clone();
     for host in &redirect_hosts {
         rl.register_host(host);
+    }
+
+    // Plumb cert-less routes onto the companion's plaintext table.
+    // First drop any prior entries from this same rule (hot-reload
+    // safety), then register the current set.
+    rl.unregister_plaintext_routes(&rule.name);
+    if !cert_less_hosts.is_empty() {
+        let cert_less_routes: Vec<ratatoskr::rule::HttpRoute> = routes
+            .iter()
+            .filter(|r| {
+                cert_less_hosts
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&r.hostname))
+            })
+            .cloned()
+            .collect();
+        let collisions = rl.register_plaintext_routes(&cert_less_routes, &rule.name);
+        for collided in &collisions {
+            tracing::warn!(
+                rule = %rule.name,
+                route = %collided,
+                "cert-less hostname is also registered by another rule on this IP; the most recent rule wins"
+            );
+        }
     }
 
     // 2b. Register every `cert = "acme"` route with the AcmeManager so
@@ -681,6 +712,7 @@ async fn spawn_https_rule(
     Ok(ActiveProxy {
         handle,
         upstream_description: format!("https:{} routes", routes.len()),
+        cert_less_route_count: cert_less_hosts.len(),
     })
 }
 
@@ -696,6 +728,7 @@ pub(super) fn publish_snapshot(
             protocol: ap.handle.rule().protocol,
             listen: ap.handle.local_addr(),
             upstream_description: ap.upstream_description.clone(),
+            cert_less_route_count: ap.cert_less_route_count,
         })
         .collect();
     snaps.sort_by(|a, b| a.name.cmp(&b.name));

@@ -56,6 +56,13 @@ pub struct ProxySnapshot {
     /// rules render as `static:<ip>:<port>`. Not a parse target — just for
     /// control-plane reporting.
     pub upstream_description: String,
+    /// For HTTPS rules: number of routes that ended up cert-less (no
+    /// cert source resolved across the precedence chain). These
+    /// routes are served by the per-IP companion listener's plaintext
+    /// path; the cert store doesn't carry an entry for them. Zero
+    /// for non-HTTPS rules and for HTTPS rules whose every route
+    /// resolved a cert source.
+    pub cert_less_route_count: usize,
 }
 
 /// Handle to a running supervisor.

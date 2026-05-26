@@ -7,13 +7,15 @@
 //! [`CertStore`]: crate::proxy::certs::CertStore
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::lan_cidrs::LanCidrs;
 use crate::proxy::acme::AcmeManager;
 
 /// Certificate-loading configuration extracted from `ServerSection`. Held
 /// by the supervisor and consulted whenever an HTTPS rule's routes need to
 /// be reified into the shared `CertStore`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CertConfig {
     pub cert_dir: PathBuf,
     pub default_cert: Option<PathBuf>,
@@ -30,6 +32,25 @@ pub struct CertConfig {
     ///   * calls `AcmeManager::register(host, route_cfg)` for each
     ///     route whose `cert = "acme"` once the rule loads.
     pub acme: Option<AcmeManager>,
+    /// Resolved LAN-CIDR snapshot (see [`crate::lan_cidrs`]). Plumbed
+    /// onto every per-IP companion listener spawned by the supervisor
+    /// so the cert-less route branch's peer-IP filter is active.
+    pub lan_cidrs: Arc<LanCidrs>,
+}
+
+impl Default for CertConfig {
+    fn default() -> Self {
+        Self {
+            cert_dir: PathBuf::new(),
+            default_cert: None,
+            default_key: None,
+            redirect_port: None,
+            acme: None,
+            lan_cidrs: Arc::new(
+                LanCidrs::resolve(None).expect("DEFAULT_LAN_CIDR_STRINGS is parseable"),
+            ),
+        }
+    }
 }
 
 impl CertConfig {
@@ -38,6 +59,7 @@ impl CertConfig {
         default_cert: Option<PathBuf>,
         default_key: Option<PathBuf>,
         http_redirect_port: Option<u16>,
+        lan_cidrs: Arc<LanCidrs>,
     ) -> Self {
         Self {
             cert_dir,
@@ -45,6 +67,7 @@ impl CertConfig {
             default_key,
             redirect_port: http_redirect_port,
             acme: None,
+            lan_cidrs,
         }
     }
 

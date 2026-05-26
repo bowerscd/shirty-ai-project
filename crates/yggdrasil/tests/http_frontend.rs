@@ -440,6 +440,9 @@ impl TwoRouteFixture {
             default_key: None,
             redirect_port: Some(redirect_port),
             acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
         };
         let supervisor = spawn_terminal_supervisor_with_certs(
             rules_dir,
@@ -721,6 +724,9 @@ cert = "ephemeral"
             default_key: None,
             redirect_port: Some(redirect_port),
             acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
         },
         shutdown.clone(),
     )
@@ -804,6 +810,9 @@ async fn hsts_header_emitted_when_opted_in() {
             default_key: None,
             redirect_port: Some(redirect_port),
             acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
         },
         shutdown.clone(),
     )
@@ -981,6 +990,9 @@ async fn disk_backed_cert_reloads_on_change() {
             default_key: None,
             redirect_port: Some(redirect_port),
             acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
         },
         shutdown.clone(),
     )
@@ -1051,6 +1063,9 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
             default_key: None,
             redirect_port: Some(redirect_port),
             acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
         },
         shutdown.clone(),
     )

@@ -179,6 +179,7 @@ pub async fn run_relay(
             config.server.default_cert.clone(),
             config.server.default_key.clone(),
             config.server.http_redirect_port,
+            resolve_lan_cidrs(&config),
         ),
         Arc::new(crate::proxy::certs::CertStore::new()),
         config.server.graceful_drain_timeout,
@@ -338,6 +339,7 @@ pub async fn run_relay(
         None, // relay nodes never wire an AcmeManager (no HTTPS rules)
         nat_mapper.as_ref().map(|m| m.handle()),
         Arc::clone(&canary_arm_table),
+        resolve_lan_cidrs(&config),
         shutdown.clone(),
     )
     .await
@@ -479,6 +481,7 @@ pub async fn run_terminal(
         config.server.default_cert.clone(),
         config.server.default_key.clone(),
         config.server.http_redirect_port,
+        resolve_lan_cidrs(&config),
     );
     if let Some(acme_mgr) = acme_manager.clone() {
         cert_config = cert_config.with_acme(acme_mgr);
@@ -546,6 +549,7 @@ pub async fn run_terminal(
         acme_manager.clone(),
         nat_mapper.as_ref().map(|m| m.handle()),
         Arc::clone(&canary_arm_table),
+        resolve_lan_cidrs(&config),
         shutdown.clone(),
     )
     .await
@@ -616,6 +620,19 @@ pub async fn run_terminal(
         }
     }
     Ok(())
+}
+
+/// Resolve `[server].lan_cidrs` (or the default set when unset) and
+/// log the resolved set at startup. Called once per supervisor spawn.
+fn resolve_lan_cidrs(config: &config::ServerConfig) -> std::sync::Arc<crate::lan_cidrs::LanCidrs> {
+    let lan = crate::lan_cidrs::LanCidrs::resolve(config.server.lan_cidrs.as_deref())
+        .expect("config validator pre-checked CIDR syntax");
+    tracing::info!(
+        source = %lan.source().as_str(),
+        cidrs = ?lan.as_strings(),
+        "lan_cidrs resolved"
+    );
+    std::sync::Arc::new(lan)
 }
 
 /// Load the static X25519 identity from `path`, generating + persisting it

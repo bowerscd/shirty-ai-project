@@ -70,4 +70,7 @@ impl ProxyHandle {
 pub(super) struct ActiveProxy {
     pub(super) handle: ProxyHandle,
     pub(super) upstream_description: String,
+    /// For HTTPS rules: number of routes that ended up cert-less (no
+    /// cert source resolved). Zero for non-HTTPS rules.
+    pub(super) cert_less_route_count: usize,
 }
