@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::crypto::ring::sign::any_supported_type;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 
@@ -222,8 +223,7 @@ fn parse_pem_pair(
     key_path: &Path,
     key_pem: &[u8],
 ) -> Result<CertifiedKey, CertError> {
-    let mut cert_slice: &[u8] = cert_pem;
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_slice)
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CertError::Pem {
             rule: rule_name.to_string(),
@@ -240,20 +240,25 @@ fn parse_pem_pair(
         });
     }
 
-    let mut key_slice: &[u8] = key_pem;
-    let key_der: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_slice)
-        .map_err(|e| CertError::Pem {
-            rule: rule_name.to_string(),
-            route: route.to_string(),
-            kind: "private key",
-            path: key_path.to_path_buf(),
-            detail: e.to_string(),
-        })?
-        .ok_or_else(|| CertError::KeyEmpty {
-            rule: rule_name.to_string(),
-            route: route.to_string(),
-            path: key_path.to_path_buf(),
-        })?;
+    let key_der: PrivateKeyDer<'static> = match PrivateKeyDer::from_pem_slice(key_pem) {
+        Ok(k) => k,
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => {
+            return Err(CertError::KeyEmpty {
+                rule: rule_name.to_string(),
+                route: route.to_string(),
+                path: key_path.to_path_buf(),
+            });
+        }
+        Err(e) => {
+            return Err(CertError::Pem {
+                rule: rule_name.to_string(),
+                route: route.to_string(),
+                kind: "private key",
+                path: key_path.to_path_buf(),
+                detail: e.to_string(),
+            });
+        }
+    };
 
     let signing_key = any_supported_type(&key_der).map_err(|e| CertError::SigningKey {
         rule: rule_name.to_string(),
@@ -511,7 +516,7 @@ mod tests {
     #[test]
     fn malformed_cert_pem_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        // No PEM markers at all → rustls_pemfile parses zero entries → empty
+        // No PEM markers at all → PemObject parses zero entries → empty
         // chain → CertEmpty.
         let cert_path = write_file(
             dir.path(),

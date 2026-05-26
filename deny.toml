@@ -55,12 +55,7 @@ version = 2
 # advisory ID below with a sunset date if a fix isn't yet released
 # upstream.
 yanked = "deny"
-ignore = [
-    # rustls-pemfile is archived upstream and superseded by
-    # `rustls-pki-types::PemObject`. Migration is a small refactor
-    # touching the cert-loader code. Tracked separately.
-    "RUSTSEC-2025-0134",
-]
+ignore = []
 
 # =============================================================================
 # Bans — duplicate crate versions and explicit blocklist
