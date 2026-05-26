@@ -116,12 +116,27 @@ impl CertStore {
             server_default,
         };
         match load_route_cert(&spec.route, &ctx) {
-            Ok(entry) => {
+            Ok(Some(entry)) => {
                 self.inner.write().entries.insert(key.clone(), entry);
                 metrics::counter!(
                     "yggdrasil_https_cert_reload_total",
                     "route"  => key,
                     "result" => "ok",
+                )
+                .increment(1);
+                Ok(())
+            }
+            Ok(None) => {
+                // Reload spec exists for this hostname, but the cert source
+                // no longer resolves — the route has effectively become
+                // cert-less. Remove it from the store; the supervisor's
+                // next reload cycle will pick up the new shape and route
+                // the hostname onto the companion listener instead.
+                self.inner.write().entries.remove(&key);
+                metrics::counter!(
+                    "yggdrasil_https_cert_reload_total",
+                    "route"  => key,
+                    "result" => "cert_less",
                 )
                 .increment(1);
                 Ok(())
@@ -186,6 +201,17 @@ impl CertStore {
     /// True if no hostnames are loaded.
     pub fn is_empty(&self) -> bool {
         self.inner.read().entries.is_empty()
+    }
+
+    /// True if a cert for `hostname` is loaded. Used by the HTTPS
+    /// frontend to filter cert-less routes out of the `:443` SNI
+    /// table — a route whose hostname is not in the store will not be
+    /// bound on TLS.
+    pub fn contains(&self, hostname: &str) -> bool {
+        self.inner
+            .read()
+            .entries
+            .contains_key(&hostname.to_ascii_lowercase())
     }
 
     /// SNI lookup helper. `pub(super)` so the cert-module tests can call

@@ -43,7 +43,17 @@ pub struct CertContext<'a> {
 
 /// Resolve and load the certificate for a single `[[rule.route]]` following
 /// the precedence chain described in the module-level docs.
-pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertEntry, CertError> {
+///
+/// Returns `Ok(None)` when no cert source matches — that signals a
+/// **cert-less route** which lives only on the per-IP companion
+/// listener's `:80` plaintext path (see
+/// [`crate::proxy::http_frontend::redirect`]). Cert-less routes are
+/// intentionally not entered into the cert store; the HTTPS frontend
+/// will not register their hostnames in the SNI table.
+pub fn load_route_cert(
+    route: &HttpRoute,
+    ctx: &CertContext<'_>,
+) -> Result<Option<CertEntry>, CertError> {
     let hostname = &route.hostname;
 
     // 1) Explicit path.
@@ -53,14 +63,14 @@ pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertE
             .as_ref()
             .expect("validator guarantees Path(_) ⇒ Some(key)");
         let key = load_pem_pair(ctx.rule_name, hostname, cert_path, key_path)?;
-        return Ok(CertEntry {
+        return Ok(Some(CertEntry {
             key: Arc::new(key),
             origin: CertOrigin::Path {
                 cert: cert_path.clone(),
                 key: key_path.clone(),
             },
             loaded_at_unix_ms: now_unix_ms(),
-        });
+        }));
     }
 
     // 2) Ephemeral sentinel.
@@ -70,11 +80,11 @@ pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertE
             route: hostname.clone(),
             detail: e.to_string(),
         })?;
-        return Ok(CertEntry {
+        return Ok(Some(CertEntry {
             key: Arc::new(key),
             origin: CertOrigin::Ephemeral,
             loaded_at_unix_ms: now_unix_ms(),
-        });
+        }));
     }
 
     // 3) ACME-managed: convention dir is the source of truth (the
@@ -88,14 +98,14 @@ pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertE
         let acme_key = cdir.join(hostname).join("privkey.pem");
         if acme_cert.is_file() && acme_key.is_file() {
             let key = load_pem_pair(ctx.rule_name, hostname, &acme_cert, &acme_key)?;
-            return Ok(CertEntry {
+            return Ok(Some(CertEntry {
                 key: Arc::new(key),
                 origin: CertOrigin::Acme {
                     cert: acme_cert,
                     key: acme_key,
                 },
                 loaded_at_unix_ms: now_unix_ms(),
-            });
+            }));
         }
         // First-boot stand-in. The ephemeral isn't valid against a real
         // CA-signed chain on the client side, but it lets the rule
@@ -106,14 +116,14 @@ pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertE
             route: hostname.clone(),
             detail: e.to_string(),
         })?;
-        return Ok(CertEntry {
+        return Ok(Some(CertEntry {
             key: Arc::new(key),
             origin: CertOrigin::AcmePending {
                 cert: acme_cert,
                 key: acme_key,
             },
             loaded_at_unix_ms: now_unix_ms(),
-        });
+        }));
     }
 
     // 4) Convention directory (no `cert =` declared at all).
@@ -122,33 +132,34 @@ pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertE
     let conv_key = cdir.join(hostname).join("privkey.pem");
     if conv_cert.is_file() && conv_key.is_file() {
         let key = load_pem_pair(ctx.rule_name, hostname, &conv_cert, &conv_key)?;
-        return Ok(CertEntry {
+        return Ok(Some(CertEntry {
             key: Arc::new(key),
             origin: CertOrigin::Convention {
                 cert: conv_cert,
                 key: conv_key,
             },
             loaded_at_unix_ms: now_unix_ms(),
-        });
+        }));
     }
 
     // 5) Server-wide default.
     if let Some((cert_path, key_path)) = ctx.server_default {
         let key = load_pem_pair(ctx.rule_name, hostname, cert_path, key_path)?;
-        return Ok(CertEntry {
+        return Ok(Some(CertEntry {
             key: Arc::new(key),
             origin: CertOrigin::Default {
                 cert: cert_path.to_path_buf(),
                 key: key_path.to_path_buf(),
             },
             loaded_at_unix_ms: now_unix_ms(),
-        });
+        }));
     }
 
-    Err(CertError::NoSource {
-        rule: ctx.rule_name.to_string(),
-        route: hostname.clone(),
-    })
+    // 6) Cert-less route. Intentional — this hostname lives on the
+    //    per-IP companion listener's :80 plaintext path only. Operator
+    //    sees a load-time WARN naming the hostname (emitted by the
+    //    supervisor's route partition step).
+    Ok(None)
 }
 
 /// Resolve every route in `rule` and insert the results into `store`. This is
@@ -160,12 +171,21 @@ pub fn load_route_cert(route: &HttpRoute, ctx: &CertContext<'_>) -> Result<CertE
 /// `CertStore::reload_host` can re-resolve the cert later without any
 /// extra context from the caller. Ephemeral routes are not recorded —
 /// they have no disk paths to watch.
+///
+/// Cert-less routes (`load_route_cert` returning `Ok(None)`) are
+/// **skipped entirely**: they are not inserted into the store and no
+/// reload spec is recorded for them. The supervisor's route-partition
+/// step is responsible for forwarding cert-less routes to the per-IP
+/// companion listener's `plaintext_routes` table. The collected
+/// cert-less hostnames for *this* rule are returned so the caller can
+/// emit a load-time `WARN` per hostname and wire the routes onto the
+/// companion listener atomically with the cert store update.
 pub fn load_rule_into_store(
     rule: &Rule,
     store: &CertStore,
     server_cert_dir: &Path,
     server_default: Option<(&Path, &Path)>,
-) -> Result<(), CertError> {
+) -> Result<Vec<String>, CertError> {
     let routes = rule.routes.as_deref().unwrap_or(&[]);
     let rule_cert_dir = rule.cert_dir.as_deref();
     let ctx = CertContext {
@@ -174,8 +194,15 @@ pub fn load_rule_into_store(
         server_cert_dir,
         server_default,
     };
+    let mut cert_less: Vec<String> = Vec::new();
     for route in routes {
-        let entry = load_route_cert(route, &ctx)?;
+        let Some(entry) = load_route_cert(route, &ctx)? else {
+            // Cert-less route: lives on :80 only. Don't insert into the
+            // cert store; the supervisor will partition it onto the
+            // per-IP companion listener.
+            cert_less.push(route.hostname.clone());
+            continue;
+        };
         // Record the spec *before* inserting the entry so a concurrent
         // observer that sees the entry can also find the spec.
         if !matches!(entry.origin, CertOrigin::Ephemeral) {
@@ -190,7 +217,7 @@ pub fn load_rule_into_store(
         }
         store.insert(&route.hostname, entry);
     }
-    Ok(())
+    Ok(cert_less)
 }
 
 /// Load and verify a `(cert, key)` PEM pair.
@@ -497,7 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn no_source_error_when_chain_exhausted() {
+    fn no_source_yields_cert_less_route_and_no_store_entry() {
+        // Under the cert-less route design, a route whose cert source
+        // doesn't resolve anywhere in the precedence chain is intentional:
+        // the route lives on the per-IP companion listener's :80
+        // plaintext path. load_rule_into_store returns the list of
+        // cert-less hostnames so the supervisor can warn + plumb them
+        // onto the companion. The cert store stays empty for these
+        // routes.
         let route = HttpRoute {
             hostname: "api.local".to_string(),
             target: Url::parse("http://10.0.0.1:8080").unwrap(),
@@ -507,10 +541,31 @@ mod tests {
         };
         let rule = rule_with_routes(vec![route]);
         let store = CertStore::new();
-        let err = load_rule_into_store(&rule, &store, &PathBuf::from("/nonexistent-dir"), None)
-            .unwrap_err();
-        assert!(matches!(err, CertError::NoSource { .. }));
+        let cert_less =
+            load_rule_into_store(&rule, &store, &PathBuf::from("/nonexistent-dir"), None)
+                .expect("cert-less route is not an error");
+        assert_eq!(cert_less, vec!["api.local".to_string()]);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn load_route_cert_returns_none_when_chain_exhausted() {
+        let route = HttpRoute {
+            hostname: "api.local".to_string(),
+            target: Url::parse("http://10.0.0.1:8080").unwrap(),
+            cert: None,
+            key: None,
+            hsts: None,
+        };
+        let server_cert_dir = PathBuf::from("/nonexistent-dir");
+        let ctx = CertContext {
+            rule_name: "r",
+            rule_cert_dir: None,
+            server_cert_dir: &server_cert_dir,
+            server_default: None,
+        };
+        let result = load_route_cert(&route, &ctx).expect("cert-less is not an error");
+        assert!(result.is_none(), "expected cert-less route → Ok(None)");
     }
 
     #[test]

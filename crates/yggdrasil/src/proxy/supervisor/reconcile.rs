@@ -519,27 +519,59 @@ async fn spawn_https_rule(
             .as_deref()
             .zip(cert_config.default_key.as_deref()),
     );
-    if let Err(e) = load_result {
-        // Roll back any entries we did manage to set (load_rule_into_store
-        // is best-effort but may have inserted some before failing).
-        for host in routes.iter().map(|r| r.hostname.clone()) {
-            cert_store.remove(&host);
+    let cert_less_hosts: Vec<String> = match load_result {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            // Roll back any entries we did manage to set (load_rule_into_store
+            // is best-effort but may have inserted some before failing).
+            for host in routes.iter().map(|r| r.hostname.clone()) {
+                cert_store.remove(&host);
+            }
+            // Emit per-route reload-failed counters. We can't know exactly which
+            // route hit the error, so we count the rule itself as failing on its
+            // first route — this is good enough as an alert signal.
+            if let Some(first) = routes.first() {
+                metrics::counter!(
+                    "yggdrasil_https_cert_reload_total",
+                    "route" => first.hostname.to_ascii_lowercase(),
+                    "result" => "err",
+                )
+                .increment(1);
+            }
+            return Err(e).with_context(|| format!("load certs for HTTPS rule {:?}", rule.name));
         }
-        // Emit per-route reload-failed counters. We can't know exactly which
-        // route hit the error, so we count the rule itself as failing on its
-        // first route — this is good enough as an alert signal.
-        if let Some(first) = routes.first() {
-            metrics::counter!(
-                "yggdrasil_https_cert_reload_total",
-                "route" => first.hostname.to_ascii_lowercase(),
-                "result" => "err",
-            )
-            .increment(1);
-        }
-        return Err(e).with_context(|| format!("load certs for HTTPS rule {:?}", rule.name));
+    };
+
+    // Emit a load-time WARN per cert-less route — operators who *thought*
+    // they had a cert via fallthrough see this loud at startup.
+    // (Phase E plumbs `cert_less_hosts` onto the per-IP companion
+    // listener's `plaintext_routes` table; today the routes are accepted
+    // but their plaintext path is not yet served.)
+    for host in &cert_less_hosts {
+        tracing::warn!(
+            rule = %rule.name,
+            route = %host,
+            cert = "none",
+            "no cert source resolved; route served as plaintext on :80 to lan_cidrs peers only"
+        );
+        metrics::gauge!(
+            "yggdrasil_certless_routes",
+            "rule" => rule.name.clone(),
+            "hostname" => host.clone(),
+        )
+        .set(1.0);
     }
+
     for r in routes {
         let host_lower = r.hostname.to_ascii_lowercase();
+        // Skip the cert-watcher / reload-counter wiring for cert-less
+        // routes — they have nothing in the cert store to watch.
+        if cert_less_hosts
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&r.hostname))
+        {
+            continue;
+        }
         loaded_hosts.push(host_lower.clone());
         // Register the route's disk paths with the cert watcher (a no-op
         // for ephemeral routes, since their `watched_paths()` is empty).
