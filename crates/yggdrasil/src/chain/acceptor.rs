@@ -35,20 +35,25 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use ratatoskr::canary::{
+    CanaryArm as CanaryArmFrame, CanaryHop, CanaryReply, CANARY_REPLY_MAX_WIRE_BYTES,
+};
 use ratatoskr::chain_query::{ChainHopQuery, ChainHopReply, CHAIN_HOP_REPLY_MAX_WIRE_BYTES};
 use ratatoskr::control::{ChainHop, Mode};
 use ratatoskr::control_frame::{AckStatus, ControlBodyType, ControlEnvelope};
 use ratatoskr::predicate::{predicate_reject, PredicateSet, PREDICATE_SET_MAX_WIRE_BYTES};
 use ratatoskr::pubkey::PubKey;
+use ratatoskr::rule::Protocol;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::chain::client::{ChainClientHandle, QueryError};
 use crate::chain::derive::{derive, DeriveConfig};
 use crate::chain::introspection::IntrospectionState;
+use crate::proxy::canary::CanaryArmTable;
 use crate::proxy::supervisor::SupervisorHandle;
 
 /// State file name under `state_dir`. Single file regardless of how many
@@ -126,6 +131,12 @@ pub struct ChainAcceptor {
     /// [`Mode::Relay`] (the only mode that runs an acceptor on the
     /// downstream-facing side).
     mode: OnceLock<Mode>,
+    /// Resolved `[server].name` (or hostname fallback). Stamped onto
+    /// the local [`ChainHop`] so cross-chain renderers can label hops
+    /// by something more readable than their pubkey. Set via
+    /// [`set_node_name`](ChainAcceptor::set_node_name); when unset
+    /// the local hop reports `name = None`.
+    node_name: OnceLock<String>,
     /// Downstream-facing outbound channel hand into the heartbeat
     /// server. The acceptor uses this to push `ChainHopReply`
     /// envelopes back down the chain after assembling them. Unset
@@ -137,6 +148,13 @@ pub struct ChainAcceptor {
     /// nodes without `[dial]` (gateways and top-of-chain relays); in
     /// that case the reply contains only this hop's local view.
     upstream: OnceLock<ChainClientHandle>,
+    /// Shared per-daemon canary arm table. Set by `set_arm_table`
+    /// when the daemon wires the canary surface. When unset, an
+    /// incoming `CanaryArm` is still handled (the recursion continues
+    /// up the chain so the reply assembles correctly) but the local
+    /// arm-installation step is a no-op, so probe traffic at this
+    /// hop's listeners would forward to the configured backend.
+    arm_table: OnceLock<Arc<CanaryArmTable>>,
 }
 
 impl ChainAcceptor {
@@ -167,8 +185,10 @@ impl ChainAcceptor {
             introspection: OnceLock::new(),
             started_at: Instant::now(),
             mode: OnceLock::new(),
+            node_name: OnceLock::new(),
             outbound: OnceLock::new(),
             upstream: OnceLock::new(),
+            arm_table: OnceLock::new(),
         }))
     }
 
@@ -178,6 +198,14 @@ impl ChainAcceptor {
     /// [`Mode::Relay`].
     pub fn set_mode(&self, mode: Mode) -> std::result::Result<(), Mode> {
         self.mode.set(mode)
+    }
+
+    /// Install the resolved node name (`[server].name`, falling back
+    /// to `gethostname(3)`) reported in the local [`ChainHop::name`].
+    /// Must be called at most once; idempotent no-op when omitted —
+    /// the local hop then reports `name = None`.
+    pub fn set_node_name(&self, name: String) -> std::result::Result<(), String> {
+        self.node_name.set(name)
     }
 
     /// Install the downstream-facing outbound channel hand from the
@@ -199,6 +227,18 @@ impl ChainAcceptor {
         handle: ChainClientHandle,
     ) -> std::result::Result<(), ChainClientHandle> {
         self.upstream.set(handle)
+    }
+
+    /// Install the shared canary arm table. The terminal-mode handler
+    /// for `CanaryArm` consults this to install per-rule arm entries
+    /// (so the rule's L4 listener short-circuits matching probe
+    /// traffic to an in-process echo). Optional: omit on nodes that
+    /// don't run rule listeners.
+    pub fn set_arm_table(
+        &self,
+        table: Arc<CanaryArmTable>,
+    ) -> std::result::Result<(), Arc<CanaryArmTable>> {
+        self.arm_table.set(table)
     }
 
     /// Attach the chain-introspection sink. Must be called at most
@@ -260,6 +300,19 @@ impl ChainAcceptor {
                 // sees the misuse in metrics/logs.
                 tracing::warn!(
                     "drop ChainHopReply on relay-acceptor side (replies flow upstream-to-downstream)"
+                );
+                AckStatus::Unknown
+            }
+            ControlBodyType::CanaryArm => {
+                self.spawn_canary_arm_handler(body);
+                AckStatus::Ok
+            }
+            ControlBodyType::CanaryReply => {
+                // Like ChainHopReply, replies belong on the
+                // upstream-facing chain-client side. If one shows up
+                // at an acceptor the downstream is mis-encoding.
+                tracing::warn!(
+                    "drop CanaryReply on relay-acceptor side (replies flow upstream-to-downstream)"
                 );
                 AckStatus::Unknown
             }
@@ -518,10 +571,12 @@ impl ChainAcceptor {
         };
         let mode = self.mode.get().copied().unwrap_or(Mode::Relay);
         let uptime_secs = self.started_at.elapsed().as_secs();
+        let name = self.node_name.get().cloned();
         let local_hop = ChainHop {
             hop_index: 0,
             mode,
             uptime_secs,
+            name,
             view,
             query_rtt_ms: None,
         };
@@ -651,6 +706,242 @@ impl ChainAcceptor {
             tracing::warn!(
                 query_id = reply.query_id,
                 "outbound channel closed; dropping ChainHopReply",
+            );
+        }
+    }
+
+    /// Decode a `CanaryArm` body and spawn a background task to
+    /// install the arm locally (terminal-only), recurse upstream, and
+    /// emit a [`CanaryReply`] back down the chain. Mirrors the
+    /// [`spawn_chain_hop_query_handler`](Self::spawn_chain_hop_query_handler)
+    /// shape.
+    fn spawn_canary_arm_handler(self: &Arc<Self>, body: &[u8]) {
+        let arm: CanaryArmFrame = match postcard::from_bytes(body) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode inbound CanaryArm");
+                metrics::counter!(
+                    "yggdrasil_canary_arm_total",
+                    "outcome" => "decode_error",
+                )
+                .increment(1);
+                return;
+            }
+        };
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.handle_canary_arm(arm).await;
+        });
+    }
+
+    async fn handle_canary_arm(self: Arc<Self>, arm: CanaryArmFrame) {
+        let query_id = arm.query_id;
+        metrics::counter!(
+            "yggdrasil_canary_arm_total",
+            "outcome" => "received",
+        )
+        .increment(1);
+        let started = Instant::now();
+
+        // 1. Local hop assembly. Without introspection we don't know
+        //    our own pubkey, so bail with a partial reply.
+        let local_pubkey = match self.introspection.get() {
+            Some(ix) => ix.snapshot().chain.local,
+            None => {
+                tracing::warn!(
+                    query_id,
+                    "CanaryArm received but no introspection sink wired; replying partial",
+                );
+                self.send_canary_reply(CanaryReply {
+                    query_id,
+                    hops: vec![],
+                    partial: true,
+                    error: Some("local introspection unavailable".into()),
+                })
+                .await;
+                return;
+            }
+        };
+        let mode = self.mode.get().copied().unwrap_or(Mode::Relay);
+        let name = self.node_name.get().cloned();
+        let rule_present = self.has_matching_rule(arm.rule_listen, arm.rule_protocol);
+        // Only terminal-mode hops install the in-process echo
+        // intercept — relays just pass bytes through at L4, so there's
+        // nothing to short-circuit at the relay's rule listener.
+        let echo_armed = if mode == Mode::Terminal && rule_present {
+            if let Some(table) = self.arm_table.get() {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // Server-side TTL clamp: never trust a remote-supplied
+                // expiry beyond a local maximum. 60s comfortably covers
+                // the canary's default probe duration + grace; longer
+                // arms have no operational use case and represent
+                // unnecessary surface.
+                const SERVER_MAX_ARM_TTL_MS: u64 = 60_000;
+                let raw_ttl_ms = arm.expires_unix_ms.saturating_sub(now_ms);
+                let ttl_ms = raw_ttl_ms.min(SERVER_MAX_ARM_TTL_MS);
+                if ttl_ms > 0 {
+                    table.arm(
+                        arm.rule_listen,
+                        arm.rule_protocol,
+                        arm.token,
+                        Duration::from_millis(ttl_ms),
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let local_hop = CanaryHop {
+            hop_index: 0,
+            pubkey: local_pubkey,
+            name,
+            mode,
+            rule_present,
+            echo_armed,
+            query_rtt_ms: None,
+        };
+
+        // 2. Recurse upstream when we still have budget + an upstream.
+        const FORWARDING_OVERHEAD_MS: u32 = 250;
+        let depth_budget = arm.depth_budget.saturating_sub(1);
+        let upstream_deadline_ms = arm.deadline_ms.saturating_sub(FORWARDING_OVERHEAD_MS);
+        let mut hops = vec![local_hop];
+        let mut partial = false;
+        let mut error: Option<String> = None;
+
+        if let Some(upstream) = self.upstream.get() {
+            if depth_budget > 0 && upstream_deadline_ms > 0 {
+                let deadline = Duration::from_millis(upstream_deadline_ms as u64);
+                let upstream_started = Instant::now();
+                let upstream_arm = CanaryArmFrame {
+                    query_id: 0, // overwritten by the router
+                    depth_budget,
+                    deadline_ms: upstream_deadline_ms,
+                    rule_listen: arm.rule_listen,
+                    rule_protocol: arm.rule_protocol,
+                    token: arm.token,
+                    expires_unix_ms: arm.expires_unix_ms,
+                };
+                match upstream.query_upstream_canary(upstream_arm, deadline).await {
+                    Ok(reply) => {
+                        let rtt_ms =
+                            upstream_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        for (offset, mut hop) in reply.hops.into_iter().enumerate() {
+                            hop.hop_index = (hops.len() + offset) as u32;
+                            if offset == 0 {
+                                hop.query_rtt_ms = Some(rtt_ms);
+                            }
+                            hops.push(hop);
+                        }
+                        if reply.partial {
+                            partial = true;
+                            error = reply.error;
+                        }
+                    }
+                    Err(e) => {
+                        partial = true;
+                        error = Some(format!("upstream canary arm failed: {e}"));
+                    }
+                }
+            } else if depth_budget == 0 {
+                partial = true;
+                error = Some("depth budget exhausted".into());
+            } else {
+                partial = true;
+                error = Some("deadline exhausted before upstream forward".into());
+            }
+        }
+
+        // 3. Encode + size-check the reply. Oversize → truncate to
+        //    local hop + flag partial.
+        let mut reply = CanaryReply {
+            query_id,
+            hops,
+            partial,
+            error,
+        };
+        match postcard::to_allocvec(&reply) {
+            Ok(bytes) if bytes.len() > CANARY_REPLY_MAX_WIRE_BYTES => {
+                tracing::warn!(
+                    query_id,
+                    bytes = bytes.len(),
+                    cap = CANARY_REPLY_MAX_WIRE_BYTES,
+                    "CanaryReply oversized; truncating to local hop only",
+                );
+                reply.hops.truncate(1);
+                reply.partial = true;
+                reply.error = Some(format!(
+                    "reply exceeded {CANARY_REPLY_MAX_WIRE_BYTES} bytes; truncated to local hop"
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(query_id, error = %e, "failed to encode CanaryReply");
+                return;
+            }
+        }
+
+        metrics::counter!(
+            "yggdrasil_canary_arm_total",
+            "outcome" => if reply.partial { "replied_partial" } else { "replied_ok" },
+        )
+        .increment(1);
+        metrics::histogram!("yggdrasil_canary_arm_walk_seconds")
+            .record(started.elapsed().as_secs_f64());
+
+        self.send_canary_reply(reply).await;
+    }
+
+    /// Check the supervisor's current rule set for a non-HTTPS rule
+    /// whose `listen` and `protocol` exactly match the canary arm's
+    /// targets. HTTPS rules are not matched: canary operates on a
+    /// single L4 transport per invocation, and an HTTPS rule's
+    /// `protocol` is [`Protocol::Https`], not [`Protocol::Tcp`] or
+    /// [`Protocol::Udp`].
+    fn has_matching_rule(&self, listen: std::net::SocketAddr, protocol: Protocol) -> bool {
+        let set = self.supervisor.current_set_rx();
+        let snap = set.borrow();
+        snap.rules()
+            .iter()
+            .any(|r| r.listen == listen && r.protocol == protocol)
+    }
+
+    async fn send_canary_reply(self: &Arc<Self>, reply: CanaryReply) {
+        let bytes = match postcard::to_allocvec(&reply) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to encode CanaryReply for send");
+                return;
+            }
+        };
+        let outbound = match self.outbound.get() {
+            Some(o) => o,
+            None => {
+                tracing::debug!(
+                    query_id = reply.query_id,
+                    "no downstream outbound wired; dropping CanaryReply",
+                );
+                return;
+            }
+        };
+        let env = ControlEnvelope {
+            seq: 0,
+            body_type: ControlBodyType::CanaryReply.as_byte(),
+            body: bytes,
+        };
+        if outbound.send(env).is_err() {
+            tracing::warn!(
+                query_id = reply.query_id,
+                "outbound channel closed; dropping CanaryReply",
             );
         }
     }

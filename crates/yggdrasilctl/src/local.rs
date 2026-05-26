@@ -302,6 +302,15 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                 println!("renewal kicked for {hostname} (no result)");
             }
         }
+        Response::ChainCanary(_) => {
+            // `ChainCanary` belongs to the `chain canary` subcommand
+            // and is never produced for any request issued from the
+            // `local` scope. Treat as a routing bug.
+            bail!(
+                "server returned unexpected ChainCanary response \
+                 to local request {request:?}"
+            );
+        }
     }
     Ok(())
 }

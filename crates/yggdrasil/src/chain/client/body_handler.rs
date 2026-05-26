@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use ratatoskr::canary::{CanaryArm as CanaryArmFrame, CanaryReply};
 use ratatoskr::chain_query::{ChainHopQuery, ChainHopReply};
 use ratatoskr::control_frame::{AckStatus, ControlBodyType};
 
@@ -151,6 +152,56 @@ impl ChainClientHandle {
             Ok(Err(_)) => Err(QueryError::ClientDown),
             Err(_) => {
                 self.router.cancel(query_id);
+                Err(QueryError::Timeout)
+            }
+        }
+    }
+
+    /// Issue a [`CanaryArmFrame`] upstream and await the matching
+    /// [`CanaryReply`]. Mirrors [`query_upstream`](Self::query_upstream)
+    /// but uses the canary-side correlation map on the
+    /// [`QueryRouter`]. The originator's [`CanaryArmFrame::query_id`]
+    /// field is overwritten with the router-assigned id; callers
+    /// pass `0` (or any placeholder) for that field.
+    pub async fn query_upstream_canary(
+        &self,
+        mut arm: CanaryArmFrame,
+        deadline: Duration,
+    ) -> Result<CanaryReply, QueryError> {
+        let (query_id, rx) = self.router.register_canary();
+        arm.query_id = query_id;
+        let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+        arm.deadline_ms = deadline_ms;
+        let body = postcard::to_allocvec(&arm).map_err(QueryError::Encode)?;
+        let ack_rx = self
+            .send_control(ControlBodyType::CanaryArm.as_byte(), body)
+            .map_err(|_| {
+                self.router.cancel_canary(query_id);
+                QueryError::ClientDown
+            })?;
+
+        let ack_outcome = tokio::time::timeout(deadline, ack_rx).await;
+        match ack_outcome {
+            Err(_) => {
+                self.router.cancel_canary(query_id);
+                return Err(QueryError::Timeout);
+            }
+            Ok(Err(_)) => {
+                self.router.cancel_canary(query_id);
+                return Err(QueryError::ClientDown);
+            }
+            Ok(Ok(Err(e))) => {
+                self.router.cancel_canary(query_id);
+                return Err(QueryError::Send(e));
+            }
+            Ok(Ok(Ok(()))) => {}
+        }
+
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(QueryError::ClientDown),
+            Err(_) => {
+                self.router.cancel_canary(query_id);
                 Err(QueryError::Timeout)
             }
         }

@@ -382,6 +382,7 @@ async fn terminal_control_status_response_shape() {
     let server = ControlServer::bind(
         socket_path.clone(),
         Mode::Terminal,
+        "test-node".to_string(),
         None,
         &supervisor,
         None,
@@ -392,6 +393,7 @@ async fn terminal_control_status_response_shape() {
         None,
         None,
         None,
+        std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await
@@ -437,6 +439,7 @@ async fn terminal_control_peer_commands_are_rejected() {
     let server = ControlServer::bind(
         socket_path.clone(),
         Mode::Terminal,
+        "test-node".to_string(),
         None,
         &supervisor,
         None,
@@ -447,6 +450,7 @@ async fn terminal_control_peer_commands_are_rejected() {
         None,
         None,
         None,
+        std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await

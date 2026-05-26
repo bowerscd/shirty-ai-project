@@ -189,6 +189,43 @@ assert report["drift_detected"] is False, "expected no drift across forwarded ch
 print(f"[chain-diff] 3 hops reached; all see home-tcp-echo; drift_detected=False")
 ' || fail "chain diff --json output did not match expectations"
 
+# -------- chain canary from home: arm walks all 3 hops, probe echoes ------
+
+echo "==> [chain-canary] yggdrasilctl chain canary --port 7200 --proto tcp from home"
+
+# Run from home (the terminal hop). The arm phase recurses upstream
+# along home -> midbox -> vps, so the JSON report should carry three
+# hops. The probe data connects to home's local rule listener; the
+# canary intercept at home short-circuits it to in-process echo
+# without touching home's 127.0.0.1:7100 backend, so the rule under
+# test would still pass even if that backend were down.
+canary_json=$(dc_exec home-chain yggdrasilctl \
+    --json chain --socket /run/yggdrasil/control.sock \
+    canary --port 7200 --proto tcp --duration 500ms --timeout 5s \
+    || true)
+echo "$canary_json" | python3 -c '
+import json, sys
+reports = json.load(sys.stdin)
+assert isinstance(reports, list), f"expected JSON array, got {type(reports).__name__}"
+assert len(reports) == 1, f"expected one report for tcp/7200, got {len(reports)}"
+report = reports[0]
+assert report["status"] == "ok", f"unexpected status: {report}"
+assert report["rule_name"] == "home-tcp-echo", f"unexpected rule_name: {report}"
+chain = report["chain"]
+assert len(chain) == 3, f"expected 3 chain hops, got {len(chain)}: {chain}"
+assert chain[0]["echo_armed"] is True, \
+    f"home hop should be echo_armed (terminal): {chain[0]}"
+assert chain[0]["rule_present"] is True, \
+    f"home hop should have rule_present: {chain[0]}"
+# Probe ran, observed at least some bytes in each direction.
+probe = report["probe_results"]
+assert probe is not None, f"missing probe_results: {report}"
+assert probe["c_to_s"]["sent"] > 0, f"no bytes sent: {probe}"
+print(f"[chain-canary] 3 hops armed, probe OK, "
+      f"sent={probe['c_to_s']['sent']} bytes, "
+      f"received={probe['s_to_c']['sent']} bytes")
+' || fail "chain canary --json output did not match expectations"
+
 # -------- done -------------------------------------------------------------
 
 echo

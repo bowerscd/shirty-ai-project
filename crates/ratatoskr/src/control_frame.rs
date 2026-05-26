@@ -109,6 +109,22 @@ pub enum ControlBodyType {
     /// correlates the reply with the originating
     /// [`ChainHopQuery`](Self::ChainHopQuery).
     ChainHopReply = 0x04,
+    /// Downstream→upstream `CanaryArm` for the recursive
+    /// `chain canary` arming phase. Body is a postcard-encoded
+    /// [`crate::canary::CanaryArm`]. Receivers acknowledge `Ok`
+    /// synchronously and asynchronously install (terminal hops)
+    /// or simply record (intermediate hops) the arm entry, then
+    /// forward to their upstream when one exists. The originator
+    /// of the canary command then drives the data phase against
+    /// the rule's listener; matching probe traffic short-circuits
+    /// to an in-process echo at the terminal.
+    CanaryArm = 0x05,
+    /// Upstream→downstream `CanaryReply` carrying the per-hop
+    /// arming-phase result. Body is a postcard-encoded
+    /// [`crate::canary::CanaryReply`]. The `query_id` field
+    /// correlates the reply with the originating
+    /// [`CanaryArm`](Self::CanaryArm).
+    CanaryReply = 0x06,
 }
 
 impl ControlBodyType {
@@ -121,6 +137,8 @@ impl ControlBodyType {
             0x02 => Self::PredicateSetUpdate,
             0x03 => Self::ChainHopQuery,
             0x04 => Self::ChainHopReply,
+            0x05 => Self::CanaryArm,
+            0x06 => Self::CanaryReply,
             _ => return None,
         })
     }
@@ -217,6 +235,16 @@ mod tests {
         assert_eq!(
             ControlBodyType::from_byte(0x04),
             Some(ControlBodyType::ChainHopReply),
+        );
+        assert_eq!(ControlBodyType::CanaryArm.as_byte(), 0x05);
+        assert_eq!(
+            ControlBodyType::from_byte(0x05),
+            Some(ControlBodyType::CanaryArm),
+        );
+        assert_eq!(ControlBodyType::CanaryReply.as_byte(), 0x06);
+        assert_eq!(
+            ControlBodyType::from_byte(0x06),
+            Some(ControlBodyType::CanaryReply),
         );
         assert!(ControlBodyType::from_byte(0xFF).is_none());
     }

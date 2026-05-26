@@ -102,10 +102,12 @@ pub async fn run_relay(
     mode: config::Mode,
 ) -> Result<()> {
     let wire_mode: ratatoskr::control::Mode = mode.into();
+    let node_name = config.resolved_name();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
         mode = mode.as_str(),
+        name = %node_name,
         accept_listen = ?config.accept.as_ref().map(|a| a.listen),
         dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
@@ -150,6 +152,14 @@ pub async fn run_relay(
     let prom_handle =
         metrics::install_recorder(wire_mode).context("installing prometheus recorder")?;
 
+    // 4b. Shared canary arm table. Held by the supervisor (so every
+    //     per-rule TCP/UDP proxy can short-circuit canary-tagged
+    //     traffic to in-process echoes) AND by the chain acceptor
+    //     (which installs arm entries on `CanaryArm` envelopes). The
+    //     table is empty until an operator runs `yggdrasilctl chain
+    //     canary`, so this only allocates the `Arc<DashMap>` shell.
+    let canary_arm_table = Arc::new(crate::proxy::canary::CanaryArmTable::new());
+
     // 5. Rule-driven proxy supervisor. Built *before* the heartbeat
     //    listener so the chain acceptor can hold a handle to it.
     let resolver_factory = match mode {
@@ -157,7 +167,7 @@ pub async fn run_relay(
         config::Mode::Relay => ResolverFactory::new_relay(peer_state.clone()),
         config::Mode::Terminal => unreachable!("run_relay only dispatched for gateway/relay"),
     };
-    let supervisor = ProxySupervisor::spawn(
+    let supervisor = ProxySupervisor::spawn_with_cert_store(
         config.server.rules_dir.clone(),
         RULE_DEBOUNCE,
         resolver_factory,
@@ -169,7 +179,9 @@ pub async fn run_relay(
             config.server.default_key.clone(),
             config.server.http_redirect_port,
         ),
+        Arc::new(crate::proxy::certs::CertStore::new()),
         config.server.graceful_drain_timeout,
+        Arc::clone(&canary_arm_table),
         shutdown.clone(),
     )
     .await
@@ -236,6 +248,10 @@ pub async fn run_relay(
     if let Some(acc) = chain_acceptor.as_ref() {
         acc.set_mode(wire_mode)
             .map_err(|_| anyhow::anyhow!("mode set twice on acceptor"))?;
+        acc.set_node_name(node_name.clone())
+            .map_err(|_| anyhow::anyhow!("node_name set twice on acceptor"))?;
+        acc.set_arm_table(Arc::clone(&canary_arm_table))
+            .map_err(|_| anyhow::anyhow!("arm_table set twice on acceptor"))?;
     }
 
     // 6a. Heartbeat (chain) listener — only when [accept] is set.
@@ -309,6 +325,7 @@ pub async fn run_relay(
     let control = ControlServer::bind(
         config.control.socket.clone(),
         wire_mode,
+        node_name.clone(),
         Some(peer_state.clone()),
         &supervisor,
         Some(pending_store.clone()),
@@ -319,6 +336,7 @@ pub async fn run_relay(
         chain_client_handle.clone(),
         None, // relay nodes never wire an AcmeManager (no HTTPS rules)
         nat_mapper.as_ref().map(|m| m.handle()),
+        Arc::clone(&canary_arm_table),
         shutdown.clone(),
     )
     .await
@@ -380,10 +398,12 @@ pub async fn run_terminal(
     mode: config::Mode,
 ) -> Result<()> {
     let wire_mode: ratatoskr::control::Mode = mode.into();
+    let node_name = config.resolved_name();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config  = %args.config.display(),
         mode = mode.as_str(),
+        name = %node_name,
         dial_endpoint = ?config.dial.as_ref().map(|d| &d.endpoint),
         rules_dir = %config.server.rules_dir.display(),
         "yggdrasil starting"
@@ -463,6 +483,11 @@ pub async fn run_terminal(
         cert_config = cert_config.with_acme(acme_mgr);
     }
 
+    // Shared canary arm table — see `run_relay` for the rationale.
+    // Terminals are the canary's echo terminus, so they always carry
+    // an arm table; idle daemons just hold an empty `Arc<DashMap>`.
+    let canary_arm_table = Arc::new(crate::proxy::canary::CanaryArmTable::new());
+
     let supervisor = ProxySupervisor::spawn_with_cert_store(
         config.server.rules_dir.clone(),
         RULE_DEBOUNCE,
@@ -472,6 +497,7 @@ pub async fn run_terminal(
         cert_config,
         cert_store,
         config.server.graceful_drain_timeout,
+        Arc::clone(&canary_arm_table),
         shutdown.clone(),
     )
     .await
@@ -507,6 +533,7 @@ pub async fn run_terminal(
     let control = ControlServer::bind(
         config.control.socket.clone(),
         wire_mode,
+        node_name.clone(),
         None,
         &supervisor,
         None,
@@ -517,6 +544,7 @@ pub async fn run_terminal(
         chain_client_handle.clone(),
         acme_manager.clone(),
         nat_mapper.as_ref().map(|m| m.handle()),
+        Arc::clone(&canary_arm_table),
         shutdown.clone(),
     )
     .await

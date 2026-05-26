@@ -19,13 +19,14 @@
 //! different schema is forbidden.
 
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::predicate::Predicate;
 use crate::pubkey::PubKey;
-use crate::rule::Rule;
+use crate::rule::{Protocol, Rule};
 
 /// Runtime mode the daemon is operating in, surfaced in status responses.
 ///
@@ -176,6 +177,53 @@ pub enum Request {
         /// The route hostname (case-insensitive).
         hostname: String,
     },
+    /// Probe a rule's L4 forwarding path end-to-end through the chain.
+    /// The daemon:
+    ///   1. Resolves a rule for `(rule_listen, rule_protocol)` on the
+    ///      local node, returning [`error_codes::NO_SUCH_RULE`] with a
+    ///      close-match suggestion list if none matches.
+    ///   2. Arms every hop along the chain via a recursive `CanaryArm`
+    ///      fanout. If any hop is unreachable, returns
+    ///      [`ChainCanaryResponse::status`] = [`CanaryStatus::ChainDead`].
+    ///   3. Opens a probe connection to its own rule listener,
+    ///      prefixing the 32-byte arming token. Token-matched traffic
+    ///      short-circuits to an in-process echo at the terminal hop
+    ///      (never reaches the configured backend). Computes per-
+    ///      direction throughput / loss / latency over `duration_ms`.
+    ///   4. Classifies the outcome as [`CanaryStatus::Ok`] or
+    ///      [`CanaryStatus::Degraded`] based on loss / latency
+    ///      thresholds.
+    ///
+    /// Backs `yggdrasilctl chain canary --port N [--proto tcp|udp]`.
+    ChainCanary {
+        /// Rule's listen `(bind, port)` tuple. The CLI typically
+        /// translates `--port N` into `0.0.0.0:N` (or the rule's
+        /// explicit bind when `--bind` is supplied) before sending.
+        rule_listen: SocketAddr,
+        /// L4 protocol of the rule. The daemon's lookup is on
+        /// `(rule_listen, rule_protocol)`; `Protocol::Https` is
+        /// invalid here because canary operates on a single
+        /// transport per invocation — HTTPS rules are probed via two
+        /// `ChainCanary` requests issued back-to-back by the CLI
+        /// (one TCP, one UDP).
+        rule_protocol: Protocol,
+        /// Probe duration in milliseconds. Defaults at the CLI side
+        /// to 3000.
+        duration_ms: u32,
+        /// Sustained rate. For `Protocol::Tcp` this is interpreted as
+        /// megabits per second per direction (the CLI default is
+        /// 1 MB/s); for `Protocol::Udp` it is packets per second per
+        /// direction (the CLI default is 100 pps). Setting to `0`
+        /// uses the daemon's protocol default.
+        rate: u32,
+        /// UDP-only payload size in bytes. Ignored for TCP. CLI
+        /// default: 1200 (fits one MTU after chain framing overhead).
+        /// `0` uses the daemon's default.
+        payload_bytes: u32,
+        /// End-to-end timeout for the arm phase, in milliseconds.
+        /// `None` uses [`crate::canary::CANARY_ARM_DEFAULT_DEADLINE_MS`].
+        timeout_ms: Option<u32>,
+    },
 }
 
 /// All possible server → client messages.
@@ -242,6 +290,10 @@ pub enum Response {
         /// field is `true` in practice).
         success: bool,
     },
+    /// Successful response to [`Request::ChainCanary`]. The `status`
+    /// field discriminates between the four primary outcomes; the
+    /// other fields carry the structured detail rendered by the CLI.
+    ChainCanary(ChainCanaryResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -495,6 +547,13 @@ pub struct ChainHop {
     pub mode: Mode,
     /// Process uptime in whole seconds.
     pub uptime_secs: u64,
+    /// Human-readable label for this hop, sourced from the hop's
+    /// `[server].name` config (falling back to `gethostname(3)`).
+    /// Renderers prefer this over [`ChainIdentity::local`] for display.
+    /// Carried as `#[serde(default)]` so old peers that never wrote
+    /// the field continue to deserialise.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Predicates, derived rule set, and chain identity facts. Every
     /// field of [`DerivedRulesResponse`] is wire-stable across hops.
     pub view: DerivedRulesResponse,
@@ -561,6 +620,115 @@ pub struct AcmeHostInfo {
     pub not_after_unix: Option<u64>,
 }
 
+/// Top-level discriminator for [`ChainCanaryResponse::status`]. Drives
+/// the renderer's output shape and the CLI's exit code.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryStatus {
+    /// Probe ran clean: arm phase reached every hop, data phase
+    /// completed within loss / latency thresholds.
+    Ok,
+    /// Probe ran but the loss rate or tail latency exceeded the
+    /// daemon's classifier thresholds. Numbers are still in
+    /// [`ChainCanaryResponse::probe_results`].
+    Degraded,
+    /// No rule on this node binds the requested `(rule_listen,
+    /// rule_protocol)`. The accompanying
+    /// [`ChainCanaryResponse::close_matches`] suggests likely
+    /// near-misses for the renderer.
+    NoSuchRule,
+    /// The arm phase couldn't reach a hop. The chain was up to the
+    /// last responding hop in [`ChainCanaryResponse::chain`]; further
+    /// hops are absent. [`ChainCanaryResponse::probe_results`] is
+    /// `None` — no data phase ran.
+    ChainDead,
+}
+
+/// Per-direction probe statistics surfaced to the CLI. Computed at the
+/// originator from observations on its own end of the probe
+/// connection; no per-hop accounting is needed because the data phase
+/// rides the rule's existing L4 forwarding code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectionStats {
+    /// Total bytes (TCP) or datagrams (UDP) emitted by this side
+    /// during the probe.
+    pub sent: u64,
+    /// Total bytes / datagrams received back from the echo. For TCP
+    /// this is equal to `sent` unless the chain broke mid-probe; for
+    /// UDP it reflects per-flow loss.
+    pub received: u64,
+    /// Sustained throughput in bits per second.
+    pub throughput_bps: u64,
+    /// Per-direction latency percentile at p50, in microseconds. For
+    /// TCP this is round-trip; for UDP it's the one-way send → echo →
+    /// receive observed at the originator (i.e. round-trip, same
+    /// semantics for the operator).
+    pub latency_p50_micros: u64,
+    /// Per-direction latency percentile at p99, in microseconds. See
+    /// `latency_p50_micros`.
+    pub latency_p99_micros: u64,
+}
+
+/// Aggregate probe results returned alongside [`CanaryStatus::Ok`]
+/// or [`CanaryStatus::Degraded`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeResults {
+    /// Client → server direction (originator's send path through the
+    /// chain, echoed back from the terminal hop's intercept).
+    pub c_to_s: DirectionStats,
+    /// Server → client direction (terminal's echo path back to the
+    /// originator). For symmetric probes the numbers should mirror
+    /// `c_to_s`; asymmetry is real diagnostic signal.
+    pub s_to_c: DirectionStats,
+    /// Connection-establishment RTT in microseconds, TCP only. `None`
+    /// for UDP and for chains that didn't get past the arm phase.
+    pub connection_rtt_micros: Option<u64>,
+}
+
+/// Suggested near-miss when `chain canary` hits [`CanaryStatus::NoSuchRule`].
+/// The CLI walks these and prints a "closest matches" block before
+/// exiting non-zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloseMatch {
+    /// Listener address (bind IP + port) the suggested rule binds.
+    pub listen: SocketAddr,
+    /// Protocol of the suggested rule.
+    pub protocol: crate::rule::Protocol,
+    /// Human-readable rule name as declared in the terminal's
+    /// `conf.d/*.toml` (and, for derived rules on relays, copied
+    /// through verbatim).
+    pub rule_name: String,
+}
+
+/// Successful response to [`Request::ChainCanary`]. The CLI dispatches
+/// on `status` to pick between the four output shapes (OK / DEGRADED /
+/// NO_SUCH_RULE / CHAIN_DEAD).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainCanaryResponse {
+    /// Primary outcome word; drives exit code and renderer.
+    pub status: CanaryStatus,
+    /// Hop-by-hop chain assembly from the arm-phase recursion.
+    /// Includes the local hop at index 0. For [`CanaryStatus::ChainDead`]
+    /// this is the truncated chain up to the last responding hop.
+    pub chain: Vec<crate::canary::CanaryHop>,
+    /// Per-direction probe statistics. `None` for
+    /// [`CanaryStatus::NoSuchRule`] and [`CanaryStatus::ChainDead`] —
+    /// the data phase never ran.
+    pub probe_results: Option<ProbeResults>,
+    /// Mirrors [`crate::canary::CanaryReply::partial`].
+    #[serde(default)]
+    pub partial: bool,
+    /// Close-matches suggested when `status == NoSuchRule`. Empty for
+    /// every other status.
+    #[serde(default)]
+    pub close_matches: Vec<CloseMatch>,
+    /// Resolved rule name as declared on the local node, when a rule
+    /// was matched. `None` for [`CanaryStatus::NoSuchRule`]; populated
+    /// in every other case for renderer convenience.
+    #[serde(default)]
+    pub rule_name: Option<String>,
+}
+
 /// Stable error-code strings used in `Response::Error.code`. Kept in one place
 /// so tests on both sides can assert against them without typos.
 pub mod error_codes {
@@ -612,6 +780,13 @@ pub mod error_codes {
     /// The daemon has no `[acme]` section configured but the operator
     /// asked for ACME-managed state via `local acme list/renew`.
     pub const ACME_NOT_CONFIGURED: &str = "acme_not_configured";
+    /// `chain canary --port N --proto X` was called but no rule on
+    /// this node binds `(port, proto)`. The accompanying response
+    /// carries [`super::ChainCanaryResponse::close_matches`] for
+    /// renderer-side suggestion. Not surfaced as an `Error` — the
+    /// daemon returns a successful [`super::Response::ChainCanary`]
+    /// with `status = [super::CanaryStatus::NoSuchRule]`.
+    pub const NO_SUCH_RULE: &str = "no_such_rule";
 }
 
 /// Default UDS path the server binds and the CLI connects to.
@@ -871,6 +1046,7 @@ mod tests {
                 hop_index: 0,
                 mode: Mode::Terminal,
                 uptime_secs: 42,
+                name: None,
                 view,
                 query_rtt_ms: None,
             }],

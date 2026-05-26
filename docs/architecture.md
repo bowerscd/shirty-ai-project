@@ -523,6 +523,48 @@ Derived rules — what each upstream hop actually accepted — are carried
 inline in each `ChainHop` record, so `chain diff` no longer needs a
 side-channel HTTP fetch.
 
+### Chain canary
+
+`yggdrasilctl chain canary --port N [--proto tcp|udp]` is a second
+recursive query that piggybacks on the chain control plane to
+install per-rule arm entries, then drives a real L4 probe through
+the rule's listener.
+
+The arm phase shape mirrors `ChainHopQuery`. Wire frames live in
+[`ratatoskr::canary`](../crates/ratatoskr/src/canary.rs):
+
+```text
+CanaryArm   = { query_id, depth_budget, deadline_ms,
+                rule_listen: SocketAddr, rule_protocol: Protocol,
+                token: [u8; 32], expires_unix_ms }
+CanaryReply = { query_id, hops: Vec<CanaryHop>, partial, error }
+CanaryHop   = { hop_index, pubkey, name, mode,
+                rule_present, echo_armed, query_rtt_ms }
+```
+
+Each hop receives the arm, records `rule_present` for the requested
+`(listen, protocol)` against its own rule set, and — when this hop is
+terminal-mode and owns a matching rule — installs an entry in its
+local `CanaryArmTable` keyed by the 32-byte token. The receiver then
+recurses upstream and assembles the response as `[local_hop,
+upstream_hops…]`. Arm TTLs are clamped server-side (≤ 60s) so a
+runaway token can't linger past the probe window.
+
+The data phase runs over the rule's normal L4 path: the originator
+connects (TCP) or sends datagrams (UDP) to the rule's own listener,
+prefixed with the 32-byte token. The TCP / UDP listener code in
+`proxy/tcp.rs` / `proxy/udp/mod.rs` consults the arm table on each
+accept / datagram via an O(1) `is_armed(listen, protocol)` guard.
+When at least one arm is live, the first 32 bytes are matched
+against the table; matching traffic is echoed in-process and never
+reaches the configured backend. The cold-path cost on listeners
+when no canary is in flight is one shard probe per accept / datagram.
+
+The originator collects per-direction throughput, loss, and latency
+into `hdrhistogram` buckets and reports back via the
+`ChainCanaryResponse` UDS response. Exit codes: `0=OK`,
+`1=DEGRADED`, `2=NO_SUCH_RULE`, `3=CHAIN_DEAD`, `4=RPC_ERROR`.
+
 ## Control plane: yggdrasilctl over UDS
 
 `/run/yggdrasil/control.sock` carries newline-delimited JSON. We chose

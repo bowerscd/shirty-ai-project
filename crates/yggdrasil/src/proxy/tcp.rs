@@ -34,13 +34,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
-use tokio::io::copy_bidirectional_with_sizes;
+use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use ratatoskr::rule::Rule;
+use ratatoskr::canary::CANARY_TOKEN_LEN;
+use ratatoskr::rule::{Protocol, Rule};
 
+use super::canary::CanaryArmTable;
 use super::proxy_protocol;
 use super::resolver::UpstreamResolver;
 
@@ -59,6 +61,16 @@ const LISTEN_BACKLOG: i32 = 1024;
 /// small and the extra working set hurts cache locality on hosts with
 /// many concurrent connections.
 const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
+
+/// How long the per-accept canary-token peek waits for the first
+/// [`CANARY_TOKEN_LEN`] bytes to arrive before giving up. Real client
+/// connections that don't send anything in this window fall through to
+/// the normal forwarding path — the kernel buffer is untouched by the
+/// peek so the upstream `copy_bidirectional` reads them normally.
+/// 200 ms is short enough that the worst-case "real client, slow start"
+/// added latency is invisible to humans, and long enough that genuine
+/// canary probe traffic (which we control) is reliably caught.
+const CANARY_PEEK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Handle to a running per-rule TCP proxy. Drop to stop (the cancellation
 /// token cascade aborts the accept loops and lets in-flight connections
@@ -89,11 +101,33 @@ pub struct TcpProxy {
 }
 
 impl TcpProxy {
+    /// Bind `workers` listeners and spawn accept loops with no canary
+    /// arm-table wired (`is_armed` always returns false). Convenience
+    /// alias used by tests and by call sites that don't participate in
+    /// the daemon-wide canary surface.
+    pub async fn spawn(rule: Rule, resolver: UpstreamResolver, workers: usize) -> Result<Self> {
+        Self::spawn_with_arm_table(rule, resolver, workers, Arc::new(CanaryArmTable::new())).await
+    }
+
     /// Bind `workers` listeners (via SO_REUSEPORT when `workers > 1`) and
     /// spawn one accept loop per listener. Returns once every socket is
     /// listening, so callers can rely on connect attempts succeeding
     /// immediately after this resolves. `workers == 0` is rejected.
-    pub async fn spawn(rule: Rule, resolver: UpstreamResolver, workers: usize) -> Result<Self> {
+    ///
+    /// The `arm_table` is consulted on every accepted connection: when
+    /// at least one canary is in flight for this rule's `(listen,
+    /// Tcp)`, the first [`CANARY_TOKEN_LEN`] bytes are peeked and
+    /// compared against the table; matching connections short-circuit
+    /// to an in-process echo without reaching the configured backend.
+    /// Non-matching and unarmed-table connections take the normal
+    /// upstream forwarding path with zero added cost beyond an O(1)
+    /// shard probe.
+    pub async fn spawn_with_arm_table(
+        rule: Rule,
+        resolver: UpstreamResolver,
+        workers: usize,
+        arm_table: Arc<CanaryArmTable>,
+    ) -> Result<Self> {
         ensure!(workers > 0, "TCP worker count must be >= 1");
 
         let requested_workers = workers;
@@ -143,6 +177,7 @@ impl TcpProxy {
             let task_resolver = resolver.clone();
             let task_local = local_addr;
             let task_tracker = conn_tracker.clone();
+            let task_arm_table = Arc::clone(&arm_table);
             let handle = tokio::spawn(async move {
                 run_accept_loop(
                     task_rule,
@@ -153,6 +188,7 @@ impl TcpProxy {
                     task_accept_cancel,
                     task_conn_cancel,
                     task_tracker,
+                    task_arm_table,
                 )
                 .await;
             });
@@ -274,6 +310,7 @@ async fn run_accept_loop(
     accept_cancel: CancellationToken,
     conn_cancel: CancellationToken,
     conn_tracker: TaskTracker,
+    arm_table: Arc<CanaryArmTable>,
 ) {
     loop {
         tokio::select! {
@@ -306,6 +343,56 @@ async fn run_accept_loop(
                     "worker" => worker_id.to_string(),
                 )
                 .increment(1);
+
+                // Canary fast-path: when at least one canary is in
+                // flight against this rule's `(listen, Tcp)`, peek
+                // the first 32 bytes of the connection and route
+                // matching probe traffic to an in-process echo
+                // instead of dialing the configured backend.
+                //
+                // The cold path (no canary armed, the steady state)
+                // is a single DashMap shard probe; once that returns
+                // `false`, we skip the peek entirely and proceed to
+                // the existing resolver/forwarding logic with no
+                // added cost.
+                if arm_table.is_armed(local_addr, Protocol::Tcp) {
+                    match peek_and_match_canary_token(&client, &arm_table, local_addr).await {
+                        Some(matched_token) => {
+                            tracing::debug!(
+                                rule = %rule.name,
+                                worker = worker_id,
+                                client = %client_addr,
+                                "canary token matched; routing to in-process echo"
+                            );
+                            metrics::counter!(
+                                "yggdrasil_tcp_canary_echo_total",
+                                "rule" => rule.name.clone(),
+                            )
+                            .increment(1);
+                            let conn_rule = Arc::clone(&rule);
+                            let task_conn_cancel = conn_cancel.clone();
+                            conn_tracker.spawn(async move {
+                                run_canary_echo(
+                                    conn_rule,
+                                    client,
+                                    client_addr,
+                                    matched_token,
+                                    task_conn_cancel,
+                                )
+                                .await;
+                            });
+                            continue;
+                        }
+                        None => {
+                            // No matching token (or peek timed out /
+                            // returned < CANARY_TOKEN_LEN bytes). Fall
+                            // through to normal forwarding; the peek
+                            // does not consume buffered bytes so the
+                            // upstream's `copy_bidirectional` sees
+                            // them verbatim.
+                        }
+                    }
+                }
 
                 let target_addr = match resolver.current_target() {
                     Some(addr) => addr,
@@ -359,6 +446,97 @@ async fn run_accept_loop(
             }
         }
     }
+}
+
+/// Peek the first [`CANARY_TOKEN_LEN`] bytes of an accepted connection
+/// without consuming them, and check whether they match a live arm in
+/// the table. Returns `Some(token)` on match and `None` otherwise
+/// (no match, peek timeout, or fewer than `CANARY_TOKEN_LEN` bytes
+/// available within [`CANARY_PEEK_TIMEOUT`]).
+///
+/// The peek leaves the kernel receive buffer intact, so connections
+/// that fall through this check have all their bytes available for
+/// the normal `copy_bidirectional` forwarding path.
+async fn peek_and_match_canary_token(
+    client: &TcpStream,
+    arm_table: &CanaryArmTable,
+    local_addr: SocketAddr,
+) -> Option<[u8; CANARY_TOKEN_LEN]> {
+    let mut buf = [0u8; CANARY_TOKEN_LEN];
+    let peeked = tokio::time::timeout(CANARY_PEEK_TIMEOUT, client.peek(&mut buf)).await;
+    let n = match peeked {
+        Ok(Ok(n)) => n,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    if n < CANARY_TOKEN_LEN {
+        return None;
+    }
+    if arm_table.match_token(local_addr, Protocol::Tcp, &buf) {
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+/// In-process echo handler for a canary-matched TCP connection.
+/// Reads (and discards) the [`CANARY_TOKEN_LEN`]-byte token prefix
+/// that triggered the match, then loops reading bytes from the client
+/// and writing them straight back until either side closes or the
+/// drain cancel fires.
+///
+/// The configured backend is never contacted — the entire conversation
+/// stays in-process, which is the point of `chain canary`: it tests
+/// the rule's data path without depending on the rule's actual
+/// backend being reachable.
+async fn run_canary_echo(
+    rule: Arc<Rule>,
+    mut client: TcpStream,
+    client_addr: SocketAddr,
+    _matched_token: [u8; CANARY_TOKEN_LEN],
+    cancel: CancellationToken,
+) {
+    // Consume the token bytes from the kernel buffer so the echo
+    // loop sees only the probe payload.
+    let mut token_drain = [0u8; CANARY_TOKEN_LEN];
+    if let Err(e) = client.read_exact(&mut token_drain).await {
+        tracing::debug!(
+            rule = %rule.name,
+            client = %client_addr,
+            error = %e,
+            "canary echo: failed to drain token prefix"
+        );
+        return;
+    }
+
+    let (mut read_half, mut write_half) = client.split();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::debug!(
+                rule = %rule.name,
+                client = %client_addr,
+                "canary echo: cancel signal, tearing down"
+            );
+        }
+        res = tokio::io::copy(&mut read_half, &mut write_half) => {
+            match res {
+                Ok(n) => tracing::debug!(
+                    rule = %rule.name,
+                    client = %client_addr,
+                    bytes_echoed = n,
+                    "canary echo complete"
+                ),
+                Err(e) => tracing::debug!(
+                    rule = %rule.name,
+                    client = %client_addr,
+                    error = %e,
+                    "canary echo: io error"
+                ),
+            }
+        }
+    }
+    // Half-close write side so the client's `read` returns EOF.
+    let _ = write_half.shutdown().await;
 }
 
 /// Bind `workers` TCP listeners on `addr`. With `workers == 1` falls back
@@ -924,5 +1102,147 @@ mod tests {
             "stop hung past the drain budget ({elapsed:?} vs budget {drain_budget:?})"
         );
         drop(client);
+    }
+
+    // ---- Canary intercept ----
+
+    #[tokio::test]
+    async fn canary_armed_token_match_routes_to_in_process_echo() {
+        // No backend exists at all — `target_port = 1` is intentionally
+        // unreachable. If the canary fast path is wired correctly the
+        // client still sees its bytes echoed.
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = TcpProxy::spawn_with_arm_table(
+            rule("canary-tcp", 1, None),
+            static_resolver("127.0.0.1:1".parse().unwrap()),
+            1,
+            Arc::clone(&arm_table),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let token = [0xABu8; CANARY_TOKEN_LEN];
+        arm_table.arm(listen, Protocol::Tcp, token, Duration::from_secs(5));
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        // Send the 32-byte token + a payload; expect the payload back.
+        client.write_all(&token).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        proxy.stop(None).await;
+    }
+
+    #[tokio::test]
+    async fn canary_unarmed_table_forwards_normally_even_with_token_prefix() {
+        // Arm-table empty: the fast path should be skipped entirely
+        // and the (random-looking) prefix forwarded verbatim to the
+        // backend's echo server. End-to-end semantics match the
+        // plain proxy.
+        let (upstream, _us) = echo_server().await;
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = TcpProxy::spawn_with_arm_table(
+            rule("canary-cold", upstream.port(), None),
+            static_resolver(upstream),
+            1,
+            arm_table,
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let token = [0xCDu8; CANARY_TOKEN_LEN];
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&token).await.unwrap();
+        client.write_all(b"world").await.unwrap();
+        let mut buf = [0u8; CANARY_TOKEN_LEN + 5];
+        client.read_exact(&mut buf).await.unwrap();
+        // Token bytes pass through the echo server too — the proxy
+        // did NOT consume them.
+        assert_eq!(&buf[..CANARY_TOKEN_LEN], &token);
+        assert_eq!(&buf[CANARY_TOKEN_LEN..], b"world");
+
+        proxy.stop(None).await;
+    }
+
+    #[tokio::test]
+    async fn canary_armed_with_wrong_token_falls_through_to_backend() {
+        // Arm with one token but send a different prefix: the peek
+        // is performed (table is "hot") but match_token returns
+        // false, so traffic forwards to the backend. The peek must
+        // not have consumed the bytes; the backend's echo sees them
+        // verbatim.
+        let (upstream, _us) = echo_server().await;
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = TcpProxy::spawn_with_arm_table(
+            rule("canary-wrong-token", upstream.port(), None),
+            static_resolver(upstream),
+            1,
+            Arc::clone(&arm_table),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let armed_token = [0x11u8; CANARY_TOKEN_LEN];
+        arm_table.arm(listen, Protocol::Tcp, armed_token, Duration::from_secs(5));
+
+        let unrelated_prefix = [0x22u8; CANARY_TOKEN_LEN];
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&unrelated_prefix).await.unwrap();
+        client.write_all(b"abc").await.unwrap();
+        let mut buf = [0u8; CANARY_TOKEN_LEN + 3];
+        client.read_exact(&mut buf).await.unwrap();
+        // Backend's echo returned both the prefix bytes and the
+        // payload verbatim — proves the peek did not consume them.
+        assert_eq!(&buf[..CANARY_TOKEN_LEN], &unrelated_prefix);
+        assert_eq!(&buf[CANARY_TOKEN_LEN..], b"abc");
+
+        proxy.stop(None).await;
+    }
+
+    #[tokio::test]
+    async fn canary_armed_short_client_send_falls_through() {
+        // Arm the table, then have the client send fewer than
+        // CANARY_TOKEN_LEN bytes within the peek timeout. The peek
+        // returns < 32 bytes; we fall through to the backend, which
+        // echoes the partial payload back.
+        let (upstream, _us) = echo_server().await;
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = TcpProxy::spawn_with_arm_table(
+            rule("canary-short", upstream.port(), None),
+            static_resolver(upstream),
+            1,
+            Arc::clone(&arm_table),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        arm_table.arm(
+            listen,
+            Protocol::Tcp,
+            [0x33u8; CANARY_TOKEN_LEN],
+            Duration::from_secs(5),
+        );
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        // Short payload; less than CANARY_TOKEN_LEN bytes. Peek
+        // timeout fires; we fall through.
+        client.write_all(b"hi").await.unwrap();
+        // The peek timeout is short (200ms); after that the proxy
+        // will dial the backend and start forwarding. Wait long
+        // enough to clear the peek window.
+        let mut buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("read should complete after peek timeout")
+            .expect("backend echo should succeed");
+        assert_eq!(&buf, b"hi");
+
+        proxy.stop(None).await;
     }
 }

@@ -51,8 +51,10 @@ use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use ratatoskr::rule::Rule;
+use ratatoskr::canary::CANARY_TOKEN_LEN;
+use ratatoskr::rule::{Protocol, Rule};
 
+use super::canary::CanaryArmTable;
 use super::resolver::{UpstreamResolver, WatchHandle};
 
 /// Default cap on concurrent client flows per UDP rule. Sized to cover any
@@ -126,7 +128,28 @@ impl UdpProxy {
     }
 
     /// Bind frontend sockets and spawn the proxy tasks with explicit flow cap
-    /// and worker count. `workers == 0` is rejected.
+    /// and worker count. `workers == 0` is rejected. Convenience alias for
+    /// callers that don't participate in the daemon-wide canary surface;
+    /// installs an empty arm-table.
+    pub async fn spawn_with(
+        rule: Rule,
+        resolver: UpstreamResolver,
+        max_flows: usize,
+        workers: usize,
+    ) -> Result<Self> {
+        Self::spawn_with_arm_table(
+            rule,
+            resolver,
+            max_flows,
+            workers,
+            Arc::new(CanaryArmTable::new()),
+        )
+        .await
+    }
+
+    /// Bind frontend sockets and spawn the proxy tasks with explicit
+    /// flow cap, worker count, and canary arm-table. `workers == 0`
+    /// is rejected.
     ///
     /// ## Threading model
     ///
@@ -141,11 +164,22 @@ impl UdpProxy {
     /// started with. This mirrors nginx's per-worker event-loop shape
     /// (the udp-measure-out strace data identified cross-worker
     /// futex calls as the dominant UDP overhead).
-    pub async fn spawn_with(
+    ///
+    /// ## Canary intercept
+    ///
+    /// The frontend loop calls `arm_table.is_armed(rule.listen, Udp)`
+    /// on each received batch. When false (the steady state), the
+    /// datagram is passed through to the normal flow-table dispatcher
+    /// with zero added cost. When true, each datagram's first 32
+    /// bytes are matched against the table; matching datagrams are
+    /// echoed back to the source from the frontend socket and do not
+    /// allocate a flow-table entry.
+    pub async fn spawn_with_arm_table(
         rule: Rule,
         resolver: UpstreamResolver,
         max_flows: usize,
         workers: usize,
+        arm_table: Arc<CanaryArmTable>,
     ) -> Result<Self> {
         ensure!(workers > 0, "UDP worker count must be >= 1");
 
@@ -204,6 +238,7 @@ impl UdpProxy {
             let shard_t = Arc::clone(&shards[worker_id]);
             let flow_count_t = Arc::clone(&flow_count);
             let max_flows_t = max_flows;
+            let arm_table_t = Arc::clone(&arm_table);
             let thread_name = format!("ygg-udp-{}-{}", rule.name, worker_id);
             let handle = std::thread::Builder::new()
                 .name(thread_name)
@@ -236,16 +271,30 @@ impl UdpProxy {
                                 return;
                             }
                         };
+                        let local_addr = match frontend.local_addr() {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::error!(
+                                    rule = %rule_t.name,
+                                    worker_id,
+                                    error = %e,
+                                    "UDP worker: frontend local_addr lookup failed; worker exiting"
+                                );
+                                return;
+                            }
+                        };
                         let worker = UdpWorker {
                             worker_id,
                             frontend,
                             rule: rule_t,
+                            local_addr,
                             resolver: resolver_t,
                             flows: shard_t,
                             flow_count: flow_count_t,
                             cancel: cancel_t,
                             start,
                             max_flows: max_flows_t,
+                            arm_table: arm_table_t,
                         };
                         worker.frontend_loop().await;
                     });
@@ -458,12 +507,22 @@ struct UdpWorker {
     worker_id: usize,
     frontend: Arc<UdpSocket>,
     rule: Rule,
+    /// Resolved bound address of `frontend`. Used for arm-table
+    /// lookups instead of `rule.listen`, because the rule's literal
+    /// `listen` may carry port `0` (kernel-assigned) and the actual
+    /// listener lives at the OS-resolved port.
+    local_addr: SocketAddr,
     resolver: UpstreamResolver,
     flows: Arc<DashMap<SocketAddr, Arc<FlowEntry>>>,
     flow_count: Arc<AtomicUsize>,
     cancel: CancellationToken,
     start: Instant,
     max_flows: usize,
+    /// Per-daemon arm table. The frontend loop consults it on every
+    /// datagram via the O(1) `is_armed` shard probe; matching
+    /// token-prefixed datagrams are echoed in-process at the frontend
+    /// socket and never enter the flow table.
+    arm_table: Arc<CanaryArmTable>,
 }
 
 struct FlowAccounting {
@@ -605,6 +664,13 @@ impl UdpWorker {
                 }
             };
             increment_udp_datagrams_received(&self.rule.name, self.worker_id, n);
+            // Canary fast-path: when at least one canary is in flight
+            // against this rule's `(listen, Udp)`, peek the first 32
+            // bytes of each datagram in the batch and route matching
+            // probe traffic to an in-process echo. The cold path
+            // (no canary armed, the steady state) is one DashMap
+            // shard probe per batch, not per datagram.
+            let arm_active = self.arm_table.is_armed(self.local_addr, Protocol::Udp);
             let owned: Vec<(Vec<u8>, SocketAddr)> = {
                 let _g = crate::profile::section("udp", "frontend_copy_owned");
                 recv.iter(&scratch, n)
@@ -612,6 +678,40 @@ impl UdpWorker {
                     .collect()
             };
             for (payload, client_addr) in owned {
+                if arm_active && payload.len() >= CANARY_TOKEN_LEN {
+                    let mut prefix = [0u8; CANARY_TOKEN_LEN];
+                    prefix.copy_from_slice(&payload[..CANARY_TOKEN_LEN]);
+                    if self
+                        .arm_table
+                        .match_token(self.local_addr, Protocol::Udp, &prefix)
+                    {
+                        // Echo the entire datagram (token included)
+                        // back to the source from this worker's
+                        // frontend socket. The originator strips the
+                        // token prefix on receive. The datagram does
+                        // not consume a flow-table slot.
+                        match self.frontend.send_to(&payload, client_addr).await {
+                            Ok(_) => {
+                                metrics::counter!(
+                                    "yggdrasil_udp_canary_echo_total",
+                                    "rule" => self.rule.name.clone(),
+                                    "worker" => self.worker_id.to_string(),
+                                )
+                                .increment(1);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    rule = %self.rule.name,
+                                    worker_id = self.worker_id,
+                                    client = %client_addr,
+                                    error = %e,
+                                    "UDP canary echo send_to failed"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
                 self.handle_inbound(&payload, client_addr).await;
             }
         }
@@ -1913,5 +2013,153 @@ mod tests {
 
         // After stop, all flow-table shards should be empty.
         assert_eq!(shards.iter().map(|shard| shard.len()).sum::<usize>(), 0);
+    }
+
+    // ---- Canary intercept ----
+
+    #[tokio::test]
+    async fn canary_armed_token_match_echoes_at_frontend() {
+        // No upstream backend exists — the resolver points at a closed
+        // port. If the canary fast-path works, the client still gets
+        // its datagram back. No flow-table entry should be created.
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = UdpProxy::spawn_with_arm_table(
+            udp_rule("canary-udp", 1, 60),
+            static_resolver("127.0.0.1:1".parse().unwrap()),
+            MAX_FLOWS_PER_RULE_DEFAULT,
+            1,
+            Arc::clone(&arm_table),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let token = [0xABu8; CANARY_TOKEN_LEN];
+        arm_table.arm(listen, Protocol::Udp, token, Duration::from_secs(5));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut payload = Vec::with_capacity(CANARY_TOKEN_LEN + 5);
+        payload.extend_from_slice(&token);
+        payload.extend_from_slice(b"hello");
+        client.send_to(&payload, listen).await.unwrap();
+
+        let mut buf = [0u8; CANARY_TOKEN_LEN + 5];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("recv timed out")
+            .unwrap();
+        assert_eq!(n, CANARY_TOKEN_LEN + 5);
+        // Whole datagram (token included) echoed back verbatim.
+        assert_eq!(&buf[..CANARY_TOKEN_LEN], &token);
+        assert_eq!(&buf[CANARY_TOKEN_LEN..], b"hello");
+        // No flow-table entry was allocated.
+        assert_eq!(proxy.active_flows(), 0);
+
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn canary_unarmed_table_forwards_normally_even_with_token_prefix() {
+        // Arm-table empty: the fast path is skipped, the datagram
+        // (token-prefixed or not) is forwarded to the configured
+        // backend and echoed there. Same semantics as plain UDP
+        // proxying.
+        let upstream = echo_server().await;
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = UdpProxy::spawn_with_arm_table(
+            udp_rule("canary-cold-udp", upstream.port(), 60),
+            static_resolver(upstream),
+            MAX_FLOWS_PER_RULE_DEFAULT,
+            1,
+            arm_table,
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let token = [0xCDu8; CANARY_TOKEN_LEN];
+        let mut payload = Vec::with_capacity(CANARY_TOKEN_LEN + 5);
+        payload.extend_from_slice(&token);
+        payload.extend_from_slice(b"world");
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let got = send_recv(&client, listen, &payload).await;
+        assert_eq!(got.len(), CANARY_TOKEN_LEN + 5);
+        assert_eq!(&got[..CANARY_TOKEN_LEN], &token);
+        assert_eq!(&got[CANARY_TOKEN_LEN..], b"world");
+        // Normal forwarding path: a flow-table entry IS created.
+        assert_eq!(proxy.active_flows(), 1);
+
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn canary_armed_with_wrong_token_falls_through_to_backend() {
+        // Table is hot (some arm exists), but the datagram's prefix
+        // doesn't match. The intercept must not consume it; the
+        // backend's echo sees the datagram verbatim and the flow
+        // table picks up a normal entry.
+        let upstream = echo_server().await;
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = UdpProxy::spawn_with_arm_table(
+            udp_rule("canary-wrong-udp", upstream.port(), 60),
+            static_resolver(upstream),
+            MAX_FLOWS_PER_RULE_DEFAULT,
+            1,
+            Arc::clone(&arm_table),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let armed_token = [0x11u8; CANARY_TOKEN_LEN];
+        arm_table.arm(listen, Protocol::Udp, armed_token, Duration::from_secs(5));
+
+        let unrelated_prefix = [0x22u8; CANARY_TOKEN_LEN];
+        let mut payload = Vec::with_capacity(CANARY_TOKEN_LEN + 3);
+        payload.extend_from_slice(&unrelated_prefix);
+        payload.extend_from_slice(b"abc");
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let got = send_recv(&client, listen, &payload).await;
+        // Backend's echo returned the prefix + payload verbatim —
+        // proves the intercept did not consume the datagram.
+        assert_eq!(&got[..CANARY_TOKEN_LEN], &unrelated_prefix);
+        assert_eq!(&got[CANARY_TOKEN_LEN..], b"abc");
+        assert_eq!(proxy.active_flows(), 1);
+
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn canary_armed_short_datagram_falls_through() {
+        // Datagram is shorter than CANARY_TOKEN_LEN bytes; the
+        // intercept skips it without trying to match and the normal
+        // flow-table dispatch runs.
+        let upstream = echo_server().await;
+        let arm_table = Arc::new(CanaryArmTable::new());
+        let proxy = UdpProxy::spawn_with_arm_table(
+            udp_rule("canary-short-udp", upstream.port(), 60),
+            static_resolver(upstream),
+            MAX_FLOWS_PER_RULE_DEFAULT,
+            1,
+            Arc::clone(&arm_table),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        arm_table.arm(
+            listen,
+            Protocol::Udp,
+            [0x33u8; CANARY_TOKEN_LEN],
+            Duration::from_secs(5),
+        );
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let got = send_recv(&client, listen, b"hi").await;
+        assert_eq!(&got, b"hi");
+        assert_eq!(proxy.active_flows(), 1);
+
+        proxy.stop().await;
     }
 }

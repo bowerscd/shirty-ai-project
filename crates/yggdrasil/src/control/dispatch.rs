@@ -160,6 +160,18 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                       hoisted by handle_connection)"
                 .to_string(),
         },
+        // Routed in `server::handle_connection` to the async
+        // `dispatch_chain_canary` handler (Phase 3) — the canary
+        // path's arm-phase + probe-phase both await across the
+        // chain client and the rule's listener. Hitting this arm
+        // means the hoist in `handle_connection` is missing.
+        Request::ChainCanary { .. } => Response::Error {
+            code: error_codes::INTERNAL_ERROR.into(),
+            message: "internal routing error: ChainCanary reached \
+                      the synchronous dispatcher (should have been \
+                      hoisted by handle_connection)"
+                .to_string(),
+        },
         // `ChainApply` is handled by [`super::handlers::dispatch_chain_apply`]
         // in [`super::server::handle_connection`]: the apply path is async
         // because [`crate::proxy::supervisor::SupervisorHandle::apply_ruleset`]

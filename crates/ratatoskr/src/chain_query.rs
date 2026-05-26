@@ -106,6 +106,7 @@ mod tests {
             hop_index: 0,
             mode: Mode::Terminal,
             uptime_secs: 42,
+            name: None,
             query_rtt_ms: None,
             view: DerivedRulesResponse {
                 predicates: vec![],

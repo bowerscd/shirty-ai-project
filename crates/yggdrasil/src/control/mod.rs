@@ -73,6 +73,11 @@ pub(in crate::control) struct ControlState {
     /// [`ratatoskr::control::StatusResponse::mode`] and used as the gate
     /// for the `downstream ...` request family.
     pub(in crate::control) mode: Mode,
+    /// Resolved `[server].name` (falling back to `gethostname(3)`).
+    /// Embedded in `ChainHop.name` so cross-chain renderers can label
+    /// hops by something more readable than their pubkey. Captured
+    /// at startup; not hot-reloadable.
+    pub(in crate::control) node_name: String,
     pub(in crate::control) peer_state: Option<Arc<PeerState>>,
     pub(in crate::control) snapshot_rx:
         tokio::sync::watch::Receiver<Vec<crate::proxy::supervisor::ProxySnapshot>>,
@@ -121,6 +126,13 @@ pub(in crate::control) struct ControlState {
     // `nat-status-handler` phase wires the projection up.
     #[allow(dead_code)]
     pub(in crate::control) nat: Option<crate::nat::NatMapperHandle>,
+    /// Shared per-daemon canary arm table. The `ChainCanary` handler
+    /// installs an arm here when this node is the terminal hop for
+    /// the rule under test (so the originator's probe traffic is
+    /// echoed in-process at this node's rule listener) and disarms
+    /// it on completion. Always present on daemons that ran through
+    /// `run_relay` / `run_terminal`.
+    pub(in crate::control) canary_arm_table: Arc<crate::proxy::canary::CanaryArmTable>,
 }
 
 impl ControlServer {
@@ -150,6 +162,7 @@ impl ControlServer {
     pub async fn bind(
         socket_path: impl Into<PathBuf>,
         mode: Mode,
+        node_name: String,
         peer_state: Option<Arc<PeerState>>,
         supervisor: &ProxySupervisor,
         pending_store: Option<Arc<PendingPeerStore>>,
@@ -160,6 +173,7 @@ impl ControlServer {
         chain_client_handle: Option<ChainClientHandle>,
         acme: Option<crate::proxy::acme::AcmeManager>,
         nat: Option<crate::nat::NatMapperHandle>,
+        canary_arm_table: Arc<crate::proxy::canary::CanaryArmTable>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let socket_path: PathBuf = socket_path.into();
@@ -195,6 +209,7 @@ impl ControlServer {
         let state = Arc::new(ControlState {
             started_at: Instant::now(),
             mode,
+            node_name,
             peer_state,
             snapshot_rx: supervisor.snapshot_receiver(),
             reload_trigger: supervisor.reload_trigger(),
@@ -208,6 +223,7 @@ impl ControlServer {
             chain_client_handle,
             acme,
             nat,
+            canary_arm_table,
         });
 
         let main_cancel = cancel.clone();

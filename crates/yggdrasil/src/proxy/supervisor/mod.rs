@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::rule::{Protocol, RuleSet};
 
+use crate::proxy::canary::CanaryArmTable;
 use crate::proxy::certs::{CertStore, CertWatcher};
 use crate::proxy::resolver::ResolverFactory;
 use crate::rules::{ReloadTrigger, RuleWatcher};
@@ -185,6 +186,7 @@ impl ProxySupervisor {
             cert_config,
             Arc::new(CertStore::new()),
             graceful_drain_timeout,
+            Arc::new(CanaryArmTable::new()),
             shutdown,
         )
         .await
@@ -193,7 +195,11 @@ impl ProxySupervisor {
     /// Variant that takes a caller-built `Arc<CertStore>`. The caller
     /// retains a clone so external subsystems (notably the
     /// `AcmeManager`'s renewer task) can call `reload_host` against
-    /// the same map the supervisor's cert watcher updates.
+    /// the same map the supervisor's cert watcher updates. The
+    /// `arm_table` is the daemon-wide canary arm table (see
+    /// [`CanaryArmTable`]); the supervisor threads it into every
+    /// per-rule TCP / UDP proxy so the rule listeners can short-
+    /// circuit canary-tagged traffic to in-process echoes.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_with_cert_store(
         rules_dir: impl Into<PathBuf>,
@@ -204,6 +210,7 @@ impl ProxySupervisor {
         cert_config: CertConfig,
         cert_store: Arc<CertStore>,
         graceful_drain_timeout: Option<Duration>,
+        arm_table: Arc<CanaryArmTable>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let rules_dir: PathBuf = rules_dir.into();
@@ -240,6 +247,7 @@ impl ProxySupervisor {
             Arc::clone(&cert_store),
             Arc::clone(&cert_watcher),
             graceful_drain_timeout,
+            arm_table,
             main_cancel,
             snapshot_tx,
         ));

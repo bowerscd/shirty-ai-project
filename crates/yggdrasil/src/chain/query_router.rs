@@ -1,50 +1,38 @@
 //! Per-session query/reply correlation for the recursive `ChainSummary`
-//! RPC.
+//! and `chain canary` RPCs.
 //!
-//! [`Request::ChainSummary`] over UDS turns into a [`ChainHopQuery`] on
-//! the chain control plane. The receiver eventually answers with a
-//! [`ChainHopReply`] envelope (not an ACK — the ACK only confirms that
-//! the query was delivered). The two are correlated by `query_id`.
-//!
-//! Multiple concurrent walks can be in flight on the same chain session
-//! (e.g. an operator issuing `chain summary` while `chain diff` is also
-//! running), so the router is a small `Arc<...>` shared between:
-//!
-//! * the upstream-facing [`crate::chain::ChainClient`] body-handler
-//!   closure, which decodes incoming `ChainHopReply` envelopes and
-//!   resolves the matching oneshot;
-//! * the public [`crate::chain::ChainClientHandle::query_upstream`]
-//!   API (allocates a fresh `query_id`, registers the oneshot, sends
-//!   the query, awaits the reply with a timeout).
+//! Both query types share the same correlation shape: the originator
+//! allocates a `query_id`, registers a oneshot, sends the query
+//! envelope upstream, and awaits the reply with a timeout. The router
+//! holds two parallel pending maps — one per reply type — so a
+//! [`ChainHopReply`] and a [`CanaryReply`] with the same `query_id`
+//! don't collide (each is matched against its own map based on the
+//! control body type at decode time).
 //!
 //! Production handlers wrap the router via
 //! [`QueryRouter::install_into_body_handler`], which composes it with
 //! any caller-supplied secondary body handler so other body types
 //! (today: only `Reserved`/`Noop`/`PredicateSetUpdate`) still reach
 //! their dispatchers.
-//!
-//! [`Request::ChainSummary`]: ratatoskr::control::Request::ChainSummary
-//! [`ChainHopQuery`]: ratatoskr::chain_query::ChainHopQuery
-//! [`ChainHopReply`]: ratatoskr::chain_query::ChainHopReply
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use ratatoskr::canary::CanaryReply;
 use ratatoskr::chain_query::ChainHopReply;
 use ratatoskr::control_frame::{AckStatus, ControlBodyType};
 use tokio::sync::oneshot;
 
 use super::client::BodyHandler;
 
-/// Shared per-session router for outstanding [`ChainHopQuery`]
-/// correlations.
-///
-/// [`ChainHopQuery`]: ratatoskr::chain_query::ChainHopQuery
+/// Shared per-session router for outstanding `ChainHopReply` and
+/// `CanaryReply` correlations.
 #[derive(Debug, Default)]
 pub struct QueryRouter {
     next_id: AtomicU32,
-    pending: Mutex<HashMap<u32, oneshot::Sender<ChainHopReply>>>,
+    pending_chain_hop: Mutex<HashMap<u32, oneshot::Sender<ChainHopReply>>>,
+    pending_canary: Mutex<HashMap<u32, oneshot::Sender<CanaryReply>>>,
 }
 
 impl QueryRouter {
@@ -53,7 +41,8 @@ impl QueryRouter {
             // Start non-zero so logs visibly differ from the zero
             // default of test fixtures.
             next_id: AtomicU32::new(1),
-            pending: Mutex::new(HashMap::new()),
+            pending_chain_hop: Mutex::new(HashMap::new()),
+            pending_canary: Mutex::new(HashMap::new()),
         })
     }
 
@@ -64,15 +53,44 @@ impl QueryRouter {
     pub fn register(self: &Arc<Self>) -> (u32, oneshot::Receiver<ChainHopReply>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        let mut guard = self.pending.lock().expect("query router lock poisoned");
+        let mut guard = self
+            .pending_chain_hop
+            .lock()
+            .expect("query router lock poisoned");
         guard.insert(id, tx);
         (id, rx)
     }
 
-    /// Drop a registration without awaiting the reply. Used by
-    /// timeout paths so a late reply doesn't leak the oneshot slot.
+    /// Allocate a fresh `query_id` and register a oneshot that will
+    /// be resolved when a [`CanaryReply`] with that id is received.
+    pub fn register_canary(self: &Arc<Self>) -> (u32, oneshot::Receiver<CanaryReply>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let mut guard = self
+            .pending_canary
+            .lock()
+            .expect("query router lock poisoned");
+        guard.insert(id, tx);
+        (id, rx)
+    }
+
+    /// Drop a `ChainHopReply` registration without awaiting the reply.
+    /// Used by timeout paths so a late reply doesn't leak the oneshot
+    /// slot.
     pub fn cancel(&self, query_id: u32) {
-        let mut guard = self.pending.lock().expect("query router lock poisoned");
+        let mut guard = self
+            .pending_chain_hop
+            .lock()
+            .expect("query router lock poisoned");
+        guard.remove(&query_id);
+    }
+
+    /// Drop a `CanaryReply` registration without awaiting the reply.
+    pub fn cancel_canary(&self, query_id: u32) {
+        let mut guard = self
+            .pending_canary
+            .lock()
+            .expect("query router lock poisoned");
         guard.remove(&query_id);
     }
 
@@ -81,7 +99,22 @@ impl QueryRouter {
     /// Late replies (after the waiter timed out and dropped the
     /// receiver) and replies for unknown ids both return `false`.
     pub fn resolve(&self, reply: ChainHopReply) -> bool {
-        let mut guard = self.pending.lock().expect("query router lock poisoned");
+        let mut guard = self
+            .pending_chain_hop
+            .lock()
+            .expect("query router lock poisoned");
+        match guard.remove(&reply.query_id) {
+            Some(tx) => tx.send(reply).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Try to route a decoded [`CanaryReply`] onto its awaiting oneshot.
+    pub fn resolve_canary(&self, reply: CanaryReply) -> bool {
+        let mut guard = self
+            .pending_canary
+            .lock()
+            .expect("query router lock poisoned");
         match guard.remove(&reply.query_id) {
             Some(tx) => tx.send(reply).is_ok(),
             None => false,
@@ -89,7 +122,8 @@ impl QueryRouter {
     }
 
     /// Build a [`BodyHandler`] that special-cases
-    /// [`ControlBodyType::ChainHopReply`] (decodes + routes to this
+    /// [`ControlBodyType::ChainHopReply`] and
+    /// [`ControlBodyType::CanaryReply`] (decodes + routes to this
     /// router, acks `Ok`) and delegates every other body type to
     /// `inner`. When `inner` is `None`, every other body type acks
     /// `Unknown` (the chain-client default).
@@ -110,6 +144,23 @@ impl QueryRouter {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to decode inbound ChainHopReply");
+                        AckStatus::Unknown
+                    }
+                }
+            } else if body_type == ControlBodyType::CanaryReply.as_byte() {
+                match postcard::from_bytes::<CanaryReply>(body) {
+                    Ok(reply) => {
+                        let resolved = router.resolve_canary(reply);
+                        if !resolved {
+                            tracing::debug!(
+                                "CanaryReply for unknown or already-resolved query_id; \
+                                 the originating canary may have timed out"
+                            );
+                        }
+                        AckStatus::Ok
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to decode inbound CanaryReply");
                         AckStatus::Unknown
                     }
                 }

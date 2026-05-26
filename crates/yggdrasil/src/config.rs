@@ -88,6 +88,14 @@ impl From<Mode> for ratatoskr::control::Mode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
+    /// Human-readable label for this node. Surfaced in `chain summary`,
+    /// `chain ping`, `chain diff`, `chain health`, and `chain canary`
+    /// outputs in place of the long X25519 pubkey. Falls back to
+    /// `gethostname(3)` when unset. Free-form UTF-8, ≤ 32 bytes, no
+    /// control characters, no embedded whitespace. Empty strings are
+    /// treated as if the field were absent.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Directory containing `*.toml` rule files. Defaults to `/etc/yggdrasil/conf.d`.
     #[serde(default = "default_rules_dir")]
     pub rules_dir: PathBuf,
@@ -307,6 +315,95 @@ fn default_acme_renew_jitter() -> Duration {
     Duration::from_secs(12 * 3600)
 }
 
+/// Maximum byte length of `[server].name`. Keeps wire propagation
+/// through `ChainHop` cheap and renderers predictable.
+pub const SERVER_NAME_MAX_BYTES: usize = 32;
+
+/// Validate `[server].name` shape. Rejects names that exceed
+/// [`SERVER_NAME_MAX_BYTES`], contain control characters, or contain
+/// any ASCII whitespace (including embedded spaces).
+fn validate_server_name(name: &str) -> Result<(), ConfigError> {
+    if name.is_empty() {
+        // Empty string is treated identically to "absent" by callers;
+        // it is not an error in itself, but the resolver will fall
+        // back to gethostname(3) for an empty value too.
+        return Ok(());
+    }
+    if name.len() > SERVER_NAME_MAX_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "[server].name must be <= {SERVER_NAME_MAX_BYTES} bytes (got {} bytes)",
+            name.len(),
+        )));
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err(ConfigError::Invalid(
+            "[server].name must not contain control characters".into(),
+        ));
+    }
+    if name.chars().any(|c| c.is_whitespace()) {
+        return Err(ConfigError::Invalid(
+            "[server].name must not contain whitespace".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the kernel's hostname via `gethostname(3)`. Used as the
+/// fallback for `[server].name` when the operator hasn't set one.
+/// On any failure (extremely rare — kernel always provides one) the
+/// fallback returns `"unknown"` so renderers always have something
+/// non-empty to display.
+fn read_hostname_or_unknown() -> String {
+    // SAFETY: gethostname is async-signal-safe and writes at most
+    // `buf.len()` bytes plus a trailing NUL. We allocate
+    // HOST_NAME_MAX + 1 = 65 bytes and locate the NUL terminator
+    // ourselves; if gethostname returns -1 we fall back to "unknown".
+    const BUFLEN: usize = 65;
+    let mut buf = [0u8; BUFLEN];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, BUFLEN) };
+    if rc != 0 {
+        return "unknown".to_string();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(BUFLEN);
+    let name = std::str::from_utf8(&buf[..end]).unwrap_or("unknown");
+    // Apply the same shape constraints as a user-configured name:
+    // a hostname containing whitespace, control characters, or being
+    // longer than SERVER_NAME_MAX_BYTES gets truncated and sanitised
+    // so the renderer never sees a malformed string. This is a
+    // last-resort fallback; operators wanting a controlled value
+    // should set `[server].name` explicitly.
+    let mut sanitised: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .collect();
+    if sanitised.is_empty() {
+        return "unknown".to_string();
+    }
+    if sanitised.len() > SERVER_NAME_MAX_BYTES {
+        // Truncate on a char boundary to keep UTF-8 valid.
+        sanitised.truncate(
+            sanitised
+                .char_indices()
+                .take_while(|(idx, _)| *idx <= SERVER_NAME_MAX_BYTES)
+                .last()
+                .map(|(idx, _)| idx)
+                .unwrap_or(SERVER_NAME_MAX_BYTES),
+        );
+    }
+    sanitised
+}
+
+/// Resolve the effective node label for this daemon. Returns the
+/// configured `[server].name` when non-empty, otherwise the kernel
+/// hostname (sanitised; falls back to `"unknown"` if hostname lookup
+/// fails). Always non-empty.
+pub fn resolve_server_name(configured: Option<&str>) -> String {
+    match configured {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => read_hostname_or_unknown(),
+    }
+}
+
 impl ServerConfig {
     /// Load and validate a config file from disk.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -336,6 +433,13 @@ impl ServerConfig {
         }
     }
 
+    /// Resolve the effective node label. See [`resolve_server_name`] for
+    /// the resolution rules. Always non-empty, suitable for direct
+    /// embedding in `ChainHop.name` and CLI renderers.
+    pub fn resolved_name(&self) -> String {
+        resolve_server_name(self.server.name.as_deref())
+    }
+
     /// Validate the in-memory config.
     pub fn validate(&self) -> Result<(), ConfigError> {
         // ---- Derived mode shape ----
@@ -346,6 +450,9 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "[server].workers must be >= 1 when set".into(),
             ));
+        }
+        if let Some(name) = &self.server.name {
+            validate_server_name(name)?;
         }
 
         // ---- [dial] sanity ----
@@ -620,6 +727,139 @@ mod tests {
         .unwrap();
         assert!(matches!(err, ConfigError::Invalid(s)
                 if s.contains("[server].workers must be >= 1 when set")));
+    }
+
+    // ---- [server].name ----
+
+    #[test]
+    fn name_defaults_to_none() {
+        let cfg = parse(relay_minimal_toml()).unwrap();
+        assert_eq!(cfg.server.name, None);
+    }
+
+    #[test]
+    fn name_parses_when_set() {
+        let cfg = parse(
+            r#"
+            [server]
+            name = "vps"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.name.as_deref(), Some("vps"));
+    }
+
+    #[test]
+    fn name_empty_string_is_accepted_but_resolves_to_hostname() {
+        let cfg = parse(
+            r#"
+            [server]
+            name = ""
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.name.as_deref(), Some(""));
+        // resolved_name falls through to the hostname for empty values.
+        assert!(!cfg.resolved_name().is_empty());
+    }
+
+    #[test]
+    fn name_too_long_is_rejected() {
+        let too_long = "a".repeat(SERVER_NAME_MAX_BYTES + 1);
+        let toml = format!(
+            r#"
+            [server]
+            name = "{too_long}"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        );
+        let err = parse(&toml).err().unwrap();
+        assert!(
+            matches!(err, ConfigError::Invalid(ref s) if s.contains("[server].name must be <=")),
+            "expected size rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn name_with_whitespace_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            name = "vps prod"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, ConfigError::Invalid(ref s) if s.contains("must not contain whitespace")),
+            "expected whitespace rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn name_with_control_char_is_rejected() {
+        let err = parse(
+            "
+            [server]
+            name = \"vps\\n\"
+
+            [accept]
+            pubkey = \"x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"
+            listen = \"0.0.0.0:51820\"
+            ",
+        )
+        .err()
+        .unwrap();
+        // `\n` is both whitespace and a control char; whichever check
+        // fires first is acceptable. We assert that a control-or-
+        // whitespace error path was taken.
+        assert!(
+            matches!(err, ConfigError::Invalid(ref s)
+                if s.contains("must not contain control characters")
+                    || s.contains("must not contain whitespace")),
+            "expected control/whitespace rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_name_uses_configured_value_when_set() {
+        let cfg = parse(
+            r#"
+            [server]
+            name = "vps"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolved_name(), "vps");
+    }
+
+    #[test]
+    fn resolved_name_falls_back_to_hostname_when_unset() {
+        let cfg = parse(relay_minimal_toml()).unwrap();
+        // gethostname always returns *something* on Linux; the
+        // resolver guarantees non-empty.
+        let resolved = cfg.resolved_name();
+        assert!(!resolved.is_empty());
+        assert!(resolved.len() <= SERVER_NAME_MAX_BYTES);
     }
 
     // ---- [server].nat_traversal ----

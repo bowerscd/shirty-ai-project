@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::rule::{Protocol, Rule, RuleSet};
 
+use crate::proxy::canary::CanaryArmTable;
 use crate::proxy::certs::{load_rule_into_store, CertStore, CertWatcher};
 use crate::proxy::h3_frontend::H3Frontend;
 use crate::proxy::http_frontend::{HttpFrontend, RedirectListener};
@@ -40,6 +41,7 @@ pub(super) async fn supervisor_loop(
     cert_store: Arc<CertStore>,
     cert_watcher: Arc<CertWatcher>,
     graceful_drain_timeout: Option<Duration>,
+    arm_table: Arc<CanaryArmTable>,
     cancel: CancellationToken,
     snapshot_tx: tokio::sync::watch::Sender<Vec<ProxySnapshot>>,
 ) {
@@ -89,6 +91,7 @@ pub(super) async fn supervisor_loop(
                             &cert_config,
                             &cert_store,
                             &cert_watcher,
+                            &arm_table,
                             &cancel,
                         )
                         .await;
@@ -120,6 +123,7 @@ pub(super) async fn supervisor_loop(
                             &cert_config,
                             &cert_store,
                             &cert_watcher,
+                            &arm_table,
                             &cancel,
                         )
                         .await;
@@ -170,6 +174,7 @@ async fn apply_set(
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
+    arm_table: &Arc<CanaryArmTable>,
     parent_cancel: &CancellationToken,
 ) {
     // Compute the diff against the supervisor-owned current state, not
@@ -195,6 +200,7 @@ async fn apply_set(
         cert_config,
         cert_store,
         cert_watcher,
+        arm_table,
         parent_cancel,
     )
     .await;
@@ -212,6 +218,7 @@ async fn apply_update(
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
+    arm_table: &Arc<CanaryArmTable>,
     parent_cancel: &CancellationToken,
 ) {
     let RuleUpdate { set, diff } = update;
@@ -277,6 +284,7 @@ async fn apply_update(
             cert_store,
             cert_watcher,
             redirect_listeners,
+            arm_table,
             parent_cancel,
             active,
         )
@@ -306,6 +314,7 @@ async fn apply_update(
             cert_store,
             cert_watcher,
             redirect_listeners,
+            arm_table,
             parent_cancel,
             active,
         )
@@ -383,6 +392,7 @@ async fn spawn_proxy_for_rule(
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
     redirect_listeners: &mut HashMap<IpAddr, RedirectListener>,
+    arm_table: &Arc<CanaryArmTable>,
     parent_cancel: &CancellationToken,
     active: &HashMap<String, ActiveProxy>,
 ) -> Result<ActiveProxy> {
@@ -428,10 +438,19 @@ async fn spawn_proxy_for_rule(
             let upstream_description = resolver.describe();
             let workers = resolve_workers(default_workers);
             let handle = match rule.protocol {
-                Protocol::Tcp => ProxyHandle::Tcp(TcpProxy::spawn(rule, resolver, workers).await?),
-                Protocol::Udp => ProxyHandle::Udp(
-                    UdpProxy::spawn_with(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT, workers)
+                Protocol::Tcp => ProxyHandle::Tcp(
+                    TcpProxy::spawn_with_arm_table(rule, resolver, workers, Arc::clone(arm_table))
                         .await?,
+                ),
+                Protocol::Udp => ProxyHandle::Udp(
+                    UdpProxy::spawn_with_arm_table(
+                        rule,
+                        resolver,
+                        MAX_FLOWS_PER_RULE_DEFAULT,
+                        workers,
+                        Arc::clone(arm_table),
+                    )
+                    .await?,
                 ),
                 Protocol::Https => unreachable!(),
             };

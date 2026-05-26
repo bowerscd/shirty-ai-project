@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use ratatoskr::control::{error_codes, Request, Response};
 
-use super::handlers::{dispatch_chain_apply, dispatch_chain_summary, dispatch_rules_reload};
+use super::handlers::{
+    dispatch_chain_apply, dispatch_chain_canary, dispatch_chain_summary, dispatch_rules_reload,
+};
 use super::{dispatch, ControlState};
 
 pub(super) async fn accept_loop(
@@ -106,6 +108,33 @@ async fn handle_connection(
                         // supervisor has applied it. Returns the
                         // post-reload count.
                         let response = dispatch_rules_reload(&state).await;
+                        let mut buf =
+                            serde_json::to_vec(&response).context("encode response")?;
+                        buf.push(b'\n');
+                        writer.write_all(&buf).await.context("write response")?;
+                    }
+                    Ok(Request::ChainCanary {
+                        rule_listen,
+                        rule_protocol,
+                        duration_ms,
+                        rate,
+                        payload_bytes,
+                        timeout_ms,
+                    }) => {
+                        // Canary runs an arm-phase RPC up the chain and
+                        // then drives a real L4 probe through the rule's
+                        // listener; both phases await across the network,
+                        // so it's hoisted out of the sync dispatcher.
+                        let response = dispatch_chain_canary(
+                            rule_listen,
+                            rule_protocol,
+                            duration_ms,
+                            rate,
+                            payload_bytes,
+                            timeout_ms,
+                            &state,
+                        )
+                        .await;
                         let mut buf =
                             serde_json::to_vec(&response).context("encode response")?;
                         buf.push(b'\n');

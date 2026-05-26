@@ -152,6 +152,7 @@ pub(in crate::control) async fn dispatch_chain_summary(
         hop_index: 0,
         mode: state.mode,
         uptime_secs: state.started_at.elapsed().as_secs(),
+        name: Some(state.node_name.clone()),
         view: ix.snapshot(),
         query_rtt_ms: None,
     };

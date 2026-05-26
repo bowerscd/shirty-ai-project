@@ -89,6 +89,7 @@ async fn bind_relay_control(
     ControlServer::bind(
         socket,
         Mode::Relay,
+        "test-node".to_string(),
         Some(peer_state),
         supervisor,
         Some(pending),
@@ -99,6 +100,7 @@ async fn bind_relay_control(
         None,
         None,
         None,
+        std::sync::Arc::new(crate::proxy::canary::CanaryArmTable::new()),
         shutdown,
     )
     .await
@@ -552,6 +554,7 @@ async fn derived_rules_endpoint_returns_snapshot_when_introspection_wired() {
     let server = ControlServer::bind(
         socket.clone(),
         Mode::Relay,
+        "test-node".to_string(),
         Some(peer_state.clone()),
         &supervisor,
         Some(pending),
@@ -562,6 +565,7 @@ async fn derived_rules_endpoint_returns_snapshot_when_introspection_wired() {
         None,
         None,
         None,
+        std::sync::Arc::new(crate::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await

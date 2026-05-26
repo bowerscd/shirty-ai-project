@@ -27,6 +27,7 @@ This document contains the help content for the `yggdrasilctl` command-line prog
 * [`yggdrasilctl chain summary`↴](#yggdrasilctl-chain-summary)
 * [`yggdrasilctl chain health`↴](#yggdrasilctl-chain-health)
 * [`yggdrasilctl chain ping`↴](#yggdrasilctl-chain-ping)
+* [`yggdrasilctl chain canary`↴](#yggdrasilctl-chain-canary)
 * [`yggdrasilctl identity`↴](#yggdrasilctl-identity)
 * [`yggdrasilctl identity show`↴](#yggdrasilctl-identity-show)
 * [`yggdrasilctl identity rotate`↴](#yggdrasilctl-identity-rotate)
@@ -251,6 +252,7 @@ Chain-control plane operations
 * `summary` — One-line-per-hop overview of the chain (pubkey, role, version, uptime, rule count). Pure projection of the same `Request::ChainSummary` RPC that backs `chain diff`; no extra daemon plumbing
 * `health` — Per-hop health (healthy / degraded / down / starting), aggregated to a chain-wide worst-of-hops verdict. Exit code reflects the worst hop: 0=healthy/starting, 1=degraded, 2=down, 3=RPC error
 * `ping` — Per-hop control-plane round-trip time. Walks the chain via the same `Request::ChainSummary` RPC and prints each hop's measured query→reply RTT (or `-` for the local hop, which has no RTT to report). Useful for isolating "slow link" vs. "unreachable hop" during a chain incident
+* `canary` — Probe a rule's L4 forwarding path end-to-end through the chain and report per-direction throughput, loss, and latency. Routes a token-prefixed probe through the rule's listener so the terminal hop short-circuits to an in-process echo — testing the chain without depending on the rule's configured backend being reachable
 
 ###### **Options:**
 
@@ -326,6 +328,38 @@ Per-hop control-plane round-trip time. Walks the chain via the same `Request::Ch
 
   Default value: `5s`
 * `--hop <PUBKEY>` — If set, restrict the rendered output to a single hop matching this tagged x25519 pubkey (`x25519:<hex>`). The whole chain is still walked — only the rendering is filtered. Useful in scripts that probe a specific hop without needing to compute its index
+
+
+
+## `yggdrasilctl chain canary`
+
+Probe a rule's L4 forwarding path end-to-end through the chain and report per-direction throughput, loss, and latency. Routes a token-prefixed probe through the rule's listener so the terminal hop short-circuits to an in-process echo — testing the chain without depending on the rule's configured backend being reachable.
+
+Exit code: 0=OK, 1=DEGRADED, 2=NO_SUCH_RULE, 3=CHAIN_DEAD, 4=RPC error.
+
+**Usage:** `yggdrasilctl chain canary [OPTIONS] --port <PORT>`
+
+###### **Options:**
+
+* `--port <PORT>` — Port the rule listens on. Required
+* `--proto <PROTO>` — Transport. Required only when the local node has more than one rule binding `--port` (one TCP, one UDP); inferred from the rule set otherwise
+
+  Possible values: `tcp`, `udp`
+
+* `--bind <IP>` — Bind address of the rule's listener. Defaults to whichever address the local rule actually binds (typically `0.0.0.0`)
+* `--duration <DURATION>` — Probe duration. Default 3s; pass a humantime string (e.g. `500ms`, `10s`)
+
+  Default value: `3s`
+* `--rate <RATE>` — Sustained send rate. For TCP: MiB/s per direction (default 1). For UDP: packets per second per direction (default 100). Pass `0` to use the daemon's protocol default
+
+  Default value: `0`
+* `--payload <BYTES>` — UDP-only payload size in bytes (ignored for TCP). Default 1200. Pass `0` to use the daemon's default
+
+  Default value: `0`
+* `--timeout <DURATION>` — Arming-phase deadline. The probe data phase runs for `--duration` regardless; this caps how long we wait for the chain to walk and install arms before giving up with `CHAIN_DEAD`
+
+  Default value: `5s`
+* `--json` — Emit a machine-readable JSON object instead of the human- readable table. Same field shape as [`ratatoskr::control::ChainCanaryResponse`]
 
 
 

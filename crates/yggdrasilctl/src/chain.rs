@@ -22,8 +22,67 @@ use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::{RuleFile, RuleSet};
 
 pub use cli_defs::yggdrasilctl::chain::{
-    ApplyArgs, Cmd, DiffArgs, HealthArgs, PingArgs, SummaryArgs,
+    ApplyArgs, CanaryArgs, Cmd, DiffArgs, HealthArgs, PingArgs, ProtoArg, SummaryArgs,
 };
+
+/// Number of hex characters used for the short-pubkey fallback /
+/// collision disambiguator in chain-hop renderers. Eight hex chars =
+/// 32 bits of identity, ample for human cross-reference in any
+/// realistic chain.
+pub const HOP_LABEL_PUBKEY_PREFIX_HEX: usize = 8;
+
+/// Format the short-pubkey form used when no `[server].name` is set
+/// or when two hops in the same chain collide on name.
+///
+/// Returns e.g. `"x25519:7f3a2b1c"`. The full pubkey is wire-form
+/// `x25519:<64 hex chars>`; we truncate the hex tail.
+fn short_pubkey(pk: &PubKey) -> String {
+    let full = pk.to_string();
+    // PubKey::to_string() formats as `"x25519:<hex>"`. Find the
+    // colon and keep the prefix bytes after it. If the encoding ever
+    // changes shape, fall back to the full form.
+    match full.find(':') {
+        Some(idx) => {
+            let prefix = &full[..=idx];
+            let hex = &full[idx + 1..];
+            let take = hex.len().min(HOP_LABEL_PUBKEY_PREFIX_HEX);
+            format!("{prefix}{}", &hex[..take])
+        }
+        None => full,
+    }
+}
+
+/// Compute display labels for an ordered list of chain hops. Prefers
+/// each hop's `[server].name` when set (non-empty); falls back to the
+/// short pubkey form. When two or more hops in the same chain walk
+/// share a name, every colliding hop's label is suffixed with its
+/// short pubkey for disambiguation (`"vps (x25519:7f3a2b1c)"`).
+///
+/// Pure function; takes `(name, pubkey)` pairs and returns labels in
+/// the same order. Sized for tens of hops, not thousands.
+pub fn hop_labels<'a, I>(hops: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (Option<&'a str>, &'a PubKey)>,
+{
+    let pairs: Vec<(Option<&str>, &PubKey)> = hops.into_iter().collect();
+    let mut name_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(pairs.len());
+    for (name, _) in &pairs {
+        if let Some(n) = name.filter(|s| !s.is_empty()) {
+            *name_counts.entry(n).or_insert(0) += 1;
+        }
+    }
+    pairs
+        .iter()
+        .map(|(name, pk)| match name.filter(|s| !s.is_empty()) {
+            Some(n) if name_counts.get(n).copied().unwrap_or(0) > 1 => {
+                format!("{n} ({})", short_pubkey(pk))
+            }
+            Some(n) => n.to_string(),
+            None => short_pubkey(pk),
+        })
+        .collect()
+}
 
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     match cmd {
@@ -32,6 +91,7 @@ pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
         Cmd::Summary(args) => summary(socket, &args, json).await,
         Cmd::Health(args) => health(socket, &args, json).await,
         Cmd::Ping(args) => ping(socket, &args, json).await,
+        Cmd::Canary(args) => canary(socket, &args, json).await,
     }
 }
 
@@ -143,6 +203,12 @@ struct HopReport {
     /// `dial`. For hop 0 this is the local node's own
     /// `chain.local`; we record it for cross-check symmetry.
     expected_pubkey: PubKey,
+    /// Hop's resolved `[server].name` (falls back to hostname on
+    /// the daemon side). Used by the renderer for human-friendly
+    /// labelling; `None` means the daemon predates the field or
+    /// the operator explicitly cleared it.
+    #[serde(default)]
+    name: Option<String>,
     /// Snapshot the hop returned. `chain.local` is asserted to equal
     /// `expected_pubkey` before this struct is constructed; any mismatch
     /// aborts the walk.
@@ -250,6 +316,7 @@ async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
         hops.push(HopReport {
             index: wire_hop.hop_index as usize,
             expected_pubkey,
+            name: wire_hop.name,
             view: wire_hop.view,
             drift,
         });
@@ -403,7 +470,13 @@ fn compute_diff(
 ///   under v1 — relays do not re-publish)
 /// ```
 fn render_human(report: &DiffReport) {
-    for hop in &report.hops {
+    let labels = hop_labels(
+        report
+            .hops
+            .iter()
+            .map(|h| (h.name.as_deref(), &h.view.chain.local)),
+    );
+    for (idx, hop) in report.hops.iter().enumerate() {
         let role = if hop.index == 0 { "local" } else { "upstream" };
         let v = &hop.view;
         let version_label = v
@@ -417,9 +490,9 @@ fn render_human(report: &DiffReport) {
             .map(|p| format!(" origin={p}"))
             .unwrap_or_default();
         println!(
-            "hop {idx} ({role} {pk}): predicates={count}{version_label}{origin_label}",
-            idx = hop.index,
-            pk = v.chain.local,
+            "hop {idx_disp} ({role} {label}): predicates={count}{version_label}{origin_label}",
+            idx_disp = hop.index,
+            label = labels[idx],
             count = v.predicates.len(),
         );
         println!("  derived_rules: {} active", v.derived_rules.len());
@@ -514,6 +587,10 @@ struct SummaryHop {
     index: u32,
     /// Hop's tagged x25519 pubkey.
     pubkey: PubKey,
+    /// Hop's resolved `[server].name` (or hostname fallback). Used by
+    /// the renderer for human-friendly labelling.
+    #[serde(default)]
+    name: Option<String>,
     /// Runtime mode the hop is operating in.
     mode: ratatoskr::control::Mode,
     /// Hop's process uptime in whole seconds.
@@ -555,6 +632,7 @@ async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result
         .map(|h| SummaryHop {
             index: h.hop_index,
             pubkey: h.view.chain.local,
+            name: h.name.clone(),
             mode: h.mode,
             uptime_secs: h.uptime_secs,
             rule_count: h.view.derived_rules.len(),
@@ -584,16 +662,17 @@ async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result
 /// hop 2  gateway   x25519:fff…  uptime=304s rules=0  predicates=0
 /// ```
 fn render_summary_human(report: &SummaryReport) {
-    for hop in &report.hops {
+    let labels = hop_labels(report.hops.iter().map(|h| (h.name.as_deref(), &h.pubkey)));
+    for (idx, hop) in report.hops.iter().enumerate() {
         let version_label = hop
             .predicate_version
             .map(|v| format!(" v={v}"))
             .unwrap_or_default();
         println!(
-            "hop {idx}  {mode:<8}  {pk}  uptime={uptime}s  rules={rules}  predicates={preds}{version_label}",
-            idx = hop.index,
+            "hop {hop_idx}  {mode:<8}  {label}  uptime={uptime}s  rules={rules}  predicates={preds}{version_label}",
+            hop_idx = hop.index,
             mode = format!("{:?}", hop.mode).to_lowercase(),
-            pk = hop.pubkey,
+            label = labels[idx],
             uptime = hop.uptime_secs,
             rules = hop.rule_count,
             preds = hop.predicate_count,
@@ -637,6 +716,10 @@ enum HealthTier {
 struct HealthHop {
     index: u32,
     pubkey: PubKey,
+    /// Hop's resolved `[server].name` (or hostname fallback). Used by
+    /// the renderer for human-friendly labelling.
+    #[serde(default)]
+    name: Option<String>,
     mode: ratatoskr::control::Mode,
     uptime_secs: u64,
     tier: HealthTier,
@@ -754,6 +837,7 @@ fn classify_hop(hop: &ratatoskr::control::ChainHop, now_unix: i64) -> HealthHop 
     HealthHop {
         index: hop.hop_index,
         pubkey: hop.view.chain.local,
+        name: hop.name.clone(),
         mode: hop.mode,
         uptime_secs: hop.uptime_secs,
         tier,
@@ -762,7 +846,8 @@ fn classify_hop(hop: &ratatoskr::control::ChainHop, now_unix: i64) -> HealthHop 
 }
 
 fn render_health_human(report: &HealthReport) {
-    for hop in &report.hops {
+    let labels = hop_labels(report.hops.iter().map(|h| (h.name.as_deref(), &h.pubkey)));
+    for (idx, hop) in report.hops.iter().enumerate() {
         let tier_label = match hop.tier {
             HealthTier::Healthy => "healthy",
             HealthTier::Starting => "starting",
@@ -770,10 +855,10 @@ fn render_health_human(report: &HealthReport) {
             HealthTier::Down => "down",
         };
         println!(
-            "hop {idx}  {mode:<8}  {pk}  {tier}",
-            idx = hop.index,
+            "hop {hop_idx}  {mode:<8}  {label}  {tier}",
+            hop_idx = hop.index,
             mode = format!("{:?}", hop.mode).to_lowercase(),
-            pk = hop.pubkey,
+            label = labels[idx],
             tier = tier_label,
         );
         for reason in &hop.reasons {
@@ -806,6 +891,10 @@ struct PingHop {
     index: u32,
     /// Hop's tagged x25519 pubkey (used for `--hop` filtering).
     pubkey: PubKey,
+    /// Hop's resolved `[server].name` (or hostname fallback). Used by
+    /// the renderer for human-friendly labelling.
+    #[serde(default)]
+    name: Option<String>,
     /// Wall-clock RTT measured by this hop's parent for the
     /// `ChainHopQuery` that produced it. `None` on the local hop and
     /// (legacy daemons) on hops whose parent didn't stamp an RTT.
@@ -842,6 +931,7 @@ async fn ping(socket: &Path, args: &PingArgs, json_output: bool) -> Result<()> {
         .map(|h| PingHop {
             index: h.hop_index,
             pubkey: h.view.chain.local,
+            name: h.name.clone(),
             query_rtt_ms: h.query_rtt_ms,
         })
         .collect();
@@ -875,15 +965,16 @@ async fn ping(socket: &Path, args: &PingArgs, json_output: bool) -> Result<()> {
 /// hop 2  x25519:fff…  rtt=37ms
 /// ```
 fn render_ping_human(report: &PingReport) {
-    for hop in &report.hops {
+    let labels = hop_labels(report.hops.iter().map(|h| (h.name.as_deref(), &h.pubkey)));
+    for (idx, hop) in report.hops.iter().enumerate() {
         let rtt = match hop.query_rtt_ms {
             Some(ms) => format!("{ms}ms"),
             None => "-".to_string(),
         };
         println!(
-            "hop {idx}  {pk}  rtt={rtt}",
-            idx = hop.index,
-            pk = hop.pubkey,
+            "hop {hop_idx}  {label}  rtt={rtt}",
+            hop_idx = hop.index,
+            label = labels[idx],
         );
     }
     if report.partial {
@@ -895,8 +986,370 @@ fn render_ping_human(report: &PingReport) {
 }
 
 // =============================================================================
-// Tests — diff comparison + serde round-trip
+// `chain canary` — probe a rule's L4 forwarding end-to-end
 // =============================================================================
+
+use ratatoskr::control::{
+    CanaryStatus, ChainCanaryResponse, DerivedRulesResponse as DerivedRules, DirectionStats,
+};
+use ratatoskr::rule::Protocol;
+
+/// Exit code map matching the cli-reference docs.
+const CANARY_EXIT_OK: i32 = 0;
+const CANARY_EXIT_DEGRADED: i32 = 1;
+const CANARY_EXIT_NO_SUCH_RULE: i32 = 2;
+const CANARY_EXIT_CHAIN_DEAD: i32 = 3;
+
+async fn canary(socket: &Path, args: &CanaryArgs, json_output: bool) -> Result<()> {
+    // 1. Resolve which rule(s) match the operator's `--port [--proto]`
+    //    by pre-fetching the local rule snapshot. This catches the
+    //    "no such rule" / "HTTPS dual-probe" / "ambiguous port"
+    //    branches before hitting the daemon's full canary path.
+    let derived = fetch_derived_rules(socket).await?;
+    let matches = derived
+        .derived_rules
+        .iter()
+        .filter(|r| {
+            r.listen.port() == args.port && args.bind.map(|ip| r.listen.ip() == ip).unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+
+    let probes: Vec<(std::net::SocketAddr, Protocol)> = if matches.is_empty() {
+        // No match locally — let the daemon's NO_SUCH_RULE path
+        // emit the close-match suggestions.
+        let listen: std::net::SocketAddr = match args.bind {
+            Some(ip) => std::net::SocketAddr::new(ip, args.port),
+            None => format!("0.0.0.0:{}", args.port).parse().unwrap(),
+        };
+        let proto = match args.proto {
+            Some(ProtoArg::Tcp) => Protocol::Tcp,
+            Some(ProtoArg::Udp) => Protocol::Udp,
+            None => Protocol::Tcp, // arbitrary; the daemon won't find a match either way
+        };
+        vec![(listen, proto)]
+    } else {
+        select_probes_from_matches(&matches, args)?
+    };
+
+    let mut overall_exit = CANARY_EXIT_OK;
+    let mut json_collected: Vec<ChainCanaryResponse> = Vec::with_capacity(probes.len());
+
+    for (listen, proto) in probes {
+        let req = Request::ChainCanary {
+            rule_listen: listen,
+            rule_protocol: proto,
+            duration_ms: (args.duration.as_millis().min(u32::MAX as u128)) as u32,
+            rate: args.rate,
+            payload_bytes: args.payload,
+            timeout_ms: Some((args.timeout.as_millis().min(u32::MAX as u128)) as u32),
+        };
+        let resp_timeout = args.timeout + args.duration + Duration::from_secs(5);
+        let response = send_chain_request(socket, &req, resp_timeout).await?;
+        let c = match response {
+            Response::ChainCanary(c) => c,
+            Response::Error { code, message } => {
+                bail!("daemon returned Error({code}): {message}");
+            }
+            other => bail!("unexpected response: {other:?}"),
+        };
+        // Track worst-of outcomes across multiple probes (HTTPS
+        // dual-probe path).
+        let this_exit = match c.status {
+            CanaryStatus::Ok => CANARY_EXIT_OK,
+            CanaryStatus::Degraded => CANARY_EXIT_DEGRADED,
+            CanaryStatus::NoSuchRule => CANARY_EXIT_NO_SUCH_RULE,
+            CanaryStatus::ChainDead => CANARY_EXIT_CHAIN_DEAD,
+        };
+        if this_exit > overall_exit {
+            overall_exit = this_exit;
+        }
+        if !json_output {
+            render_canary_human(&c, proto, listen);
+        }
+        json_collected.push(c);
+    }
+
+    if json_output {
+        // Emit one JSON object per probe as an array. For a single
+        // probe consumers can `[0]`-index; for HTTPS dual-probe the
+        // array carries both.
+        let s = serde_json::to_string_pretty(&json_collected).context("serialise canary report")?;
+        println!("{s}");
+    }
+
+    if overall_exit != CANARY_EXIT_OK {
+        std::process::exit(overall_exit);
+    }
+    Ok(())
+}
+
+/// Choose which `(listen, proto)` probe(s) to send based on the local
+/// rule snapshot. Encodes the HTTPS dual-probe rule (run both TCP and
+/// UDP for an HTTPS rule) and the "ambiguous port, --proto required"
+/// rule.
+fn select_probes_from_matches(
+    matches: &[&ratatoskr::rule::Rule],
+    args: &CanaryArgs,
+) -> Result<Vec<(std::net::SocketAddr, Protocol)>> {
+    // Distinct (listen, protocol) tuples in the matched rules,
+    // expanding HTTPS into its underlying TCP + UDP listeners.
+    let mut tuples: Vec<(std::net::SocketAddr, Protocol)> = Vec::new();
+    for r in matches {
+        match r.protocol {
+            Protocol::Tcp | Protocol::Udp => tuples.push((r.listen, r.protocol)),
+            Protocol::Https => {
+                tuples.push((r.listen, Protocol::Tcp));
+                tuples.push((r.listen, Protocol::Udp));
+            }
+        }
+    }
+    tuples.sort_by_key(|(_, p)| match p {
+        Protocol::Tcp => 0,
+        Protocol::Udp => 1,
+        Protocol::Https => 2,
+    });
+    tuples.dedup();
+
+    let want_proto = args.proto.map(|p| match p {
+        ProtoArg::Tcp => Protocol::Tcp,
+        ProtoArg::Udp => Protocol::Udp,
+    });
+
+    let filtered: Vec<(std::net::SocketAddr, Protocol)> = match want_proto {
+        Some(p) => tuples.iter().copied().filter(|(_, pp)| *pp == p).collect(),
+        None => tuples,
+    };
+
+    if filtered.is_empty() {
+        bail!(
+            "no rule binds {}/{} on this node",
+            args.port,
+            args.proto
+                .map(|p| match p {
+                    ProtoArg::Tcp => "tcp",
+                    ProtoArg::Udp => "udp",
+                })
+                .unwrap_or("?"),
+        );
+    }
+    if want_proto.is_none() && filtered.len() > 1 {
+        // Multiple transports on the same port that aren't paired
+        // into a single HTTPS rule — operator must disambiguate.
+        // Exception: an HTTPS rule produces (TCP, UDP) at the same
+        // listen, and we want to run both. Detect that case by
+        // checking if any matched rule is `Protocol::Https`.
+        let has_https = matches.iter().any(|r| r.protocol == Protocol::Https);
+        if !has_https {
+            bail!(
+                "port {} has multiple transports bound; pass --proto tcp or --proto udp",
+                args.port,
+            );
+        }
+    }
+    Ok(filtered)
+}
+
+async fn fetch_derived_rules(socket: &Path) -> Result<DerivedRules> {
+    let response =
+        send_chain_request(socket, &Request::DerivedRules, DEFAULT_CLIENT_TIMEOUT_SECS).await?;
+    match response {
+        Response::DerivedRules(d) => Ok(d),
+        other => bail!("expected DerivedRules response, got {other:?}"),
+    }
+}
+
+const DEFAULT_CLIENT_TIMEOUT_SECS: Duration = Duration::from_secs(5);
+
+/// Generic UDS round-trip helper. Sends `req` as one JSON line, reads
+/// one JSON line back, deserialises into `Response`.
+async fn send_chain_request(socket: &Path, req: &Request, timeout: Duration) -> Result<Response> {
+    let socket_path: PathBuf = socket.to_path_buf();
+    let stream = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
+        .await
+        .with_context(|| format!("UDS connect timeout to {}", socket_path.display()))?
+        .with_context(|| format!("connecting to {}", socket_path.display()))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let mut buf = serde_json::to_vec(req).context("encode request")?;
+    buf.push(b'\n');
+    tokio::time::timeout(timeout, writer.write_all(&buf))
+        .await
+        .context("write timeout sending request")?
+        .context("writing request")?;
+
+    let mut line = String::new();
+    let n = tokio::time::timeout(timeout, reader.read_line(&mut line))
+        .await
+        .context("read timeout awaiting response")?
+        .context("reading response")?;
+    if n == 0 {
+        bail!("daemon closed UDS without responding");
+    }
+    serde_json::from_str(&line).context("parse response")
+}
+
+fn render_canary_human(c: &ChainCanaryResponse, proto: Protocol, listen: std::net::SocketAddr) {
+    let proto_str = match proto {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::Https => "https",
+    };
+
+    match c.status {
+        CanaryStatus::NoSuchRule => {
+            println!(
+                "no rule binds {}/{} on this node.\n",
+                listen.port(),
+                proto_str,
+            );
+            if c.close_matches.is_empty() {
+                println!("no close matches.");
+            } else {
+                println!("closest matches:");
+                for m in &c.close_matches {
+                    let p = match m.protocol {
+                        Protocol::Tcp => "tcp",
+                        Protocol::Udp => "udp",
+                        Protocol::Https => "https",
+                    };
+                    println!(
+                        "  {port:<5} /{p:<5}  rule {name:?}  on {bind}",
+                        port = m.listen.port(),
+                        name = m.rule_name,
+                        bind = m.listen.ip(),
+                    );
+                }
+            }
+            println!("\nresult: NO_SUCH_RULE");
+        }
+        CanaryStatus::ChainDead => {
+            print_chain_header(c, proto_str, listen);
+            println!();
+            println!("setup phase:");
+            for (idx, hop) in c.chain.iter().enumerate() {
+                let label = hop_label_for(hop);
+                let prev = if idx == 0 {
+                    "(self)".to_string()
+                } else {
+                    hop_label_for(&c.chain[idx - 1])
+                };
+                let detail = if let Some(rtt_ms) = hop.query_rtt_ms {
+                    format!("OK ({rtt_ms} ms)")
+                } else {
+                    "OK".to_string()
+                };
+                println!("  {prev:>20} → {label:<20}  {detail}");
+            }
+            if c.partial {
+                println!();
+                println!("chain truncated; last reachable hop above. The next hop along");
+                println!("the chain did not respond within the arming timeout.");
+            }
+            println!();
+            println!("result: CHAIN_DEAD");
+        }
+        CanaryStatus::Ok | CanaryStatus::Degraded => {
+            print_chain_header(c, proto_str, listen);
+            if let Some(p) = c.probe_results.as_ref() {
+                println!();
+                render_probe_table(p, proto);
+            }
+            println!();
+            println!(
+                "result: {}",
+                match c.status {
+                    CanaryStatus::Ok => "OK",
+                    CanaryStatus::Degraded => "DEGRADED",
+                    _ => unreachable!(),
+                }
+            );
+        }
+    }
+}
+
+fn print_chain_header(c: &ChainCanaryResponse, proto_str: &str, listen: std::net::SocketAddr) {
+    let rule = c.rule_name.as_deref().unwrap_or("?");
+    println!(
+        "rule:   {rule}  ({proto_str}, listen {bind}:{port})",
+        bind = listen.ip(),
+        port = listen.port(),
+    );
+    let chain_line = c
+        .chain
+        .iter()
+        .enumerate()
+        .map(|(idx, hop)| {
+            let label = hop_label_for(hop);
+            if idx == 0 {
+                format!("{label} (self)")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" → ");
+    println!("chain:  {chain_line}");
+}
+
+fn render_probe_table(p: &ProbeResultsAlias, proto: Protocol) {
+    let is_tcp = matches!(proto, Protocol::Tcp);
+    if is_tcp {
+        println!(
+            "probe:  duration {} ms, TCP byte-stream",
+            p.c_to_s.throughput_bps / 8 / 1024,
+        );
+    } else {
+        println!("probe:  duration {} ms, UDP datagrams", 0);
+    }
+    println!();
+    println!(
+        "{:<18}  {:>12}  {:>10}  {:>12}  {:>12}",
+        "direction", "throughput", "loss", "p50 latency", "p99 latency",
+    );
+    let rows = [
+        ("client → server", &p.c_to_s),
+        ("server → client", &p.s_to_c),
+    ];
+    for (name, d) in rows {
+        let loss = if d.sent == 0 {
+            0.0
+        } else {
+            1.0 - (d.received as f64 / d.sent as f64).min(1.0)
+        };
+        let mbps = (d.throughput_bps as f64) / 1_000_000.0;
+        println!(
+            "{:<18}  {:>10.2} Mbps  {:>7.2} %  {:>9} µs  {:>9} µs",
+            name,
+            mbps,
+            loss * 100.0,
+            d.latency_p50_micros,
+            d.latency_p99_micros,
+        );
+    }
+    if let Some(rtt) = p.connection_rtt_micros {
+        println!();
+        println!("connection establish: {rtt} µs");
+    }
+}
+
+// Alias so the function signature reads naturally without re-importing
+// the full path.
+use ratatoskr::control::ProbeResults as ProbeResultsAlias;
+
+/// Hop label resolution mirroring [`hop_labels`] but for one
+/// `CanaryHop` — `name` when set, short pubkey otherwise.
+fn hop_label_for(hop: &ratatoskr::canary::CanaryHop) -> String {
+    match hop.name.as_deref().filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => short_pubkey(&hop.pubkey),
+    }
+}
+
+// Suppress the dead-imports warning when these aliases aren't reached
+// from other call sites in the file.
+#[allow(dead_code)]
+fn _suppress_dead(_d: &DirectionStats) {}
 
 #[cfg(test)]
 mod tests {
@@ -906,6 +1359,62 @@ mod tests {
 
     fn pk(seed: u8) -> PubKey {
         PubKey::x25519([seed; 32])
+    }
+
+    // ---- hop_labels ----
+
+    #[test]
+    fn hop_labels_prefer_name_when_set() {
+        let k1 = pk(1);
+        let k2 = pk(2);
+        let labels = hop_labels([(Some("vps"), &k1), (Some("home"), &k2)]);
+        assert_eq!(labels, vec!["vps".to_string(), "home".to_string()]);
+    }
+
+    #[test]
+    fn hop_labels_fall_back_to_short_pubkey_when_unset() {
+        let k = pk(0x7f);
+        let labels = hop_labels([(None, &k)]);
+        assert_eq!(labels.len(), 1);
+        assert!(
+            labels[0].starts_with("x25519:"),
+            "expected short pubkey, got {:?}",
+            labels[0]
+        );
+        assert_eq!(
+            labels[0].len(),
+            "x25519:".len() + HOP_LABEL_PUBKEY_PREFIX_HEX
+        );
+    }
+
+    #[test]
+    fn hop_labels_treat_empty_string_as_unset() {
+        let k = pk(1);
+        let labels = hop_labels([(Some(""), &k)]);
+        assert!(labels[0].starts_with("x25519:"));
+    }
+
+    #[test]
+    fn hop_labels_disambiguate_collisions_with_short_pubkey_suffix() {
+        let k1 = pk(0x11);
+        let k2 = pk(0x22);
+        let labels = hop_labels([(Some("vps"), &k1), (Some("vps"), &k2)]);
+        assert_eq!(labels.len(), 2);
+        assert!(labels[0].starts_with("vps ("), "got {:?}", labels[0]);
+        assert!(labels[0].ends_with(')'));
+        assert!(labels[1].starts_with("vps ("), "got {:?}", labels[1]);
+        assert_ne!(
+            labels[0], labels[1],
+            "colliding labels must still be distinguishable"
+        );
+    }
+
+    #[test]
+    fn hop_labels_no_disambiguation_when_only_one_hop_holds_a_given_name() {
+        let k1 = pk(1);
+        let k2 = pk(2);
+        let labels = hop_labels([(Some("vps"), &k1), (Some("home"), &k2)]);
+        assert_eq!(labels, vec!["vps".to_string(), "home".to_string()]);
     }
 
     fn pred(name: &str, port: u16, proto: Protocol) -> Predicate {
@@ -1104,6 +1613,7 @@ mod tests {
             hop_index: 0,
             mode: ratatoskr::control::Mode::Terminal,
             uptime_secs,
+            name: None,
             query_rtt_ms: None,
             view: view(Vec::new(), pk(1), None, None, None).pipe(|mut v| {
                 v.chain.last_apply_unix = last_apply_unix;

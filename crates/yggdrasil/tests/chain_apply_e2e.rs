@@ -83,6 +83,7 @@ async fn terminal_chain_apply_enqueues_and_reports() {
     let server = ControlServer::bind(
         socket_path.clone(),
         Mode::Terminal,
+        "test-node".to_string(),
         None,
         &supervisor,
         None,
@@ -93,6 +94,7 @@ async fn terminal_chain_apply_enqueues_and_reports() {
         None,
         None,
         None,
+        std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await
@@ -179,6 +181,7 @@ async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
     let server = ControlServer::bind(
         socket_path.clone(),
         Mode::Relay,
+        "test-node".to_string(),
         Some(peer_state),
         &supervisor,
         None,
@@ -189,6 +192,7 @@ async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
         None,
         None,
         None,
+        std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await
@@ -233,6 +237,7 @@ async fn terminal_chain_apply_rejects_duplicate_names() {
     let server = ControlServer::bind(
         socket_path.clone(),
         Mode::Terminal,
+        "test-node".to_string(),
         None,
         &supervisor,
         None,
@@ -243,6 +248,7 @@ async fn terminal_chain_apply_rejects_duplicate_names() {
         None,
         None,
         None,
+        std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await
@@ -305,6 +311,7 @@ async fn terminal_chain_apply_rejects_oversize_predicate_set() {
     let server = ControlServer::bind(
         socket_path.clone(),
         Mode::Terminal,
+        "test-node".to_string(),
         None,
         &supervisor,
         None,
@@ -315,6 +322,7 @@ async fn terminal_chain_apply_rejects_oversize_predicate_set() {
         None,
         None,
         None,
+        std::sync::Arc::new(yggdrasil::proxy::canary::CanaryArmTable::new()),
         shutdown.clone(),
     )
     .await

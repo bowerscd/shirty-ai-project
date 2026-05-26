@@ -221,6 +221,63 @@ If a hop genuinely diverges (different version + same origin, or
 content drift), investigate the publisher / acceptor metrics on that
 hop.
 
+### Debugging a rule end-to-end with `chain canary`
+
+`yggdrasilctl chain canary --port N [--proto tcp|udp]` probes a rule's
+L4 forwarding path through the chain end-to-end. The canary's
+probe traffic is prefixed with a 32-byte random arming token; the
+terminal hop short-circuits matching traffic to an in-process echo
+instead of forwarding to the configured backend. That means the
+canary works regardless of whether the rule's `target_addr` is
+reachable — it tests the *chain*, not the backend.
+
+Pick the port you exposed in the rule, optionally narrow by `--proto`,
+and run on any node in the chain:
+
+```bash
+sudo yggdrasilctl chain canary --port 2222 --proto tcp
+```
+
+Successful output:
+
+```
+rule:   ssh  (tcp, listen 0.0.0.0:2222)
+chain:  home (self)
+
+probe:  duration 3 s, TCP byte-stream
+
+direction         throughput      loss   p50 latency  p99 latency
+client → server      1.04 Mbps   0.00 %       180 µs       340 µs
+server → client      1.04 Mbps   0.00 %       180 µs       340 µs
+
+connection establish: 220 µs
+
+result: OK
+```
+
+Exit codes (for shell / orchestration use):
+
+| code | meaning                                                |
+|------|--------------------------------------------------------|
+| 0    | OK                                                     |
+| 1    | DEGRADED (probe ran, loss or p99 over thresholds)      |
+| 2    | NO_SUCH_RULE (port + proto don't bind anywhere here)   |
+| 3    | CHAIN_DEAD (arm phase couldn't reach a hop)            |
+| 4    | RPC error reaching the daemon                          |
+
+The `NO_SUCH_RULE` output includes a "closest matches" list — same
+port different proto, then different port same proto. That's usually
+the fastest way to spot a typo'd `[[rule]] listen` or a missing
+predicate publish.
+
+For HTTPS rules the canary probes TCP/443 and UDP/443 separately and
+emits both reports — same command, no extra flags. Pass `--json` for a
+machine-parseable object covering all probes.
+
+The canary **does not** test the rule's configured backend. That's a
+separate concern; verify backend reachability from the terminal host
+with `nc` / `curl` if needed.
+
 ### Key rotation
 
 Identity keys are long-term. Rotate them when:
