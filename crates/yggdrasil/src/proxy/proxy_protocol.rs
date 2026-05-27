@@ -1,9 +1,15 @@
 //! PROXY-protocol header emission for upstream connections.
 //!
 //! Implements both [v1] (ASCII, human-readable, max 107 bytes) and [v2]
-//! (binary, fixed 16-byte header + variable address block). The header is
-//! emitted once on each new upstream TCP connection, **before** any
-//! application-layer bytes flow.
+//! (binary, fixed 16-byte header + variable address block). For TCP, the
+//! header is emitted once on each new upstream connection **before** any
+//! application-layer bytes flow. For UDP HTTPS / HTTP/3 chain traffic,
+//! the relay sends a PROXY v2 header as a standalone first datagram on
+//! each new (relay→terminal) UDP flow; subsequent datagrams in the same
+//! flow are forwarded raw. The terminal's h3 interpose socket calls
+//! [`decode_v2_from_datagram`] on every received datagram and gates on
+//! the v2 magic; valid QUIC datagrams cannot be mis-classified (see the
+//! magic-byte non-collision tests in this module).
 //!
 //! [v1]: https://www.haproxy.org/download/2.6/doc/proxy-protocol.txt §2.1
 //! [v2]: https://www.haproxy.org/download/2.6/doc/proxy-protocol.txt §2.2
@@ -422,6 +428,82 @@ where
     })
 }
 
+/// Decode a PROXY v2 header from the start of a UDP datagram.
+///
+/// Returns `Some(endpoints)` if `buf` begins with the v2 magic and parses
+/// as a valid TCP4 or TCP6 v2 PROXY header. Returns `None` for any
+/// non-PROXY input — including any valid QUIC datagram, which the
+/// magic-byte non-collision tests in this module prove cannot match.
+///
+/// Tolerant of malformed input: on truncation, oversized address length,
+/// unknown family/proto, or LOCAL command, returns `None` rather than
+/// erroring. The UDP caller (h3 interpose socket) treats `None` as
+/// "this datagram is not a PROXY header — pass it to quinn"; malformed
+/// PROXY-shaped datagrams are also surfaced as `None` and the call site
+/// decides whether to drop or log.
+///
+/// Used by the terminal's HTTP/3 interpose socket to recover the real
+/// client IP from the relay's first-datagram emission on the chain's
+/// UDP/QUIC leg.
+pub fn decode_v2_from_datagram(buf: &[u8]) -> Option<ProxyEndpoints> {
+    if buf.len() < 16 || buf[..12] != V2_SIG {
+        return None;
+    }
+    let ver_cmd = buf[12];
+    let fam_proto = buf[13];
+    let addr_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
+
+    // Version (high nibble) must be 2.
+    if (ver_cmd & 0xF0) != 0x20 {
+        return None;
+    }
+    if addr_len > V2_MAX_ADDR {
+        return None;
+    }
+    if buf.len() < 16 + addr_len {
+        return None;
+    }
+    // LOCAL command (low nibble 0): header is well-formed but the
+    // addresses are unusable. Surface as None so the caller falls back to
+    // the quinn-observed peer addr.
+    if (ver_cmd & 0x0F) == 0x00 {
+        return None;
+    }
+    let payload = &buf[16..16 + addr_len];
+
+    // The relay's encoder writes 0x11 / 0x21 (STREAM/TCP) even for UDP
+    // chain traffic — this matches HAProxy's historical convention and
+    // lets the encoder be shared between TCP and UDP forwarders.
+    // Receivers that only need the address pair ignore the proto nibble.
+    match fam_proto {
+        0x11 if payload.len() >= 12 => {
+            let c_ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+            let s_ip = Ipv4Addr::new(payload[4], payload[5], payload[6], payload[7]);
+            let c_port = u16::from_be_bytes([payload[8], payload[9]]);
+            let s_port = u16::from_be_bytes([payload[10], payload[11]]);
+            Some(ProxyEndpoints {
+                client: SocketAddr::new(IpAddr::V4(c_ip), c_port),
+                server: SocketAddr::new(IpAddr::V4(s_ip), s_port),
+            })
+        }
+        0x21 if payload.len() >= 36 => {
+            let mut c_oct = [0u8; 16];
+            c_oct.copy_from_slice(&payload[0..16]);
+            let mut s_oct = [0u8; 16];
+            s_oct.copy_from_slice(&payload[16..32]);
+            let c_ip = Ipv6Addr::from(c_oct);
+            let s_ip = Ipv6Addr::from(s_oct);
+            let c_port = u16::from_be_bytes([payload[32], payload[33]]);
+            let s_port = u16::from_be_bytes([payload[34], payload[35]]);
+            Some(ProxyEndpoints {
+                client: SocketAddr::new(IpAddr::V6(c_ip), c_port),
+                server: SocketAddr::new(IpAddr::V6(s_ip), s_port),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,5 +745,135 @@ mod tests {
         });
         let err = read_optional_header(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // ---- decode_v2_from_datagram (UDP path) ---------------------------------
+
+    #[test]
+    fn v2_datagram_round_trip_ipv4() {
+        let client = v4("203.0.113.7:54321");
+        let server = v4("198.51.100.4:443");
+        let dgram = encode_v2(client, server);
+        let decoded = decode_v2_from_datagram(&dgram).expect("v4 datagram decodes");
+        assert_eq!(decoded.client, client);
+        assert_eq!(decoded.server, server);
+    }
+
+    #[test]
+    fn v2_datagram_round_trip_ipv6() {
+        let client = v6("[2001:db8::1]:54321");
+        let server = v6("[2001:db8::2]:443");
+        let dgram = encode_v2(client, server);
+        let decoded = decode_v2_from_datagram(&dgram).expect("v6 datagram decodes");
+        assert_eq!(decoded.client, client);
+        assert_eq!(decoded.server, server);
+    }
+
+    #[test]
+    fn v2_datagram_with_trailing_bytes_decodes_using_addr_len() {
+        // The relay sends PROXY v2 standalone in v1 of this feature, but the
+        // decoder must be self-delimiting via `addr_len` per spec — so a
+        // future change that coalesces the header with the first
+        // application datagram does not silently break detection.
+        let mut dgram = encode_v2(v4("203.0.113.7:54321"), v4("198.51.100.4:443"));
+        dgram.extend_from_slice(b"\xC0\xFF\xEE\xDE\xAD\xBE\xEF");
+        let decoded = decode_v2_from_datagram(&dgram).expect("decodes despite trailer");
+        assert_eq!(decoded.client, v4("203.0.113.7:54321"));
+    }
+
+    #[test]
+    fn v2_datagram_rejects_short_input() {
+        assert!(decode_v2_from_datagram(&[]).is_none());
+        assert!(decode_v2_from_datagram(&[0x0D; 11]).is_none());
+        // Full magic but no header trailer.
+        assert!(decode_v2_from_datagram(&V2_SIG[..]).is_none());
+    }
+
+    #[test]
+    fn v2_datagram_rejects_missing_magic() {
+        let mut buf = vec![0u8; 28];
+        buf[0] = 0xAA;
+        assert!(decode_v2_from_datagram(&buf).is_none());
+    }
+
+    #[test]
+    fn v2_datagram_rejects_addr_len_larger_than_buffer() {
+        let mut buf = encode_v2(v4("203.0.113.7:54321"), v4("198.51.100.4:443"));
+        let len_bytes = 1024u16.to_be_bytes();
+        buf[14] = len_bytes[0];
+        buf[15] = len_bytes[1];
+        assert!(decode_v2_from_datagram(&buf).is_none());
+    }
+
+    #[test]
+    fn v2_datagram_rejects_addr_len_above_v2_max_addr() {
+        let mut buf = vec![0u8; 16 + 600];
+        buf[..12].copy_from_slice(&V2_SIG);
+        buf[12] = 0x21; // version 2 + PROXY
+        buf[13] = 0x11; // AF_INET + STREAM
+        let len_bytes = (V2_MAX_ADDR as u16 + 1).to_be_bytes();
+        buf[14] = len_bytes[0];
+        buf[15] = len_bytes[1];
+        assert!(decode_v2_from_datagram(&buf).is_none());
+    }
+
+    #[test]
+    fn v2_datagram_rejects_local_command() {
+        // ver_cmd low nibble = 0 → LOCAL: header well-formed but addresses
+        // unusable. The interpose socket falls back to the connection's
+        // observed peer addr in this case.
+        let mut buf = encode_v2(v4("203.0.113.7:54321"), v4("198.51.100.4:443"));
+        buf[12] = 0x20; // version 2 + LOCAL command
+        assert!(decode_v2_from_datagram(&buf).is_none());
+    }
+
+    #[test]
+    fn v2_datagram_rejects_wrong_version() {
+        let mut buf = encode_v2(v4("203.0.113.7:54321"), v4("198.51.100.4:443"));
+        buf[12] = 0x31; // version 3 + PROXY
+        assert!(decode_v2_from_datagram(&buf).is_none());
+    }
+
+    #[test]
+    fn v2_magic_byte_zero_clears_quic_long_header_form_bit() {
+        // QUIC long-header packets (RFC 9000 §17.2) set the high bit (0x80,
+        // the "header form" bit) in byte 0. PROXY v2 magic byte 0 is 0x0D.
+        // Therefore no valid QUIC long-header packet can collide with our
+        // gate condition `buf[..12] == V2_SIG` at the first byte.
+        assert_eq!(
+            V2_SIG[0] & 0x80,
+            0,
+            "v2 magic byte 0 must have QUIC form-bit clear"
+        );
+    }
+
+    #[test]
+    fn v2_magic_byte_zero_clears_quic_short_header_fixed_bit() {
+        // QUIC short-header packets (RFC 9000 §17.3) have form bit (0x80)
+        // clear AND fixed bit (0x40) set in byte 0. PROXY v2 magic byte 0
+        // = 0x0D — both 0x80 and 0x40 clear. No valid QUIC short-header
+        // packet can collide.
+        assert_eq!(
+            V2_SIG[0] & 0x40,
+            0,
+            "v2 magic byte 0 must have QUIC fixed-bit clear"
+        );
+    }
+
+    #[test]
+    fn synthetic_quic_initial_long_header_datagram_is_not_proxy() {
+        // QUIC Initial: byte 0 = 0xC0..0xCF (form=1, fixed=1, type Initial).
+        // Followed by 4-byte version, then connection IDs.
+        let mut dgram = vec![0xC3, 0x00, 0x00, 0x00, 0x01];
+        dgram.resize(1200, 0); // pad to a typical Initial size
+        assert!(decode_v2_from_datagram(&dgram).is_none());
+    }
+
+    #[test]
+    fn synthetic_quic_short_header_datagram_is_not_proxy() {
+        // QUIC short header: form=0, fixed=1 → byte 0 in [0x40..0x80).
+        let mut dgram = vec![0x40, 0xDE, 0xAD, 0xBE, 0xEF];
+        dgram.resize(1024, 0);
+        assert!(decode_v2_from_datagram(&dgram).is_none());
     }
 }
