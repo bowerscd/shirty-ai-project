@@ -18,10 +18,8 @@
 
 use rand::Rng;
 
-use ratatoskr::rule::AcmeRouteConfig;
-
 use super::client::AcmeClient;
-use super::{storage, AcmeError, AcmeManager, HostState, HostStatus, KickRequest};
+use super::{storage, AcmeError, AcmeManager, AcmeRouteConfig, HostState, HostStatus, KickRequest};
 
 pub(super) async fn register_host(
     manager: &AcmeManager,
@@ -144,9 +142,17 @@ async fn run_loop(
         }
 
         // Time to issue. The result is reported both back to any
-        // external kick reply AND mirrored into HostState.
+        // external kick reply AND mirrored into HostState. When the
+        // host matches the operator-configured wildcard apex, also
+        // include `*.<host>` in the SAN list so the issued cert
+        // covers the apex + one level of subdomains.
         let client = AcmeClient::new(&manager);
-        let outcome = client.issue(&host, &route_cfg).await;
+        let extra_sans: Vec<String> = if manager.config().domain == host {
+            vec![format!("*.{host}")]
+        } else {
+            Vec::new()
+        };
+        let outcome = client.issue(&host, &extra_sans, &route_cfg).await;
         match &outcome {
             Ok(cert) => {
                 if let Err(e) = storage::write_atomic(manager.storage_dir(), &host, cert) {

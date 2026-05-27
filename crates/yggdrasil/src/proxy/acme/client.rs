@@ -9,11 +9,10 @@
 use std::time::Duration;
 
 use instant_acme::{ChallengeType, Identifier, KeyAuthorization, NewOrder, OrderStatus};
-use ratatoskr::rule::{AcmeChallenge, AcmeRouteConfig};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
 use super::account::AccountKey;
-use super::{dns01, AcmeError, AcmeManager};
+use super::{dns01, AcmeChallenge, AcmeError, AcmeManager, AcmeRouteConfig};
 
 /// Outcome of a successful issuance: the cert chain and matching
 /// private key, both as PEM bytes ready to write to disk.
@@ -39,9 +38,17 @@ impl<'a> AcmeClient<'a> {
     /// Run the full ACME flow for `host` using the challenge type and
     /// optional DNS provider from `route_cfg`. Returns the issued cert
     /// chain + private key as PEM bytes.
+    ///
+    /// `extra_sans` lists additional SAN identifiers to include in the
+    /// CSR alongside `host`. For wildcard issuance the caller passes
+    /// `[format!("*.{host}")]`; for non-wildcard issuance pass an
+    /// empty slice. All SAN identifiers go through the per-host
+    /// authorization loop (each gets its own DNS-01 / HTTP-01
+    /// challenge).
     pub async fn issue(
         &self,
         host: &str,
+        extra_sans: &[String],
         route_cfg: &AcmeRouteConfig,
     ) -> Result<IssuedCert, AcmeError> {
         let cfg = self.manager.config();
@@ -54,11 +61,15 @@ impl<'a> AcmeClient<'a> {
             )
             .await?;
 
-        // Submit the order.
-        let identifier = Identifier::Dns(host.to_string());
+        // Submit the order with apex + all extra SANs.
+        let mut identifiers: Vec<Identifier> = Vec::with_capacity(1 + extra_sans.len());
+        identifiers.push(Identifier::Dns(host.to_string()));
+        for san in extra_sans {
+            identifiers.push(Identifier::Dns(san.clone()));
+        }
         let mut order = account
             .new_order(&NewOrder {
-                identifiers: &[identifier],
+                identifiers: &identifiers,
             })
             .await
             .map_err(|e| AcmeError::Client {
@@ -188,11 +199,15 @@ impl<'a> AcmeClient<'a> {
         outcome?;
 
         // Build CSR + key. ECDSA P-256 is the default rcgen keypair.
-        let mut params =
-            CertificateParams::new(vec![host.to_string()]).map_err(|e| AcmeError::Client {
-                host: host.to_string(),
-                detail: format!("CertificateParams::new: {e}"),
-            })?;
+        // The CSR's SAN list mirrors the order's identifier list so the
+        // CA issues against the same names it authorised.
+        let mut san_list: Vec<String> = Vec::with_capacity(1 + extra_sans.len());
+        san_list.push(host.to_string());
+        san_list.extend(extra_sans.iter().cloned());
+        let mut params = CertificateParams::new(san_list).map_err(|e| AcmeError::Client {
+            host: host.to_string(),
+            detail: format!("CertificateParams::new: {e}"),
+        })?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, host);
         params.distinguished_name = dn;

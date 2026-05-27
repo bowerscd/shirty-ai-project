@@ -57,12 +57,41 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-
-use ratatoskr::rule::AcmeRouteConfig;
 
 use crate::config::AcmeSection;
 use crate::proxy::certs::CertStore;
+
+/// Per-route ACME configuration. Owned by this module after the
+/// schema-cleanup that removed per-route cert sources from
+/// `ratatoskr::rule::HttpRoute`. Kept as a stable shape so the
+/// renewer/client/storage layers continue to compile against the
+/// existing API; a follow-up batch replaces per-route registration
+/// with a single per-terminal wildcard issuance driven by
+/// `[acme].domain`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcmeRouteConfig {
+    pub challenge: AcmeChallenge,
+    pub provider: Option<String>,
+}
+
+impl AcmeRouteConfig {
+    pub fn http01() -> Self {
+        Self {
+            challenge: AcmeChallenge::Http01,
+            provider: None,
+        }
+    }
+}
+
+/// Challenge selector for an ACME-managed route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AcmeChallenge {
+    Http01,
+    Dns01,
+}
 
 /// Errors produced anywhere in the ACME pipeline.
 #[derive(Debug, thiserror::Error)]
@@ -213,6 +242,33 @@ impl AcmeManager {
         renewer::register_host(self, host, route_cfg).await
     }
 
+    /// Bootstrap the wildcard issuance loop for the operator-configured
+    /// `[acme].domain`. Picks the (single, validated-at-config-load)
+    /// DNS provider sub-table to drive DNS-01.
+    ///
+    /// Returns immediately; issuance + scheduled renewals happen on the
+    /// background renewer task.
+    pub async fn start_wildcard(&self) -> Result<(), AcmeError> {
+        let cfg = self.config();
+        let host = cfg.domain.clone();
+        // Exactly one [acme.dns.<name>] sub-table is validated at config
+        // load. Pick the lone provider name.
+        let provider = cfg
+            .dns
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| AcmeError::Account {
+                host: host.clone(),
+                detail: "no [acme.dns.<provider>] sub-table configured (validator gap)".into(),
+            })?;
+        let route_cfg = AcmeRouteConfig {
+            challenge: AcmeChallenge::Dns01,
+            provider: Some(provider),
+        };
+        renewer::register_host(self, &host, &route_cfg).await
+    }
+
     /// Snapshot the renewer-task state of every managed hostname.
     /// Returns an empty vec when `[acme]` is unconfigured / no
     /// ACME-managed routes are loaded.
@@ -320,7 +376,7 @@ impl AcmeManager {
     }
 }
 
-// Tiny re-export alias so HostState doesn't depend on the public
-// `ratatoskr::rule::AcmeChallenge` re-export path being stable. Kept
-// crate-private; downstream code uses the `route_cfg` field.
-pub(crate) use ratatoskr::rule::AcmeChallenge as AcmeRouteChallengeEcho;
+// AcmeChallenge is now defined locally above (was previously
+// `ratatoskr::rule::AcmeChallenge`). The alias is kept so renewer
+// code referring to `AcmeRouteChallengeEcho` keeps compiling.
+pub(crate) use AcmeChallenge as AcmeRouteChallengeEcho;
