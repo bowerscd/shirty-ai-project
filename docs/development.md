@@ -203,12 +203,14 @@ covers the directive syntax.
 
 ### `hyper` + `tokio-rustls` + `rustls` + `rcgen` — L7 HTTPS frontend
 
-HTTPS rules terminate TLS on the *terminal* node and parse HTTP/1.1 +
+HTTPS terminates TLS on the *terminal* node and parses HTTP/1.1 +
 HTTP/2 in-process. `hyper` provides the HTTP state machines;
-`tokio-rustls` is the async TLS wrapper around `rustls`. Certificates can
-come from disk, an in-memory ephemeral self-signed CA generated via
-`rcgen` (test fixtures and `cert = "ephemeral"`), or ACME (see
-`instant-acme` below). The frontend lives in
+`tokio-rustls` is the async TLS wrapper around `rustls`. Certificates
+come from disk through a three-rung node-wide resolver
+(`[server].default_cert` / cert-dir convention / cert-less LAN); the
+ACME wildcard renewer writes its renewed PEMs into that chain via
+`instant-acme` (see below). Test fixtures generate self-signed leaves
+via `rcgen`. The frontend lives in
 [`crates/yggdrasil/src/proxy/http_frontend/`](../crates/yggdrasil/src/proxy/http_frontend/);
 cert plumbing in
 [`certs/`](../crates/yggdrasil/src/proxy/certs/).
@@ -219,8 +221,9 @@ cert plumbing in
 ### `quinn` + `h3` + `h3-quinn` — HTTP/3 frontend
 
 QUIC datagram transport (`quinn`) + HTTP/3 framing (`h3`) glued via
-`h3-quinn`. HTTPS rules auto-enable HTTP/3 by default and advertise it
-via `Alt-Svc`; the frontend lives in
+`h3-quinn`. The HTTPS frontend auto-enables HTTP/3 when
+`[server].https_http3 = true` (the default) and advertises it via
+`Alt-Svc`; the frontend lives in
 [`crates/yggdrasil/src/proxy/h3_frontend.rs`](../crates/yggdrasil/src/proxy/h3_frontend.rs).
 The same `rustls` cert plumbing as HTTP/1.1+2.
 
@@ -261,11 +264,12 @@ is `Type=notify`. See
 
 ### `instant-acme` + `hickory-resolver` + `x509-parser` — ACME issuance
 
-ACME (RFC 8555) certificate issuance for HTTPS rules. `instant-acme`
-drives the protocol; `hickory-resolver` is used for DNS-01 challenges
-(checking propagation); `x509-parser` reads issued certs back for
-metadata (expiry, SANs). Both HTTP-01 (any provider) and DNS-01
-(Cloudflare today) are supported. Lives in
+ACME (RFC 8555) certificate issuance for the terminal's node-wide
+wildcard cert. `instant-acme` drives the protocol; `hickory-resolver`
+is used for DNS-01 challenge propagation checks; `x509-parser` reads
+the issued cert back for metadata (expiry, SANs). The renewer issues
+one cert per terminal with SANs `[<apex>, *.<apex>]` via DNS-01
+(Cloudflare is the only provider implemented today). Lives in
 [`crates/yggdrasil/src/proxy/acme/`](../crates/yggdrasil/src/proxy/acme/).
 
 [instant-acme docs](https://docs.rs/instant-acme/) /
@@ -372,8 +376,9 @@ terms (TLS, QUIC, HTTP/3, ACME, SO_REUSEPORT, etc.) are not redefined here.
   [`proxy/forward.rs`](../crates/yggdrasil/src/proxy/forward.rs).
 
 - **Alt-Svc** — RFC 7838 `Alt-Svc` header advertising HTTP/3 availability
-  on the HTTP/1.1+2 listener. yggdrasil emits this automatically for any
-  HTTPS rule with HTTP/3 enabled.
+  on the HTTP/1.1+2 listener. yggdrasil emits this automatically for the
+  node-wide HTTPS frontend when `[server].https_http3 = true` and
+  `[server].https_alt_svc = true` (both default to on).
 
 - **Canary** — chain self-test mechanism. `yggdrasilctl chain canary` arms
   a test packet at one hop and verifies it reaches the other end with the

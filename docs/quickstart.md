@@ -138,10 +138,10 @@ matching listeners on its side.
 ```bash
 sudo tee /etc/yggdrasil/conf.d/ssh.toml >/dev/null <<'EOF'
 [[rule]]
-name          = "ssh"
-listen        = "0.0.0.0:2222"
-protocol      = "tcp"
-target_addr = "127.0.0.1:22"
+name     = "ssh"
+listen   = "0.0.0.0:2222"
+protocol = "tcp"
+target   = "127.0.0.1:22"
 EOF
 ```
 
@@ -218,17 +218,17 @@ for Bedrock, TCP for Java):
 ```bash
 sudo tee /etc/yggdrasil/conf.d/minecraft.toml >/dev/null <<'EOF'
 [[rule]]
-name          = "minecraft-java"
-listen        = "0.0.0.0:25565"
-protocol      = "tcp"
-target_addr = "127.0.0.1:25565"
+name     = "minecraft-java"
+listen   = "0.0.0.0:25565"
+protocol = "tcp"
+target   = "127.0.0.1:25565"
 
 [[rule]]
-name          = "minecraft-bedrock"
-listen        = "0.0.0.0:19132"
-protocol      = "udp"
-target_addr = "127.0.0.1:19132"
-idle_timeout  = "120s"
+name         = "minecraft-bedrock"
+listen       = "0.0.0.0:19132"
+protocol     = "udp"
+target       = "127.0.0.1:19132"
+idle_timeout = "120s"
 EOF
 ```
 

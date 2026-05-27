@@ -67,7 +67,7 @@ type, labels, meaning.
 | `yggdrasil_build_info`                            | gauge   | `version`                       | Constant `1`. Used to join other metrics with the deployed build.       |
 | `yggdrasil_mode`                                  | gauge   | `mode` (`relay`/`terminal`)     | Constant `1`. Lets dashboards branch on mode.                          |
 | `yggdrasil_rules_loaded`                          | gauge   | (none)                          | Number of rules currently in the live rule set.                         |
-| `yggdrasil_https_routes`                          | gauge   | (none)                          | Number of cert'd `[[rule.route]]` entries currently loaded.             |
+| `yggdrasil_https_routes`                          | gauge   | (none)                          | Number of cert'd top-level `[[route]]` entries currently loaded.        |
 | `yggdrasil_certless_routes`                       | gauge   | `rule`, `hostname`              | One per cert-less route. Constant `1` per live entry.                   |
 | `yggdrasil_certless_requests_total`               | counter | `rule`, `hostname`              | Cert-less route requests served as plaintext on `:80`.                  |
 | `yggdrasil_certless_requests_denied_total`        | counter | `rule`, `reason`                | Cert-less requests denied. `reason` is `peer_not_in_lan_cidrs` or `host_not_in_routes`. Operators alert on this — non-zero rate = external probing. |
@@ -101,11 +101,11 @@ type, labels, meaning.
 | `yggdrasil_udp_active_flows`                      | gauge     | `rule`, `worker`                | Active UDP flows currently held by each zero-based worker shard.       |
 | `yggdrasil_udp_flows_drained_on_ip_change_total`  | counter   | `rule`, `worker`                | UDP flows torn down per worker because the downstream IP changed.      |
 | `yggdrasil_udp_flows_rejected_total`              | counter   | `rule`, `worker`, `reason`      | UDP flows rejected before insertion (`cap`, etc.) per worker.         |
-| `yggdrasil_https_tls_handshakes_total`            | counter   | `rule`, `result`                | TLS handshake outcomes for HTTPS rules.                                |
-| `yggdrasil_https_cert_reload_total`               | counter   | `route`, `result`               | Per-route cert source reload outcomes.                                 |
-| `yggdrasil_acme_renew_total`                      | counter   | `hostname`, `result`            | ACME issuance/renewal outcomes (`ok` / `err`).                         |
-| `yggdrasil_acme_expiry_seconds`                   | gauge     | `hostname`                      | Unix-epoch `not_after` of each ACME-managed cert; useful for "renewal stuck" alerts. |
-| `yggdrasil_http_requests_total`                   | counter   | `rule`, `route`, …              | Requests routed by the HTTPS frontend.                                |
+| `yggdrasil_https_tls_handshakes_total`            | counter   | `rule`, `result`                | TLS handshake outcomes on the node-wide HTTPS frontend. `rule` is the synthetic frontend name (`__https__`) since HTTPS is no longer per-rule after the L7 schema cleanup.                                |
+| `yggdrasil_https_cert_reload_total`               | counter   | `route`, `result`               | Per-hostname cert reload outcomes (cert-watcher debounced disk writes plus ACME renewal pushes).                                 |
+| `yggdrasil_acme_renew_total`                      | counter   | `hostname`, `result`            | ACME issuance/renewal outcomes (`ok` / `err`). After the L7 schema cleanup the renewer issues a **single wildcard cert** per terminal — `hostname` is the apex domain from `[acme].domain`, and there's exactly one series per node.                         |
+| `yggdrasil_acme_expiry_seconds`                   | gauge     | `hostname`                      | Unix-epoch `not_after` of the wildcard cert; useful for "renewal stuck" alerts. |
+| `yggdrasil_http_requests_total`                   | counter   | `rule`, `route`, …              | Requests routed by the HTTPS frontend. `rule` is the synthetic frontend name; `route` is the matched hostname.                                |
 | `yggdrasil_http_request_duration_seconds`         | histogram | `rule`, `route`                 | Per-route HTTPS request latency.                                       |
 | `yggdrasil_hot_section_seconds`                   | histogram | `subsystem`, `section`          | **Dev-only** (requires `--features profile`). Wall-clock duration of named hot-path sections — see [profile](#profiling) for usage. `subsystem` is `udp` / `tcp` / `http`; `section` is a stable identifier like `frontend_wait`, `handle_inbound`, `flow_lookup`, `upstream_send`, `sendmmsg_to_client`. Not emitted in production builds. |
 
@@ -231,7 +231,7 @@ L4 forwarding path through the chain end-to-end. The canary's
 probe traffic is prefixed with a 32-byte random arming token; the
 terminal hop short-circuits matching traffic to an in-process echo
 instead of forwarding to the configured backend. That means the
-canary works regardless of whether the rule's `target_addr` is
+canary works regardless of whether the rule's `target` is
 reachable — it tests the *chain*, not the backend.
 
 Pick the port you exposed in the rule, optionally narrow by `--proto`,
@@ -273,9 +273,10 @@ port different proto, then different port same proto. That's usually
 the fastest way to spot a typo'd `[[rule]] listen` or a missing
 predicate publish.
 
-For HTTPS rules the canary probes TCP/443 and UDP/443 separately and
-emits both reports — same command, no extra flags. Pass `--json` for a
-machine-parseable object covering all probes.
+For terminals with `[[route]]` blocks, the canary probes TCP and UDP on
+`[server].https_listen` separately and emits both reports — same command,
+no extra flags. UDP is only probed when `[server].https_http3 = true`.
+Pass `--json` for a machine-parseable object covering all probes.
 
 The canary **does not** test the rule's configured backend. That's a
 separate concern; verify backend reachability from the terminal host
@@ -482,9 +483,11 @@ The relay shows a pending candidate but no `accept` is wired.
 ### "PROXY-protocol upstream sees the wrong client IP"
 
 `proxy_protocol = "v1"` / `"v2"` is **TCP relay-mode only**. On a
-terminal-mode rule (`target_addr` / `target_host`), the config
-validator rejects `proxy_protocol`. On a UDP or HTTPS rule, same — the
-validator rejects it.
+terminal-mode rule (a rule with `target` set), the config validator
+rejects `proxy_protocol`. On a UDP rule, same — the validator
+rejects it. Top-level `[[route]]` blocks don't accept
+`proxy_protocol` at all; HTTPS routing happens at the L7 frontend
+which injects `X-Forwarded-For` directly.
 
 ### "chain diff says origin mismatch with previous hop"
 

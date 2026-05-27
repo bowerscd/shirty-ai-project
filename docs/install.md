@@ -97,7 +97,7 @@ terminal, `[accept]` only => gateway, both => relay).
 
 The unit runs the daemon as the dedicated `yggdrasil` user with
 `CAP_NET_BIND_SERVICE` so it can bind low ports (e.g. `0.0.0.0:443`
-for HTTPS rules). Every hardening flag from
+for `[server].https_listen`). Every hardening flag from
 [docs/security.md → Operational hardening](security.md#operational-hardening)
 is on by default. Drop `AmbientCapabilities` /
 `CapabilityBoundingSet` via `systemctl edit yggdrasil` if every rule

@@ -96,7 +96,7 @@ you don't trust the transport.
 | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
 | Internet ↔ relay's public port      | Whatever the application protocol carries: cleartext TCP/UDP, or TLS/QUIC for HTTPS / HTTP/3.       |
 | Relay ↔ next hop ↔ … ↔ terminal     | Encrypted under Noise_IK + ChaCha20-Poly1305. Strict-monotonic replay window.                       |
-| Terminal ↔ application backend       | Cleartext from the terminal to `127.0.0.1` (or whatever `target_addr` / `target_host` resolves to). |
+| Terminal ↔ application backend       | Cleartext from the terminal to whatever the rule's `target` resolves to (a literal IP, or the DNS resolver's most recent answer). |
 | `yggdrasilctl` ↔ daemon              | Unix domain socket, no encryption. Restrict via filesystem permissions.                              |
 
 The chain plane gives you confidentiality and integrity **only between
@@ -104,8 +104,8 @@ chain neighbours**. From the open internet to the relay, traffic has only
 whatever protection the application protocol provides. From the terminal
 to the actual backend, it's cleartext on the loopback interface of the
 terminal host. If you need encryption across the public internet and the
-chain, run TLS or QUIC on top. Terminal HTTPS rules do this for the
-client-to-terminal leg while keeping certificate resolution on the
+chain, run TLS or QUIC on top. The terminal's HTTPS frontend does this for
+the client-to-terminal leg while keeping certificate resolution on the
 terminal; the relay is L4 passthrough, but still sees metadata such as
 addresses, ports, byte counts, and timing.
 
@@ -129,11 +129,11 @@ addresses, ports, byte counts, and timing.
     `X-Forwarded-For` header value will reflect the
     *immediate-upstream relay's* IP, not the real client's IP. The
     relay-to-terminal PROXY-protocol mechanism that addresses this for
-    plain TCP HTTPS rules does not yet have an equivalent for UDP/QUIC
+    plain TCP rules does not yet have an equivalent for UDP/QUIC
     traffic (PROXY v2 over UDP datagrams). Documented separately under
     [HTTPS-predicate derivation](architecture.md#https-predicate-derivation).
-    Until a follow-up lands, h3 rules behind a relay should not be used
-    by applications that rely on client-IP-based authorisation or
+    Until a follow-up lands, HTTPS traffic behind a relay should not be
+    used by applications that rely on client-IP-based authorisation or
     rate-limiting.
 
 ## What yggdrasil protects against
@@ -281,10 +281,11 @@ worth supporting.
 
 ## Cert-less HTTPS routes — the LAN-only trust boundary
 
-A `[[rule.route]]` with no resolvable cert source becomes a
-**cert-less route**: it is never bound to the `:443` SNI table, and
-the per-IP companion listener serves it as plain HTTP on `:80` to
-peers in `[server].lan_cidrs`. See
+A top-level `[[route]]` whose hostname doesn't resolve via the
+three-rung cert resolver becomes a **cert-less route**: it is never
+bound to the `:443` SNI table, and the per-IP companion listener
+serves it as plain HTTP on `:80` to peers in `[server].lan_cidrs`.
+See
 [`configuration.md`](configuration.md#serverlan_cidrs-private-peer-set)
 for the configuration knob.
 

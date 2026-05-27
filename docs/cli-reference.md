@@ -146,28 +146,29 @@ accepted.
 
 ### `local acme list`
 
-Print one row per ACME-managed hostname with its challenge type
-(`http01` / `dns01`), provider (`cloudflare` / `-` for HTTP-01),
-renewer state (`idle` / `pending` / `failed`), next scheduled renewal
-(absolute Unix epoch plus a relative "in 3 d" / "<expired>" hint), and
-the last error message when one is recorded. Hostnames are sourced from
-the live derived rule set, so a route that was just added but hasn't
-yet been picked up by the renewer shows up as `pending` with no next
-renewal time. Returns `error_codes::ACME_NOT_CONFIGURED` if `[acme]` is
-absent from the daemon config.
+After the L7 schema cleanup the renewer manages a **single wildcard
+cert** per terminal, not per-route entries. The command prints one
+row covering the apex domain from `[acme].domain` with its renewer
+state (`idle` / `pending` / `failed`), challenge (`dns01` — the
+provider derived from the `[acme.dns.<name>]` sub-table), next
+scheduled renewal (absolute Unix epoch plus a relative "in 3 d" /
+"<expired>" hint), and the last error when one is recorded.
+Returns `error_codes::ACME_NOT_CONFIGURED` if `[acme]` is absent
+from the daemon config.
 
 ### `local acme renew <hostname>`
 
-Force an immediate ACME issuance for `<hostname>`, bypassing the
-renewer's schedule. The CLI blocks until issuance completes (typically
-5-60 s) or the daemon's 5-minute deadline expires. On success, the
-freshly-issued PEM is written under `[acme].storage_dir` and
-`CertStore::reload_host` swaps it in atomically — clients see no
-connection interruption. Returns `error_codes::ACME_UNKNOWN_HOST` if
-the hostname isn't in the derived rule set,
-`error_codes::ACME_RENEW_FAILED` (with the underlying CA error) on
-issuance failure, or `error_codes::ACME_NOT_CONFIGURED` if `[acme]` is
-absent.
+Force an immediate ACME issuance, bypassing the renewer's schedule.
+`<hostname>` must be the apex domain configured in `[acme].domain`
+(there's only one cert to renew per terminal post-schema-cleanup);
+any other value returns `error_codes::ACME_UNKNOWN_HOST`. The CLI
+blocks until issuance completes (typically 5-60 s) or the daemon's
+5-minute deadline expires. On success, the freshly-issued PEM is
+written under `[acme].storage_dir` and `CertStore::reload_host`
+swaps it in atomically — clients see no connection interruption.
+Returns `error_codes::ACME_RENEW_FAILED` (with the underlying CA
+error) on issuance failure, or `error_codes::ACME_NOT_CONFIGURED`
+if `[acme]` is absent.
 
 ---
 

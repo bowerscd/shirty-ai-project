@@ -309,7 +309,9 @@ On each new accept:
 1. Resolve the dial target. Relay mode: snapshot
    `peer_state.current_ip()` (drop the socket immediately if `None`),
    combine with `rule.target_port`. Terminal mode: read the rule's
-   `target_addr` or DNS-resolved `target_host` directly.
+   `target` directly — if its host portion parses as a literal IP,
+   dial that; otherwise the DNS resolver's most recent answer for
+   the hostname.
 2. Dial the target. Connection failures close the client without sending
    bytes (no leaked half-open).
 3. Optionally write a PROXY-protocol v1/v2 header so the upstream service
@@ -363,40 +365,44 @@ for known clients (they just hit the worker's local `DashMap` shard).
 
 ### HTTPS (`proxy/http_frontend.rs`, `proxy/h3_frontend.rs`)
 
-Terminal-side HTTPS rules are the L7 frontend: they resolve certificates,
-terminate TLS for HTTP/1.1 and HTTP/2, terminate QUIC/TLS for HTTP/3 when
-HTTP/3 is enabled, perform SNI / `Host:` virtual-host routing, and forward
-requests as cleartext HTTP to per-route backend URLs. Certificate
-resolution stays terminal-only.
+The terminal's HTTPS L7 frontend is **node-wide**: one listener on
+`[server].https_listen` resolves certificates, terminates TLS for
+HTTP/1.1 and HTTP/2, terminates QUIC/TLS for HTTP/3 when
+`[server].https_http3 = true`, performs SNI / `Host:` virtual-host
+routing against the unified `[[route]]` set, and forwards requests as
+cleartext HTTP to per-route backend URLs. Certificate resolution stays
+terminal-only.
 
 #### HTTPS-predicate derivation
 
-When predicates flow upward, each terminal HTTPS rule publishes an HTTPS
-predicate with a `https_http3` flag. The relay derives a `(Tcp, port)`
-listener for every HTTPS predicate. When `https_http3 = true`, it also
-derives a `(Udp, port)` listener with `idle_timeout = 30s`. TCP carries
-TLS-wrapped HTTP/1.1 and HTTP/2; UDP carries QUIC datagrams for HTTP/3.
-The relay is L4 passthrough on both transports: it does not resolve
-certificates or inspect TLS / QUIC payloads.
+When predicates flow upward, the terminal publishes a **single** HTTPS
+predicate (when the rule set has at least one `[[route]]`) carrying
+the node-wide `listen_port` plus the `https_http3` flag from
+`[server]`. The relay derives a `(Tcp, port)` listener for the
+predicate. When `https_http3 = true`, it also derives a `(Udp, port)`
+listener with `idle_timeout = 30s`. TCP carries TLS-wrapped HTTP/1.1
+and HTTP/2; UDP carries QUIC datagrams for HTTP/3. The relay is L4
+passthrough on both transports: it does not resolve certificates or
+inspect TLS / QUIC payloads.
 
 For multi-hop chain traffic, `X-Forwarded-For` headers injected by the
-terminal's HTTPS frontend show the immediate upstream relay's IP, not the
-real client's IP. The relay-side PROXY-protocol mechanism that addresses
-this for plain TCP HTTPS rules does not yet have an equivalent for UDP /
-QUIC traffic (PROXY v2 over UDP datagrams). This is a documented
-limitation, not a regression — the same behavior applies to TCP HTTPS rules
-today when `proxy_protocol` is not set. See
-[configuration.md → HTTPS rules](configuration.md#https-rules).
+terminal's HTTPS frontend show the immediate upstream relay's IP, not
+the real client's IP. The relay-side PROXY-protocol mechanism that
+addresses this for plain TCP rules does not yet have an equivalent for
+UDP / QUIC traffic (PROXY v2 over UDP datagrams). This is a documented
+limitation, not a regression — the same behavior applies to TCP HTTPS
+traffic today when `proxy_protocol` is not set. See
+[configuration.md → `[[route]]`](configuration.md#route--https-virtual-hosts-terminal-mode).
 
 #### HTTP/3 (QUIC)
 
-Each HTTPS rule with `http3 != Some(false)` auto-opens a QUIC endpoint on
-UDP `(rule.listen.ip(), rule.listen.port())` alongside the TCP TLS
-listener. The QUIC path uses `quinn` 0.11 + `h3` 0.0.8 + `h3-quinn` over
-the same `rustls 0.23` server config built by
-`build_rustls_server_config` (ALPN `h3` vs `["h2", "http/1.1"]` for TCP)
-— cert resolution propagates automatically across both transports because
-both hold an `Arc<dyn ResolvesServerCert>` pointing at the same
+When `[server].https_http3 = true` (the default), the supervisor opens
+a QUIC endpoint on UDP `(https_listen.ip(), https_listen.port())`
+alongside the TCP TLS listener. The QUIC path uses `quinn` 0.11 + `h3`
+0.0.8 + `h3-quinn` over the same `rustls 0.23` server config built by
+`build_rustls_server_config` (ALPN `h3` vs `["h2", "http/1.1"]` for
+TCP) — cert resolution propagates automatically across both transports
+because both hold an `Arc<dyn ResolvesServerCert>` pointing at the same
 `CertStore`.
 
 Connection migration is on; 0-RTT is explicitly off (per-route opt-in
@@ -418,31 +424,30 @@ back to the HTTP/2 WS handshake on the TCP path.
 
 The TCP HTTPS path injects `Alt-Svc: h3=":<port>"; ma=86400` on every
 response so capable clients upgrade to HTTP/3 on the next request.
-Disabled per-rule via `alt_svc = false`.
+Suppressed node-wide via `[server].https_alt_svc = false`; the header
+is also automatically suppressed when `[server].https_http3 = false`
+(there's no h3 listener to advertise).
 
 #### Cert-less routes and the per-IP companion listener
 
-An HTTPS rule may contain `[[rule.route]]` blocks with no resolvable
-cert source — these are **cert-less routes**, served only on the
-per-IP companion listener's plaintext `:80` path
+A top-level `[[route]]` block whose hostname doesn't resolve to a
+cert via the three-rung resolver is a **cert-less route**, served
+only on the per-IP companion listener's plaintext `:80` path
 (`proxy/http_frontend/redirect.rs`). The companion's pipeline is
-four-step:
+three-step (no ACME HTTP-01 — wildcard issuance uses DNS-01):
 
-1. **ACME HTTP-01** — `GET /.well-known/acme-challenge/<token>` is
-   served regardless of source IP (required by the Let's Encrypt
-   prober).
-2. **Cert-less route serving** — if `peer_addr.ip() ∈ lan_cidrs` and
+1. **Cert-less route serving** — if `peer_addr.ip() ∈ lan_cidrs` and
    `Host` matches a cert-less route on this IP, proxy plaintext via
    `serve_request` with `ConnContext { tls: false, .. }`. Reuses
    the full HTTPS request pipeline (sanitise / inject_forwarded /
    build_upstream_uri / WebSocket upgrade) with `X-Forwarded-Proto:
    http` and no `Alt-Svc` injection.
-3. **Cert'd-host 301 redirect** — else if `Host` matches a cert'd
+2. **Cert'd-host 301 redirect** — else if `Host` matches a cert'd
    hostname in the per-IP `HostSet`, emit
    `301 Location: https://<host><path>` regardless of source IP.
-4. **404** — else.
+3. **404** — else.
 
-Step 2's peer-IP filter is the trust boundary for cert-less routes.
+Step 1's peer-IP filter is the trust boundary for cert-less routes.
 The default `lan_cidrs` set is loopback + RFC 1918 + RFC 4193 (see
 `crates/yggdrasil/src/lan_cidrs.rs`); operators on multi-tenant
 private networks override it via `[server].lan_cidrs`. See
@@ -457,22 +462,36 @@ cert-less routes never project upstream.
 
 ## Rules: hot reload (terminal-side)
 
-On the terminal, `[server].rules_dir` is watched via `notify-debouncer-mini`
-with a 250 ms debounce. The worker task:
+On the terminal, `[server].rules_dir` is watched via
+`notify-debouncer-mini` with a 250 ms debounce. The worker task:
 
-1. On filesystem event → `RuleSet::from_dir(rules_dir)` → returns a fresh
-   `RuleSet` (validated, cross-file uniqueness checked).
-2. `previous.diff(&new) → RuleDiff { added, removed, changed, unchanged }`.
-3. **Unchanged rules are strictly untouched.** The supervisor doesn't
-   even look at them. Editing rule B never disturbs rule A's listener or
-   its in-flight UDP flows. This is the branch-level analogue of
-   heartbeat invariance.
-4. Validation failures keep the previous `RuleSet` live. There is no
+1. On filesystem event → `RuleSet::from_dir(rules_dir)` → returns a
+   fresh `RuleSet` (validated, cross-file uniqueness checked — both
+   `[[rule]]` names and `[[route]]` hostnames are unique across all
+   files).
+2. `previous.diff(&new) → RuleDiff { added, removed, changed, unchanged }`
+   over the L4 rule set only.
+3. **Unchanged `[[rule]]` listeners are strictly untouched.** The
+   supervisor doesn't even look at them. Editing rule B never disturbs
+   rule A's listener or its in-flight UDP flows. This is the
+   branch-level analogue of heartbeat invariance.
+4. Route reconciliation runs separately: if `[[route]]` set changed at
+   all (added / removed / changed in any way), the supervisor stops
+   and respawns the node-wide HTTPS frontend on
+   `[server].https_listen`. In-flight HTTPS connections are cancelled
+   at the swap boundary; L4 listeners are untouched. Per-route
+   diffing (preserve in-flight HTTPS through a route edit) is a
+   deferred follow-up.
+5. Validation failures keep the previous `RuleSet` live. There is no
    "partial apply" mode — half-good reloads are worse than no reload.
-5. The new `RuleSet` is fed to the **predicate publisher** (if
+6. The new `RuleSet` is fed to the **predicate publisher** (if
    `[dial]` is set), which projects it through
-   `predicate_extractor::extract` and pushes the resulting `PredicateSet`
-   to the upstream chain client on its next tick.
+   `predicate_extractor::extract` and pushes the resulting
+   `PredicateSet` to the upstream chain client on its next tick. The
+   projection emits one HTTPS predicate per terminal (carrying
+   `listen_port` and `https_http3` from `[server]`) when at least one
+   `[[route]]` exists; the relay derives matching `(Tcp, port)` plus
+   `(Udp, port)` listeners.
 
 Force a re-scan with `yggdrasilctl local rules reload` (for filesystems
 where inotify is unreliable — NFS, FUSE, some container bind mounts).
