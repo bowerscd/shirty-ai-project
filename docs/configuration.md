@@ -31,9 +31,12 @@ hex is rejected on parse.
 | `workers`          | optional positive integer | unset (`None` → `available_parallelism()` at proxy spawn) | Daemon-wide default for SO_REUSEPORT accept-loop fan-out across the proxy's TCP listeners and UDP frontend sockets. `0` is rejected. Per-rule overrides aren't exposed — fan-out is a kernel-level concern (the kernel hash-distributes incoming SYNs / datagrams across the workers sharing an `addr:port`), so a per-rule knob would buy nothing a global default doesn't already provide. |
 | `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
 | `identity_file`    | path                   | `/etc/yggdrasil/identity.key`    | Long-term X25519 identity (64 bytes: 32 secret ++ 32 public). Mode 0600. Auto-generated on first start if missing. |
-| `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the convention cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). |
-| `default_cert`     | path                   | unset                            | HTTPS only. Wildcard / fallback certificate PEM. Must be set together with `default_key`.       |
+| `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the convention cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). Used when neither `default_cert`+`default_key` nor a wildcard ACME cert covers the requested SNI hostname. |
+| `default_cert`     | path                   | unset                            | HTTPS only. Wildcard / fallback certificate PEM, served whenever its SANs cover the inbound SNI hostname. Must be set together with `default_key`. The ACME wildcard issuance pipeline (when `[acme]` is configured) writes its renewed PEMs to `<storage_dir>/<domain>/{fullchain,privkey}.pem`; operators point `default_cert`/`default_key` at those files so the renewer's writes are picked up by the cert watcher without further wiring. |
 | `default_key`      | path                   | unset                            | HTTPS only. Private key PEM matching `default_cert`. Must be set together with it.              |
+| `https_listen`     | `host:port`            | `0.0.0.0:443`                    | HTTPS only. Node-wide HTTPS listener address. Every top-level `[[route]]` lands on this socket; per-route `listen` overrides aren't supported in v1. Set to e.g. `0.0.0.0:8443` when running unprivileged. |
+| `https_http3`      | bool                   | `true`                           | HTTPS only. Whether the node binds the HTTP/3 UDP companion on the same `(ip, port)` as `https_listen`. Set `false` to opt out of HTTP/3 — saves a UDP socket plus a NAT mapping. The `Alt-Svc: h3=":<port>"` advertisement is suppressed automatically when this is `false`. |
+| `https_alt_svc`    | bool                   | `true`                           | HTTPS only. Whether HTTPS responses include the `Alt-Svc: h3=":<port>"; ma=86400` header that advertises the HTTP/3 alternative. Set `false` to suppress the header while still serving HTTP/3 (useful when a CDN in front of the terminal would re-write the advertisement). `https_alt_svc = true` combined with `https_http3 = false` is rejected at config load — there's no h3 listener to advertise. |
 | `http_redirect_port` | optional u16         | unset (`None` → `80`)            | HTTPS only. Port for the per-IP HTTP→HTTPS redirect listener the supervisor auto-spawns. Default `80`. Set to a non-privileged port when running unprivileged (no `CAP_NET_BIND_SERVICE`), or to `0` for an ephemeral kernel-assigned port (useful in containers / dev / bench harnesses). |
 | `graceful_drain_timeout` | optional humantime duration | unset                            | When set, on `SIGTERM` the daemon stops accepting new TCP / HTTPS connections immediately but waits up to this duration for in-flight conversations to finish naturally before cancelling them. UDP is per-datagram and unaffected. systemd users should pair this with a matching `TimeoutStopSec=` in the unit file. Default unset = preserve the historical abrupt-cancel behaviour (in-flight conns die when the runtime drops them). |
 | `nat_traversal`    | enum (`off` / `pcp` / `natpmp` / `auto`) | `off`                  | Opt-in NAT port-mapping for home-hosted gateways / relays / standalone terminals. See [NAT traversal](#nat-traversal) below. |
@@ -86,14 +89,24 @@ session. Presence of `[accept]` makes the effective mode `relay`.
 
 ### `[acme]` — optional (terminal mode only)
 
-Configures ACME (RFC 8555) issuance + renewal for HTTPS routes that
-declare `cert = "acme"`. Only meaningful on terminal nodes — relays
-passthrough TLS without terminating and have no `[[rule.route]]`
-blocks to issue against. When this section is absent, any `cert =
-"acme"` route is rejected at config load.
+Configures ACME (RFC 8555) issuance + renewal of a **single wildcard
+certificate** for the terminal's apex domain. Only meaningful on
+terminal nodes — relays passthrough TLS without terminating. When
+this section is absent, the daemon serves whichever PEMs are on disk
+(via `[server].default_cert` / cert-dir convention) and never talks
+to a CA.
+
+Issuance is **DNS-01 only** — wildcards (`*.example.com`) require it
+per RFC 8555 §7.1.3, so HTTP-01 isn't offered. The renewer issues
+one cert with SANs `[<domain>, *.<domain>]` covering both the apex
+and every immediate subdomain. Operators point
+`[server].default_cert` / `default_key` at the renewer's output path
+(`<storage_dir>/<domain>/{fullchain,privkey}.pem`) so the existing
+`CertWatcher` reload pipeline picks up renewals automatically.
 
 | Key                          | Type        | Default                                              | Notes                                                                                                            |
 | ---------------------------- | ----------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `domain`                     | DNS name    | **required**                                         | The apex domain the wildcard covers. SANs are derived as `[<domain>, *.<domain>]`. Must be a valid hostname.   |
 | `directory_url`              | string URL  | `https://acme-v02.api.letsencrypt.org/directory`    | LE staging is `https://acme-staging-v02.api.letsencrypt.org/directory`; flip while shaking out a deployment.    |
 | `contact_email`              | string      | **required**                                         | Registered with the CA so it can notify you about impending expiries or account problems.                       |
 | `account_key_path`           | path        | `/var/lib/yggdrasil/acme/account.key`                | Long-lived ACME account credentials. Auto-generated on first run; mode `0600`.                                  |
@@ -102,7 +115,10 @@ blocks to issue against. When this section is absent, any `cert =
 | `renew_before`               | `humantime` | `30d`                                                | Renew this far in advance of `not_after`.                                                                       |
 | `renew_jitter`               | `humantime` | `12h`                                                | Random jitter added to spread renewal load.                                                                     |
 
-DNS-01 providers live under sub-tables `[acme.dns.<name>]`. The only
+The DNS-01 provider is **derived from the (single) `[acme.dns.<name>]`
+sub-table** present in the config. Exactly one sub-table is required;
+zero is rejected ("no DNS-01 provider configured") and two-or-more
+is rejected ("multiple DNS-01 providers — pick one"). The only
 provider implemented today is `cloudflare`:
 
 | Key             | Type        | Notes                                                                                                |
@@ -110,44 +126,39 @@ provider implemented today is `cloudflare`:
 | `api_token`     | string      | Inline Cloudflare API token (scope: `Zone.DNS:Edit`). Mutually exclusive with `api_token_env`.       |
 | `api_token_env` | string      | Name of an environment variable holding the token. Preferred — keeps the secret out of the config.  |
 
-Per-route challenge selection:
+Example:
 
 ```toml
-[[rule.route]]
-hostname = "api.example.com"
-target   = "http://192.168.1.10:8080"
-cert     = "acme"                       # HTTP-01 shorthand
+[acme]
+domain                  = "example.com"
+contact_email           = "ops@example.com"
+terms_of_service_agreed = true
 
-[[rule.route]]
-hostname = "wildcard.example.com"
-target   = "http://192.168.1.11:8080"
-
-  [rule.route.cert.acme]                # DNS-01 explicit form
-  challenge = "dns01"
-  provider  = "cloudflare"
+[acme.dns.cloudflare]
+api_token_env = "CLOUDFLARE_API_TOKEN"
 ```
 
-HTTP-01 requires the terminal's predicate set to include a TCP rule
-on port 80 reachable from the public internet (so the CA can fetch
-`/.well-known/acme-challenge/<token>`). The daemon's `:80` redirect
-listener answers the challenge in-band before falling through to
-its usual HTTP→HTTPS redirect.
-
-While the first issuance is in flight, the daemon serves an
-in-memory ephemeral self-signed cert as a stand-in. Browsers will
-warn until the renewer writes the real PEM and `CertStore::reload_host`
-swaps it in.
+At startup the daemon kicks off a `start_wildcard()` issuance against
+the apex domain (driven through the same renewer machinery that
+schedules subsequent renewals). While issuance is in flight, the
+daemon serves whatever cert is already on disk via the three-rung
+resolver (typically the previous renewed wildcard, if any). Browsers
+see `ERR_CERT_AUTHORITY_INVALID` only on the very first startup with
+no prior PEM — once the renewer writes the real cert,
+`CertWatcher::reload_host` swaps it in without restart.
 
 ### NAT traversal
 
 When the daemon is hosted behind a consumer router (home gateway,
 home-hosted standalone terminal, home-hosted mid-chain relay), every
-listener it spawns — rule listeners, the chain `[accept].listen`
-socket, the HTTPS redirect listener on port 80, and the HTTP/3 UDP
-companion of each HTTPS rule — needs an inbound port forward on the
-router. Setting `[server].nat_traversal` opts the daemon into asking
-the router for those forwards automatically via the standard IETF
-binary protocols:
+listener it spawns — `[[rule]]` L4 listeners, the chain
+`[accept].listen` socket, the node-wide HTTPS listener on
+`[server].https_listen`, its HTTP/3 UDP companion (when
+`[server].https_http3 = true`), and the HTTP→HTTPS redirect listener
+on `[server].http_redirect_port` — needs an inbound port forward on
+the router. Setting `[server].nat_traversal` opts the daemon into
+asking the router for those forwards automatically via the standard
+IETF binary protocols:
 
 | Value      | Behaviour                                                                    |
 | ---------- | ---------------------------------------------------------------------------- |
@@ -156,15 +167,17 @@ binary protocols:
 | `"natpmp"` | RFC 6886 NAT-PMP only. Use for older routers that don't speak PCP. |
 | `"auto"`   | Try PCP first; on `UnsuppVersion` or socket timeout per RFC 6887 §9, retry with NAT-PMP. Recommended default for unknown networks. |
 
-**What gets mapped.** Every TCP / UDP / HTTPS rule's `listen.port()`,
-plus port 80 (or `[server].http_redirect_port`) for the HTTPS
-redirect listener (one per unique bind IP — multiple HTTPS rules on
-the same IP share one redirect mapping), plus the HTTP/3 UDP
-companion port of every HTTPS rule whose `http3` field is not
-`false`, plus the `[accept].listen` port on relay / gateway nodes.
-Listeners bound to loopback, link-local, or a publicly-routable
-address are filtered out (they don't need NAT, and mapping a public
-IP confuses CGNAT-traversal routers).
+**What gets mapped.** Every TCP / UDP rule's `listen.port()`; for
+HTTPS, the node-wide `[server].https_listen` socket, plus the
+`Alt-Svc` h3 UDP companion on the same port when
+`[server].https_http3 = true`, plus the HTTP→HTTPS redirect listener
+on `[server].http_redirect_port` (default `80`); plus the
+`[accept].listen` port on relay / gateway nodes. HTTPS mappings only
+fire when the live rule set has at least one top-level `[[route]]`
+— a terminal with no routes doesn't bind the HTTPS socket and
+nothing is mapped. Listeners bound to loopback, link-local, or a
+publicly-routable address are filtered out (they don't need NAT, and
+mapping a public IP confuses CGNAT-traversal routers).
 
 **Lifetime and renewal.** The daemon asks for a 2-hour mapping;
 consumer routers typically clamp this to 1 hour. The daemon renews
@@ -213,14 +226,25 @@ listen = "0.0.0.0:51820"
 pubkey = "x25519:9d2f04a3...4b7c"
 ```
 
-### Complete example (terminal home box)
+### Complete example (terminal home box with HTTPS + ACME)
 
 ```toml
 [server]
+default_cert  = "/var/lib/yggdrasil/acme/example.com/fullchain.pem"
+default_key   = "/var/lib/yggdrasil/acme/example.com/privkey.pem"
+nat_traversal = "auto"
 
 [dial]
 pubkey   = "x25519:6c5a30bb...0ff1"
 endpoint = "vps.example.net:51820"
+
+[acme]
+domain                  = "example.com"
+contact_email           = "ops@example.com"
+terms_of_service_agreed = true
+
+[acme.dns.cloudflare]
+api_token_env = "CLOUDFLARE_API_TOKEN"
 ```
 
 ### Complete example (mid-chain relay)
@@ -254,75 +278,68 @@ overwritten on the next downstream push. (Pushing a candidate rule set
 directly without writing to disk is `yggdrasilctl chain apply --file
 rules.toml`.)
 
-Each file contains zero or more `[[rule]]` tables. Splitting rules into
-multiple files is purely cosmetic — yggdrasil aggregates them all into
-one unified rule set with global uniqueness checks.
+A rule file contains two kinds of top-level table:
+
+* **`[[rule]]`** — an L4 listener (TCP or UDP). One rule per listener.
+* **`[[route]]`** — an HTTPS virtual host. Routes are merged across
+  every file in `rules_dir`; the daemon binds a single node-wide HTTPS
+  listener on `[server].https_listen` and dispatches by SNI / `Host:`.
+
+Splitting rules and routes across multiple files is cosmetic — yggdrasil
+aggregates them all into one unified set with global uniqueness checks
+(rule `name`s and `(ip, port, protocol)` tuples are unique across files;
+route `hostname`s are unique across files).
 
 ### `[[rule]]` — repeatable
 
-| Key              | Type                       | TCP | UDP | HTTPS | Default       | Notes                                                                                                              |
-| ---------------- | -------------------------- | --- | --- | ----- | ------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `name`           | string                     | ✓   | ✓   | ✓     | **required**  | Globally unique across all rule files. No whitespace or control characters.                                        |
-| `listen`         | `host:port`                | ✓   | ✓   | ✓     | **required**  | Listen socket. `port` must be non-zero. Globally unique by `(ip, port, protocol)`.                                 |
-| `protocol`       | `"tcp"`/`"udp"`/`"https"`  | ✓   | ✓   | ✓     | **required**  | Determines whether this is a TCP listener, a UDP receiver, or the HTTPS L7 frontend.                                |
-| `target_port`  | u16                        | ✓   | ✓   | —     | one of these  | Relay mode. Port on the residential host. The IP comes from the heartbeat. Mutually exclusive with `target_addr` and `target_host`. |
-| `target_addr`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. Literal upstream socket address. Mutually exclusive with `target_port` and `target_host`.       |
-| `target_host`  | `host:port`                | ✓   | ✓   | —     | one of these  | Terminal mode. DNS-resolved upstream. Re-resolves periodically; on lookup failure, retains the previously-resolved address. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `target_port` and `target_addr`. |
-| `idle_timeout`   | `humantime`                | —   | ✓   | —     | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP / HTTPS rules.            |
-| `proxy_protocol` | `"v1"`/`"v2"`              | ✓   | —   | —     | absent        | TCP relay rules only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP / HTTPS rules and on terminal-mode rules (`target_addr` / `target_host`). |
-| `cert_dir`       | path                       | —   | —   | ✓     | inherits from `[server]` | HTTPS only. Per-rule override of the convention cert directory.                                          |
-| `http3`          | `Option<bool>`             | —   | —   | ✓     | `true`        | HTTPS only. Enables HTTP/3 over UDP / QUIC on the same `(ip, port)` as TCP HTTPS. Set `http3 = false` to opt out and derive / listen TCP only. |
-| `alt_svc`        | `Option<bool>`             | —   | —   | ✓     | `true` when `http3` is on | HTTPS only. Controls the TCP HTTPS `Alt-Svc: h3=":<port>"; ma=86400` response header that advertises HTTP/3. Set `alt_svc = false` to suppress it. `alt_svc = true` with `http3 = false` is rejected. |
-| `[[rule.route]]` | table                      | —   | —   | ✓     | **required**  | HTTPS only. One entry per virtual host — see the HTTPS section below.                                              |
+| Key              | Type                       | TCP | UDP | Default       | Notes                                                                                                              |
+| ---------------- | -------------------------- | --- | --- | ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `name`           | string                     | ✓   | ✓   | **required**  | Globally unique across all rule files. No whitespace or control characters.                                        |
+| `listen`         | `host:port`                | ✓   | ✓   | **required**  | Listen socket. `port` must be non-zero. Globally unique by `(ip, port, protocol)`.                                 |
+| `protocol`       | `"tcp"`/`"udp"`            | ✓   | ✓   | **required**  | Determines whether this is a TCP listener or a UDP receiver. `protocol = "https"` was removed in the L7 schema cleanup — use top-level `[[route]]` blocks instead. |
+| `target_port`    | u16                        | ✓   | ✓   | one of these  | Relay mode. Port on the residential host. The IP comes from the heartbeat. Mutually exclusive with `target`.       |
+| `target`         | `host:port`                | ✓   | ✓   | one of these  | Terminal mode. Upstream socket. If the host portion parses as an IP, the daemon dials directly (static); otherwise it's a DNS hostname that the daemon re-resolves periodically. On lookup failure the previously-resolved address is retained. New connections pick up the current resolution; existing flows are **not** rebound. Mutually exclusive with `target_port`. |
+| `idle_timeout`   | `humantime`                | —   | ✓   | `60s`         | UDP only. Drop a flow if no datagrams in either direction for this long. Rejected on TCP rules.                    |
+| `proxy_protocol` | `"v1"`/`"v2"`              | ✓   | —   | absent        | TCP relay rules only. Prepend a PROXY-protocol header so the upstream sees the real client IP. Rejected on UDP rules and on terminal-mode rules (rules with `target` set). |
 
 Validation runs at load time. A malformed rule file fails the **whole**
-reload — yggdrasil keeps serving the previous rule set rather than half-
-applying a broken update.
+reload — yggdrasil keeps serving the previous rule set rather than
+half-applying a broken update.
 
 ### Examples (terminal mode)
 
 ```toml
 # /etc/yggdrasil/conf.d/ssh.toml — TCP rule pointing at the local sshd.
 [[rule]]
-name          = "ssh"
-listen        = "0.0.0.0:2222"
-protocol      = "tcp"
-target_addr = "127.0.0.1:22"
+name     = "ssh"
+listen   = "0.0.0.0:2222"
+protocol = "tcp"
+target   = "127.0.0.1:22"
 ```
 
 ```toml
-# /etc/yggdrasil/conf.d/games.toml — mixed TCP + UDP, DNS-resolved upstream.
+# /etc/yggdrasil/conf.d/games.toml — mixed TCP + UDP. The Java rule
+# uses a DNS-resolved upstream (periodic re-resolution); the others
+# dial a literal IP.
 [[rule]]
-name          = "minecraft-java"
-listen        = "0.0.0.0:25565"
-protocol      = "tcp"
-target_host = "minecraft.lan:25565"
+name     = "minecraft-java"
+listen   = "0.0.0.0:25565"
+protocol = "tcp"
+target   = "minecraft.lan:25565"
 
 [[rule]]
-name          = "minecraft-bedrock"
-listen        = "0.0.0.0:19132"
-protocol      = "udp"
-target_addr = "192.168.1.20:19132"
-idle_timeout  = "120s"
+name         = "minecraft-bedrock"
+listen       = "0.0.0.0:19132"
+protocol     = "udp"
+target       = "192.168.1.20:19132"
+idle_timeout = "120s"
 
 [[rule]]
-name          = "wireguard"
-listen        = "0.0.0.0:51821"
-protocol      = "udp"
-target_addr = "127.0.0.1:51820"
-idle_timeout  = "300s"
-```
-
-```toml
-# /etc/yggdrasil/conf.d/printer.toml — DNS hostname, periodically re-resolved.
-# Rebinds apply to *new* flows only — long-lived TCP sessions and UDP flows
-# are not torn down when the address changes (matching nginx / haproxy
-# semantics).
-[[rule]]
-name          = "printer"
-listen        = "0.0.0.0:9100"
-protocol      = "tcp"
-target_host = "printer.lan:9100"
+name         = "wireguard"
+listen       = "0.0.0.0:51821"
+protocol     = "udp"
+target       = "127.0.0.1:51820"
+idle_timeout = "300s"
 ```
 
 ### Relay-mode rules
@@ -336,79 +353,76 @@ the heartbeat):
 ```toml
 # What a derived rule on a single-hop relay would look like if you dumped it.
 [[rule]]
-name          = "ssh"
-listen        = "0.0.0.0:2222"
-protocol      = "tcp"
+name        = "ssh"
+listen      = "0.0.0.0:2222"
+protocol    = "tcp"
 target_port = 22
 ```
 
-### HTTPS rules
+### `[[route]]` — HTTPS virtual hosts (terminal mode)
 
-An `https` rule on the terminal is the L7 frontend. It terminates TLS for
-HTTP/1.1 and HTTP/2, terminates QUIC/TLS for HTTP/3 unless `http3 = false`,
-performs SNI-based virtual-host routing, and forwards each request as
-cleartext HTTP to a per-route backend URL. Each `[[rule.route]]` table is
-one virtual host.
+A `[[route]]` block declares one HTTPS virtual host served by the
+terminal's node-wide HTTPS frontend. The frontend binds
+`[server].https_listen` (default `0.0.0.0:443`) once, terminates TLS
+for HTTP/1.1 / HTTP/2 (and QUIC/TLS for HTTP/3 when
+`[server].https_http3 = true`), performs SNI / `Host:` virtual-host
+routing, and forwards each request as cleartext HTTP to the
+per-route `target`.
 
-HTTPS rules with `http3` enabled (the default) automatically listen on both
-TCP and UDP `(ip, port)`. The QUIC listener shares the rule's cert
-resolution and route table with the TCP path.
-
-When the terminal publishes the rule through the chain, operators no longer
-need to manually create matching TCP/443 plus UDP/443 passthrough rules on
-the relay. A terminal HTTPS rule publishes one HTTPS predicate; the relay
-derives TCP for the TLS listener and, when HTTP/3 is enabled, UDP with a
-30s idle timeout for QUIC datagrams. Certificate resolution remains
+When the terminal publishes its predicate set through the chain, the
+relay derives one TCP listener (HTTPS over TLS) and — when HTTP/3 is
+enabled — one UDP listener (QUIC with a 30 s idle timeout) for the
+configured `https_listen.port()`. Certificate resolution remains
 terminal-only; the relay is L4 passthrough on both transports.
 
-| Key              | Type        | Default              | Notes                                                                                                       |
-| ---------------- | ----------- | -------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `hostname`       | DNS name    | **required**         | SNI / `Host:` value. Case-insensitive. Globally unique across all https routes.                             |
-| `target`         | `http://…`  | **required**         | Backend URL. Cleartext HTTP only — the encrypted leg ends at the terminal HTTPS frontend.                   |
-| `cert`           | path or `"ephemeral"` | unset      | Per-route certificate. A path PEM pairs with `key`. The literal string `"ephemeral"` generates a self-signed cert in memory — only valid for localhost-shaped hostnames (testing). |
-| `key`            | path        | unset                | Per-route private key PEM. Must accompany a path-style `cert`; forbidden with `cert = "ephemeral"`.         |
-| `hsts`           | bool/table  | `false`              | `true` ⇒ default `Strict-Transport-Security` header. Table form (`max_age`, `include_subdomains`, `preload`) gives fine control. |
+| Key        | Type        | Default        | Notes                                                                                                       |
+| ---------- | ----------- | -------------- | ----------------------------------------------------------------------------------------------------------- |
+| `hostname` | DNS name    | **required**   | SNI / `Host:` value. Case-insensitive. Globally unique across all routes in all files.                       |
+| `target`   | `http://…`  | **required**   | Backend URL. Cleartext HTTP only — the encrypted leg ends at the terminal's HTTPS frontend.                |
+| `hsts`     | bool/table  | `false`        | `true` ⇒ default `Strict-Transport-Security` header. Table form (`max_age`, `include_subdomains`, `preload`) gives fine control. Cert-less routes reject `hsts`. |
 
-Cert source precedence (per route): explicit `cert` + `key` paths →
-`cert = "ephemeral"` → `<cert_dir>/<hostname>/{fullchain,privkey}.pem`
-convention → `server.default_cert` + `server.default_key` → **cert-less
-route** (no cert source resolved).
+**Cert resolution is node-wide, not per-route.** Routes do not carry
+a `cert` / `key` field. The supervisor walks a three-rung chain per
+incoming SNI hostname:
 
-A cert-less route is permitted by design. Its hostname is **not**
-bound to the `:443` SNI table; the per-IP companion listener serves it
-as plain HTTP on `:80` to peers in
-[`[server].lan_cidrs`](#server-lan_cidrs-private-peer-set). This is the
-mechanism for LAN-only hostnames that can't get a public-CA cert
-(`*.local`, internal `*.lan`, etc.). Operators see a `WARN` log line
-per cert-less route at startup naming the consequence; the
-`yggdrasil_certless_routes` gauge tracks the live count.
+1. **`[server].default_cert` + `default_key`** — wildcard / fallback
+   PEM. Served whenever its SANs cover the SNI hostname. When
+   `[acme]` is configured the renewer writes the wildcard cert into
+   `<storage_dir>/<domain>/{fullchain,privkey}.pem`; operators
+   typically point `default_cert` / `default_key` at those files so
+   the watcher picks up renewals automatically.
+2. **`<cert_dir>/<hostname>/{fullchain,privkey}.pem` convention** —
+   a per-hostname PEM pair on disk. Useful for one-off certs sitting
+   alongside an ACME wildcard.
+3. **Cert-less route** — no source resolved. The hostname is **not**
+   bound to the `:443` SNI table; the per-IP companion listener
+   serves it as plain HTTP on `:80` to peers in
+   [`[server].lan_cidrs`](#server-lan_cidrs-private-peer-set). This
+   is the mechanism for LAN-only hostnames that can't get a
+   public-CA cert (`*.local`, internal `*.lan`, etc.). Operators
+   see a `WARN` log line per cert-less route at startup naming the
+   consequence; the `yggdrasil_certless_routes` gauge tracks the
+   live count.
 
 ```toml
-# /etc/yggdrasil/conf.d/web.toml
-[[rule]]
-name     = "public-https"
-listen   = "0.0.0.0:443"
-protocol = "https"
+# /etc/yggdrasil/conf.d/web.toml — three virtual hosts on one terminal.
 
-  [[rule.route]]
-  hostname = "api.example.com"
-  target   = "http://10.0.0.10:8080"
-  cert     = "/etc/yggdrasil/certs/api.example.com.crt"
-  key      = "/etc/yggdrasil/certs/api.example.com.key"
-  hsts     = true
+[[route]]
+hostname = "api.example.com"
+target   = "http://10.0.0.10:8080"
+hsts     = true
+# Cert comes from `[server].default_cert` (the wildcard *.example.com).
 
-  [[rule.route]]
-  hostname = "app.example.com"
-  target   = "http://10.0.0.11:3000"
-  # No explicit cert — falls through to the cert_dir convention or
-  # the default cert. If neither matches, becomes a cert-less route
-  # served on :80 plaintext to lan_cidrs peers only.
+[[route]]
+hostname = "app.example.com"
+target   = "http://10.0.0.11:3000"
+# Same — covered by the wildcard.
 
-  [[rule.route]]
-  hostname = "internal.lan"
-  target   = "http://192.168.1.50:8080"
-  # Intentionally cert-less: served on :80 plaintext to LAN peers
-  # only. `hsts` is rejected on cert-less routes by the validator.
+[[route]]
+hostname = "internal.lan"
+target   = "http://192.168.1.50:8080"
+# Intentionally cert-less: served on :80 plaintext to LAN peers only
+# (no SNI match on :443). `hsts` would be rejected by the validator.
 ```
 
 ### `[server].lan_cidrs` (private-peer set)
@@ -467,12 +481,22 @@ completeness:
   rename it into place, or `vim` it — within ~250 ms the diff is applied.
 * A reload that fails validation is **rejected as a unit**. The previous
   rule set keeps serving traffic; the error is logged.
+* `[[rule]]` (L4 listener) changes are reconciled per-rule: unchanged
+  rules' listeners and in-flight flows survive the reload untouched;
+  added rules spawn fresh listeners; removed rules stop instantly;
+  changed rules swap on the same `listen` address.
+* `[[route]]` (HTTPS virtual host) changes currently trigger a full
+  stop+respawn of the node-wide HTTPS frontend on `[server].https_listen`.
+  In-flight HTTPS connections are cancelled at the swap boundary (no
+  grace period). Per-route diffing is a deferred follow-up; L4 rules
+  are unaffected.
 * Changes to **`/etc/yggdrasil/config.toml`** itself are not hot-reloaded;
   restart the daemon (`systemctl restart yggdrasil`). Only `conf.d/*.toml`
-  files are picked up live. In particular, the `[dial]` and `[accept]` tables are
-  read once at startup — `yggdrasilctl identity add-dial` /
-  `add-accept` / `remove-*` mutations require a restart to take
-  effect.
+  files are picked up live. In particular, the `[dial]`, `[accept]`, `[acme]`,
+  and HTTPS-related `[server]` knobs (`https_listen`, `https_http3`,
+  `https_alt_svc`, `default_cert`, `default_key`, `cert_dir`) are read
+  once at startup — `yggdrasilctl identity add-dial` / `add-accept` /
+  `remove-*` mutations require a restart to take effect.
 * `yggdrasilctl local rules reload` forces a re-scan in case you suspect
   the inotify event was missed (NFS, container bind mounts with cached
   metadata, etc.).
