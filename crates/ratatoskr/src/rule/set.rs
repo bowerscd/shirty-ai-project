@@ -1,5 +1,5 @@
-//! `RuleSet`: cross-file-validated aggregate of rules plus the
-//! reload-diff (`RuleChange`, `RuleDiff`).
+//! `RuleSet`: cross-file-validated aggregate of rules + HTTPS routes plus
+//! the reload-diff (`RuleChange`, `RuleDiff`).
 //!
 //! Split out from the original monolithic `rule.rs` (Phase B1).
 
@@ -8,13 +8,21 @@ use std::net::SocketAddr;
 use crate::error::{Error, Result};
 
 use super::file::RuleFile;
+use super::http_route::HttpRoute;
 use super::rule_def::Rule;
 use super::types::Protocol;
 
 /// Aggregated, cross-file-validated set of rules ready for use by the runtime.
+///
+/// Carries two independent collections:
+/// * `rules` — L4 (TCP / UDP) `[[rule]]` blocks, each owning its own listener.
+/// * `routes` — HTTPS routes contributed by top-level `[[route]]` blocks
+///   across all files, attached to the node-wide HTTPS listener
+///   (`[server].https_listen`).
 #[derive(Debug, Clone, Default)]
 pub struct RuleSet {
     rules: Vec<Rule>,
+    routes: Vec<HttpRoute>,
 }
 
 impl RuleSet {
@@ -22,11 +30,13 @@ impl RuleSet {
     /// cross-file uniqueness validation. Per-rule validation runs first.
     pub fn from_files(files: impl IntoIterator<Item = RuleFile>) -> Result<Self> {
         let mut rules: Vec<Rule> = Vec::new();
+        let mut routes: Vec<HttpRoute> = Vec::new();
         for f in files {
             f.validate_each()?;
             rules.extend(f.rule);
+            routes.extend(f.route);
         }
-        Self::from_rules_unchecked_individuals(rules)
+        Self::from_parts_unchecked_individuals(rules, routes)
     }
 
     /// Build a [`RuleSet`] from an already-constructed list of rules.
@@ -38,13 +48,26 @@ impl RuleSet {
         for r in &rules {
             r.validate()?;
         }
-        Self::from_rules_unchecked_individuals(rules)
+        Self::from_parts_unchecked_individuals(rules, Vec::new())
     }
 
-    // Cross-rule duplicate detection only — assumes each rule has already
-    // been individually validated.
-    fn from_rules_unchecked_individuals(rules: Vec<Rule>) -> Result<Self> {
-        // Duplicate name check.
+    /// Build a [`RuleSet`] from already-constructed rule + route lists.
+    /// Each is individually validated, then cross-collection uniqueness
+    /// checks run.
+    pub fn from_parts(rules: Vec<Rule>, routes: Vec<HttpRoute>) -> Result<Self> {
+        for r in &rules {
+            r.validate()?;
+        }
+        for route in &routes {
+            super::validate::validate_http_route("<route>", route)?;
+        }
+        Self::from_parts_unchecked_individuals(rules, routes)
+    }
+
+    // Cross-collection duplicate detection only — assumes each rule and
+    // route has already been individually validated.
+    fn from_parts_unchecked_individuals(rules: Vec<Rule>, routes: Vec<HttpRoute>) -> Result<Self> {
+        // Duplicate rule-name check.
         {
             let mut seen = std::collections::HashSet::<&str>::new();
             for r in &rules {
@@ -57,8 +80,7 @@ impl RuleSet {
             }
         }
 
-        // Duplicate listen claim check. TCP and UDP can share an address, but
-        // HTTPS also claims UDP on the same port for HTTP/3.
+        // Duplicate L4 listen claim check. TCP and UDP can share an address.
         {
             let mut listens = std::collections::HashMap::<SocketAddr, Vec<(&str, Protocol)>>::new();
             for r in &rules {
@@ -73,16 +95,6 @@ impl RuleSet {
                                 other_name
                             )));
                         }
-                        if r.protocol == Protocol::Https || *other_proto == Protocol::Https {
-                            return Err(Error::InvalidRule(format!(
-                                "rules {:?} ({}) and {:?} ({}) share listen address {}; HTTPS rules implicitly claim both TCP and UDP on the port (HTTP/3 listens on UDP), so no other rule may share the same (ip, port)",
-                                r.name,
-                                r.protocol.as_str(),
-                                other_name,
-                                other_proto.as_str(),
-                                r.listen
-                            )));
-                        }
                     }
                 }
                 listens
@@ -92,15 +104,33 @@ impl RuleSet {
             }
         }
 
-        Ok(Self { rules })
+        // Duplicate-hostname check across HTTPS routes.
+        {
+            let mut seen_hosts = std::collections::HashSet::<String>::new();
+            for r in &routes {
+                let lc = r.hostname.to_ascii_lowercase();
+                if !seen_hosts.insert(lc.clone()) {
+                    return Err(Error::InvalidRule(format!(
+                        "duplicate HTTPS route hostname {:?} across rule files",
+                        r.hostname
+                    )));
+                }
+            }
+        }
+
+        Ok(Self { rules, routes })
     }
 
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }
 
+    pub fn routes(&self) -> &[HttpRoute] {
+        &self.routes
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.rules.is_empty() && self.routes.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -113,6 +143,9 @@ impl RuleSet {
 
     /// Compute a name-keyed diff against a new set. Used by the hot-reload
     /// watcher to figure out which listeners to add, remove, or restart.
+    ///
+    /// Currently only diffs the L4 `rules` collection. HTTPS routes are
+    /// hot-reloaded as a single replacement set by the supervisor.
     pub fn diff(&self, new: &RuleSet) -> RuleDiff {
         use std::collections::HashMap;
 

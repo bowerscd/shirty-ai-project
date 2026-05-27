@@ -1111,15 +1111,10 @@ mod tests {
                 name: "echo-tcp".into(),
                 listen: "127.0.0.1:9100".parse().unwrap(),
                 protocol: Protocol::Tcp,
-                target_addr: Some("10.0.0.5:9000".parse().unwrap()),
+                target: Some("10.0.0.5:9000".to_string()),
                 target_port: None,
-                target_host: None,
                 idle_timeout: None,
                 proxy_protocol: None,
-                routes: None,
-                cert_dir: None,
-                http3: None,
-                alt_svc: None,
             }],
         };
         let s = serde_json::to_string(&r).unwrap();

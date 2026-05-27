@@ -1,11 +1,7 @@
 //! Integration tests for the rule schema, validation, file loading, and
 //! diff. Split out from the original monolithic `rule.rs` (Phase B1).
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
-
-use url::Url;
 
 use crate::error::{Error, Result};
 
@@ -32,31 +28,44 @@ fn parses_minimal_tcp_rule() {
     assert_eq!(r.name, "ssh");
     assert_eq!(r.protocol, Protocol::Tcp);
     assert_eq!(r.target_port, Some(22));
-    assert_eq!(r.target_addr, None);
+    assert_eq!(r.target, None);
     assert_eq!(r.idle_timeout, None);
     assert_eq!(r.proxy_protocol, None);
     f.validate_each().unwrap();
 }
 
 #[test]
-fn parses_terminal_style_tcp_rule() {
+fn parses_terminal_style_tcp_rule_with_ip_literal() {
     let f = parse(
         r#"
             [[rule]]
             name = "home-ssh"
             listen = "0.0.0.0:2222"
             protocol = "tcp"
-            target_addr = "192.168.1.10:22"
+            target = "192.168.1.10:22"
             "#,
     )
     .unwrap();
     let r = &f.rule[0];
     assert_eq!(r.target_port, None);
-    assert_eq!(
-        r.target_addr,
-        Some("192.168.1.10:22".parse::<SocketAddr>().unwrap())
-    );
+    assert_eq!(r.target.as_deref(), Some("192.168.1.10:22"));
     f.validate_each().unwrap();
+}
+
+#[test]
+fn parses_terminal_style_tcp_rule_with_dns_name() {
+    let f = parse(
+        r#"
+            [[rule]]
+            name = "dns-rule"
+            listen = "0.0.0.0:9100"
+            protocol = "tcp"
+            target = "printer.lan:9100"
+            "#,
+    )
+    .unwrap();
+    f.validate_each().expect("should validate");
+    assert_eq!(f.rule[0].target.as_deref(), Some("printer.lan:9100"));
 }
 
 #[test]
@@ -67,17 +76,14 @@ fn parses_terminal_style_udp_rule() {
             name = "home-dns"
             listen = "0.0.0.0:53"
             protocol = "udp"
-            target_addr = "192.168.1.1:53"
+            target = "192.168.1.1:53"
             idle_timeout = "30s"
             "#,
     )
     .unwrap();
     let r = &f.rule[0];
     assert_eq!(r.protocol, Protocol::Udp);
-    assert_eq!(
-        r.target_addr,
-        Some("192.168.1.1:53".parse::<SocketAddr>().unwrap())
-    );
+    assert_eq!(r.target.as_deref(), Some("192.168.1.1:53"));
     assert_eq!(r.idle_timeout, Some(Duration::from_secs(30)));
     f.validate_each().unwrap();
 }
@@ -186,7 +192,7 @@ fn rejects_zero_target_port() {
 }
 
 #[test]
-fn rejects_both_target_port_and_target_addr() {
+fn rejects_both_target_port_and_target() {
     let f = parse(
         r#"
             [[rule]]
@@ -194,19 +200,19 @@ fn rejects_both_target_port_and_target_addr() {
             listen = "0.0.0.0:22"
             protocol = "tcp"
             target_port = 22
-            target_addr = "192.168.1.1:22"
+            target = "192.168.1.1:22"
             "#,
     )
     .unwrap();
     let err = f.validate_each().err();
     assert!(matches!(
         err,
-        Some(Error::InvalidRule(s)) if s.contains("exactly one of target_port")
+        Some(Error::InvalidRule(s)) if s.contains("not both")
     ));
 }
 
 #[test]
-fn rejects_neither_target_port_nor_target_addr() {
+fn rejects_neither_target_port_nor_target() {
     let f = parse(
         r#"
             [[rule]]
@@ -224,33 +230,33 @@ fn rejects_neither_target_port_nor_target_addr() {
 }
 
 #[test]
-fn rejects_target_addr_with_zero_port() {
+fn rejects_target_with_zero_port() {
     let f = parse(
         r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            target_addr = "192.168.1.1:0"
+            target = "192.168.1.1:0"
             "#,
     )
     .unwrap();
     let err = f.validate_each().err();
     assert!(matches!(
         err,
-        Some(Error::InvalidRule(s)) if s.contains("target_addr port")
+        Some(Error::InvalidRule(s)) if s.contains("port must be non-zero")
     ));
 }
 
 #[test]
-fn rejects_proxy_protocol_with_target_addr() {
+fn rejects_proxy_protocol_with_target() {
     let f = parse(
         r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            target_addr = "192.168.1.1:22"
+            target = "192.168.1.1:22"
             proxy_protocol = "v2"
             "#,
     )
@@ -263,134 +269,43 @@ fn rejects_proxy_protocol_with_target_addr() {
 }
 
 #[test]
-fn parses_target_host_as_terminal_rule() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "dns-rule"
-            listen = "0.0.0.0:9100"
-            protocol = "tcp"
-            target_host = "printer.lan:9100"
-            "#,
-    )
-    .unwrap();
-    f.validate_each().expect("should validate");
-    let h = f.rule[0].target_host.as_ref().expect("target_host set");
-    assert_eq!(h.host, "printer.lan");
-    assert_eq!(h.port, 9100);
-}
-
-#[test]
-fn rejects_target_host_with_invalid_hostname() {
-    // Wildcards are not valid DNS hostnames in `is_valid_dns_hostname`.
+fn rejects_target_with_invalid_hostname() {
+    // Wildcards are not valid DNS hostnames, and they don't parse as IP
+    // literals either, so the parse failure surfaces at validate time
+    // (the field itself is just a String, not strongly parsed at deserialize).
     let f = parse(
         r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            target_host = "*.example.com:22"
-            "#,
-    );
-    // The Deserialize impl rejects this at TOML-parse time, so we expect
-    // a TomlParse error rather than a validate error.
-    assert!(f.is_err(), "*.example.com should be rejected at parse time");
-    let msg = format!("{}", f.unwrap_err());
-    assert!(msg.contains("not a valid DNS name"), "got: {msg}");
-}
-
-#[test]
-fn rejects_target_host_with_zero_port() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "bad"
-            listen = "0.0.0.0:22"
-            protocol = "tcp"
-            target_host = "host.example:0"
-            "#,
-    );
-    assert!(f.is_err(), "zero port should be rejected at parse time");
-    let msg = format!("{}", f.unwrap_err());
-    assert!(msg.contains("non-zero"), "got: {msg}");
-}
-
-#[test]
-fn rejects_target_host_missing_port() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "bad"
-            listen = "0.0.0.0:22"
-            protocol = "tcp"
-            target_host = "hostnoport"
-            "#,
-    );
-    assert!(f.is_err(), "missing port should be rejected at parse time");
-    let msg = format!("{}", f.unwrap_err());
-    assert!(
-        msg.contains("expected \"hostname:port\"") || msg.contains("port"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn rejects_target_host_combined_with_target_addr() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "bad"
-            listen = "0.0.0.0:22"
-            protocol = "tcp"
-            target_addr = "192.168.1.1:22"
-            target_host = "example.lan:22"
+            target = "*.example.com:22"
             "#,
     )
     .unwrap();
     let err = f.validate_each().err();
     assert!(matches!(
         err,
-        Some(Error::InvalidRule(s)) if s.contains("not multiple")
+        Some(Error::InvalidRule(s)) if s.contains("not a valid")
     ));
 }
 
 #[test]
-fn rejects_target_host_combined_with_target_port() {
+fn rejects_target_missing_port() {
     let f = parse(
         r#"
             [[rule]]
             name = "bad"
             listen = "0.0.0.0:22"
             protocol = "tcp"
-            target_port = 22
-            target_host = "example.lan:22"
+            target = "hostnoport"
             "#,
     )
     .unwrap();
     let err = f.validate_each().err();
     assert!(matches!(
         err,
-        Some(Error::InvalidRule(s)) if s.contains("not multiple")
-    ));
-}
-
-#[test]
-fn rejects_proxy_protocol_with_target_host() {
-    let f = parse(
-        r#"
-            [[rule]]
-            name = "bad"
-            listen = "0.0.0.0:22"
-            protocol = "tcp"
-            target_host = "example.lan:22"
-            proxy_protocol = "v2"
-            "#,
-    )
-    .unwrap();
-    let err = f.validate_each().err();
-    assert!(matches!(
-        err,
-        Some(Error::InvalidRule(s)) if s.contains("proxy_protocol is invalid on terminal rules")
+        Some(Error::InvalidRule(s)) if s.contains("expected \"host:port\"")
     ));
 }
 
@@ -508,22 +423,12 @@ fn l4_rule_file(name: &str, listen: &str, protocol: Protocol) -> RuleFile {
     .unwrap()
 }
 
-fn https_rule_file(name: &str, listen: &str) -> RuleFile {
-    let hostname = name.replace('_', "-");
-    parse(&format!(
-        r#"
-            [[rule]]
-            name = "{name}"
-            listen = "{listen}"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "{hostname}.local"
-              target = "http://127.0.0.1:8080"
-              cert     = "ephemeral"
-            "#,
-    ))
-    .unwrap()
+#[allow(dead_code)]
+fn https_rule_file(_name: &str, _listen: &str) -> RuleFile {
+    // After the L7 schema cleanup, HTTPS rules don't exist on `[[rule]]`.
+    // This helper is kept (returning an empty file) so tests that reference
+    // it compile until they're removed.
+    RuleFile::default()
 }
 
 #[test]
@@ -536,67 +441,12 @@ fn rule_set_allows_tcp_and_udp_on_same_listen_addr() {
     assert_eq!(set.len(), 2);
 }
 
-#[test]
-fn rule_set_allows_https_rules_on_different_ports() {
-    let set = RuleSet::from_files([
-        https_rule_file("https-443", "0.0.0.0:443"),
-        https_rule_file("https-8443", "0.0.0.0:8443"),
-    ])
-    .unwrap();
-    assert_eq!(set.len(), 2);
-}
-
-#[test]
-fn rule_set_allows_https_and_udp_on_different_ips_same_port() {
-    let set = RuleSet::from_files([
-        https_rule_file("https-a", "192.0.2.1:443"),
-        l4_rule_file("udp-b", "192.0.2.2:443", Protocol::Udp),
-    ])
-    .unwrap();
-    assert_eq!(set.len(), 2);
-}
-
-#[test]
-fn rule_set_rejects_https_and_tcp_on_same_listen_addr() {
-    let err = RuleSet::from_files([
-        https_rule_file("https-web", "0.0.0.0:443"),
-        l4_rule_file("tcp-web", "0.0.0.0:443", Protocol::Tcp),
-    ])
-    .unwrap_err();
-    let Error::InvalidRule(msg) = err else {
-        panic!("expected InvalidRule");
-    };
-    assert!(msg.contains("\"https-web\""), "got: {msg}");
-    assert!(msg.contains("\"tcp-web\""), "got: {msg}");
-    assert!(msg.contains("(https)"), "got: {msg}");
-    assert!(msg.contains("(tcp)"), "got: {msg}");
-    assert!(
-        msg.contains("HTTPS rules implicitly claim both TCP and UDP"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn rule_set_rejects_https_and_udp_on_same_listen_addr() {
-    let err = RuleSet::from_files([
-        l4_rule_file("udp-web", "0.0.0.0:443", Protocol::Udp),
-        https_rule_file("https-web", "0.0.0.0:443"),
-    ])
-    .err();
-    assert!(matches!(err, Some(Error::InvalidRule(s))
-            if s.contains("HTTPS rules implicitly claim both TCP and UDP")));
-}
-
-#[test]
-fn rule_set_rejects_two_https_rules_on_same_listen_addr() {
-    let err = RuleSet::from_files([
-        https_rule_file("https-a", "0.0.0.0:443"),
-        https_rule_file("https-b", "0.0.0.0:443"),
-    ])
-    .err();
-    assert!(matches!(err, Some(Error::InvalidRule(s))
-            if s.contains("duplicate listen address") && s.contains("protocol https")));
-}
+// The legacy `rule_set_allows_https_*` / `rule_set_rejects_https_*` /
+// `rule_set_rejects_two_https_rules_*` tests were predicated on
+// HTTPS rules existing in `[[rule]]`. With the L7 schema cleanup,
+// HTTPS routes live in top-level `[[route]]` blocks; the duplicate-
+// hostname check has its own coverage in
+// `rule_set_rejects_duplicate_route_hostnames_case_insensitive`.
 
 #[test]
 fn rule_set_rejects_two_tcp_rules_on_same_listen_addr() {
@@ -658,7 +508,11 @@ fn rule(name: &str, port: u16, proto: Protocol, target: u16) -> Rule {
 }
 
 fn set(rules: Vec<Rule>) -> RuleSet {
-    RuleSet::from_files([RuleFile { rule: rules }]).unwrap()
+    RuleSet::from_files([RuleFile {
+        rule: rules,
+        route: Vec::new(),
+    }])
+    .unwrap()
 }
 
 #[test]
@@ -769,813 +623,223 @@ fn with_bind_override_does_not_cross_address_families() {
 }
 
 // ===== L7 (HTTPS) schema tests =====
-
-fn parse_one(s: &str) -> Result<Rule> {
-    let f = parse(s)?;
-    assert_eq!(f.rule.len(), 1);
-    Ok(f.rule.into_iter().next().unwrap())
-}
+//
+// HTTPS routes are top-level `[[route]]` blocks, not nested in
+// `[[rule]]`. Rule rejects `protocol = "https"` outright.
 
 #[test]
-fn parses_minimal_https_rule_with_ephemeral_cert() {
-    let r = parse_one(
+fn rule_rejects_https_protocol() {
+    let f = parse(
         r#"
             [[rule]]
             name = "h"
             listen = "0.0.0.0:443"
             protocol = "https"
-
-              [[rule.route]]
-              hostname = "app.localhost"
-              target = "http://127.0.0.1:8080"
-              cert     = "ephemeral"
             "#,
     )
     .unwrap();
-    assert_eq!(r.protocol, Protocol::Https);
-    let routes = r.routes.as_ref().expect("routes present");
-    assert_eq!(routes.len(), 1);
-    assert_eq!(routes[0].hostname, "app.localhost");
-    assert_eq!(routes[0].target.scheme(), "http");
-    assert_eq!(routes[0].target.port(), Some(8080));
-    assert_eq!(routes[0].cert, Some(CertSource::Ephemeral));
-    assert_eq!(routes[0].key, None);
-    assert_eq!(routes[0].hsts, None);
-    r.validate().expect("schema-valid");
+    let err = f.validate_each().err();
+    assert!(matches!(
+        err,
+        Some(Error::InvalidRule(s)) if s.contains("protocol = \"https\" is not valid on `[[rule]]`")
+    ));
 }
 
 #[test]
-fn parses_https_rule_with_path_cert_and_key() {
-    let r = parse_one(
+fn parses_minimal_top_level_route() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "api.home.example"
-              target = "http://192.168.1.10:8080"
-              cert     = "/tls/api/fullchain.pem"
-              key      = "/tls/api/privkey.pem"
+            [[route]]
+            hostname = "app.example.com"
+            target = "http://192.168.1.10:8080"
             "#,
     )
     .unwrap();
-    let route = &r.routes.as_ref().unwrap()[0];
-    assert_eq!(
-        route.cert,
-        Some(CertSource::Path(PathBuf::from("/tls/api/fullchain.pem")))
-    );
-    assert_eq!(route.key, Some(PathBuf::from("/tls/api/privkey.pem")));
-    r.validate().unwrap();
+    assert_eq!(f.route.len(), 1);
+    assert_eq!(f.route[0].hostname, "app.example.com");
+    assert_eq!(f.route[0].target.scheme(), "http");
+    assert_eq!(f.route[0].target.port(), Some(8080));
+    assert_eq!(f.route[0].hsts, None);
+    f.validate_each().unwrap();
 }
 
 #[test]
-fn https_rule_accepts_multiple_routes_and_distinct_hosts() {
-    let r = parse_one(
+fn route_rejects_invalid_hostname() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "a.local"
-              target = "http://10.0.0.1:80"
-              cert     = "ephemeral"
-
-              [[rule.route]]
-              hostname = "b.local"
-              target = "http://10.0.0.2:80"
-              cert     = "ephemeral"
+            [[route]]
+            hostname = "*.example.com"
+            target = "http://192.168.1.10:8080"
             "#,
     )
     .unwrap();
-    assert_eq!(r.routes.as_ref().unwrap().len(), 2);
-    r.validate().unwrap();
+    let err = f.validate_each().err();
+    assert!(matches!(
+        err,
+        Some(Error::InvalidRule(s)) if s.contains("not a valid DNS name")
+    ));
 }
 
 #[test]
-fn https_rule_rejects_duplicate_route_hostnames_case_insensitive() {
-    let err = parse_one(
+fn route_rejects_non_http_target_scheme() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "App.local"
-              target = "http://10.0.0.1:80"
-              cert     = "ephemeral"
-
-              [[rule.route]]
-              hostname = "app.LOCAL"
-              target = "http://10.0.0.2:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("duplicate route hostname")));
-}
-
-#[test]
-fn https_rule_requires_non_empty_routes() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(
-        matches!(err, Error::InvalidRule(s) if s.contains("requires at least one")),
-        "expected 'requires at least one' error"
-    );
-}
-
-#[test]
-fn https_rule_rejects_target_port() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            target_port = 80
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://127.0.0.1:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`target_port` is not valid")),);
-}
-
-#[test]
-fn https_rule_rejects_target_addr() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            target_addr = "127.0.0.1:80"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://127.0.0.1:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`target_addr` is not valid")),);
-}
-
-#[test]
-fn https_rule_rejects_target_host() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            target_host = "backend.lan:80"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://127.0.0.1:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`target_host` is not valid")),);
-}
-
-#[test]
-fn https_rule_rejects_proxy_protocol() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            proxy_protocol = "v2"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://127.0.0.1:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`proxy_protocol` is not valid")),);
-}
-
-#[test]
-fn https_rule_rejects_idle_timeout() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            idle_timeout = "30s"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://127.0.0.1:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`idle_timeout`")));
-}
-
-#[test]
-fn tcp_rule_rejects_route_blocks() {
-    let err = parse(
-        r#"
-            [[rule]]
-            name = "x"
-            listen = "0.0.0.0:1234"
-            protocol = "tcp"
-            target_port = 22
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://127.0.0.1:80"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate_each()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`route` blocks are only valid")));
-}
-
-#[test]
-fn tcp_rule_rejects_cert_dir() {
-    let err = parse(
-        r#"
-            [[rule]]
-            name = "x"
-            listen = "0.0.0.0:1234"
-            protocol = "tcp"
-            target_port = 22
-            cert_dir = "/tls"
-            "#,
-    )
-    .unwrap()
-    .validate_each()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`cert_dir` is only valid")));
-}
-
-#[test]
-fn https_rule_rejects_non_http_target_scheme() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "https://10.0.0.1:443"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("target URL scheme")),);
-}
-
-#[test]
-fn https_rule_accepts_target_with_default_http_port() {
-    // http://10.0.0.1 (no explicit port) → url crate sets known default
-    // port 80; we accept it. Adopting the URL semantics avoids forcing
-    // operators to write `:80` redundantly.
-    let r = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://10.0.0.1"
-              cert     = "ephemeral"
+            [[route]]
+            hostname = "app.example.com"
+            target = "https://192.168.1.10:8080"
             "#,
     )
     .unwrap();
-    r.validate().unwrap();
-    assert_eq!(
-        r.routes.as_ref().unwrap()[0].target.port_or_known_default(),
-        Some(80)
-    );
+    let err = f.validate_each().err();
+    assert!(matches!(
+        err,
+        Some(Error::InvalidRule(s)) if s.contains("scheme must be \"http\"")
+    ));
 }
 
 #[test]
-fn https_rule_rejects_path_cert_without_key() {
-    let err = parse_one(
+fn route_accepts_default_http_port() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "api.home.example"
-              target = "http://10.0.0.1:80"
-              cert     = "/tls/cert.pem"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("`key` must also")));
-}
-
-#[test]
-fn https_rule_rejects_ephemeral_cert_with_key() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://10.0.0.1:80"
-              cert     = "ephemeral"
-              key      = "/tls/k.pem"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("does not take a separate")));
-}
-
-#[test]
-fn https_rule_rejects_key_without_cert() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://10.0.0.1:80"
-              key      = "/tls/k.pem"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("but no `cert` is provided")));
-}
-
-#[test]
-fn https_rule_accepts_cert_less_route() {
-    // No cert source → cert-less route. Permitted at the schema layer
-    // (the supervisor partitions it to the :80 companion listener).
-    let r = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "subnautica.janus.local"
-              target = "http://192.168.156.7:8080"
-
-              [[rule.route]]
-              hostname = "app.localhost"
-              target = "http://127.0.0.1:8080"
-              cert = "ephemeral"
+            [[route]]
+            hostname = "app.example.com"
+            target = "http://192.168.1.10"
             "#,
     )
     .unwrap();
-    let routes = r.routes.as_ref().expect("routes present");
-    assert_eq!(routes.len(), 2);
-    assert_eq!(routes[0].hostname, "subnautica.janus.local");
-    assert_eq!(routes[0].cert, None, "first route is cert-less");
-    assert_eq!(routes[0].key, None);
-    assert_eq!(routes[0].hsts, None);
-    assert_eq!(routes[1].cert, Some(CertSource::Ephemeral));
-    r.validate()
-        .expect("mixed cert'd + cert-less rule is schema-valid");
+    // `port_or_known_default()` returns 80 for an http: URL without an explicit port.
+    f.validate_each().unwrap();
 }
 
 #[test]
-fn https_rule_rejects_hsts_on_cert_less_route() {
-    // HSTS over plain HTTP is undefined per RFC 6797 §8.1; a cert-less
-    // route serves only on :80, so setting `hsts` would be a silent
-    // operator error. Reject explicitly.
-    let err = parse_one(
+fn route_hsts_shorthand_true_yields_defaults() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "subnautica.janus.local"
-              target = "http://192.168.156.7:8080"
-              hsts = true
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(
-        matches!(err, Error::InvalidRule(s) if s.contains("`hsts` requires a cert source")),
-        "expected hsts-on-cert-less rejection"
-    );
-}
-
-#[test]
-fn https_rule_rejects_hsts_table_on_cert_less_route() {
-    // Same constraint, table form of hsts.
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "internal.janus.local"
-              target = "http://192.168.156.10:80"
-              hsts = { max_age = 15552000, include_subdomains = true }
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(
-        matches!(err, Error::InvalidRule(s) if s.contains("`hsts` requires a cert source")),
-        "expected hsts-on-cert-less rejection (table form)"
-    );
-}
-
-#[test]
-fn https_rule_ephemeral_allows_localhost_pattern_hostnames() {
-    for host in [
-        "localhost",
-        "app.localhost",
-        "deep.nested.localhost",
-        "thing.local",
-        "raspberrypi.local",
-    ] {
-        let r = parse_one(&format!(
-            r#"
-                [[rule]]
-                name = "h"
-                listen = "0.0.0.0:443"
-                protocol = "https"
-
-                  [[rule.route]]
-                  hostname = "{host}"
-                  target = "http://127.0.0.1:8080"
-                  cert     = "ephemeral"
-                "#
-        ))
-        .unwrap();
-        r.validate()
-            .unwrap_or_else(|e| panic!("hostname {host:?} unexpectedly rejected: {e:?}"));
-    }
-}
-
-#[test]
-fn https_rule_ephemeral_rejects_public_hostnames() {
-    let err = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "api.example.com"
-              target = "http://127.0.0.1:8080"
-              cert     = "ephemeral"
-            "#,
-    )
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s) if s.contains("only allowed for")));
-}
-
-#[test]
-fn https_rule_rejects_invalid_dns_hostname() {
-    for bad in [
-        "-leading-dash.local",
-        "trailing-dash-.local",
-        "label..double-dot.local",
-        "white space.local",
-    ] {
-        let err = parse_one(&format!(
-            r#"
-                [[rule]]
-                name = "h"
-                listen = "0.0.0.0:443"
-                protocol = "https"
-
-                  [[rule.route]]
-                  hostname = "{bad}"
-                  target = "http://127.0.0.1:8080"
-                  cert     = "ephemeral"
-                "#
-        ))
-        .unwrap()
-        .validate()
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidRule(s) if s.contains("not a valid DNS name")),
-            "hostname {bad:?} should have been rejected as malformed"
-        );
-    }
-}
-
-#[test]
-fn https_rule_hsts_shorthand_true_yields_defaults() {
-    let r = parse_one(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://10.0.0.1:80"
-              cert     = "ephemeral"
-              hsts     = true
+            [[route]]
+            hostname = "app.example.com"
+            target = "http://192.168.1.10:8080"
+            hsts = true
             "#,
     )
     .unwrap();
-    let hsts = r.routes.as_ref().unwrap()[0]
-        .hsts
-        .expect("hsts shorthand parsed");
+    let hsts = f.route[0].hsts.unwrap();
     assert_eq!(hsts.max_age, DEFAULT_HSTS_MAX_AGE);
     assert!(!hsts.include_subdomains);
     assert!(!hsts.preload);
 }
 
 #[test]
-fn https_rule_hsts_shorthand_false_yields_none() {
-    let r = parse_one(
+fn route_hsts_shorthand_false_yields_none() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://10.0.0.1:80"
-              cert     = "ephemeral"
-              hsts     = false
+            [[route]]
+            hostname = "app.example.com"
+            target = "http://192.168.1.10:8080"
+            hsts = false
             "#,
     )
     .unwrap();
-    assert_eq!(r.routes.as_ref().unwrap()[0].hsts, None);
+    assert_eq!(f.route[0].hsts, None);
 }
 
 #[test]
-fn https_rule_hsts_explicit_table_overrides_defaults() {
-    let r = parse_one(
+fn route_hsts_explicit_table_overrides_defaults() {
+    let f = parse(
         r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
+            [[route]]
+            hostname = "app.example.com"
+            target = "http://192.168.1.10:8080"
 
-              [[rule.route]]
-              hostname = "x.local"
-              target = "http://10.0.0.1:80"
-              cert     = "ephemeral"
-
-              [rule.route.hsts]
+              [route.hsts]
               max_age = 600
               include_subdomains = true
               preload = true
             "#,
     )
     .unwrap();
-    let hsts = r.routes.as_ref().unwrap()[0].hsts.unwrap();
+    let hsts = f.route[0].hsts.unwrap();
     assert_eq!(hsts.max_age, 600);
     assert!(hsts.include_subdomains);
     assert!(hsts.preload);
 }
 
 #[test]
-fn cert_source_deserialises_ephemeral_string() {
-    let cs: CertSource = toml::from_str("v = \"ephemeral\"\n")
-        .map(|t: toml::Table| t["v"].clone().try_into::<CertSource>().unwrap())
-        .unwrap();
-    assert_eq!(cs, CertSource::Ephemeral);
+fn rule_set_aggregates_routes_across_files() {
+    let f1 = parse(
+        r#"
+            [[route]]
+            hostname = "a.example.com"
+            target = "http://10.0.0.1:80"
+            "#,
+    )
+    .unwrap();
+    let f2 = parse(
+        r#"
+            [[route]]
+            hostname = "b.example.com"
+            target = "http://10.0.0.2:80"
+            "#,
+    )
+    .unwrap();
+    let rs = RuleSet::from_files([f1, f2]).unwrap();
+    assert_eq!(rs.routes().len(), 2);
+    let hosts: std::collections::HashSet<_> =
+        rs.routes().iter().map(|r| r.hostname.as_str()).collect();
+    assert!(hosts.contains("a.example.com"));
+    assert!(hosts.contains("b.example.com"));
 }
 
 #[test]
-fn cert_source_deserialises_path_string() {
-    let cs: CertSource = toml::from_str("v = \"/tls/x.pem\"\n")
-        .map(|t: toml::Table| t["v"].clone().try_into::<CertSource>().unwrap())
-        .unwrap();
-    assert_eq!(cs, CertSource::Path(PathBuf::from("/tls/x.pem")));
+fn rule_set_rejects_duplicate_route_hostnames_case_insensitive() {
+    let f1 = parse(
+        r#"
+            [[route]]
+            hostname = "App.Example.com"
+            target = "http://10.0.0.1:80"
+            "#,
+    )
+    .unwrap();
+    let f2 = parse(
+        r#"
+            [[route]]
+            hostname = "app.example.COM"
+            target = "http://10.0.0.2:80"
+            "#,
+    )
+    .unwrap();
+    let err = RuleSet::from_files([f1, f2]).err();
+    assert!(matches!(
+        err,
+        Some(Error::InvalidRule(s)) if s.contains("duplicate HTTPS route hostname")
+    ));
 }
 
 #[test]
-fn cert_source_rejects_empty_string() {
-    let err: Result<CertSource> = toml::from_str("v = \"\"\n")
-        .map(|t: toml::Table| {
-            t["v"].clone().try_into::<CertSource>().map_err(|e| {
-                // Box the toml::de::Error into Error::InvalidRule for
-                // uniform handling in the assertion below.
-                Error::InvalidRule(e.to_string())
-            })
-        })
-        .unwrap();
-    assert!(err.is_err());
+fn mixed_rule_and_route_in_same_file() {
+    let f = parse(
+        r#"
+            [[rule]]
+            name = "subnautica"
+            listen = "0.0.0.0:34006"
+            protocol = "udp"
+            target = "127.0.0.1:11000"
+
+            [[route]]
+            hostname = "subnautica.janus.local"
+            target = "http://192.168.156.7:8080"
+            "#,
+    )
+    .unwrap();
+    assert_eq!(f.rule.len(), 1);
+    assert_eq!(f.route.len(), 1);
+    f.validate_each().unwrap();
 }
 
 #[test]
 fn https_protocol_serialises_as_lowercase() {
-    let p = Protocol::Https;
-    let v = serde_json::to_string(&p).unwrap();
-    assert_eq!(v, "\"https\"");
-    assert_eq!(p.as_str(), "https");
-}
-
-fn https_rule_with_options(extra: &str) -> String {
-    format!(
-        r#"
-            [[rule]]
-            name = "h"
-            listen = "0.0.0.0:443"
-            protocol = "https"
-            {extra}
-
-              [[rule.route]]
-              hostname = "app.local"
-              target = "http://127.0.0.1:8080"
-              cert     = "ephemeral"
-            "#,
-    )
-}
-
-#[test]
-fn https_rule_parses_http3_true() {
-    let r = parse_one(&https_rule_with_options("http3 = true")).unwrap();
-    r.validate().unwrap();
-    assert_eq!(r.http3, Some(true));
-    assert_eq!(r.alt_svc, None);
-}
-
-#[test]
-fn https_rule_parses_http3_false() {
-    let r = parse_one(&https_rule_with_options("http3 = false")).unwrap();
-    r.validate().unwrap();
-    assert_eq!(r.http3, Some(false));
-    assert_eq!(r.alt_svc, None);
-}
-
-#[test]
-fn https_rule_defaults_h3_options_to_absent() {
-    let r = parse_one(&https_rule_with_options("")).unwrap();
-    r.validate().unwrap();
-    assert_eq!(r.http3, None);
-    assert_eq!(r.alt_svc, None);
-}
-
-#[test]
-fn https_rule_accepts_http3_false_and_alt_svc_false() {
-    let r = parse_one(&https_rule_with_options(
-        "http3 = false\n            alt_svc = false",
-    ))
-    .unwrap();
-    r.validate().unwrap();
-    assert_eq!(r.http3, Some(false));
-    assert_eq!(r.alt_svc, Some(false));
-}
-
-#[test]
-fn https_rule_accepts_alt_svc_true_alone() {
-    let r = parse_one(&https_rule_with_options("alt_svc = true")).unwrap();
-    r.validate().unwrap();
-    assert_eq!(r.http3, None);
-    assert_eq!(r.alt_svc, Some(true));
-}
-
-#[test]
-fn https_rule_rejects_alt_svc_true_when_http3_disabled() {
-    let err = parse_one(&https_rule_with_options(
-        "http3 = false\n            alt_svc = true",
-    ))
-    .unwrap()
-    .validate()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s)
-            if s.contains("`alt_svc = true` is incompatible with `http3 = false`")));
-}
-
-#[test]
-fn tcp_rule_rejects_http3() {
-    let err = parse(
-        r#"
-            [[rule]]
-            name = "ssh"
-            listen = "0.0.0.0:22"
-            protocol = "tcp"
-            target_port = 22
-            http3 = true
-            "#,
-    )
-    .unwrap()
-    .validate_each()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s)
-            if s.contains("`http3` is only meaningful for `protocol = \"https\"` rules")));
-}
-
-#[test]
-fn udp_rule_rejects_alt_svc() {
-    let err = parse(
-        r#"
-            [[rule]]
-            name = "dns"
-            listen = "0.0.0.0:53"
-            protocol = "udp"
-            target_port = 53
-            alt_svc = true
-            "#,
-    )
-    .unwrap()
-    .validate_each()
-    .unwrap_err();
-    assert!(matches!(err, Error::InvalidRule(s)
-            if s.contains("`alt_svc` is only meaningful for `protocol = \"https\"` rules")));
-}
-
-#[test]
-fn https_h3_options_toml_round_trip() {
-    let rule = Rule {
-        name: "h".to_string(),
-        listen: "0.0.0.0:443".parse().unwrap(),
-        protocol: Protocol::Https,
-        target_port: None,
-        target_addr: None,
-        target_host: None,
-        idle_timeout: None,
-        proxy_protocol: None,
-        routes: Some(vec![HttpRoute {
-            hostname: "app.local".to_string(),
-            target: Url::parse("http://127.0.0.1:8080").unwrap(),
-            cert: Some(CertSource::Ephemeral),
-            key: None,
-            hsts: None,
-        }]),
-        cert_dir: None,
-        http3: Some(false),
-        alt_svc: Some(false),
-    };
-    rule.validate().unwrap();
-    let f = RuleFile {
-        rule: vec![rule.clone()],
-    };
-    let toml = toml::to_string(&f).unwrap();
-    assert!(toml.contains("http3 = false"), "toml was: {toml}");
-    assert!(toml.contains("alt_svc = false"), "toml was: {toml}");
-    let back = parse(&toml).unwrap();
-    back.validate_each().unwrap();
-    assert_eq!(back.rule[0], rule);
+    // Protocol uses #[serde(rename_all = "lowercase")] so the
+    // discriminator round-trips as a lowercase string. toml can't
+    // serialise a top-level enum, so check via serde_json.
+    let s = serde_json::to_string(&Protocol::Https).unwrap();
+    assert_eq!(s, "\"https\"");
 }

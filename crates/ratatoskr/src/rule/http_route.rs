@@ -3,18 +3,21 @@
 //!
 //! Split out from the original monolithic `rule.rs` (Phase B1).
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
-use super::cert_source::CertSource;
 use super::types::HstsConfig;
 
 /// A single HTTPS route attached to a `Protocol::Https` rule.
 ///
 /// Routes are matched by exact `Host` header against the inbound request
 /// (after SNI). All fields beyond `hostname` and `target` are optional.
+///
+/// Certificate resolution is **node-wide**, not per-route — the daemon
+/// serves whichever cert covers a given SNI hostname via the three-rung
+/// resolver (`[server].default_cert+default_key` → ACME-managed wildcard
+/// → cert-less LAN). Routes whose hostname is not covered by any cert
+/// fall through to the cert-less LAN path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRoute {
     /// DNS hostname the route is served as. Matched as an exact, case-
@@ -24,29 +27,6 @@ pub struct HttpRoute {
     /// explicit host + port (path/query are ignored; only the authority is
     /// used to dial the backend).
     pub target: Url,
-    /// Certificate source for this hostname. Precedence when resolving
-    /// effective cert at load time:
-    /// 1. `cert == Some(Path(p))` plus `key` → load `p` + `key` from disk.
-    /// 2. `cert == Some(Ephemeral)` → generate in memory.
-    /// 3. Convention dir `{rule.cert_dir | server.cert_dir}/{hostname}/`
-    ///    containing `fullchain.pem` + `privkey.pem`.
-    /// 4. Global `[server].default_cert` / `default_key`.
-    /// 5. `None` ⇒ **cert-less route** — the hostname is never bound to
-    ///    the `:443` SNI table and is served only on the per-IP
-    ///    companion listener's plaintext `:80` path, restricted to peers
-    ///    in `lan_cidrs` (see the daemon's `LanCidrs` resolution). The
-    ///    operator-visible signal is a load-time `WARN` naming the
-    ///    cert-less hostname.
-    ///
-    /// See the per-rule schema (`Rule::validate`) and `CertStore` (in the
-    /// `yggdrasil` crate) for the actual lookup loop. This proto-level
-    /// schema only enforces local-shape invariants.
-    #[serde(default)]
-    pub cert: Option<CertSource>,
-    /// Private-key file alongside `cert = Path(...)`. Rejected if `cert` is
-    /// `Ephemeral` or absent.
-    #[serde(default)]
-    pub key: Option<PathBuf>,
     /// HTTP Strict-Transport-Security policy. See [`HstsConfig`] for the
     /// shorthand-vs-table TOML shapes. `None` means no header is emitted.
     #[serde(default, deserialize_with = "deserialize_optional_hsts")]

@@ -23,40 +23,36 @@
 //! idle_timeout   = "30s"          # optional, defaults to 60s for udp
 //! ```
 //!
-//! Example (terminal-mode rules — dial a fixed LAN address):
+//! Example (terminal-mode rules — dial a `host:port` LAN target;
+//! `host` may be an IP literal for a static target, or a DNS name for
+//! periodic re-resolution):
 //!
 //! ```toml
 //! [[rule]]
-//! name          = "home-ssh"
-//! listen        = "0.0.0.0:2222"
-//! protocol      = "tcp"
-//! target_addr = "192.168.1.10:22"
+//! name     = "home-ssh"
+//! listen   = "0.0.0.0:2222"
+//! protocol = "tcp"
+//! target   = "192.168.1.10:22"      # IP literal: static
 //!
 //! [[rule]]
-//! name          = "home-dns"
-//! listen        = "0.0.0.0:53"
-//! protocol      = "udp"
-//! target_addr = "192.168.1.1:53"
-//! idle_timeout  = "30s"
-//! ```
+//! name     = "home-dns"
+//! listen   = "0.0.0.0:53"
+//! protocol = "udp"
+//! target   = "192.168.1.1:53"
+//! idle_timeout = "30s"
 //!
-//! Example (terminal-mode rules — dial a DNS-resolved upstream, with
-//! periodic re-resolution at runtime):
-//!
-//! ```toml
 //! [[rule]]
-//! name          = "home-printer"
-//! listen        = "0.0.0.0:9100"
-//! protocol      = "tcp"
-//! target_host = "printer.lan:9100"
+//! name     = "home-printer"
+//! listen   = "0.0.0.0:9100"
+//! protocol = "tcp"
+//! target   = "printer.lan:9100"     # DNS name: re-resolved every 30s
 //! ```
 //!
-//! `target_addr` (a literal `IP:PORT`) and `target_host`
-//! (a `HOSTNAME:PORT` resolved via the OS resolver, refreshed every 30s)
-//! are siblings — use `target_addr` when you have a static IP, and
-//! `target_host` when the LAN device's IP comes from DHCP or you want to
-//! pin to a mDNS name. Picking exactly one is a per-rule validation
-//! requirement.
+//! The loader picks the resolver shape based on whether the host portion
+//! of `target` parses as an IP literal. IP literals become a static
+//! resolver; DNS names become a re-resolving resolver. Picking exactly
+//! one of `target_port` (relay) and `target` (terminal) is a per-rule
+//! validation requirement.
 //!
 //! Example (HTTPS L7 frontend — terminal-mode only, terminates TLS and
 //! reverse-proxies to multiple LAN backends by hostname):
@@ -92,17 +88,16 @@
 //!   TCP or UDP is rejected. `alt_svc = true` with `http3 = false` is rejected.
 //! * `listen` port must be non-zero (binding to port 0 makes no sense for a
 //!   fixed-listener proxy).
-//! * For `protocol = "tcp" | "udp"`: exactly one of `target_port` /
-//!   `target_addr` / `target_host` is set (3-way XOR). `target_port`,
-//!   when set, must be non-zero; `target_addr`, when set, must have a
-//!   non-zero port; `target_host`, when set, must be a syntactically
-//!   valid DNS hostname with a non-zero port.
-//! * `proxy_protocol` is rejected when `target_addr` or `target_host`
-//!   is set — terminal rules cannot emit headers (the relay's header
-//!   passes through verbatim).
+//! * For `protocol = "tcp" | "udp"`: exactly one of `target_port` and
+//!   `target` is set (2-way XOR). `target_port`, when set, must be
+//!   non-zero; `target`, when set, must parse as `host:port` with a
+//!   non-zero port and a host that is either an IP literal or a valid
+//!   DNS name.
+//! * `proxy_protocol` is rejected when `target` is set — terminal rules
+//!   cannot emit headers (the relay's header passes through verbatim).
 //! * For `protocol = "https"`: `routes` is present and non-empty;
-//!   `target_port` / `target_addr` / `target_host` / `proxy_protocol`
-//!   / `idle_timeout` are all absent. Per-route invariants:
+//!   `target_port` / `target` / `proxy_protocol` / `idle_timeout` are
+//!   all absent. Per-route invariants:
 //!   hostname is a syntactically valid DNS name (no duplicates within the rule); `target` URL scheme
 //!   is `"http"` with explicit host + port; `cert` as a path requires `key`
 //!   alongside; `cert = "ephemeral"` requires the hostname to match
@@ -116,10 +111,10 @@
 //!
 //! ## Module layout (Phase B1 split)
 //!
-//! - `types` — `Protocol`, `ProxyProto`, `TargetHost`, `HstsConfig`,
+//! - `types` — `Protocol`, `ProxyProto`, `HstsConfig`,
 //!   `DEFAULT_HSTS_MAX_AGE`.
-//! - `cert_source` — `CertSource` and its bespoke (de)serialisation.
 //! - `http_route` — `HttpRoute` with the HSTS shorthand handling.
+//! - `target` — `Target` parsed from the L4 `target` field (static vs DNS).
 //! - `rule_def` — `Rule` struct + per-rule validation,
 //!   `DEFAULT_UDP_IDLE_TIMEOUT`, `with_bind_override`,
 //!   `resolved_idle_timeout`.
@@ -128,20 +123,20 @@
 //! - `file` — `RuleFile` and the per-file TOML parser/validator.
 //! - `set` — `RuleSet`, `RuleChange`, `RuleDiff`.
 
-mod cert_source;
 mod file;
 mod http_route;
 mod rule_def;
 mod set;
+mod target;
 mod types;
 mod validate;
 
 #[cfg(test)]
 mod tests;
 
-pub use cert_source::{AcmeChallenge, AcmeRouteConfig, CertSource};
 pub use file::RuleFile;
 pub use http_route::HttpRoute;
 pub use rule_def::{Rule, DEFAULT_UDP_IDLE_TIMEOUT};
 pub use set::{RuleChange, RuleDiff, RuleSet};
-pub use types::{HstsConfig, Protocol, ProxyProto, TargetHost, DEFAULT_HSTS_MAX_AGE};
+pub use target::Target;
+pub use types::{HstsConfig, Protocol, ProxyProto, DEFAULT_HSTS_MAX_AGE};

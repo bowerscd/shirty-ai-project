@@ -1,11 +1,9 @@
 //! Small leaf types shared across the rule module: `Protocol`,
-//! `ProxyProto`, `TargetHost`, `HstsConfig`.
+//! `ProxyProto`, `HstsConfig`.
 //!
 //! Split out from the original monolithic `rule.rs` (Phase B1).
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-use super::validate::is_valid_dns_hostname;
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Transport protocol selected per-rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -35,79 +33,6 @@ impl Protocol {
 pub enum ProxyProto {
     V1,
     V2,
-}
-
-/// Terminal-mode upstream specified as a DNS hostname plus port. Parsed
-/// from a single TOML string of the form `"hostname:port"`.
-///
-/// The host portion is validated against the same DNS-label rules as
-/// `[[rule.route]] hostname` (RFC-1123 LDH labels, no wildcards, no
-/// underscores, optional trailing dot tolerated). The port portion must be
-/// a non-zero u16.
-///
-/// Resolution is performed at runtime by the yggdrasil daemon (see
-/// `yggdrasil::proxy::resolver::UpstreamResolver::Dns`), refreshed
-/// periodically; the rule itself only carries the (host, port) tuple.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetHost {
-    pub host: String,
-    pub port: u16,
-}
-
-impl std::fmt::Display for TargetHost {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
-    }
-}
-
-impl std::str::FromStr for TargetHost {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        // Split on the *last* `:` so `host` may contain colons in IPv6
-        // literal form — though IPv6 literals are not valid DNS hostnames
-        // and will be caught by the validator below. Splitting on the last
-        // colon keeps the error message focused on the hostname rather
-        // than producing a confusing "port not a number" message.
-        let (host, port_str) = s
-            .rsplit_once(':')
-            .ok_or_else(|| format!("target_host {s:?}: expected \"hostname:port\""))?;
-        if host.is_empty() {
-            return Err(format!("target_host {s:?}: empty hostname"));
-        }
-        let port: u16 = port_str
-            .parse()
-            .map_err(|_| format!("target_host {s:?}: port {port_str:?} is not a u16"))?;
-        if port == 0 {
-            return Err(format!("target_host {s:?}: port must be non-zero"));
-        }
-        if !is_valid_dns_hostname(host) {
-            return Err(format!(
-                "target_host {s:?}: hostname {host:?} is not a valid DNS \
-                 name (LDH labels, no wildcards, no underscores)"
-            ));
-        }
-        Ok(TargetHost {
-            host: host.to_string(),
-            port,
-        })
-    }
-}
-
-impl Serialize for TargetHost {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for TargetHost {
-    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-        let s = String::deserialize(de)?;
-        s.parse::<TargetHost>().map_err(D::Error::custom)
-    }
 }
 
 /// HTTP Strict-Transport-Security policy attached to a single HTTPS route.

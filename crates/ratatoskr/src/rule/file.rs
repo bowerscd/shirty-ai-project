@@ -6,13 +6,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+use super::http_route::HttpRoute;
 use super::rule_def::Rule;
+use super::validate::validate_http_route;
 
 /// A single rule file (`/etc/yggdrasil/conf.d/*.toml`) deserialised from TOML.
+///
+/// Files may carry zero or more `[[rule]]` blocks (L4 — TCP / UDP) and
+/// zero or more top-level `[[route]]` blocks (L7 — HTTPS routes
+/// attached to the node-wide HTTPS listener).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleFile {
     #[serde(default)]
     pub rule: Vec<Rule>,
+    #[serde(default)]
+    pub route: Vec<HttpRoute>,
 }
 
 impl RuleFile {
@@ -46,71 +54,50 @@ impl RuleFile {
     /// assert_eq!(file.rule.len(), 2);
     /// ```
     ///
-    /// Terminal-mode rules with a static LAN address (`target_addr`):
+    /// Terminal-mode L4 rule with a static IP literal target:
     ///
     /// ```
     /// use ratatoskr::rule::RuleFile;
     /// let toml = r#"
     ///     [[rule]]
-    ///     name        = "home-ssh"
-    ///     listen      = "0.0.0.0:2222"
-    ///     protocol    = "tcp"
-    ///     target_addr = "192.168.1.10:22"
+    ///     name     = "home-ssh"
+    ///     listen   = "0.0.0.0:2222"
+    ///     protocol = "tcp"
+    ///     target   = "192.168.1.10:22"
     /// "#;
     /// RuleFile::from_toml("terminal.toml", toml).unwrap()
     ///     .validate_each().unwrap();
     /// ```
     ///
-    /// Terminal-mode rule with a DNS-resolved upstream (`target_host`),
-    /// re-resolved every 30 s by the daemon:
+    /// HTTPS routes (terminal-mode only; attach to the node-wide
+    /// `[server].https_listen`):
     ///
     /// ```
     /// use ratatoskr::rule::RuleFile;
     /// let toml = r#"
-    ///     [[rule]]
-    ///     name        = "home-printer"
-    ///     listen      = "0.0.0.0:9100"
-    ///     protocol    = "tcp"
-    ///     target_host = "printer.lan:9100"
-    /// "#;
-    /// RuleFile::from_toml("terminal-dns.toml", toml).unwrap()
-    ///     .validate_each().unwrap();
-    /// ```
-    ///
-    /// HTTPS L7 frontend (terminal-mode only; SNI-dispatches to multiple
-    /// LAN backends):
-    ///
-    /// ```
-    /// use ratatoskr::rule::RuleFile;
-    /// let toml = r#"
-    ///     [[rule]]
-    ///     name     = "home-https"
-    ///     listen   = "0.0.0.0:443"
-    ///     protocol = "https"
-    ///
-    ///       [[rule.route]]
-    ///       hostname = "app.local"
-    ///       target   = "http://192.168.1.11:3000"
-    ///       cert     = "ephemeral"
+    ///     [[route]]
+    ///     hostname = "app.local"
+    ///     target   = "http://192.168.1.11:3000"
     /// "#;
     /// RuleFile::from_toml("https.toml", toml).unwrap()
     ///     .validate_each().unwrap();
     /// ```
-    ///
-    /// Picking exactly one of `target_port`, `target_addr`, or
-    /// `target_host` is a per-rule validation requirement; rules that
-    /// omit all three (or set more than one) are rejected by
-    /// [`RuleFile::validate_each`].
     pub fn from_toml(path: impl Into<std::path::PathBuf>, s: &str) -> Result<Self> {
         let path = path.into();
         toml::from_str(s).map_err(|source| Error::TomlParse { path, source })
     }
 
-    /// Validate every rule in the file. Cross-file uniqueness is enforced by
-    /// [`super::RuleSet::from_files`].
+    /// Validate every rule and route in the file. Cross-file uniqueness is
+    /// enforced by [`super::RuleSet::from_files`].
     pub fn validate_each(&self) -> Result<()> {
         for r in &self.rule {
             r.validate()?;
+        }
+        // Routes have no rule-level grouping; validate each with a
+        // synthetic "<file-level>" tag in the error path. Cross-file
+        // hostname uniqueness is enforced at RuleSet build time.
+        for route in &self.route {
+            validate_http_route("<route>", route)?;
         }
         Ok(())
     }
