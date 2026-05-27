@@ -407,8 +407,6 @@ async fn dispatch(
             let single_route = vec![HttpRoute {
                 hostname: bare_host.to_string(),
                 target,
-                cert: None,
-                key: None,
                 hsts: None,
             }];
             let route_table = Arc::new(RouteTable::build(&single_route, &rule_name));
@@ -420,6 +418,7 @@ async fn dispatch(
                 routes: route_table,
                 client: backend_client.clone(),
                 tls: false,
+                emit_alt_svc: false,
             });
             // Stash so the compiler doesn't think we're using moved
             // values across the await below.

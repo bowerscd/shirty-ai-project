@@ -105,8 +105,6 @@ mod tests {
         let routes = vec![HttpRoute {
             hostname: "API.example.com".into(),
             target: "http://10.0.0.1:8080".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         let t = RouteTable::build(&routes, "test-rule");
@@ -123,15 +121,11 @@ mod tests {
         let route_a = vec![HttpRoute {
             hostname: "a.example".into(),
             target: "http://10.0.0.1:80".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         let route_b = vec![HttpRoute {
             hostname: "b.example".into(),
             target: "http://10.0.0.2:80".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         let mut t = RouteTable::build(&route_a, "rule-a");
@@ -147,15 +141,11 @@ mod tests {
         let route_a = vec![HttpRoute {
             hostname: "shared.example".into(),
             target: "http://10.0.0.1:80".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         let route_b = vec![HttpRoute {
             hostname: "shared.example".into(),
             target: "http://10.0.0.2:80".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         let mut t = RouteTable::build(&route_a, "rule-a");
@@ -169,16 +159,12 @@ mod tests {
         let routes = vec![HttpRoute {
             hostname: "x.example".into(),
             target: "http://10.0.0.1:80".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         let mut t = RouteTable::build(&routes, "rule-a");
         let extra = vec![HttpRoute {
             hostname: "y.example".into(),
             target: "http://10.0.0.2:80".parse().unwrap(),
-            cert: None,
-            key: None,
             hsts: None,
         }];
         t.extend(&extra, "rule-b");

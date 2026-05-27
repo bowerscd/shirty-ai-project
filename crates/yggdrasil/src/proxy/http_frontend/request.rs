@@ -48,6 +48,11 @@ pub(crate) struct ConnContext {
     /// `Alt-Svc` advertisement (plaintext responses don't advertise an
     /// HTTP/3 alternative).
     pub(crate) tls: bool,
+    /// Should the frontend emit `Alt-Svc: h3=":..."` on TLS responses?
+    /// Equivalent to `[server].https_http3 && [server].https_alt_svc`
+    /// — we only advertise h3 when the h3 listener actually exists and
+    /// the operator hasn't suppressed alt-svc.
+    pub(crate) emit_alt_svc: bool,
 }
 
 impl ConnContext {
@@ -360,16 +365,13 @@ fn maybe_inject_alt_svc<B>(resp: &mut http::Response<B>, ctx: &ConnContext) {
     if !ctx.tls {
         return;
     }
+    if !ctx.emit_alt_svc {
+        return;
+    }
     let Some(rule) = ctx.rule.as_ref() else {
         return;
     };
     if rule.protocol != ratatoskr::rule::Protocol::Https {
-        return;
-    }
-    if rule.http3 == Some(false) {
-        return;
-    }
-    if rule.alt_svc == Some(false) {
         return;
     }
 

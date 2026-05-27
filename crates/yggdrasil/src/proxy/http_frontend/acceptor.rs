@@ -37,6 +37,7 @@ pub(super) async fn accept_loop(
     acceptor: TlsAcceptor,
     routes: Arc<RouteTable>,
     client: BackendClient,
+    emit_alt_svc: bool,
     accept_cancel: CancellationToken,
     conn_cancel: CancellationToken,
     conn_tracker: TaskTracker,
@@ -82,6 +83,7 @@ pub(super) async fn accept_loop(
                         conn_acceptor,
                         conn_routes,
                         conn_client,
+                        emit_alt_svc,
                         task_conn_cancel,
                     )
                     .await
@@ -104,6 +106,7 @@ async fn handle_tcp_connection(
     acceptor: TlsAcceptor,
     routes: Arc<RouteTable>,
     client: BackendClient,
+    emit_alt_svc: bool,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     // Step 1: optional PROXY-protocol header. We only consume it; the
@@ -160,6 +163,7 @@ async fn handle_tcp_connection(
         routes: Arc::clone(&routes),
         client: client.clone(),
         tls: true,
+        emit_alt_svc,
     });
 
     let service = service_fn(move |req: hyper::Request<Incoming>| {

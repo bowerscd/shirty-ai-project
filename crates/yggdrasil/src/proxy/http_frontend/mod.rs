@@ -78,13 +78,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rustls::ServerConfig;
-use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::info;
 
 use ratatoskr::rule::Rule;
 
@@ -145,103 +142,94 @@ impl std::fmt::Debug for HttpFrontend {
 }
 
 impl HttpFrontend {
-    /// Bind `rule.listen` and start the HTTPS acceptor. Returns once the
+    /// Bind `listen` and start the HTTPS acceptor. Returns once the
     /// socket is listening.
     ///
     /// `cert_store` is shared across all HTTPS frontends in the supervisor
     /// and used as the rustls `ResolvesServerCert`. The supervisor is
     /// responsible for ensuring the store contains entries for every
-    /// hostname this rule serves *before* `spawn` is called.
+    /// hostname in `routes` *before* `spawn` is called.
+    ///
+    /// `emit_alt_svc` controls whether HTTPS responses get the
+    /// `Alt-Svc: h3="..."` header. The supervisor sets this to
+    /// `cert_config.https_http3 && cert_config.https_alt_svc` — we only
+    /// advertise h3 when the h3 listener is actually running and the
+    /// operator hasn't suppressed alt-svc.
     pub async fn spawn(
-        rule: &Rule,
+        name: String,
+        listen: SocketAddr,
+        routes: &[ratatoskr::rule::HttpRoute],
         cert_store: Arc<CertStore>,
+        emit_alt_svc: bool,
         parent: CancellationToken,
     ) -> Result<Self> {
-        let all_routes = rule
-            .routes
-            .as_ref()
-            .filter(|r| !r.is_empty())
-            .with_context(|| {
-                format!(
-                    "HTTPS rule {:?} has no routes; validator should have rejected this",
-                    rule.name,
-                )
-            })?;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
 
-        // Cert-less routes (route.cert == None and no fallback cert
-        // resolved in the cert store) do NOT enter the :443 SNI table.
-        // They live only on the per-IP companion listener's :80
-        // plaintext path (see proxy/http_frontend/redirect.rs).
-        // Filter the route table here so :443 SNI lookups for those
-        // hostnames hit `UnrecognizedName` at TLS handshake time,
-        // which is the right failure mode for "this name isn't served
-        // over TLS".
-        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = all_routes
+        // Cert-less routes (no cert resolved into the cert store) do NOT
+        // enter the :443 SNI table. They live only on the per-IP
+        // companion listener's :80 plaintext path. Filter to the
+        // cert-resolved subset before building the route table so :443
+        // SNI lookups for cert-less hostnames hit `UnrecognizedName`.
+        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = routes
             .iter()
-            .filter(|r| {
-                // Belt-and-suspenders: present in TOML *or* resolved
-                // via the cert store (which includes default_cert /
-                // cert_dir convention paths). The supervisor partition
-                // step is the ground truth; this check just keeps the
-                // route table in sync if HttpFrontend::spawn is ever
-                // called without prior partitioning.
-                r.cert.is_some() || cert_store.contains(&r.hostname)
-            })
+            .filter(|r| cert_store.contains(&r.hostname))
             .cloned()
             .collect();
 
         if cert_d_routes.is_empty() {
-            // Every route in this rule is cert-less. There is no :443
-            // surface to bind. The supervisor handles this case by
-            // routing every cert-less host onto the companion
-            // listener and skipping HttpFrontend::spawn for this rule
-            // entirely; if we got here regardless, we should not bind
-            // an empty TLS listener.
             anyhow::bail!(
-                "HTTPS rule {:?}: every route is cert-less; nothing to serve on :443",
-                rule.name
+                "HTTPS frontend {:?}: every route is cert-less; nothing to serve on :443",
+                name
             );
         }
 
-        let route_table = Arc::new(RouteTable::build(&cert_d_routes, &rule.name));
+        // Internal accept_loop still threads an Arc<Rule> for log
+        // context. Synthesize a placeholder rule whose name + listen
+        // match this frontend; the protocol is Https so the
+        // request-handler's `maybe_inject_alt_svc` accepts it. The
+        // remaining fields are unused on the HTTPS path.
+        let synth_rule = Arc::new(Rule {
+            name: name.clone(),
+            listen,
+            protocol: ratatoskr::rule::Protocol::Https,
+            target_port: Some(1),
+            target: None,
+            idle_timeout: None,
+            proxy_protocol: None,
+        });
+
+        let route_table = Arc::new(route::RouteTable::build(&cert_d_routes, &name));
 
         let server_config = build_rustls_server_config(cert_store, &[b"h2", b"http/1.1"]);
         let acceptor = TlsAcceptor::from(server_config);
 
-        let listener = TcpListener::bind(rule.listen).await.with_context(|| {
-            format!(
-                "bind HTTPS listener for rule {:?} on {}",
-                rule.name, rule.listen,
-            )
+        let listener = TcpListener::bind(listen).await.map_err(|e| {
+            anyhow::anyhow!("bind HTTPS listener for {:?} on {}: {e}", name, listen)
         })?;
-        let local_addr = listener
-            .local_addr()
-            .context("read HTTPS TcpListener local_addr")?;
+        let local_addr = listener.local_addr()?;
 
         let accept_cancel = parent.child_token();
         let conn_cancel = CancellationToken::new();
-        let backend_client = build_backend_client();
+        let backend_client = backend::build_backend_client();
         let conn_tracker = TaskTracker::new();
 
-        let task_rule = Arc::new(rule.clone());
-        let task_rule_name = rule.name.clone();
+        let task_rule_name = name.clone();
+        let task_rule = Arc::clone(&synth_rule);
         let task_accept_cancel = accept_cancel.clone();
         let task_conn_cancel = conn_cancel.clone();
         let task_routes = Arc::clone(&route_table);
-        let task_acceptor = acceptor.clone();
-        let task_client = backend_client.clone();
-        let task_local = local_addr;
         let task_tracker = conn_tracker.clone();
-
         let handle = tokio::spawn(async move {
             acceptor::accept_loop(
                 task_rule_name,
                 task_rule,
                 listener,
-                task_local,
-                task_acceptor,
+                local_addr,
+                acceptor,
                 task_routes,
-                task_client,
+                backend_client,
+                emit_alt_svc,
                 task_accept_cancel,
                 task_conn_cancel,
                 task_tracker,
@@ -249,15 +237,16 @@ impl HttpFrontend {
             .await;
         });
 
-        info!(
-            rule = %rule.name,
+        tracing::info!(
+            name = %name,
             listen = %local_addr,
+            alpn = "h2,http/1.1",
             routes = route_table.len(),
-            "HTTPS rule listening"
+            "HTTPS endpoint listening"
         );
 
         Ok(Self {
-            rule_name: rule.name.clone(),
+            rule_name: name,
             local_addr,
             accept_cancel,
             conn_cancel,
@@ -265,7 +254,6 @@ impl HttpFrontend {
             conn_tracker,
         })
     }
-
     pub fn rule_name(&self) -> &str {
         &self.rule_name
     }

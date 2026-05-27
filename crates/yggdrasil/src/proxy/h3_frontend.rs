@@ -62,7 +62,8 @@ const H3_RESPONSE_CHUNK_BYTES: usize = 8 * 1024;
 const SHUTDOWN_CLOSE_CODE: VarInt = VarInt::from_u32(0);
 
 pub struct H3Frontend {
-    rule: Rule,
+    name: String,
+    listen: SocketAddr,
     local_addr: SocketAddr,
     cancel: CancellationToken,
     handle: JoinHandle<()>,
@@ -73,35 +74,46 @@ pub struct H3Frontend {
 }
 
 impl H3Frontend {
-    pub async fn spawn(rule: Rule, cert_store: Arc<CertStore>) -> Result<Self> {
-        let all_routes = rule
-            .routes
-            .as_ref()
-            .filter(|r| !r.is_empty())
-            .with_context(|| {
-                format!(
-                    "HTTPS rule {:?} has no routes; validator should have rejected this",
-                    rule.name,
-                )
-            })?;
+    /// Spawn the QUIC/HTTP3 endpoint serving `routes` on `listen`,
+    /// resolving certs through `cert_store`. `name` is operator-facing
+    /// (used in logs); for the node-wide HTTPS frontend it's
+    /// conventionally `"public-https"`.
+    pub async fn spawn(
+        name: String,
+        listen: SocketAddr,
+        routes: &[ratatoskr::rule::HttpRoute],
+        cert_store: Arc<CertStore>,
+    ) -> Result<Self> {
+        // The internal run_accept_loop / serve_connection / handle_stream
+        // pipeline still threads a `Rule` through for logging context.
+        // Synthesize a placeholder rule whose `name` and `listen`
+        // match this HTTPS frontend — the other fields are unused on
+        // the HTTPS path.
+        let synth_rule = Rule {
+            name: name.clone(),
+            listen,
+            protocol: ratatoskr::rule::Protocol::Https,
+            target_port: Some(1),
+            target: None,
+            idle_timeout: None,
+            proxy_protocol: None,
+        };
 
-        // Cert-less routes don't enter the QUIC SNI table (HTTP/3
-        // requires TLS, so a cert-less hostname has nothing to serve
-        // here). Matches the filter applied by HttpFrontend::spawn.
-        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = all_routes
+        // Cert-less routes don't enter the QUIC SNI table.
+        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = routes
             .iter()
-            .filter(|r| r.cert.is_some() || cert_store.contains(&r.hostname))
+            .filter(|r| cert_store.contains(&r.hostname))
             .cloned()
             .collect();
 
         if cert_d_routes.is_empty() {
             anyhow::bail!(
-                "HTTPS rule {:?}: every route is cert-less; nothing to serve on HTTP/3",
-                rule.name
+                "HTTPS frontend {:?}: every route is cert-less; nothing to serve on HTTP/3",
+                name
             );
         }
 
-        let route_table = Arc::new(RouteTable::build(&cert_d_routes, &rule.name));
+        let route_table = Arc::new(RouteTable::build(&cert_d_routes, &name));
 
         let rustls_arc = build_rustls_server_config(cert_store, &[b"h3"]);
         let rustls_inner: rustls::ServerConfig = (*rustls_arc).clone();
@@ -120,12 +132,8 @@ impl H3Frontend {
             .max_concurrent_bidi_streams(VarInt::from_u32(256));
         server_config.transport_config(Arc::new(transport));
 
-        let endpoint = Endpoint::server(server_config, rule.listen).with_context(|| {
-            format!(
-                "bind QUIC endpoint for rule {:?} on {}",
-                rule.name, rule.listen
-            )
-        })?;
+        let endpoint = Endpoint::server(server_config, listen)
+            .with_context(|| format!("bind QUIC endpoint for {:?} on {}", name, listen))?;
         let local_addr = endpoint.local_addr().context("read QUIC local_addr")?;
 
         let backend_client = build_backend_client();
@@ -133,7 +141,7 @@ impl H3Frontend {
         let cancel = CancellationToken::new();
         let conn_tracker = TaskTracker::new();
         let task_cancel = cancel.clone();
-        let task_rule = rule.clone();
+        let task_rule = synth_rule.clone();
         let task_endpoint = endpoint.clone();
         let task_routes = Arc::clone(&route_table);
         let task_client = backend_client.clone();
@@ -151,7 +159,7 @@ impl H3Frontend {
         });
 
         info!(
-            rule = %rule.name,
+            name = %name,
             listen = %local_addr,
             alpn = "h3",
             routes = route_table.len(),
@@ -161,7 +169,8 @@ impl H3Frontend {
         );
 
         Ok(Self {
-            rule,
+            name,
+            listen,
             local_addr,
             cancel,
             handle,
@@ -169,8 +178,12 @@ impl H3Frontend {
         })
     }
 
-    pub fn rule(&self) -> &Rule {
-        &self.rule
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn listen(&self) -> SocketAddr {
+        self.listen
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -192,7 +205,7 @@ impl H3Frontend {
             Some(t) if !t.is_zero() => {
                 if tokio::time::timeout(t, self.handle).await.is_err() {
                     tracing::warn!(
-                        rule = %self.rule.name,
+                        name = %self.name,
                         timeout_secs = t.as_secs(),
                         "h3 graceful drain timeout expired during endpoint.wait_idle"
                     );
@@ -543,57 +556,82 @@ where
 mod tests {
     use super::*;
     use crate::proxy::certs::CertStore;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::sign::CertifiedKey;
 
     // Full end-to-end h3 request dispatch tests live in
-    // `h3-tests-integration` (deferred follow-up) — they require a
-    // quinn client harness with the ephemeral server cert pinned.
-    // SNI-miss handshake rejection belongs there too: it needs a real
-    // client handshake to observe resolver failure.
+    // `crates/yggdrasil/tests/http3_frontend.rs` — they require a quinn
+    // client harness with the server cert trusted, which only the
+    // integration-test binary carries. The smoke test below confirms
+    // the bind path (cert resolution → QUIC bind) works in isolation.
+
+    /// Insert a minimal trusted entry into the cert store for `host`
+    /// so the spawn path doesn't bail on the "every route is cert-less"
+    /// branch. Uses an in-memory self-signed leaf via `rcgen`.
+    fn insert_self_signed(store: &CertStore, host: &str) {
+        use std::path::PathBuf;
+        let mut params = rcgen::CertificateParams::new(vec![host.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_der: CertificateDer<'static> = CertificateDer::from(cert.der().to_vec());
+        let key_der: PrivateKeyDer<'static> = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+        let signer = rustls::crypto::ring::sign::any_supported_type(&key_der).unwrap();
+        let ck = CertifiedKey::new(vec![cert_der], signer);
+        let entry = super::super::certs::origin::CertEntry {
+            origin: super::super::certs::origin::CertOrigin::Default {
+                cert: PathBuf::from("test"),
+                key: PathBuf::from("test"),
+            },
+            key: Arc::new(ck),
+            loaded_at_unix_ms: 0,
+        };
+        store.insert(host, entry);
+    }
 
     #[tokio::test]
     async fn binds_quic_endpoint() {
         let store = Arc::new(CertStore::new());
-        let rule_toml = r#"
-            [[rule]]
-            name = "h3-smoke"
-            listen = "127.0.0.1:0"
-            protocol = "https"
-
-            [[rule.route]]
-            hostname = "localhost"
-            target = "http://127.0.0.1:65535"
-            cert = "ephemeral"
-        "#;
-        let f = ratatoskr::rule::RuleFile::from_toml("smoke.toml", rule_toml).unwrap();
-        let rule = f.rule.into_iter().next().unwrap();
-        let q = H3Frontend::spawn(rule, store)
-            .await
-            .expect("spawn h3 endpoint");
+        let host = "localhost";
+        insert_self_signed(&store, host);
+        let target = url::Url::parse("http://127.0.0.1:65535/").unwrap();
+        let routes = vec![ratatoskr::rule::HttpRoute {
+            hostname: host.to_string(),
+            target,
+            hsts: None,
+        }];
+        let q = H3Frontend::spawn(
+            "h3-smoke".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            &routes,
+            store,
+        )
+        .await
+        .expect("spawn h3 endpoint");
         assert!(q.local_addr().port() != 0);
         q.stop(None).await;
     }
 
     #[tokio::test]
-    async fn ephemeral_cert_rule_brings_up_endpoint() {
+    async fn empty_routes_fail_fast() {
         let store = Arc::new(CertStore::new());
-        let rule_toml = r#"
-            [[rule]]
-            name = "h3-ephemeral"
-            listen = "127.0.0.1:0"
-            protocol = "https"
-
-            [[rule.route]]
-            hostname = "localhost"
-            target = "http://127.0.0.1:65535"
-            cert = "ephemeral"
-        "#;
-        let f = ratatoskr::rule::RuleFile::from_toml("e.toml", rule_toml).unwrap();
-        let rule = f.rule.into_iter().next().unwrap();
-        let q = H3Frontend::spawn(rule, Arc::clone(&store))
-            .await
-            .expect("spawn h3 endpoint");
-        assert!(q.local_addr().port() != 0);
-        q.stop(None).await;
+        let routes: Vec<ratatoskr::rule::HttpRoute> = Vec::new();
+        let res = H3Frontend::spawn(
+            "h3-empty".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            &routes,
+            store,
+        )
+        .await;
+        let err = match res {
+            Ok(_) => panic!("empty routes must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("every route is cert-less"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]
