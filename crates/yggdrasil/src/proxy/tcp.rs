@@ -106,13 +106,30 @@ impl TcpProxy {
     /// alias used by tests and by call sites that don't participate in
     /// the daemon-wide canary surface.
     pub async fn spawn(rule: Rule, resolver: UpstreamResolver, workers: usize) -> Result<Self> {
-        Self::spawn_with_arm_table(rule, resolver, workers, Arc::new(CanaryArmTable::new())).await
+        Self::spawn_with_arm_table(
+            rule,
+            resolver,
+            workers,
+            false,
+            Arc::new(CanaryArmTable::new()),
+        )
+        .await
     }
 
     /// Bind `workers` listeners (via SO_REUSEPORT when `workers > 1`) and
     /// spawn one accept loop per listener. Returns once every socket is
     /// listening, so callers can rely on connect attempts succeeding
     /// immediately after this resolves. `workers == 0` is rejected.
+    ///
+    /// `expect_inbound_proxy` enables PROXY-protocol consumption on the
+    /// inbound side of each accepted connection. Set to `true` only on
+    /// mid-chain Relay nodes for chain-derived rules, where the
+    /// upstream Gateway / Relay always prepends a PROXY-v2 header on
+    /// every connection. With this enabled the proxy uses the decoded
+    /// client when synthesising its own outbound PROXY emission, so a
+    /// 3+ hop chain preserves the original client IP all the way to
+    /// the terminal. Off by default — turning it on for an
+    /// arbitrary peer would deadlock server-speaks-first protocols.
     ///
     /// The `arm_table` is consulted on every accepted connection: when
     /// at least one canary is in flight for this rule's `(listen,
@@ -126,6 +143,7 @@ impl TcpProxy {
         rule: Rule,
         resolver: UpstreamResolver,
         workers: usize,
+        expect_inbound_proxy: bool,
         arm_table: Arc<CanaryArmTable>,
     ) -> Result<Self> {
         ensure!(workers > 0, "TCP worker count must be >= 1");
@@ -185,6 +203,7 @@ impl TcpProxy {
                     listener,
                     task_local,
                     worker_id,
+                    expect_inbound_proxy,
                     task_accept_cancel,
                     task_conn_cancel,
                     task_tracker,
@@ -307,6 +326,7 @@ async fn run_accept_loop(
     listener: TcpListener,
     local_addr: SocketAddr,
     worker_id: usize,
+    expect_inbound_proxy: bool,
     accept_cancel: CancellationToken,
     conn_cancel: CancellationToken,
     conn_tracker: TaskTracker,
@@ -439,6 +459,7 @@ async fn run_accept_loop(
                         client_addr,
                         target_addr,
                         local_addr,
+                        expect_inbound_proxy,
                         task_conn_cancel,
                     )
                     .await;
@@ -581,9 +602,10 @@ fn build_tcp_listener_socket(addr: SocketAddr) -> io::Result<TcpListener> {
 async fn handle_connection(
     rule: Arc<Rule>,
     mut client: TcpStream,
-    client_addr: SocketAddr,
+    mut client_addr: SocketAddr,
     target_addr: SocketAddr,
     server_listen: SocketAddr,
+    expect_inbound_proxy: bool,
     cancel: CancellationToken,
 ) {
     // Connect to upstream first. If this fails, close the client without
@@ -622,6 +644,43 @@ async fn handle_connection(
         }
     };
 
+    // Multi-hop client-IP recovery: on a mid-chain relay, the upstream
+    // chain hop prepends a PROXY-v2 header to each new connection. Peel
+    // it off and use the decoded client when synthesising our own
+    // outbound PROXY emission below, so the next hop sees the real
+    // client rather than us.
+    //
+    // We only do this read when the caller explicitly expects an
+    // inbound PROXY header (`expect_inbound_proxy = true`). Without
+    // that gate, a server-speaks-first protocol (FTP / SMTP / MySQL
+    // banner / etc.) — or any test that opens a TCP without sending —
+    // would block here forever waiting for the client to send a byte
+    // that never comes. `expect_inbound_proxy` is only set on
+    // mid-chain Relay nodes for chain-derived rules where the
+    // upstream Gateway / Relay always emits PROXY-v2.
+    let leftover = if expect_inbound_proxy {
+        match proxy_protocol::read_optional_header(&mut client).await {
+            Ok(decode) => {
+                if let Some(endpoints) = decode.endpoints {
+                    client_addr = endpoints.client;
+                }
+                decode.leftover
+            }
+            Err(e) => {
+                tracing::warn!(
+                    rule = %rule.name,
+                    client = %client_addr,
+                    upstream = %target_addr,
+                    error = %e,
+                    "inbound PROXY-protocol read failed"
+                );
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // PROXY-protocol header (if configured) goes out before any client bytes.
     if let Some(version) = rule.proxy_protocol {
         if let Err(e) =
@@ -634,6 +693,23 @@ async fn handle_connection(
                 version = ?version,
                 error = %e,
                 "PROXY-protocol header write failed"
+            );
+            return;
+        }
+    }
+
+    // Re-inject any bytes that `read_optional_header` peeked but did
+    // not consume as PROXY (the lookalike-rejection paths return up to
+    // 12 bytes here). Without this the upstream would miss the start
+    // of the application stream.
+    if !leftover.is_empty() {
+        if let Err(e) = upstream.write_all(&leftover).await {
+            tracing::warn!(
+                rule = %rule.name,
+                client = %client_addr,
+                upstream = %target_addr,
+                error = %e,
+                "leftover-from-PROXY-peek write to upstream failed"
             );
             return;
         }
@@ -909,6 +985,117 @@ mod tests {
         proxy.stop(None).await;
     }
 
+    /// Multi-hop client-IP bridging: when `expect_inbound_proxy = true`,
+    /// the proxy reads any PROXY-v2 header the upstream chain hop
+    /// prepended and uses the decoded client when emitting its own
+    /// outbound PROXY-v2 header. The next hop downstream sees the
+    /// ORIGINAL client (not the previous hop's address), so 3+ hop
+    /// chains preserve the real client IP all the way to the terminal.
+    #[tokio::test]
+    async fn bridges_inbound_proxy_v2_to_outbound() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = upstream.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 28];
+            sock.read_exact(&mut buf).await.unwrap();
+            let _ = tx.send(buf);
+        });
+
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
+        let proxy = TcpProxy::spawn_with_arm_table(
+            rule("midhop", target_addr.port(), Some(ProxyProto::V2)),
+            dynamic_resolver(peer, target_addr.port()),
+            1,
+            true,
+            Arc::new(CanaryArmTable::new()),
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let real_client: SocketAddr = "203.0.113.45:54321".parse().unwrap();
+        let server_dst: SocketAddr = "198.51.100.4:443".parse().unwrap();
+        let inbound_header =
+            crate::proxy::proxy_protocol::encode_header(ProxyProto::V2, real_client, server_dst);
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&inbound_header).await.unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("outbound timeout")
+            .expect("oneshot dropped");
+
+        let decoded =
+            crate::proxy::proxy_protocol::decode_v2_from_datagram(&outbound).expect("decode v2");
+        assert_eq!(decoded.client, real_client);
+        assert_eq!(decoded.server, listen);
+
+        proxy.stop(None).await;
+    }
+
+    /// Sanity: when `expect_inbound_proxy = false` (the default —
+    /// Gateway-mode or any non-chain TCP proxy), an inbound PROXY-v2
+    /// header is NOT consumed. It would be forwarded as application
+    /// bytes. This is the correctness invariant that lets
+    /// server-speaks-first protocols (SMTP, FTP, MySQL banner) keep
+    /// working alongside chain HTTPS in the same daemon.
+    #[tokio::test]
+    async fn does_not_consume_inbound_proxy_when_flag_off() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = upstream.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 56];
+            sock.read_exact(&mut buf).await.unwrap();
+            let _ = tx.send(buf);
+        });
+
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
+        let proxy = TcpProxy::spawn(
+            rule("gateway-mode", target_addr.port(), Some(ProxyProto::V2)),
+            dynamic_resolver(peer, target_addr.port()),
+            1,
+        )
+        .await
+        .unwrap();
+        let listen = proxy.local_addr();
+
+        let inbound_header = crate::proxy::proxy_protocol::encode_header(
+            ProxyProto::V2,
+            "203.0.113.45:54321".parse().unwrap(),
+            "198.51.100.4:443".parse().unwrap(),
+        );
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&inbound_header).await.unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("outbound timeout")
+            .expect("oneshot dropped");
+
+        let our_proxy = &outbound[..28];
+        let decoded = crate::proxy::proxy_protocol::decode_v2_from_datagram(our_proxy)
+            .expect("decode our outbound v2");
+        assert_eq!(
+            decoded.client.ip().to_string(),
+            "127.0.0.1",
+            "outbound PROXY must carry our kernel-observed peer when expect_inbound_proxy=false"
+        );
+        assert_eq!(
+            &outbound[28..56],
+            inbound_header.as_slice(),
+            "inbound PROXY bytes should pass through to upstream untouched when flag is off"
+        );
+
+        proxy.stop(None).await;
+    }
+
     #[tokio::test]
     async fn closes_when_upstream_unreachable() {
         let peer = PeerState::new([0u8; 32]);
@@ -1116,6 +1303,7 @@ mod tests {
             rule("canary-tcp", 1, None),
             static_resolver("127.0.0.1:1".parse().unwrap()),
             1,
+            false,
             Arc::clone(&arm_table),
         )
         .await
@@ -1148,6 +1336,7 @@ mod tests {
             rule("canary-cold", upstream.port(), None),
             static_resolver(upstream),
             1,
+            false,
             arm_table,
         )
         .await
@@ -1181,6 +1370,7 @@ mod tests {
             rule("canary-wrong-token", upstream.port(), None),
             static_resolver(upstream),
             1,
+            false,
             Arc::clone(&arm_table),
         )
         .await
@@ -1216,6 +1406,7 @@ mod tests {
             rule("canary-short", upstream.port(), None),
             static_resolver(upstream),
             1,
+            false,
             Arc::clone(&arm_table),
         )
         .await

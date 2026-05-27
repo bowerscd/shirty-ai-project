@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use ratatoskr::rule::{HttpRoute, Protocol, Rule, RuleSet};
+use ratatoskr::rule::{HttpRoute, Protocol, ProxyProto, Rule, RuleSet};
 
 use crate::proxy::canary::CanaryArmTable;
 use crate::proxy::certs::{load_routes_into_store, CertStore, CertWatcher};
@@ -618,10 +618,27 @@ async fn spawn_proxy_for_rule(
                 .with_context(|| format!("build resolver for rule {:?}", rule.name))?;
             let upstream_description = resolver.describe();
             let workers = resolve_workers(default_workers);
+            // Inbound PROXY-protocol consumption is only meaningful on a
+            // mid-chain Relay for chain-derived rules: the upstream
+            // Gateway / Relay prepended a PROXY-v2 header on every
+            // accepted connection, and we use the decoded client when
+            // synthesising our own outbound PROXY emission so a 3+ hop
+            // chain preserves the real client IP. Gateways see real
+            // internet clients (no PROXY). Terminals don't proxy
+            // chain-derived rules (their HTTPS frontend handles PROXY
+            // directly via `read_optional_header` in the acceptor).
+            let expect_inbound_proxy = matches!(resolver_factory.mode, crate::config::Mode::Relay)
+                && matches!(rule.proxy_protocol, Some(ProxyProto::V2));
             let handle = match rule.protocol {
                 Protocol::Tcp => ProxyHandle::Tcp(
-                    TcpProxy::spawn_with_arm_table(rule, resolver, workers, Arc::clone(arm_table))
-                        .await?,
+                    TcpProxy::spawn_with_arm_table(
+                        rule,
+                        resolver,
+                        workers,
+                        expect_inbound_proxy,
+                        Arc::clone(arm_table),
+                    )
+                    .await?,
                 ),
                 Protocol::Udp => ProxyHandle::Udp(
                     UdpProxy::spawn_with_arm_table(
@@ -629,7 +646,7 @@ async fn spawn_proxy_for_rule(
                         resolver,
                         MAX_FLOWS_PER_RULE_DEFAULT,
                         workers,
-                        false,
+                        expect_inbound_proxy,
                         Arc::clone(arm_table),
                     )
                     .await?,
