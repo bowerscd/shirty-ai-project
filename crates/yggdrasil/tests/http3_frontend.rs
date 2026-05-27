@@ -291,3 +291,133 @@ async fn h3_connect_returns_websocket_fallback_501() {
 
     frontend.stop(None).await;
 }
+
+/// End-to-end PROXY-v2 client-IP propagation for HTTP/3 chain traffic.
+///
+/// We bind a UDP socket on `127.0.0.1` standing in for the chain relay's
+/// outbound flow socket, write a PROXY-v2 datagram from it to the
+/// terminal claiming `(client = 203.0.113.45:54321 → server =
+/// terminal_addr)`, then hand the same socket to a `quinn::Endpoint` so
+/// the QUIC handshake datagrams arrive at the terminal with the *same*
+/// source 5-tuple. The terminal's interpose socket strips the PROXY
+/// datagram, records `synthetic_relay_addr → 203.0.113.45:54321`, and
+/// the h3 accept loop reflects `203.0.113.45` as `X-Forwarded-For` /
+/// `X-Real-IP` on the backend request.
+///
+/// This is the keystone test for the UDP/HTTP-3 leg of the chain
+/// client-IP propagation work: it exercises encode → kernel transport
+/// → interpose decode → map upsert → quinn accept lookup → request
+/// header injection in a single in-process pipeline.
+#[tokio::test(flavor = "multi_thread")]
+async fn h3_chain_proxy_v2_propagates_real_client_ip_to_xff() {
+    let backend = spawn_backend().await;
+    let frontend = build_frontend(backend).await;
+    let terminal_addr = frontend.local_addr();
+
+    // Synthetic relay outbound socket. Bound *before* we hand it to
+    // quinn so we can sneak a PROXY-v2 datagram out in front of the
+    // handshake on the same 5-tuple.
+    let synthetic_relay_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    synthetic_relay_sock.set_nonblocking(true).unwrap();
+    let synthetic_relay_addr = synthetic_relay_sock.local_addr().unwrap();
+
+    // Forge a "real client" address that's distinctly NOT 127.0.0.1, so
+    // the assertion below can tell apart "interpose ran" from "kernel
+    // peer fallback ran" — both would yield 127.0.0.1 on pure loopback.
+    let fake_client: SocketAddr = "203.0.113.45:54321".parse().unwrap();
+    let proxy_header = yggdrasil::proxy::proxy_protocol::encode_header(
+        ratatoskr::rule::ProxyProto::V2,
+        fake_client,
+        terminal_addr,
+    );
+    synthetic_relay_sock
+        .send_to(&proxy_header, terminal_addr)
+        .expect("send PROXY v2 datagram");
+
+    // Give the terminal's interpose socket a beat to recv + upsert.
+    // The interpose's poll_recv runs whenever quinn polls the socket;
+    // here we want the PROXY datagram to land before quinn's client-
+    // side handshake fires its Initial, otherwise quinn would see an
+    // Initial first and stamp X-Forwarded-For from the kernel peer
+    // before the interpose ever sees the PROXY datagram.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Hand the now-quiesced socket to a client-side quinn endpoint.
+    let runtime = quinn::default_runtime().unwrap();
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        synthetic_relay_sock,
+        runtime,
+    )
+    .expect("build chain-emulation client endpoint");
+    endpoint.set_default_client_config({
+        let mut crypto = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quinn ccfg");
+        quinn::ClientConfig::new(Arc::new(quic_crypto))
+    });
+
+    let (resp, body) = tokio::time::timeout(Duration::from_secs(5), async move {
+        let conn = endpoint
+            .connect(terminal_addr, "localhost")
+            .expect("dial setup")
+            .await
+            .expect("h3 handshake");
+
+        let h3q = h3_quinn::Connection::new(conn);
+        let (mut h3c, mut send) = h3::client::new(h3q).await.expect("h3 client new");
+        let driver = tokio::spawn(async move {
+            let _ = futures::future::poll_fn(|cx| h3c.poll_close(cx)).await;
+        });
+
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://localhost/")
+            .body(())
+            .unwrap();
+        let mut stream = send.send_request(req).await.expect("send_request");
+        stream.finish().await.expect("finish");
+
+        let resp = stream.recv_response().await.expect("recv_response");
+        let mut buf = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.expect("recv_data") {
+            while chunk.has_remaining() {
+                buf.push(chunk.get_u8());
+            }
+        }
+        drop(stream);
+        drop(send);
+        endpoint.close(quinn::VarInt::from_u32(0), b"done");
+        let _ = tokio::time::timeout(Duration::from_secs(1), driver).await;
+        (resp, String::from_utf8(buf).expect("utf8 body"))
+    })
+    .await
+    .expect("h3 request timed out");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The synthetic relay forwarded the PROXY-v2 datagram declaring
+    // client = 203.0.113.45. The terminal's interpose recovered that,
+    // and the h3 frontend stamped it into the backend request.
+    assert!(
+        body.contains("xff=203.0.113.45"),
+        "expected xff=203.0.113.45 (real client from PROXY v2), got body: {body}; \
+         synthetic_relay_addr was {synthetic_relay_addr}"
+    );
+    assert!(
+        body.contains("xri=203.0.113.45"),
+        "expected xri=203.0.113.45 (real client from PROXY v2), got body: {body}"
+    );
+    assert!(
+        !body.contains("xff=127.0.0.1"),
+        "X-Forwarded-For leaked the kernel-observed peer (127.0.0.1) \
+         instead of the PROXY-v2-recovered real client; interpose did \
+         not fire. body: {body}"
+    );
+
+    frontend.stop(None).await;
+}

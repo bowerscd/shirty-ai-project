@@ -34,7 +34,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
+use quinn::{default_runtime, Endpoint, EndpointConfig, ServerConfig, TransportConfig, VarInt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -43,6 +43,7 @@ use tracing::{debug, info, warn};
 use ratatoskr::rule::Rule;
 
 use super::certs::CertStore;
+use super::h3_interpose::{InterposeMap, ProxyV2InterposeSocket};
 use super::http_frontend::{
     build_backend_client, build_rustls_server_config, build_upstream_uri, sanitise_request_headers,
     sanitise_response_headers, BackendClient, RouteTable,
@@ -132,26 +133,68 @@ impl H3Frontend {
             .max_concurrent_bidi_streams(VarInt::from_u32(256));
         server_config.transport_config(Arc::new(transport));
 
-        let endpoint = Endpoint::server(server_config, listen)
-            .with_context(|| format!("bind QUIC endpoint for {:?} on {}", name, listen))?;
+        // Bind the OS UDP socket ourselves and wrap it in a
+        // `ProxyV2InterposeSocket` so PROXY-v2 first-datagrams emitted
+        // by the chain relay are stripped before they reach quinn. The
+        // shared `InterposeMap` is cloned into the accept loop (reader)
+        // and a periodic reaper task (eviction).
+        let std_socket = std::net::UdpSocket::bind(listen)
+            .with_context(|| format!("bind QUIC UDP socket for {:?} on {}", name, listen))?;
+        let runtime =
+            default_runtime().ok_or_else(|| anyhow::anyhow!("no quinn async runtime found"))?;
+        let inner_socket = runtime
+            .wrap_udp_socket(std_socket)
+            .context("wrap UDP socket for quinn")?;
+        let interpose_map = InterposeMap::new();
+        let interpose_socket: Arc<dyn quinn::AsyncUdpSocket> = Arc::new(
+            ProxyV2InterposeSocket::new(inner_socket, interpose_map.clone()),
+        );
+        let endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(server_config),
+            interpose_socket,
+            runtime,
+        )
+        .with_context(|| format!("create QUIC endpoint for {:?} on {}", name, listen))?;
         let local_addr = endpoint.local_addr().context("read QUIC local_addr")?;
 
         let backend_client = build_backend_client();
 
         let cancel = CancellationToken::new();
         let conn_tracker = TaskTracker::new();
+
+        // Periodic reaper for `interpose_map`. Sweeps every 15 s so an
+        // entry that's gone idle for the full 30 s TTL is removed
+        // within one window after expiry. Tied to `cancel` so the task
+        // exits cleanly on `H3Frontend::stop`.
+        let reaper_map = interpose_map.clone();
+        let reaper_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = reaper_cancel.cancelled() => return,
+                    _ = interval.tick() => reaper_map.reap(),
+                }
+            }
+        });
+
         let task_cancel = cancel.clone();
         let task_rule = synth_rule.clone();
         let task_endpoint = endpoint.clone();
         let task_routes = Arc::clone(&route_table);
         let task_client = backend_client.clone();
         let task_tracker = conn_tracker.clone();
+        let task_interpose_map = interpose_map.clone();
         let handle = tokio::spawn(async move {
             run_accept_loop(
                 task_rule,
                 task_endpoint,
                 task_routes,
                 task_client,
+                task_interpose_map,
                 task_cancel,
                 task_tracker,
             )
@@ -227,6 +270,7 @@ async fn run_accept_loop(
     endpoint: Endpoint,
     routes: Arc<RouteTable>,
     client: BackendClient,
+    interpose_map: InterposeMap,
     cancel: CancellationToken,
     conn_tracker: TaskTracker,
 ) {
@@ -247,6 +291,7 @@ async fn run_accept_loop(
                 let task_rule = rule.clone();
                 let task_routes = Arc::clone(&routes);
                 let task_client = client.clone();
+                let task_interpose_map = interpose_map.clone();
                 conn_tracker.spawn(async move {
                     let quic_conn = match incoming.await {
                         Ok(c) => c,
@@ -255,18 +300,39 @@ async fn run_accept_loop(
                             return;
                         }
                     };
-                    let peer = quic_conn.remote_address();
-                    debug!(rule = %task_rule.name, peer = %peer, "h3 connection established");
+                    // `quinn::Connection::remote_address()` is what
+                    // quinn knows: in a chain deployment that's the
+                    // relay's outbound ephemeral, in direct-LAN it's
+                    // the real client. Consult the interpose map to
+                    // recover the real client when the relay emitted a
+                    // PROXY-v2 datagram for this 5-tuple; otherwise
+                    // fall through to the quinn view.
+                    let relay_peer = quic_conn.remote_address();
+                    let real_client = task_interpose_map
+                        .lookup(relay_peer)
+                        .unwrap_or(relay_peer);
+                    debug!(
+                        rule = %task_rule.name,
+                        relay_peer = %relay_peer,
+                        real_client = %real_client,
+                        "h3 connection established"
+                    );
                     if let Err(e) = serve_connection(
                         task_rule.clone(),
-                        peer,
+                        real_client,
                         task_routes,
                         task_client,
                         quic_conn,
                     )
                     .await
                     {
-                        debug!(rule = %task_rule.name, peer = %peer, error = %e, "h3 connection ended");
+                        debug!(
+                            rule = %task_rule.name,
+                            relay_peer = %relay_peer,
+                            real_client = %real_client,
+                            error = %e,
+                            "h3 connection ended"
+                        );
                     }
                 });
             }

@@ -11,6 +11,7 @@ pub mod canary;
 pub mod certs;
 pub mod forward;
 pub mod h3_frontend;
+pub(crate) mod h3_interpose;
 pub mod http_frontend;
 pub mod proxy_protocol;
 pub mod resolver;

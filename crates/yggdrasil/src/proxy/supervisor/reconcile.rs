@@ -629,6 +629,7 @@ async fn spawn_proxy_for_rule(
                         resolver,
                         MAX_FLOWS_PER_RULE_DEFAULT,
                         workers,
+                        false,
                         Arc::clone(arm_table),
                     )
                     .await?,

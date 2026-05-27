@@ -52,9 +52,10 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::canary::CANARY_TOKEN_LEN;
-use ratatoskr::rule::{Protocol, Rule};
+use ratatoskr::rule::{Protocol, ProxyProto, Rule};
 
 use super::canary::CanaryArmTable;
+use super::proxy_protocol;
 use super::resolver::{UpstreamResolver, WatchHandle};
 
 /// Default cap on concurrent client flows per UDP rule. Sized to cover any
@@ -65,6 +66,14 @@ pub const MAX_FLOWS_PER_RULE_DEFAULT: usize = 65_536;
 /// largest possible IP datagram payload; jumbo / fragmented packets that
 /// arrive intact will not be truncated by us.
 const RECV_BUFFER_LEN: usize = 65_535;
+
+/// TTL on pending real-client entries stashed by `handle_inbound` after
+/// decoding a PROXY-v2 first-datagram. The follow-up application
+/// datagram should arrive within a few milliseconds on a healthy chain
+/// (PROXY and Initial are sent back-to-back on the same connected
+/// upstream socket); 5 s is generous slack that still bounds the worst
+/// case where the application datagram never arrives at all.
+const PENDING_PROXY_TTL: Duration = Duration::from_secs(5);
 
 /// Resolve the SO_REUSEPORT worker count from the daemon-wide
 /// `[server].workers` setting. `None` falls back to
@@ -109,7 +118,9 @@ impl UdpProxy {
     /// Bind frontend sockets and spawn the proxy tasks.
     ///
     /// Default workers fall back to `available_parallelism()`; flow
-    /// cap is [`MAX_FLOWS_PER_RULE_DEFAULT`].
+    /// cap is [`MAX_FLOWS_PER_RULE_DEFAULT`]; inbound PROXY-protocol
+    /// consumption is off (see [`UdpProxy::spawn_with_arm_table`] for
+    /// the rationale and when to enable it).
     pub async fn spawn(rule: Rule, resolver: UpstreamResolver) -> Result<Self> {
         let workers = resolve_workers(None);
         Self::spawn_with(rule, resolver, MAX_FLOWS_PER_RULE_DEFAULT, workers).await
@@ -130,7 +141,7 @@ impl UdpProxy {
     /// Bind frontend sockets and spawn the proxy tasks with explicit flow cap
     /// and worker count. `workers == 0` is rejected. Convenience alias for
     /// callers that don't participate in the daemon-wide canary surface;
-    /// installs an empty arm-table.
+    /// installs an empty arm-table and disables inbound PROXY consumption.
     pub async fn spawn_with(
         rule: Rule,
         resolver: UpstreamResolver,
@@ -142,14 +153,24 @@ impl UdpProxy {
             resolver,
             max_flows,
             workers,
+            false,
             Arc::new(CanaryArmTable::new()),
         )
         .await
     }
 
     /// Bind frontend sockets and spawn the proxy tasks with explicit
-    /// flow cap, worker count, and canary arm-table. `workers == 0`
-    /// is rejected.
+    /// flow cap, worker count, inbound PROXY-protocol flag, and canary
+    /// arm-table. `workers == 0` is rejected.
+    ///
+    /// `expect_inbound_proxy` enables PROXY-v2 first-datagram
+    /// consumption on the inbound side of each new flow. Set to `true`
+    /// only on mid-chain Relay nodes for chain-derived UDP rules where
+    /// the upstream Gateway / Relay always emits a PROXY-v2 first
+    /// datagram per flow. With this enabled the worker stashes the
+    /// decoded real client and uses it when emitting its own outbound
+    /// PROXY-v2 first datagram, so a 3+ hop chain preserves the real
+    /// client IP all the way to the terminal's HTTP/3 interpose.
     ///
     /// ## Threading model
     ///
@@ -179,6 +200,7 @@ impl UdpProxy {
         resolver: UpstreamResolver,
         max_flows: usize,
         workers: usize,
+        expect_inbound_proxy: bool,
         arm_table: Arc<CanaryArmTable>,
     ) -> Result<Self> {
         ensure!(workers > 0, "UDP worker count must be >= 1");
@@ -295,6 +317,8 @@ impl UdpProxy {
                             start,
                             max_flows: max_flows_t,
                             arm_table: arm_table_t,
+                            expect_inbound_proxy,
+                            pending_real_clients: Arc::new(DashMap::new()),
                         };
                         worker.frontend_loop().await;
                     });
@@ -523,6 +547,22 @@ struct UdpWorker {
     /// token-prefixed datagrams are echoed in-process at the frontend
     /// socket and never enter the flow table.
     arm_table: Arc<CanaryArmTable>,
+    /// Multi-hop client-IP bridging: when `true`, the worker peeks
+    /// every new-flow datagram for a PROXY-v2 header and, on hit,
+    /// stashes the decoded real client in `pending_real_clients` to
+    /// override the kernel-observed client for the next datagram's
+    /// outbound PROXY emission. Set only on mid-chain Relay nodes
+    /// for HTTPS-derived UDP rules where the upstream Gateway / Relay
+    /// always emits a PROXY-v2 first datagram per flow.
+    expect_inbound_proxy: bool,
+    /// Per-(kernel client_addr) cache of "the upstream chain hop just
+    /// told us the real client behind this kernel peer". Populated by
+    /// `handle_inbound` when it decodes a PROXY-v2 first-datagram;
+    /// drained on the *next* (application) datagram from the same
+    /// kernel peer. Entries older than `PENDING_PROXY_TTL` are reaped
+    /// alongside the flow reaper so an orphaned PROXY datagram (no
+    /// application follow-up) doesn't leak indefinitely.
+    pending_real_clients: Arc<DashMap<SocketAddr, (SocketAddr, Instant)>>,
 }
 
 struct FlowAccounting {
@@ -756,6 +796,31 @@ impl UdpWorker {
             return;
         }
 
+        // Multi-hop bridging: on a mid-chain Relay, the upstream chain
+        // hop sends a PROXY-v2 first datagram per new flow before the
+        // application bytes (the QUIC Initial). Decode, stash the real
+        // client in `pending_real_clients`, and bail — the next
+        // datagram from the same `client_addr` carries the
+        // application payload and triggers `create_flow` below, which
+        // drains the stash and uses the decoded address in its own
+        // outbound PROXY emission. This makes 3+ hop chains preserve
+        // the real client IP all the way to the terminal's HTTP/3
+        // interpose.
+        //
+        // Gated on `expect_inbound_proxy` so non-chain UDP rules (game
+        // ports etc.) don't pay any per-datagram parse cost and don't
+        // mis-classify a genuine application datagram that happens to
+        // start with the v2 magic bytes (which by construction no
+        // valid QUIC packet can, but other arbitrary L4 protocols
+        // could in theory).
+        if self.expect_inbound_proxy {
+            if let Some(endpoints) = proxy_protocol::decode_v2_from_datagram(payload) {
+                self.pending_real_clients
+                    .insert(client_addr, (endpoints.client, Instant::now()));
+                return;
+            }
+        }
+
         // No flow yet. Need a resolved dial target and capacity.
         let Some(target_addr) = self.resolver.current_target() else {
             increment_udp_dropped_no_peer(&self.rule.name, self.worker_id);
@@ -782,6 +847,41 @@ impl UdpWorker {
             Some(e) => e,
             None => return,
         };
+
+        // Drain any pending PROXY-decoded real client for this flow.
+        // Expired entries (older than `PENDING_PROXY_TTL`) are dropped
+        // here as a lazy reaper.
+        let outbound_client_addr = match self.pending_real_clients.remove(&client_addr) {
+            Some((_, (real, stashed_at))) if stashed_at.elapsed() <= PENDING_PROXY_TTL => real,
+            _ => client_addr,
+        };
+
+        // PROXY v2 first-datagram for HTTPS UDP/QUIC chain traffic. The
+        // derive step sets `proxy_protocol = Some(V2)` on HTTPS-derived UDP
+        // rules so the terminal's h3 interpose socket can decode this
+        // standalone datagram and remember the real client for subsequent
+        // QUIC datagrams on the same 5-tuple. Emit only V2; V1 is text-only
+        // and not meaningful as a datagram (the validator rejects V1 on UDP
+        // rules). Failures here are non-fatal — the next application
+        // datagram still goes through; the terminal just doesn't learn the
+        // real client IP for this flow and falls back to the relay-observed
+        // peer addr.
+        if let Some(ProxyProto::V2) = self.rule.proxy_protocol {
+            let header = proxy_protocol::encode_header(
+                ProxyProto::V2,
+                outbound_client_addr,
+                self.local_addr,
+            );
+            if let Err(e) = entry.upstream_sock.send(&header).await {
+                tracing::debug!(
+                    rule = %self.rule.name,
+                    client = %outbound_client_addr,
+                    upstream = %target_addr,
+                    error = %e,
+                    "PROXY v2 first-datagram send failed; flow continues without client-IP propagation"
+                );
+            }
+        }
 
         match entry.upstream_sock.send(payload).await {
             Ok(_) => {
@@ -2028,6 +2128,7 @@ mod tests {
             static_resolver("127.0.0.1:1".parse().unwrap()),
             MAX_FLOWS_PER_RULE_DEFAULT,
             1,
+            false,
             Arc::clone(&arm_table),
         )
         .await
@@ -2071,6 +2172,7 @@ mod tests {
             static_resolver(upstream),
             MAX_FLOWS_PER_RULE_DEFAULT,
             1,
+            false,
             arm_table,
         )
         .await
@@ -2105,6 +2207,7 @@ mod tests {
             static_resolver(upstream),
             MAX_FLOWS_PER_RULE_DEFAULT,
             1,
+            false,
             Arc::clone(&arm_table),
         )
         .await
@@ -2142,6 +2245,7 @@ mod tests {
             static_resolver(upstream),
             MAX_FLOWS_PER_RULE_DEFAULT,
             1,
+            false,
             Arc::clone(&arm_table),
         )
         .await
@@ -2159,6 +2263,262 @@ mod tests {
         let got = send_recv(&client, listen, b"hi").await;
         assert_eq!(&got, b"hi");
         assert_eq!(proxy.active_flows(), 1);
+
+        proxy.stop().await;
+    }
+
+    /// Background UDP capture: records every datagram it receives without
+    /// echoing. Returns `(bound addr, mpsc receiver of (payload, peer))`.
+    /// Used to assert PROXY-v2 first-datagram emission on the relay's
+    /// upstream socket.
+    async fn capture_server() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    ) {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        if tx.send((buf[..n].to_vec(), from)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    fn udp_rule_with_proxy_v2(name: &str, target_port: u16) -> Rule {
+        let f = ratatoskr::rule::RuleFile::from_toml(
+            "test.toml",
+            &format!(
+                r#"
+                [[rule]]
+                name = "{name}"
+                listen = "127.0.0.1:0"
+                protocol = "udp"
+                target_port = {target_port}
+                idle_timeout = "60s"
+                proxy_protocol = "v2"
+                "#,
+            ),
+        )
+        .unwrap();
+        f.rule.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn emits_proxy_v2_first_datagram_on_new_flow() {
+        let (upstream_addr, mut upstream_rx) = capture_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
+
+        let proxy = UdpProxy::spawn(
+            udp_rule_with_proxy_v2("h3", upstream_addr.port()),
+            dynamic_resolver(peer, upstream_addr.port()),
+        )
+        .await
+        .unwrap();
+        let proxy_listen = proxy.local_addr();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        client
+            .send_to(b"first-quic-initial", proxy_listen)
+            .await
+            .unwrap();
+
+        // First datagram on the upstream must be the PROXY v2 header,
+        // describing (client_addr -> proxy_listen).
+        let (first, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("first datagram timeout")
+            .expect("capture closed");
+        let decoded = crate::proxy::proxy_protocol::decode_v2_from_datagram(&first)
+            .expect("first datagram must be a valid PROXY v2 header");
+        assert_eq!(decoded.client, client_addr);
+        assert_eq!(decoded.server, proxy_listen);
+
+        // Second datagram must be the actual application payload.
+        let (second, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("application datagram timeout")
+            .expect("capture closed");
+        assert_eq!(&second, b"first-quic-initial");
+
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn does_not_emit_proxy_v2_when_rule_lacks_proxy_protocol() {
+        // L4 UDP rules (no proxy_protocol set, e.g. game ports) must NOT
+        // emit a PROXY header — the application payload must arrive at
+        // the upstream byte-for-byte as the client sent it.
+        let (upstream_addr, mut upstream_rx) = capture_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
+
+        let proxy = UdpProxy::spawn(
+            udp_rule("game", upstream_addr.port(), 60),
+            dynamic_resolver(peer, upstream_addr.port()),
+        )
+        .await
+        .unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"raw-payload", proxy.local_addr())
+            .await
+            .unwrap();
+
+        let (first, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("first datagram timeout")
+            .expect("capture closed");
+        assert_eq!(&first, b"raw-payload");
+        // Verify the upstream didn't also receive a stray PROXY header.
+        let drained = tokio::time::timeout(Duration::from_millis(100), upstream_rx.recv()).await;
+        assert!(
+            drained.is_err(),
+            "expected no second datagram on a non-PROXY rule, got: {drained:?}"
+        );
+
+        proxy.stop().await;
+    }
+
+    /// Multi-hop UDP client-IP bridging: with `expect_inbound_proxy = true`
+    /// the worker decodes any PROXY-v2 first datagram the upstream chain
+    /// hop emitted, stashes the real client, and uses it when synthesising
+    /// its own outbound PROXY emission on the next (application)
+    /// datagram. Mirrors the TCP `bridges_inbound_proxy_v2_to_outbound`
+    /// invariant: 3+ hop UDP/HTTP-3 chains preserve the real client IP.
+    #[tokio::test]
+    async fn bridges_inbound_proxy_v2_to_outbound_first_datagram() {
+        let (upstream_addr, mut upstream_rx) = capture_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
+
+        let proxy = UdpProxy::spawn_with_arm_table(
+            udp_rule_with_proxy_v2("h3-midhop", upstream_addr.port()),
+            dynamic_resolver(peer, upstream_addr.port()),
+            MAX_FLOWS_PER_RULE_DEFAULT,
+            1,
+            true,
+            Arc::new(CanaryArmTable::new()),
+        )
+        .await
+        .unwrap();
+        let proxy_listen = proxy.local_addr();
+
+        // The client (standing in for the upstream chain hop) sends a
+        // PROXY-v2 first datagram claiming the real client is
+        // 203.0.113.45, then the actual application bytes.
+        let real_client: SocketAddr = "203.0.113.45:54321".parse().unwrap();
+        let server_dst: SocketAddr = "198.51.100.4:443".parse().unwrap();
+        let inbound_proxy = crate::proxy::proxy_protocol::encode_header(
+            ratatoskr::rule::ProxyProto::V2,
+            real_client,
+            server_dst,
+        );
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&inbound_proxy, proxy_listen).await.unwrap();
+        // Small spacing so the worker reaches the pending-stash path
+        // before the application datagram arrives. Without it the two
+        // datagrams could be batched and the second would create a
+        // flow before the first's pending entry is recorded — a real-
+        // world race the workers see in production but the loopback-
+        // fast-path makes more likely in tests.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        client.send_to(b"app-bytes", proxy_listen).await.unwrap();
+
+        // First upstream datagram = our outbound PROXY-v2 carrying the
+        // real client (NOT 127.0.0.1, NOT the test client's addr).
+        let (outbound_proxy, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("outbound PROXY timeout")
+            .expect("capture closed");
+        let decoded =
+            crate::proxy::proxy_protocol::decode_v2_from_datagram(&outbound_proxy).expect("decode");
+        assert_eq!(
+            decoded.client, real_client,
+            "outbound PROXY must carry the real client decoded from inbound, \
+             not the kernel-observed test-client addr"
+        );
+        assert_eq!(decoded.server, proxy_listen);
+
+        // Second upstream datagram = the application payload.
+        let (app, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("app datagram timeout")
+            .expect("capture closed");
+        assert_eq!(&app, b"app-bytes");
+
+        proxy.stop().await;
+    }
+
+    /// Sanity: with `expect_inbound_proxy = false` (Gateway-mode or any
+    /// non-chain UDP rule), an inbound PROXY-v2-looking datagram is NOT
+    /// consumed as PROXY — it would be treated as application data and
+    /// forwarded raw. Mirrors the TCP correctness invariant.
+    #[tokio::test]
+    async fn does_not_consume_inbound_proxy_when_flag_off_udp() {
+        let (upstream_addr, mut upstream_rx) = capture_server().await;
+        let peer = PeerState::new([0u8; 32]);
+        let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
+
+        let proxy = UdpProxy::spawn_with_arm_table(
+            udp_rule_with_proxy_v2("h3-gateway", upstream_addr.port()),
+            dynamic_resolver(peer, upstream_addr.port()),
+            MAX_FLOWS_PER_RULE_DEFAULT,
+            1,
+            false,
+            Arc::new(CanaryArmTable::new()),
+        )
+        .await
+        .unwrap();
+        let proxy_listen = proxy.local_addr();
+
+        let inbound_proxy = crate::proxy::proxy_protocol::encode_header(
+            ratatoskr::rule::ProxyProto::V2,
+            "203.0.113.45:54321".parse().unwrap(),
+            "198.51.100.4:443".parse().unwrap(),
+        );
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        client.send_to(&inbound_proxy, proxy_listen).await.unwrap();
+
+        // First upstream datagram = our outbound PROXY-v2 with the
+        // *kernel-observed* client (127.0.0.1) because we treated the
+        // inbound PROXY bytes as application data.
+        let (outbound_proxy, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("outbound PROXY timeout")
+            .expect("capture closed");
+        let decoded =
+            crate::proxy::proxy_protocol::decode_v2_from_datagram(&outbound_proxy).expect("decode");
+        assert_eq!(
+            decoded.client, client_addr,
+            "outbound PROXY must carry the kernel-observed client when expect_inbound_proxy=false"
+        );
+
+        // Second upstream datagram = the inbound PROXY bytes,
+        // forwarded as application data unchanged.
+        let (app, _) = tokio::time::timeout(Duration::from_secs(2), upstream_rx.recv())
+            .await
+            .expect("app datagram timeout")
+            .expect("capture closed");
+        assert_eq!(
+            app.as_slice(),
+            inbound_proxy.as_slice(),
+            "inbound PROXY bytes should pass through as raw application data when flag is off"
+        );
 
         proxy.stop().await;
     }
