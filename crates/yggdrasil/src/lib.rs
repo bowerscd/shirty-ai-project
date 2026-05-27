@@ -179,6 +179,9 @@ pub async fn run_relay(
             config.server.default_cert.clone(),
             config.server.default_key.clone(),
             config.server.http_redirect_port,
+            config.server.https_listen,
+            config.server.https_http3,
+            config.server.https_alt_svc,
             resolve_lan_cidrs(&config),
         ),
         Arc::new(crate::proxy::certs::CertStore::new()),
@@ -318,6 +321,8 @@ pub async fn run_relay(
     let nat_mapper = spawn_nat_mapper(
         config.server.nat_traversal,
         config.accept.as_ref().map(|a| a.listen),
+        config.server.https_listen,
+        config.server.https_http3,
         supervisor.handle(),
         shutdown.clone(),
     )
@@ -448,7 +453,7 @@ pub async fn run_terminal(
     let has_chain_upstream = config.dial.is_some();
 
     // 4. Rule-driven proxy supervisor with a terminal-mode factory: every
-    //    rule must carry `target_addr`; `target_port` rules are
+    //    rule must carry `target`; `target_port` rules are
     //    rejected by `ResolverFactory::build`.
     let resolver_factory = ResolverFactory::new_terminal();
 
@@ -476,11 +481,27 @@ pub async fn run_terminal(
         None => None,
     };
 
+    // Kick off the wildcard issuance flow for [acme].domain at startup.
+    // The renewer manages issue + scheduled renewal in the background;
+    // we don't await its completion here (it can take minutes).
+    if let Some(acme_mgr) = acme_manager.as_ref() {
+        if let Err(e) = acme_mgr.start_wildcard().await {
+            tracing::warn!(
+                error = %e,
+                "wildcard ACME bootstrap failed; serving with whatever's currently on disk \
+                 ([server].default_cert / cert_dir convention)"
+            );
+        }
+    }
+
     let mut cert_config = CertConfig::from_server_section(
         config.server.cert_dir.clone(),
         config.server.default_cert.clone(),
         config.server.default_key.clone(),
         config.server.http_redirect_port,
+        config.server.https_listen,
+        config.server.https_http3,
+        config.server.https_alt_svc,
         resolve_lan_cidrs(&config),
     );
     if let Some(acme_mgr) = acme_manager.clone() {
@@ -527,6 +548,8 @@ pub async fn run_terminal(
     let nat_mapper = spawn_nat_mapper(
         config.server.nat_traversal,
         None,
+        config.server.https_listen,
+        config.server.https_http3,
         supervisor.handle(),
         shutdown.clone(),
     )
@@ -567,11 +590,16 @@ pub async fn run_terminal(
     let predicate_publisher_join = chain_client_handle.as_ref().map(|handle| {
         let origin = ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key());
         let supervisor_handle = supervisor.handle();
+        let https_meta = chain::predicate_extractor::HttpsPredicateMeta {
+            listen_port: config.server.https_listen.port(),
+            http3: config.server.https_http3,
+        };
         chain::predicate_publisher::spawn(
             supervisor_handle.current_set_rx(),
             handle.clone(),
             origin,
             config.server.state_dir.clone(),
+            https_meta,
             Some(introspection_state.clone()),
             shutdown.clone(),
         )
@@ -718,6 +746,8 @@ fn build_chain_client(
 async fn spawn_nat_mapper(
     mode: nat::NatTraversalMode,
     accept_listen: Option<std::net::SocketAddr>,
+    https_listen: std::net::SocketAddr,
+    https_http3: bool,
     supervisor: crate::proxy::supervisor::SupervisorHandle,
     shutdown: CancellationToken,
 ) -> Option<nat::NatMapper> {
@@ -729,6 +759,8 @@ async fn spawn_nat_mapper(
         accept_listen,
         rule_set_rx: supervisor.current_set_rx(),
         shutdown,
+        https_listen,
+        https_http3,
         gateway_override: None,
         shutdown_release_timeout: None,
     };

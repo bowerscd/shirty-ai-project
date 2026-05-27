@@ -136,6 +136,19 @@ impl MappingOrigin {
     }
 }
 
+/// Configuration for the node-wide HTTPS listener as it affects NAT
+/// mapping. Sourced from `[server].https_listen` + `[server].https_http3`.
+///
+/// Passed through [`compute_targets`] / [`enumerate_targets`] only when
+/// the live rule set has at least one top-level `[[route]]` — when
+/// routes are empty the daemon doesn't bind the HTTPS listener at all
+/// and there's nothing to map.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpsTarget {
+    pub listen: SocketAddr,
+    pub http3: bool,
+}
+
 /// A live mapping the gateway has confirmed.
 #[derive(Clone, Debug)]
 pub struct ActiveMapping {
@@ -231,6 +244,14 @@ pub struct NatMapperParams {
     pub accept_listen: Option<SocketAddr>,
     pub rule_set_rx: watch::Receiver<RuleSet>,
     pub shutdown: CancellationToken,
+    /// Node-wide HTTPS listener. Sourced from `[server].https_listen`.
+    /// The mapper emits TCP / UDP-h3 / redirect targets for it only
+    /// when the live rule set has at least one `[[route]]`.
+    pub https_listen: SocketAddr,
+    /// Whether the node's HTTPS frontend brings up an HTTP/3 endpoint.
+    /// Sourced from `[server].https_http3`. When `false`, the mapper
+    /// emits only the TCP target (no UDP) for the HTTPS listener.
+    pub https_http3: bool,
     /// Override the default-route discovery probe. Production:
     /// `None`. Integration tests: `Some(Gateway{addr=127.0.0.1, ...})`
     /// pointing at the in-process `MockNatGateway`.
@@ -281,6 +302,8 @@ impl NatMapper {
             params.mode,
             gateway,
             params.accept_listen,
+            params.https_listen,
+            params.https_http3,
             params.rule_set_rx,
             params.shutdown.clone(),
             snapshot_arc.clone(),
@@ -378,9 +401,10 @@ pub enum MapperSpawnError {
 pub fn compute_targets(
     rules: &[Rule],
     accept_listen: Option<SocketAddr>,
+    https: Option<HttpsTarget>,
     local_source: Ipv4Addr,
 ) -> HashSet<MappingTarget> {
-    enumerate_targets(rules, accept_listen, local_source).targets
+    enumerate_targets(rules, accept_listen, https, local_source).targets
 }
 
 /// What [`enumerate_targets`] returns: both the targets we'll try to
@@ -402,6 +426,7 @@ pub struct TargetEnumeration {
 pub fn enumerate_targets(
     rules: &[Rule],
     accept_listen: Option<SocketAddr>,
+    https: Option<HttpsTarget>,
     local_source: Ipv4Addr,
 ) -> TargetEnumeration {
     let mut targets: HashSet<MappingTarget> = HashSet::new();
@@ -446,25 +471,52 @@ pub fn enumerate_targets(
                         });
                     }
                     Protocol::Https => {
-                        targets.insert(MappingTarget {
-                            protocol: MapProtocol::Tcp,
-                            internal_port: port,
-                            internal_addr: resolved_internal,
-                            origin: MappingOrigin::Rule(rule.name.clone()),
-                        });
-                        if rule.http3 != Some(false) {
-                            targets.insert(MappingTarget {
-                                protocol: MapProtocol::Udp,
-                                internal_port: port,
-                                internal_addr: resolved_internal,
-                                origin: MappingOrigin::Http3(rule.name.clone()),
-                            });
-                        }
-                        // HTTPS rules implicitly spawn a redirect
-                        // listener per unique bind IP. Coalesce.
-                        redirect_ips.insert(bind_ip);
+                        // Rule::validate rejects protocol = "https" — HTTPS
+                        // listeners come from top-level [[route]] blocks,
+                        // mapped via the `https` parameter passed alongside.
+                        debug_assert!(
+                            false,
+                            "Rule with protocol = Https should be rejected at validation"
+                        );
                     }
                 }
+            }
+        }
+    }
+
+    // Node-wide HTTPS listener. Sourced from `[server].https_listen` +
+    // `[server].https_http3`. The caller passes `None` when the live
+    // rule set has no `[[route]]` entries (so the daemon hasn't bound
+    // anything to map).
+    if let Some(https) = https {
+        let listen = https.listen;
+        let bind_ip = listen.ip();
+        let port = listen.port();
+        match filter_bind_ip(bind_ip) {
+            FilterDecision::Skip(reason) => {
+                skipped.push((MappingOrigin::Rule("https".to_string()).as_token(), reason));
+            }
+            FilterDecision::Keep(v4) => {
+                let resolved_internal = if v4.is_unspecified() {
+                    local_source
+                } else {
+                    v4
+                };
+                targets.insert(MappingTarget {
+                    protocol: MapProtocol::Tcp,
+                    internal_port: port,
+                    internal_addr: resolved_internal,
+                    origin: MappingOrigin::Rule("https".to_string()),
+                });
+                if https.http3 {
+                    targets.insert(MappingTarget {
+                        protocol: MapProtocol::Udp,
+                        internal_port: port,
+                        internal_addr: resolved_internal,
+                        origin: MappingOrigin::Http3("https".to_string()),
+                    });
+                }
+                redirect_ips.insert(IpAddr::V4(v4));
             }
         }
     }
@@ -606,6 +658,8 @@ struct Reconciler {
     mode: NatTraversalMode,
     gateway: Gateway,
     accept_listen: Option<SocketAddr>,
+    https_listen: SocketAddr,
+    https_http3: bool,
     rule_set_rx: watch::Receiver<RuleSet>,
     shutdown: CancellationToken,
 
@@ -677,6 +731,8 @@ impl Reconciler {
         mode: NatTraversalMode,
         gateway: Gateway,
         accept_listen: Option<SocketAddr>,
+        https_listen: SocketAddr,
+        https_http3: bool,
         rule_set_rx: watch::Receiver<RuleSet>,
         shutdown: CancellationToken,
         snapshot: Arc<RwLock<NatSnapshot>>,
@@ -692,6 +748,8 @@ impl Reconciler {
             mode,
             gateway,
             accept_listen,
+            https_listen,
+            https_http3,
             rule_set_rx,
             shutdown,
             snapshot,
@@ -830,8 +888,23 @@ impl Reconciler {
         }
 
         let rules = self.rule_set_rx.borrow().clone();
-        let enumeration =
-            enumerate_targets(rules.rules(), self.accept_listen, self.gateway.local_source);
+        // HTTPS targets fire only when at least one top-level `[[route]]`
+        // exists — otherwise the daemon hasn't bound the listener and
+        // there's nothing to map.
+        let https = if rules.routes().is_empty() {
+            None
+        } else {
+            Some(HttpsTarget {
+                listen: self.https_listen,
+                http3: self.https_http3,
+            })
+        };
+        let enumeration = enumerate_targets(
+            rules.rules(),
+            self.accept_listen,
+            https,
+            self.gateway.local_source,
+        );
         // Emit skipped-listener metric once per (listener, reason)
         // tuple. Re-pushes of the same misconfigured config don't
         // re-increment.
@@ -1496,14 +1569,9 @@ mod tests {
             listen: SocketAddr::from_str(listen).unwrap(),
             protocol: Protocol::Tcp,
             target_port: Some(22),
-            target_addr: None,
-            target_host: None,
+            target: None,
             idle_timeout: None,
             proxy_protocol: None,
-            routes: None,
-            cert_dir: None,
-            http3: None,
-            alt_svc: None,
         }
     }
 
@@ -1513,31 +1581,9 @@ mod tests {
             listen: SocketAddr::from_str(listen).unwrap(),
             protocol: Protocol::Udp,
             target_port: Some(53),
-            target_addr: None,
-            target_host: None,
+            target: None,
             idle_timeout: None,
             proxy_protocol: None,
-            routes: None,
-            cert_dir: None,
-            http3: None,
-            alt_svc: None,
-        }
-    }
-
-    fn https_rule(name: &str, listen: &str, http3: Option<bool>) -> Rule {
-        Rule {
-            name: name.into(),
-            listen: SocketAddr::from_str(listen).unwrap(),
-            protocol: Protocol::Https,
-            target_port: None,
-            target_addr: None,
-            target_host: None,
-            idle_timeout: None,
-            proxy_protocol: None,
-            routes: Some(Vec::new()),
-            cert_dir: None,
-            http3,
-            alt_svc: None,
         }
     }
 
@@ -1548,7 +1594,7 @@ mod tests {
     #[test]
     fn tcp_rule_yields_one_tcp_target() {
         let rules = vec![tcp_rule("ssh", "192.168.1.10:22")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         assert_eq!(targets.len(), 1);
         let t = targets.iter().next().unwrap();
         assert_eq!(t.protocol, MapProtocol::Tcp);
@@ -1560,25 +1606,33 @@ mod tests {
     #[test]
     fn udp_rule_yields_one_udp_target() {
         let rules = vec![udp_rule("dns", "192.168.1.10:53")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         assert_eq!(targets.len(), 1);
         let t = targets.iter().next().unwrap();
         assert_eq!(t.protocol, MapProtocol::Udp);
         assert_eq!(t.internal_port, 53);
     }
 
+    fn https_target(listen: &str, http3: bool) -> HttpsTarget {
+        HttpsTarget {
+            listen: SocketAddr::from_str(listen).unwrap(),
+            http3,
+        }
+    }
+
     #[test]
-    fn https_rule_default_yields_tcp_udp_redirect() {
-        let rules = vec![https_rule("web", "192.168.1.10:443", None)];
-        let targets = compute_targets(&rules, None, local_source());
+    fn https_default_yields_tcp_udp_redirect() {
+        let rules: Vec<Rule> = vec![];
+        let https = Some(https_target("192.168.1.10:443", true));
+        let targets = compute_targets(&rules, None, https, local_source());
         let mut origins: Vec<String> = targets.iter().map(|t| t.origin.as_token()).collect();
         origins.sort();
         assert_eq!(
             origins,
             vec![
-                "http3:web".to_owned(),
+                "http3:https".to_owned(),
                 "redirect:192.168.1.10".to_owned(),
-                "rule:web".to_owned(),
+                "rule:https".to_owned(),
             ]
         );
         // TCP frontend on 443, UDP H/3 on 443, TCP redirect on 80.
@@ -1598,39 +1652,36 @@ mod tests {
     }
 
     #[test]
-    fn https_rule_with_http3_false_yields_only_tcp_and_redirect() {
-        let rules = vec![https_rule("web", "192.168.1.10:443", Some(false))];
-        let targets = compute_targets(&rules, None, local_source());
+    fn https_with_http3_false_yields_only_tcp_and_redirect() {
+        let rules: Vec<Rule> = vec![];
+        let https = Some(https_target("192.168.1.10:443", false));
+        let targets = compute_targets(&rules, None, https, local_source());
         let mut origins: Vec<String> = targets.iter().map(|t| t.origin.as_token()).collect();
         origins.sort();
         assert_eq!(
             origins,
-            vec!["redirect:192.168.1.10".to_owned(), "rule:web".to_owned(),]
+            vec!["redirect:192.168.1.10".to_owned(), "rule:https".to_owned(),]
         );
     }
 
     #[test]
-    fn two_https_rules_same_ip_dedupes_redirect() {
-        let rules = vec![
-            https_rule("a", "192.168.1.10:443", None),
-            https_rule("b", "192.168.1.10:8443", None),
-        ];
-        let targets = compute_targets(&rules, None, local_source());
+    fn https_redirect_is_single_target() {
+        // Node-wide HTTPS produces exactly one redirect target on
+        // the listener's bind IP — no per-rule dedup needed any more.
+        let rules: Vec<Rule> = vec![];
+        let https = Some(https_target("192.168.1.10:443", true));
+        let targets = compute_targets(&rules, None, https, local_source());
         let redirects: Vec<&MappingTarget> = targets
             .iter()
             .filter(|t| matches!(t.origin, MappingOrigin::HttpsRedirect(_)))
             .collect();
-        assert_eq!(
-            redirects.len(),
-            1,
-            "redirect listener should be deduped per IP"
-        );
+        assert_eq!(redirects.len(), 1);
     }
 
     #[test]
     fn loopback_listener_is_filtered() {
         let rules = vec![tcp_rule("local", "127.0.0.1:1234")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         assert!(
             targets.is_empty(),
             "loopback-bound listeners must not be mapped"
@@ -1640,14 +1691,14 @@ mod tests {
     #[test]
     fn link_local_listener_is_filtered() {
         let rules = vec![tcp_rule("ll", "169.254.1.2:1234")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         assert!(targets.is_empty());
     }
 
     #[test]
     fn public_internal_listener_is_filtered() {
         let rules = vec![tcp_rule("pub", "203.0.113.5:1234")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         assert!(
             targets.is_empty(),
             "publicly-bound listeners need no NAT mapping"
@@ -1657,7 +1708,7 @@ mod tests {
     #[test]
     fn unspecified_listener_uses_local_source() {
         let rules = vec![tcp_rule("any", "0.0.0.0:8080")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         let t = targets.iter().next().unwrap();
         assert_eq!(t.internal_addr, local_source());
     }
@@ -1666,7 +1717,7 @@ mod tests {
     fn accept_listen_yields_udp_target() {
         let rules: Vec<Rule> = vec![];
         let accept = SocketAddr::from_str("0.0.0.0:51820").unwrap();
-        let targets = compute_targets(&rules, Some(accept), local_source());
+        let targets = compute_targets(&rules, Some(accept), None, local_source());
         assert_eq!(targets.len(), 1);
         let t = targets.iter().next().unwrap();
         assert_eq!(t.protocol, MapProtocol::Udp);
@@ -1678,7 +1729,7 @@ mod tests {
     fn accept_listen_on_public_ip_is_filtered() {
         let rules: Vec<Rule> = vec![];
         let accept = SocketAddr::from_str("203.0.113.1:51820").unwrap();
-        let targets = compute_targets(&rules, Some(accept), local_source());
+        let targets = compute_targets(&rules, Some(accept), None, local_source());
         assert!(targets.is_empty());
     }
 
@@ -1689,7 +1740,7 @@ mod tests {
         // surface the gateway's likely `AddressMismatch` later via
         // metrics, but the listener itself is in scope.
         let rules = vec![tcp_rule("cg", "100.64.5.10:443")];
-        let targets = compute_targets(&rules, None, local_source());
+        let targets = compute_targets(&rules, None, None, local_source());
         assert_eq!(targets.len(), 1);
     }
 
@@ -1698,7 +1749,7 @@ mod tests {
     #[test]
     fn enumerate_records_loopback_skip() {
         let rules = vec![tcp_rule("local", "127.0.0.1:1234")];
-        let e = enumerate_targets(&rules, None, local_source());
+        let e = enumerate_targets(&rules, None, None, local_source());
         assert!(e.targets.is_empty());
         assert_eq!(e.skipped.len(), 1);
         assert_eq!(e.skipped[0].0, "rule:local");
@@ -1708,7 +1759,7 @@ mod tests {
     #[test]
     fn enumerate_records_link_local_skip() {
         let rules = vec![tcp_rule("ll", "169.254.5.6:1234")];
-        let e = enumerate_targets(&rules, None, local_source());
+        let e = enumerate_targets(&rules, None, None, local_source());
         assert_eq!(e.skipped.len(), 1);
         assert_eq!(e.skipped[0].1, SkipReason::LinkLocal);
     }
@@ -1716,7 +1767,7 @@ mod tests {
     #[test]
     fn enumerate_records_public_internal_skip() {
         let rules = vec![tcp_rule("pub", "203.0.113.7:443")];
-        let e = enumerate_targets(&rules, None, local_source());
+        let e = enumerate_targets(&rules, None, None, local_source());
         assert_eq!(e.skipped.len(), 1);
         assert_eq!(e.skipped[0].1, SkipReason::PublicInternal);
     }
@@ -1725,7 +1776,7 @@ mod tests {
     fn enumerate_records_accept_listen_skip_on_public_ip() {
         let rules: Vec<Rule> = vec![];
         let accept = SocketAddr::from_str("203.0.113.1:51820").unwrap();
-        let e = enumerate_targets(&rules, Some(accept), local_source());
+        let e = enumerate_targets(&rules, Some(accept), None, local_source());
         assert!(e.targets.is_empty());
         assert_eq!(e.skipped.len(), 1);
         assert_eq!(e.skipped[0].0, "accept");
