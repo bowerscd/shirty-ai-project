@@ -143,6 +143,24 @@ pub struct ServerSection {
     /// (kernel-assigned) port — useful for integration tests.
     #[serde(default)]
     pub http_redirect_port: Option<u16>,
+    /// Listener address for the node-wide HTTPS frontend. Routes
+    /// declared via top-level `[[route]]` blocks attach here.
+    /// Defaults to `0.0.0.0:443` (the standard).
+    #[serde(default = "default_https_listen")]
+    pub https_listen: SocketAddr,
+    /// Node-wide HTTP/3 enable for the HTTPS frontend. `true` (default)
+    /// makes the daemon bind UDP `https_listen` for QUIC in addition to
+    /// the TCP HTTPS listener; `false` suppresses the UDP listener
+    /// and the `Alt-Svc: h3=...` advertising header.
+    #[serde(default = "default_true")]
+    pub https_http3: bool,
+    /// Node-wide `Alt-Svc: h3=...` header enable on TCP HTTPS responses.
+    /// `true` (default) lets capable clients upgrade to HTTP/3 on the
+    /// next request; `false` suppresses the header. Rejected at load
+    /// when `https_http3 = false` (advertising a non-existent listener
+    /// is a footgun).
+    #[serde(default = "default_true")]
+    pub https_alt_svc: bool,
     /// Maximum wall-clock time the daemon will wait, after receiving
     /// `SIGTERM`, for in-flight TCP connections / HTTPS requests to
     /// complete naturally before letting the tokio runtime abort
@@ -239,10 +257,18 @@ pub struct AcceptSection {
     pub rekey_interval: Duration,
 }
 
-/// `[acme]` — ACME (RFC 8555) configuration for routes that declare
-/// `cert = "acme"`. Only meaningful on terminal-mode nodes (relays
+/// `[acme]` — ACME (RFC 8555) configuration for the node-wide
+/// wildcard cert. Only meaningful on terminal-mode nodes (relays
 /// passthrough TLS bytes without terminating). When this section is
-/// absent, any `cert = "acme"` route is rejected at config-load time.
+/// absent, the daemon doesn't try to issue any cert; HTTPS routes
+/// fall through to the convention dir, then to `default_cert`, then
+/// to the cert-less LAN path.
+///
+/// One terminal holds one wildcard cert covering the apex + a single
+/// star: SAN list `["<domain>", "*.<domain>"]`. Wildcards force
+/// DNS-01, so the daemon picks the (single) provider sub-table
+/// `[acme.dns.<name>]`. Zero or 2+ provider sub-tables are rejected
+/// at load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeSection {
@@ -256,6 +282,10 @@ pub struct AcmeSection {
     /// to notify the operator about impending expirations or account
     /// problems.
     pub contact_email: String,
+    /// Apex domain to issue against. Expands at issuance time to the
+    /// SAN list `["<domain>", "*.<domain>"]` so the resulting cert
+    /// covers the apex and one level of subdomains.
+    pub domain: String,
     /// Where to persist the long-lived ACME account key. Auto-generated
     /// on first use; mode `0600`.
     #[serde(default = "default_acme_account_key_path")]
@@ -277,9 +307,8 @@ pub struct AcmeSection {
     /// rand(0..renew_jitter)`.
     #[serde(default = "default_acme_renew_jitter", with = "humantime_serde")]
     pub renew_jitter: Duration,
-    /// Per-DNS-provider tables, keyed by provider name. Names referenced
-    /// by `cert.acme.provider` must appear here. Each provider parses
-    /// its own credentials block (see [`AcmeDnsProviderConfig`]).
+    /// DNS provider sub-tables keyed by provider name. Exactly one
+    /// sub-table is required. Names recognized today: `cloudflare`.
     #[serde(default)]
     pub dns: std::collections::BTreeMap<String, AcmeDnsProviderConfig>,
 }
@@ -312,6 +341,12 @@ fn default_rules_dir() -> PathBuf {
 }
 fn default_cert_dir() -> PathBuf {
     PathBuf::from("/etc/yggdrasil/certs")
+}
+fn default_https_listen() -> SocketAddr {
+    "0.0.0.0:443".parse().unwrap()
+}
+fn default_true() -> bool {
+    true
 }
 fn default_rekey_interval() -> Duration {
     Duration::from_secs(3600)
@@ -538,6 +573,21 @@ impl ServerConfig {
             }
         }
 
+        // ---- HTTPS knob sanity ----
+        if self.server.https_alt_svc && !self.server.https_http3 {
+            return Err(ConfigError::Invalid(
+                "[server].https_alt_svc = true is incompatible with \
+                 [server].https_http3 = false — an Alt-Svc header would \
+                 advertise a non-existent listener"
+                    .into(),
+            ));
+        }
+        if self.server.https_listen.port() == 0 {
+            return Err(ConfigError::Invalid(
+                "[server].https_listen must have a non-zero port".into(),
+            ));
+        }
+
         // ---- [acme] sanity ----
         if let Some(acme) = &self.acme {
             if !acme.terms_of_service_agreed {
@@ -553,6 +603,11 @@ impl ServerConfig {
                     acme.contact_email
                 )));
             }
+            if acme.domain.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[acme].domain must not be empty".into(),
+                ));
+            }
             if acme.directory_url.trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "[acme].directory_url must not be empty".into(),
@@ -562,6 +617,26 @@ impl ServerConfig {
                 return Err(ConfigError::Invalid(
                     "[acme].renew_before must be > 0".into(),
                 ));
+            }
+            // Wildcards force DNS-01, so exactly one [acme.dns.<name>]
+            // sub-table is required. Zero or 2+ is rejected — the
+            // operator must declare the provider unambiguously.
+            match acme.dns.len() {
+                0 => {
+                    return Err(ConfigError::Invalid(
+                        "[acme] requires exactly one [acme.dns.<provider>] \
+                         sub-table; got none"
+                            .into(),
+                    ));
+                }
+                1 => {}
+                n => {
+                    let names: Vec<&str> = acme.dns.keys().map(String::as_str).collect();
+                    return Err(ConfigError::Invalid(format!(
+                        "[acme] requires exactly one [acme.dns.<provider>] \
+                         sub-table; got {n}: {names:?}",
+                    )));
+                }
             }
             for (name, prov) in &acme.dns {
                 match (&prov.api_token, &prov.api_token_env) {
@@ -582,6 +657,14 @@ impl ServerConfig {
             }
         }
         Ok(())
+    }
+
+    /// Convenience: return the SAN list the ACME wildcard should be
+    /// issued against — apex plus a single `*.<apex>` star.
+    pub fn acme_sans(&self) -> Option<Vec<String>> {
+        self.acme
+            .as_ref()
+            .map(|a| vec![a.domain.clone(), format!("*.{}", a.domain)])
     }
 }
 
@@ -1369,5 +1452,138 @@ mod tests {
         assert!(
             matches!(err, ConfigError::Invalid(s) if s.contains("at least one of [dial] or [accept]"))
         );
+    }
+
+    #[test]
+    fn https_listen_defaults_to_443() {
+        let cfg = parse(
+            r#"
+            [server]
+            [accept]
+            listen = "0.0.0.0:51820"
+            pubkey = "x25519:0000000000000000000000000000000000000000000000000000000000000000"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.https_listen.port(), 443);
+        assert!(cfg.server.https_http3);
+        assert!(cfg.server.https_alt_svc);
+    }
+
+    #[test]
+    fn https_alt_svc_true_with_http3_false_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            https_http3   = false
+            https_alt_svc = true
+            [accept]
+            listen = "0.0.0.0:51820"
+            pubkey = "x25519:0000000000000000000000000000000000000000000000000000000000000000"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid(s) if s.contains("https_alt_svc = true") && s.contains("https_http3 = false")
+        ));
+    }
+
+    #[test]
+    fn acme_with_one_dns_provider_parses() {
+        let cfg = parse(
+            r#"
+            [server]
+            [dial]
+            pubkey   = "x25519:0000000000000000000000000000000000000000000000000000000000000000"
+            endpoint = "vps.example.com:51820"
+            [acme]
+            contact_email           = "ops@example.com"
+            terms_of_service_agreed = true
+            domain                  = "example.com"
+              [acme.dns.cloudflare]
+              api_token_env = "CLOUDFLARE_API_TOKEN"
+            "#,
+        )
+        .unwrap();
+        let acme = cfg.acme.as_ref().expect("acme present");
+        assert_eq!(acme.domain, "example.com");
+        assert_eq!(
+            cfg.acme_sans(),
+            Some(vec!["example.com".to_string(), "*.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn acme_without_domain_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            [dial]
+            pubkey   = "x25519:0000000000000000000000000000000000000000000000000000000000000000"
+            endpoint = "vps.example.com:51820"
+            [acme]
+            contact_email           = "ops@example.com"
+            terms_of_service_agreed = true
+              [acme.dns.cloudflare]
+              api_token_env = "CLOUDFLARE_API_TOKEN"
+            "#,
+        )
+        .err()
+        .unwrap();
+        // Missing `domain` is a parse error (it's required, no default).
+        assert!(matches!(
+            err,
+            ConfigError::Proto(_) | ConfigError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn acme_without_dns_subtable_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            [dial]
+            pubkey   = "x25519:0000000000000000000000000000000000000000000000000000000000000000"
+            endpoint = "vps.example.com:51820"
+            [acme]
+            contact_email           = "ops@example.com"
+            terms_of_service_agreed = true
+            domain                  = "example.com"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid(s) if s.contains("[acme.dns.<provider>]") && s.contains("got none")
+        ));
+    }
+
+    #[test]
+    fn acme_with_two_dns_subtables_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            [dial]
+            pubkey   = "x25519:0000000000000000000000000000000000000000000000000000000000000000"
+            endpoint = "vps.example.com:51820"
+            [acme]
+            contact_email           = "ops@example.com"
+            terms_of_service_agreed = true
+            domain                  = "example.com"
+              [acme.dns.cloudflare]
+              api_token_env = "CF_TOKEN"
+              [acme.dns.route53]
+              api_token_env = "AWS_TOKEN"
+            "#,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid(s) if s.contains("got 2")
+        ));
     }
 }
