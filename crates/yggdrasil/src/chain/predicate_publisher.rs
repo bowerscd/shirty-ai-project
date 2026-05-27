@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chain::client::{ChainClientHandle, ChainClientShutDown};
 use crate::chain::introspection::IntrospectionState;
-use crate::chain::predicate_extractor;
+use crate::chain::predicate_extractor::{self, HttpsPredicateMeta};
 use crate::chain::reliability::SendError;
 
 /// File name used to persist the publisher's monotone version under
@@ -78,6 +78,7 @@ pub fn spawn(
     chain_handle: ChainClientHandle,
     origin: PubKey,
     state_dir: PathBuf,
+    https_meta: HttpsPredicateMeta,
     introspection: Option<Arc<IntrospectionState>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
@@ -86,6 +87,7 @@ pub fn spawn(
         chain_handle,
         origin,
         state_dir,
+        https_meta,
         introspection,
         cancel,
     ))
@@ -96,6 +98,7 @@ async fn run(
     chain_handle: ChainClientHandle,
     origin: PubKey,
     state_dir: PathBuf,
+    https_meta: HttpsPredicateMeta,
     introspection: Option<Arc<IntrospectionState>>,
     cancel: CancellationToken,
 ) {
@@ -139,6 +142,7 @@ async fn run(
                     &set,
                     origin,
                     next_version,
+                    https_meta,
                     last_sent_predicates.as_deref(),
                     &chain_handle,
                     introspection.as_deref(),
@@ -183,16 +187,18 @@ struct AppliedPush {
 /// (or we deduped to a no-op). Skipped/rejected/timed-out pushes return
 /// `None` and the publisher carries the previous `(version,
 /// last_sent_predicates)` forward unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn publish_one(
     set: &RuleSet,
     origin: PubKey,
     next_version: u64,
+    https_meta: HttpsPredicateMeta,
     last_sent: Option<&[Predicate]>,
     chain_handle: &ChainClientHandle,
     introspection: Option<&IntrospectionState>,
     cancel: &CancellationToken,
 ) -> Option<AppliedPush> {
-    let outcome = predicate_extractor::extract(set, origin, next_version);
+    let outcome = predicate_extractor::extract(set, https_meta, origin, next_version);
     let predicate_set = outcome.set;
 
     // Dedup against the last successfully-sent predicates list. Identical
@@ -430,14 +436,9 @@ mod tests {
             listen: format!("127.0.0.1:{port}").parse().unwrap(),
             protocol: Protocol::Tcp,
             target_port: Some(port),
-            target_addr: None,
-            target_host: None,
+            target: None,
             idle_timeout: None,
             proxy_protocol: None,
-            routes: None,
-            cert_dir: None,
-            http3: None,
-            alt_svc: None,
         }
     }
 
@@ -491,6 +492,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
         );
@@ -546,6 +548,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
         );
@@ -590,6 +593,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
         );
@@ -621,6 +625,7 @@ mod tests {
                 handle,
                 origin(),
                 state_dir.path().to_path_buf(),
+                HttpsPredicateMeta::default(),
                 None,
                 cancel.clone(),
             );
@@ -647,6 +652,7 @@ mod tests {
             handle,
             origin(),
             state_dir.path().to_path_buf(),
+            HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
         );

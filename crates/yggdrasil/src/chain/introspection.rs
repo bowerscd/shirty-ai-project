@@ -141,14 +141,9 @@ mod tests {
             listen: "0.0.0.0:9001".parse().unwrap(),
             protocol: Protocol::Tcp,
             target_port: None,
-            target_addr: Some("127.0.0.1:9100".parse().unwrap()),
-            target_host: None,
+            target: Some("127.0.0.1:9100".to_string()),
             idle_timeout: None,
             proxy_protocol: None,
-            routes: None,
-            cert_dir: None,
-            http3: None,
-            alt_svc: None,
         };
         RuleSet::from_rules(vec![rule]).expect("RuleSet build")
     }

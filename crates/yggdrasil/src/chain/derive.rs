@@ -316,14 +316,9 @@ fn rule_from_predicate_l4(p: &Predicate, cfg: &DeriveConfig) -> Rule {
         listen: SocketAddr::new(cfg.bind_addr, p.listen_port),
         protocol: p.protocol,
         target_port: Some(p.listen_port),
-        target_addr: None,
-        target_host: None,
+        target: None,
         idle_timeout,
         proxy_protocol,
-        routes: None,
-        cert_dir: None,
-        http3: None,
-        alt_svc: None,
     }
 }
 
@@ -345,14 +340,9 @@ fn rule_from_https_predicate(
         listen: SocketAddr::new(cfg.bind_addr, p.listen_port),
         protocol: derived_protocol,
         target_port: Some(p.listen_port),
-        target_addr: None,
-        target_host: None,
+        target: None,
         idle_timeout,
         proxy_protocol: None,
-        routes: None,
-        cert_dir: None,
-        http3: None,
-        alt_svc: None,
     }
 }
 
@@ -441,27 +431,22 @@ mod tests {
         rule
     }
 
-    fn https_source_ruleset(name: &str, port: u16, http3: Option<bool>) -> RuleSet {
-        RuleSet::from_rules(vec![Rule {
-            name: name.to_string(),
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-            protocol: Protocol::Https,
-            target_port: None,
-            target_addr: None,
-            target_host: None,
-            idle_timeout: None,
-            proxy_protocol: None,
-            routes: Some(vec![HttpRoute {
+    fn https_source_ruleset(name: &str, _port: u16, _http3: Option<bool>) -> RuleSet {
+        // After the L7 schema cleanup, HTTPS comes from top-level
+        // [[route]] blocks (RuleSet::routes), not [[rule]] with
+        // protocol = "https". This helper now builds a RuleSet
+        // with a single route. The `name` and `port` args are kept
+        // for back-compat with the test-call sites; `port` and
+        // `http3` are unused since both come from `[server]` config
+        // after the cleanup.
+        RuleSet::from_parts(
+            Vec::new(),
+            vec![HttpRoute {
                 hostname: format!("{name}.localhost"),
                 target: Url::parse("http://127.0.0.1:8080").unwrap(),
-                cert: None,
-                key: None,
                 hsts: None,
-            }]),
-            cert_dir: None,
-            http3,
-            alt_svc: None,
-        }])
+            }],
+        )
         .expect("source HTTPS rule set must validate")
     }
 
@@ -493,8 +478,7 @@ mod tests {
         assert_eq!(rule.listen.port(), 2222);
         assert_eq!(rule.listen.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(rule.target_port, Some(2222));
-        assert_eq!(rule.target_addr, None);
-        assert_eq!(rule.target_host, None);
+        assert_eq!(rule.target, None);
         assert_eq!(rule.proxy_protocol, Some(ProxyProto::V2));
         assert_eq!(rule.idle_timeout, None);
     }
@@ -523,8 +507,7 @@ mod tests {
         assert_eq!(tcp.protocol, Protocol::Tcp);
         assert_eq!(tcp.listen, SocketAddr::new(cfg.bind_addr, 443));
         assert_eq!(tcp.target_port, Some(443));
-        assert_eq!(tcp.target_addr, None);
-        assert_eq!(tcp.target_host, None);
+        assert_eq!(tcp.target, None);
         assert_eq!(tcp.idle_timeout, None);
         assert_eq!(tcp.proxy_protocol, None);
 
@@ -532,8 +515,7 @@ mod tests {
         assert_eq!(udp.protocol, Protocol::Udp);
         assert_eq!(udp.listen, SocketAddr::new(cfg.bind_addr, 443));
         assert_eq!(udp.target_port, Some(443));
-        assert_eq!(udp.target_addr, None);
-        assert_eq!(udp.target_host, None);
+        assert_eq!(udp.target, None);
         assert_eq!(udp.idle_timeout, Some(Duration::from_secs(30)));
         assert_eq!(udp.proxy_protocol, None);
     }
@@ -682,8 +664,11 @@ mod tests {
     fn derives_same_rules_for_default_and_explicit_http3_true_source_rules() {
         let default_source = https_source_ruleset("web", 443, None);
         let explicit_source = https_source_ruleset("web", 443, Some(true));
-        let default_predicates = predicate_extractor::extract(&default_source, origin(), 7).set;
-        let explicit_predicates = predicate_extractor::extract(&explicit_source, origin(), 7).set;
+        let meta = predicate_extractor::HttpsPredicateMeta::default();
+        let default_predicates =
+            predicate_extractor::extract(&default_source, meta, origin(), 7).set;
+        let explicit_predicates =
+            predicate_extractor::extract(&explicit_source, meta, origin(), 7).set;
 
         assert_eq!(default_predicates, explicit_predicates);
         assert!(default_predicates.predicates[0].https_http3);
