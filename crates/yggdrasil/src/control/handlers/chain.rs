@@ -74,7 +74,12 @@ pub(in crate::control) async fn dispatch_chain_apply(
         // version is 8B; both are constant-sized regardless of value).
         // The publisher will project again with the real origin and
         // monotonic version on its next tick.
-        let outcome = predicate_extractor::extract(&ruleset, PubKey::x25519([0u8; 32]), 0);
+        let outcome = predicate_extractor::extract(
+            &ruleset,
+            predicate_extractor::HttpsPredicateMeta::default(),
+            PubKey::x25519([0u8; 32]),
+            0,
+        );
         let encoded = match postcard::to_allocvec(&outcome.set) {
             Ok(b) => b,
             Err(e) => {

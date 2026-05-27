@@ -741,14 +741,9 @@ mod tests {
             listen: format!("127.0.0.1:{port}").parse().unwrap(),
             protocol: Protocol::Tcp,
             target_port: Some(9001),
-            target_addr: None,
-            target_host: None,
+            target: None,
             idle_timeout: None,
             proxy_protocol: None,
-            routes: None,
-            cert_dir: None,
-            http3: None,
-            alt_svc: None,
         };
         let set = RuleSet::from_rules(vec![rule]).unwrap();
         handle.apply_ruleset(set.clone()).await.unwrap();

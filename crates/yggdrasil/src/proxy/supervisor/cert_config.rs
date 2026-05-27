@@ -6,6 +6,7 @@
 //!
 //! [`CertStore`]: crate::proxy::certs::CertStore
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,12 +26,23 @@ pub struct CertConfig {
     /// access can set this to any other value (including `0` for an
     /// ephemeral port).
     pub redirect_port: Option<u16>,
+    /// Node-wide HTTPS listener address. Every top-level `[[route]]`
+    /// that doesn't override `listen` lands here. Sourced from
+    /// `[server].https_listen` (default `0.0.0.0:443`).
+    pub https_listen: SocketAddr,
+    /// Node-wide HTTP/3 toggle for HTTPS listeners. Sourced from
+    /// `[server].https_http3` (default `true`).
+    pub https_http3: bool,
+    /// Node-wide `Alt-Svc` header toggle for HTTPS responses. Sourced
+    /// from `[server].https_alt_svc` (default `true`). Validation
+    /// rejects `alt_svc = true` combined with `http3 = false`.
+    pub https_alt_svc: bool,
     /// ACME manager (when `[acme]` is configured). When set, the
     /// supervisor:
     ///   * attaches the manager's HTTP-01 responder to every per-IP
     ///     redirect listener it spawns, and
-    ///   * calls `AcmeManager::register(host, route_cfg)` for each
-    ///     route whose `cert = "acme"` once the rule loads.
+    ///   * the manager has its wildcard issuance bootstrapped by
+    ///     [`crate::run_terminal`] at startup.
     pub acme: Option<AcmeManager>,
     /// Resolved LAN-CIDR snapshot (see [`crate::lan_cidrs`]). Plumbed
     /// onto every per-IP companion listener spawned by the supervisor
@@ -45,6 +57,9 @@ impl Default for CertConfig {
             default_cert: None,
             default_key: None,
             redirect_port: None,
+            https_listen: "0.0.0.0:443".parse().unwrap(),
+            https_http3: true,
+            https_alt_svc: true,
             acme: None,
             lan_cidrs: Arc::new(
                 LanCidrs::resolve(None).expect("DEFAULT_LAN_CIDR_STRINGS is parseable"),
@@ -54,11 +69,15 @@ impl Default for CertConfig {
 }
 
 impl CertConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_server_section(
         cert_dir: PathBuf,
         default_cert: Option<PathBuf>,
         default_key: Option<PathBuf>,
         http_redirect_port: Option<u16>,
+        https_listen: SocketAddr,
+        https_http3: bool,
+        https_alt_svc: bool,
         lan_cidrs: Arc<LanCidrs>,
     ) -> Self {
         Self {
@@ -66,6 +85,9 @@ impl CertConfig {
             default_cert,
             default_key,
             redirect_port: http_redirect_port,
+            https_listen,
+            https_http3,
+            https_alt_svc,
             acme: None,
             lan_cidrs,
         }

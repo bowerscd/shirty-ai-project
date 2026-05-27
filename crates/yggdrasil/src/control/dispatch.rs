@@ -53,22 +53,19 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                 .unwrap_or(0);
             let mut default_cert_path: Option<String> = None;
             let mut default_cert_loaded_age_secs: Option<u64> = None;
-            let mut ephemeral_cert_count: usize = 0;
             for (_host, origin, loaded_at_unix_ms) in state.cert_store.list_full() {
-                match origin {
-                    crate::proxy::certs::CertOrigin::Default { ref cert, .. }
-                        if default_cert_path.is_none() =>
-                    {
+                if let crate::proxy::certs::CertOrigin::Default { ref cert, .. } = origin {
+                    if default_cert_path.is_none() {
                         default_cert_path = Some(cert.display().to_string());
                         default_cert_loaded_age_secs =
                             Some(now_ms.saturating_sub(loaded_at_unix_ms) / 1000);
                     }
-                    crate::proxy::certs::CertOrigin::Ephemeral => {
-                        ephemeral_cert_count += 1;
-                    }
-                    _ => {}
                 }
             }
+            // Ephemeral cert support was removed alongside per-route
+            // cert sources; the count is always zero now but kept on
+            // the status surface for back-compat.
+            let ephemeral_cert_count: usize = 0;
             // Cert-less route count: sum each HTTPS rule's
             // contribution recorded in ProxySnapshot. Set by the
             // supervisor's reconcile step (cert-less routes are

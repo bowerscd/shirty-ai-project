@@ -7,7 +7,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use ratatoskr::rule::Rule;
+use ratatoskr::rule::Protocol;
 
 use crate::proxy::h3_frontend::H3Frontend;
 use crate::proxy::http_frontend::HttpFrontend;
@@ -23,13 +23,17 @@ pub(super) enum ProxyHandle {
 
 /// HTTPS handle bundles the frontend with the hostnames it registered into
 /// the per-IP redirect listener, so we can deregister cleanly on stop.
+///
+/// Post-schema-cleanup: HTTPS is a node-wide concern driven by the
+/// top-level `[[route]]` set, not per-rule. `name` is a synthetic
+/// identifier (e.g. `"https@0.0.0.0:443"`) used for logging only.
 pub(super) struct HttpsHandle {
     pub(super) frontend: HttpFrontend,
     pub(super) h3: Option<H3Frontend>,
     pub(super) redirect_hosts: Vec<String>,
     pub(super) redirect_ip: IpAddr,
     pub(super) listen: SocketAddr,
-    pub(super) rule: Rule,
+    pub(super) name: String,
 }
 
 impl ProxyHandle {
@@ -41,11 +45,19 @@ impl ProxyHandle {
         }
     }
 
-    pub(super) fn rule(&self) -> &Rule {
+    pub(super) fn name(&self) -> &str {
         match self {
-            Self::Tcp(p) => p.rule(),
-            Self::Udp(p) => p.rule(),
-            Self::Https(h) => &h.rule,
+            Self::Tcp(p) => &p.rule().name,
+            Self::Udp(p) => &p.rule().name,
+            Self::Https(h) => &h.name,
+        }
+    }
+
+    pub(super) fn protocol(&self) -> Protocol {
+        match self {
+            Self::Tcp(p) => p.rule().protocol,
+            Self::Udp(p) => p.rule().protocol,
+            Self::Https(_) => Protocol::Https,
         }
     }
 
