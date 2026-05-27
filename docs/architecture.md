@@ -80,14 +80,13 @@ handshake, and runs the heartbeat / predicate-push tasks against it.
 ```
         clients                   +---------------+   forwarded TCP/UDP   +---------------+   forwarded TCP/UDP   +---------------+   loopback dial
         ---------+--------------> |    vps        | --------------------> |    midbox     | --------------------> |    home       | ----------------> 127.0.0.1:22 etc.
-                                  | relay (root)  |                       | relay (mid)   |                       | terminal      |
+                                  | gateway       |                       | relay (mid)   |                       | terminal      |
                                   +---------------+                       +---------------+                       +---------------+
                                        ^                                       ^      ^                              |
                                        |                                       |      |                              |
-                                       | predicates flow upward                |      | predicates flow upward      |
-                                       |  (terminal publishes its rule set;    |      |  ("home-tcp-echo" derived   |
-                                       |   v1 mid-relays do NOT re-project)    |      |   into a TCP listener on     |
-                                       |                                       |      |   midbox)                    |
+                                       | predicates forwarded upstream         |      | predicates published         |
+                                       |  by the mid-relay's chain acceptor    |      |  by the terminal's chain     |
+                                       |  (verbatim — no aggregation)          |      |  client                      |
                                        |                                       |      |                              |
                                        |          Noise_IK chain control       v      v                              |
                                        +------------------ heartbeats ----------------------------------------------+
@@ -95,17 +94,35 @@ handshake, and runs the heartbeat / predicate-push tasks against it.
 
 Chain orientation rule: for any node X, `upstream(X)` is the node X dials
 (and sends heartbeats to); `downstream(X)` is the node that dials X. The
-terminal has only an upstream; the root relay has only a downstream;
+terminal has only an upstream; the root gateway has only a downstream;
 mid-chain relays have both. v1 supports exactly one upstream and one
-downstream per node.
+downstream per node, so each chain is a single path.
 
-`v1 relays do NOT re-project predicates upward.` A predicate set
-originating at a terminal lands on its immediate upstream and is derived
-into a `RuleSet` there. It is **not** aggregated and re-published on the
-next hop. This means `vps` in the three-hop diagram above runs zero rules
-(it sees no published predicates from `midbox`), and `chain diff` will
-legitimately report drift at the top hop. Predicate aggregation across
-intermediate hops is a deliberate v2 deferral.
+`Predicates propagate hop-by-hop up the chain.` A predicate set
+originating at a terminal lands on its immediate upstream (its
+neighbouring relay) and is derived into a `RuleSet` there. Mid-chain
+relays additionally **forward the same predicate bytes verbatim** to
+their own upstream via the chain acceptor's mid-chain forwarding path
+(`chain/acceptor.rs::handle_predicate_set_update`); the gateway at the
+top of the chain receives them, derives its own `RuleSet`, and binds
+the public listeners. Forwarding is byte-identical: origin pubkey and
+monotone version are preserved so each hop applies the same
+version-staleness invariant against the terminal's identity.
+
+What `v1` does **not** do is *aggregate* predicates from multiple
+downstreams (mid-chain relays only support one downstream in v1, so
+there's nothing to aggregate yet). A future v2 relay supporting
+multiple downstreams would need to merge their predicate sets before
+forwarding.
+
+Real client IPs propagate alongside the bytes: each hop that emits
+chain HTTPS PROXY-v2 (TCP prepend or UDP first-datagram) reads any
+PROXY-v2 the upstream hop wrote and forwards the original client
+address rather than its own peer addr. The gateway sees the real
+internet client and stamps the chain's first PROXY header; every
+mid-hop bridges, terminating at the home box's TLS frontend (or h3
+interpose) which stamps `X-Forwarded-For` with the original client
+even on 3-hop deployments.
 
 ### Home-hosted deployments and NAT traversal
 
@@ -385,14 +402,30 @@ and HTTP/2; UDP carries QUIC datagrams for HTTP/3. The relay is L4
 passthrough on both transports: it does not resolve certificates or
 inspect TLS / QUIC payloads.
 
-For multi-hop chain traffic, `X-Forwarded-For` headers injected by the
-terminal's HTTPS frontend show the immediate upstream relay's IP, not
-the real client's IP. The relay-side PROXY-protocol mechanism that
-addresses this for plain TCP rules does not yet have an equivalent for
-UDP / QUIC traffic (PROXY v2 over UDP datagrams). This is a documented
-limitation, not a regression — the same behavior applies to TCP HTTPS
-traffic today when `proxy_protocol` is not set. See
-[configuration.md → `[[route]]`](configuration.md#route--https-virtual-hosts-terminal-mode).
+For chain HTTPS — single-relay or 3+ hops — `X-Forwarded-For` headers
+injected by the terminal's HTTPS frontend reflect the **real client's**
+IP for both the TCP path (HTTP/1.1 + HTTP/2) and the UDP/QUIC path
+(HTTP/3). Every hop that derives an HTTPS rule emits a PROXY-v2 header
+on its outbound chain leg: prepended to the TCP byte stream for
+`(Tcp, port)`, sent as a standalone first datagram per new UDP flow for
+`(Udp, port)`. Mid-chain relays additionally **read** any PROXY-v2
+header their upstream hop wrote on the inbound side, and use the
+decoded client when re-emitting outbound — so the original client
+address survives the entire chain. The gateway sees the real internet
+client (no inbound PROXY); every mid-hop bridges; the terminal's TCP
+accept loop (`http_frontend/acceptor.rs::read_optional_header`) and
+HTTP/3 interpose socket (`h3_interpose.rs`) consume the final
+PROXY-v2 and stamp the result without operator configuration. The
+predicate wire format is unchanged.
+
+See [configuration.md → `[[route]]`](configuration.md#route--https-virtual-hosts-terminal-mode)
+for the operator-facing surface (there is none — the relay always emits
+and the terminal always consumes). Mid-chain inbound PROXY consumption
+is gated internally on `expect_inbound_proxy`, which the supervisor
+sets for chain-derived rules on `Mode::Relay` nodes only; Gateway-mode
+nodes never consume inbound PROXY (their inbound is real internet
+clients) and Terminal-mode rules don't run the L4 TCP/UDP proxy paths
+at all for HTTPS.
 
 #### HTTP/3 (QUIC)
 
@@ -417,6 +450,24 @@ the backend, dispatch via the shared `hyper-util` `LegacyClient`
 (HTTP/1.1 cleartext to LAN). Request bodies are buffered up to 16 MiB
 (`H3_REQUEST_BODY_LIMIT`); larger uploads get 413. Response bodies stream
 back in 8 KiB chunks via `send_data`.
+
+The QUIC endpoint does not bind its UDP socket directly to a kernel
+socket. Instead it goes through `ProxyV2InterposeSocket`
+(`proxy/h3_interpose.rs`) — a `quinn::AsyncUdpSocket` impl that wraps
+the real socket. Its `poll_recv` walks each batch of datagrams: any
+datagram whose first 12 bytes match the PROXY-v2 magic is decoded into
+a `(relay-source-5-tuple → real-client-addr)` entry in a shared
+`DashMap` and stripped from the batch; non-PROXY datagrams pass
+through unchanged. By construction no valid QUIC packet can match the
+v2 magic (long-header form bit / short-header fixed bit both exclude
+`0x0D`), so quinn never sees a stripped legitimate datagram.
+
+When the h3 accept loop receives a `quic_conn`, it consults the map
+with `quic_conn.remote_address()` — on hit, the real client supplied
+by the relay's PROXY emission is used as the per-connection
+`peer_addr` (which feeds `inject_forwarded`); on miss (direct LAN
+HTTP/3), the kernel-observed peer addr is used. A periodic reaper
+task evicts map entries older than the QUIC idle timeout (30 s).
 
 WebSocket-over-h3 (RFC 9220 extended CONNECT) is **not** supported — any
 CONNECT receives 501 with `Sec-WebSocket-Version: 13` so the client falls

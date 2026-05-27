@@ -125,16 +125,15 @@ addresses, ports, byte counts, and timing.
     amplification factor at the spec-mandated bound.
   * Stateless retry / address-validation tokens are quinn defaults; we
     don't override them.
-  * **Limitation:** for multi-hop chain traffic through a relay, the
-    `X-Forwarded-For` header value will reflect the
-    *immediate-upstream relay's* IP, not the real client's IP. The
-    relay-to-terminal PROXY-protocol mechanism that addresses this for
-    plain TCP rules does not yet have an equivalent for UDP/QUIC
-    traffic (PROXY v2 over UDP datagrams). Documented separately under
+  * **Chain HTTPS propagates the real client IP into `X-Forwarded-For`**
+    for both TCP (HTTP/1.1 + HTTP/2) and HTTP/3, across single-relay
+    AND multi-hop deployments. Every hop on the chain emits PROXY-v2
+    (TCP prepend or UDP first-datagram); mid-chain relays additionally
+    read inbound PROXY and bridge the decoded client into their own
+    outbound emission. Applications using client-IP-based
+    authorisation, rate-limiting, or abuse-banning (e.g. fail2ban)
+    behave correctly without operator opt-in. Documented under
     [HTTPS-predicate derivation](architecture.md#https-predicate-derivation).
-    Until a follow-up lands, HTTPS traffic behind a relay should not be
-    used by applications that rely on client-IP-based authorisation or
-    rate-limiting.
 
 ## What yggdrasil protects against
 

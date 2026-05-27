@@ -482,20 +482,51 @@ The relay shows a pending candidate but no `accept` is wired.
 
 ### "PROXY-protocol upstream sees the wrong client IP"
 
-`proxy_protocol = "v1"` / `"v2"` is **TCP relay-mode only**. On a
-terminal-mode rule (a rule with `target` set), the config validator
-rejects `proxy_protocol`. On a UDP rule, same — the validator
-rejects it. Top-level `[[route]]` blocks don't accept
-`proxy_protocol` at all; HTTPS routing happens at the L7 frontend
-which injects `X-Forwarded-For` directly.
+For `[[rule]]`s: `proxy_protocol = "v1"` / `"v2"` is **relay-mode
+only**. On a terminal-mode rule (a rule with `target` set), the
+config validator rejects `proxy_protocol`. On UDP rules, only `"v2"`
+is meaningful (the validator rejects `"v1"` because it's an ASCII
+stream prefix, not a datagram shape).
+
+For `[[route]]`s (HTTPS): operators do not configure `proxy_protocol`
+— the relay always emits a PROXY-v2 header for HTTPS-derived rules
+(prepended on the TCP leg, sent as a standalone first datagram on the
+UDP/QUIC leg), and the terminal's HTTPS frontend always consumes it.
+If a backend behind the terminal sees the relay's IP in
+`X-Forwarded-For` rather than the real client's:
+
+* For TCP HTTPS (HTTP/1.1, HTTP/2): check
+  `yggdrasilctl local derived-rules` on the relay — the
+  HTTPS-derived TCP rule must show `proxy_protocol: "v2"`. If it does
+  not, the chain control plane hasn't applied the latest derive logic
+  (rebuild or restart the relay).
+* For HTTP/3: the terminal's interpose socket
+  (`proxy/h3_interpose.rs`) requires the PROXY-v2 datagram to arrive
+  **before** the client's first QUIC Initial in the same 5-tuple. The
+  relay's UDP flow path emits in that order on the connected
+  upstream socket; if you see XFF showing the relay's IP, capture
+  with `tcpdump -i any -nn udp port 443` on the terminal and confirm
+  the first datagram of a fresh flow carries the v2 magic
+  (`0x0D 0x0A 0x0D 0x0A 0x00 0x0D 0x0A 0x51 0x55 0x49 0x54 0x0A`).
+* For multi-hop chain HTTPS: each mid-relay reads inbound PROXY and
+  uses the decoded client when emitting its own outbound PROXY, so
+  the real client IP propagates end-to-end. If XFF still shows a
+  mid-relay's IP, check that the mid-relay's daemon mode is `relay`
+  (not `gateway`) via `yggdrasilctl local status` — only `relay`
+  mode enables the inbound PROXY consumption needed for bridging.
+  Gateway-mode nodes don't consume inbound PROXY (their inbound is
+  real internet clients), so misconfiguring a mid-hop as
+  `gateway` mode breaks the bridge.
 
 ### "chain diff says origin mismatch with previous hop"
 
-Under v1, this is expected at chain boundaries — relays don't re-project
-their downstream terminals' predicate sets upward, so each hop's
-`predicate_origin` is the terminal it serves. Cross-boundary, the
-origins legitimately differ. The `chain diff` output flags this as a
-non-error.
+Under v1, this is expected for canary / TOFU staging boundaries where
+the predicate version persisted by the upstream lags behind the
+downstream's just-applied set — `chain diff` flags it as a
+non-error. Mid-chain relays forward their downstream's predicates
+verbatim (preserving origin pubkey and monotone version) so steady-
+state diff is empty across the chain; transient mismatches resolve
+on the next predicate-publish cycle.
 
 ### NAT traversal won't establish or keeps backing off
 

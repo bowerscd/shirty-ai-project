@@ -375,6 +375,21 @@ enabled — one UDP listener (QUIC with a 30 s idle timeout) for the
 configured `https_listen.port()`. Certificate resolution remains
 terminal-only; the relay is L4 passthrough on both transports.
 
+**Real client IP propagation through the chain is automatic.** On the
+TCP HTTPS leg, the relay prepends a PROXY-v2 header to each new chain
+connection before any TLS bytes; the terminal's accept path consumes
+it before the rustls handshake. On the UDP/QUIC leg, the relay sends a
+PROXY-v2 header as a standalone first datagram on each new flow; the
+terminal's HTTP/3 endpoint interposes on its UDP socket
+(`proxy/h3_interpose.rs`) to strip these and recover the real client
+addr for `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Host` stamping.
+Operators do not configure this — there is no `proxy_protocol` field on
+`[[route]]`, no `[server]` knob, and no `[[rule]]` opt-in for the
+HTTPS path. The L4 `[[rule]] proxy_protocol = "v1"|"v2"` knob remains
+operator-controlled because non-yggdrasil TCP backends may not speak
+PROXY; HTTPS is different because both ends of the chain HTTPS leg are
+yggdrasil and always agree.
+
 | Key        | Type        | Default        | Notes                                                                                                       |
 | ---------- | ----------- | -------------- | ----------------------------------------------------------------------------------------------------------- |
 | `hostname` | DNS name    | **required**   | SNI / `Host:` value. Case-insensitive. Globally unique across all routes in all files.                       |
