@@ -48,9 +48,13 @@ pub struct Rule {
     /// Default applied at load time (see [`Rule::resolved_idle_timeout`]).
     #[serde(default, with = "humantime_serde::option")]
     pub idle_timeout: Option<Duration>,
-    /// TCP only: emit a PROXY-protocol header to the upstream before forwarding.
-    /// Rejected when `target` is set (terminal rules must not synthesise
-    /// PROXY-protocol headers; relay-written headers pass through verbatim).
+    /// Relay-mode only: emit a PROXY-protocol header to the upstream before
+    /// forwarding. Rejected when `target` is set (terminal rules must not
+    /// synthesise PROXY-protocol headers; relay-written headers pass through
+    /// verbatim). Valid on both TCP and UDP relay rules. For TCP, the header
+    /// is prepended to the upstream byte stream before any application bytes;
+    /// for UDP, a PROXY-v2 header is sent as a standalone datagram on each
+    /// new flow before the first application datagram.
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProto>,
 }
@@ -146,9 +150,17 @@ impl Rule {
                 }
             }
             Protocol::Udp => {
-                if self.proxy_protocol.is_some() {
+                // `proxy_protocol` is allowed on relay-mode UDP rules so the
+                // chain's HTTPS UDP/QUIC leg can carry the real client IP to
+                // the terminal's h3 frontend. Only v2 is meaningful as a
+                // standalone datagram; v1 is ASCII designed for TCP stream
+                // prefix and not well-defined for datagrams. Terminal-mode
+                // UDP rules (target set) are already rejected above by the
+                // shared target+proxy_protocol check.
+                if matches!(self.proxy_protocol, Some(ProxyProto::V1)) {
                     return Err(Error::InvalidRule(format!(
-                        "rule {:?}: proxy_protocol is only valid for tcp rules",
+                        "rule {:?}: proxy_protocol = \"v1\" is invalid on udp \
+                         rules; use \"v2\" (v1 is ASCII, designed for stream prefix)",
                         self.name
                     )));
                 }

@@ -143,20 +143,45 @@ fn rejects_idle_timeout_on_tcp_rule() {
 }
 
 #[test]
-fn rejects_proxy_protocol_on_udp_rule() {
+fn accepts_proxy_protocol_on_relay_mode_udp_rule() {
+    // Relay-mode UDP rules (target_port set, target absent) may carry
+    // proxy_protocol = "v2" so the relay can emit a PROXY-v2 first
+    // datagram for HTTPS UDP/QUIC chain traffic. Terminal-mode UDP rules
+    // remain rejected by the shared `target + proxy_protocol` check; v1
+    // is also rejected on UDP because it's a stream-prefix ASCII shape.
     let f = parse(
         r#"
             [[rule]]
-            name = "dns"
-            listen = "0.0.0.0:53"
+            name = "h3"
+            listen = "0.0.0.0:443"
             protocol = "udp"
-            target_port = 53
+            target_port = 443
+            proxy_protocol = "v2"
+            "#,
+    )
+    .unwrap();
+    f.validate_each()
+        .expect("relay-mode UDP + proxy_protocol v2 is valid");
+    assert_eq!(f.rule[0].proxy_protocol, Some(ProxyProto::V2));
+}
+
+#[test]
+fn rejects_proxy_protocol_v1_on_udp_rule() {
+    // v1 is ASCII designed for TCP stream prefix; not meaningful as a
+    // standalone datagram. Reject on UDP relay rules.
+    let f = parse(
+        r#"
+            [[rule]]
+            name = "h3-v1"
+            listen = "0.0.0.0:443"
+            protocol = "udp"
+            target_port = 443
             proxy_protocol = "v1"
             "#,
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("proxy_protocol")));
+    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("v1") && s.contains("udp")));
 }
 
 #[test]
