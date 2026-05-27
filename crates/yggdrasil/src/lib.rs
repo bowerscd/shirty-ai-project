@@ -216,9 +216,12 @@ pub async fn run_relay(
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let derive_cfg = crate::chain::DeriveConfig {
             bind_addr,
-            // Phase 3 does not yet plumb a relay-wide PROXY-protocol
-            // policy; derived TCP rules are emitted without PROXY
-            // headers until a future phase adds the config knob.
+            // L4 (`Protocol::Tcp` / `Protocol::Udp`) derived rules don't
+            // get PROXY headers — non-yggdrasil L4 backends (game servers,
+            // SSH, etc.) don't speak PROXY. HTTPS predicates are different:
+            // their derived rules always carry `proxy_protocol = V2`
+            // unconditionally in `rule_from_https_predicate` because both
+            // ends of the chain HTTPS leg are yggdrasil.
             proxy_protocol: None,
         };
         Some(

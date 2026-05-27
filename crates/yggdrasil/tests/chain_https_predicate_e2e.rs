@@ -72,6 +72,12 @@ async fn https_predicate_with_http3_derives_tcp_and_udp_on_relay() {
         .expect("tcp rule");
     assert_eq!(tcp.listen.port(), p.listen_port);
     assert_eq!(tcp.target_port, Some(p.listen_port));
+    assert_eq!(
+        tcp.proxy_protocol,
+        Some(ratatoskr::rule::ProxyProto::V2),
+        "HTTPS-derived TCP rule must carry PROXY v2 so the terminal's \
+         HTTPS frontend can recover the real client IP for X-Forwarded-For"
+    );
 
     let udp = derived
         .rules()
@@ -81,6 +87,13 @@ async fn https_predicate_with_http3_derives_tcp_and_udp_on_relay() {
     assert_eq!(udp.listen.port(), p.listen_port);
     assert_eq!(udp.target_port, Some(p.listen_port));
     assert_eq!(udp.idle_timeout, Some(Duration::from_secs(30)));
+    assert_eq!(
+        udp.proxy_protocol,
+        Some(ratatoskr::rule::ProxyProto::V2),
+        "HTTPS-derived UDP rule must carry PROXY v2 so the relay can emit \
+         the standalone first-datagram for the terminal's h3 interpose to \
+         pick up the real client IP"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -116,5 +129,10 @@ async fn https_predicate_with_http3_disabled_derives_tcp_only() {
         .expect("tcp rule");
     assert_eq!(tcp.listen.port(), p.listen_port);
     assert_eq!(tcp.target_port, Some(p.listen_port));
+    assert_eq!(
+        tcp.proxy_protocol,
+        Some(ratatoskr::rule::ProxyProto::V2),
+        "HTTPS-derived TCP rule must carry PROXY v2 even when http3 is off"
+    );
     assert!(!derived.rules().iter().any(|r| r.protocol == Protocol::Udp));
 }

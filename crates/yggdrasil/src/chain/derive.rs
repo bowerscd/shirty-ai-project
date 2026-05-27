@@ -342,7 +342,13 @@ fn rule_from_https_predicate(
         target_port: Some(p.listen_port),
         target: None,
         idle_timeout,
-        proxy_protocol: None,
+        // HTTPS chain traffic always carries PROXY v2 from relay to terminal
+        // so the terminal's HTTPS frontend can recover the real client IP
+        // and stamp it into X-Forwarded-For. Both ends are yggdrasil and
+        // always agree on this; there is no opt-in. For TCP this is a
+        // header prepended to the byte stream; for UDP (HTTP/3) it is a
+        // standalone first datagram per new flow (see proxy::udp).
+        proxy_protocol: Some(ProxyProto::V2),
     }
 }
 
@@ -509,7 +515,7 @@ mod tests {
         assert_eq!(tcp.target_port, Some(443));
         assert_eq!(tcp.target, None);
         assert_eq!(tcp.idle_timeout, None);
-        assert_eq!(tcp.proxy_protocol, None);
+        assert_eq!(tcp.proxy_protocol, Some(ProxyProto::V2));
 
         let udp = ruleset.find("web-udp").unwrap();
         assert_eq!(udp.protocol, Protocol::Udp);
@@ -517,7 +523,7 @@ mod tests {
         assert_eq!(udp.target_port, Some(443));
         assert_eq!(udp.target, None);
         assert_eq!(udp.idle_timeout, Some(Duration::from_secs(30)));
-        assert_eq!(udp.proxy_protocol, None);
+        assert_eq!(udp.proxy_protocol, Some(ProxyProto::V2));
     }
 
     #[test]
