@@ -36,14 +36,9 @@ fn loopback_rule(name: &str, port: u16) -> Rule {
         listen: format!("192.168.0.5:{port}").parse().unwrap(),
         protocol: Protocol::Tcp,
         target_port: None,
-        target_addr: Some("127.0.0.1:9".parse().unwrap()),
-        target_host: None,
+        target: Some("127.0.0.1:9".to_string()),
         idle_timeout: None,
         proxy_protocol: None,
-        routes: None,
-        cert_dir: None,
-        http3: None,
-        alt_svc: None,
     }
 }
 
@@ -67,6 +62,8 @@ async fn spawn_mapper_against(
         accept_listen,
         rule_set_rx: rx,
         shutdown,
+        https_listen: "0.0.0.0:443".parse().unwrap(),
+        https_http3: true,
         gateway_override: Some(Gateway {
             addr: v4,
             local_source: Ipv4Addr::LOCALHOST,
@@ -88,6 +85,8 @@ async fn mapper_off_holds_no_resources_and_returns_disabled_error() {
         accept_listen: None,
         rule_set_rx: rx,
         shutdown: shutdown.clone(),
+        https_listen: "0.0.0.0:443".parse().unwrap(),
+        https_http3: true,
         gateway_override: None,
         shutdown_release_timeout: None,
     };

@@ -4,7 +4,7 @@
 //! topology:
 //!
 //! 1. **Chained TCP**: a terminal-mode supervisor accepts TCP on its rule's
-//!    `listen` socket and dials the rule's static `target_addr` on the
+//!    `listen` socket and dials the rule's static `target` on the
 //!    LAN. Chained behind a relay-mode supervisor, the round-trip from
 //!    client → relay → terminal → echo is byte-stable.
 //! 2. **Chained UDP**: the same shape with UDP datagrams. Both proxies are

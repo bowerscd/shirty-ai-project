@@ -295,70 +295,60 @@ fn http1_header(resp: &[u8], name: &str) -> Option<String> {
         })
 }
 
-/// Write an HTTPS rule file to `rules_dir` with two routes pointing at
-/// the supplied backend URLs. Both routes use `cert = "ephemeral"`.
-#[allow(clippy::too_many_arguments)]
-fn write_https_rule_two_routes_with_options(
+/// Write a top-level `[[route]]` TOML file with two routes pointing
+/// at the supplied backend URLs. After the L7 schema cleanup HTTPS is
+/// driven from top-level routes rather than from `[[rule]]`; certs are
+/// resolved node-wide via the three-rung resolver (cert convention →
+/// default cert → cert-less LAN). Tests using this helper write their
+/// PEMs into the supervisor's `cert_dir` via [`issue_cert_convention`].
+fn write_routes_two(
     rules_dir: &Path,
-    rule_name: &str,
-    listen: SocketAddr,
     api_host: &str,
     api_target: &str,
     app_host: &str,
     app_target: &str,
-    rule_options: &str,
 ) {
     let toml = format!(
         r#"
-[[rule]]
-name = "{rule_name}"
-protocol = "https"
-listen = "{listen}"
-{rule_options}
-[[rule.route]]
+[[route]]
 hostname = "{api_host}"
 target = "{api_target}"
-cert = "ephemeral"
 
-[[rule.route]]
+[[route]]
 hostname = "{app_host}"
 target = "{app_target}"
-cert = "ephemeral"
 "#,
     );
-    std::fs::write(rules_dir.join("https.toml"), toml).unwrap();
+    std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
 }
 
-/// Write an HTTPS rule with one route whose cert is loaded from disk.
-#[allow(clippy::too_many_arguments)]
-fn write_https_rule_one_route_with_paths(
-    rules_dir: &Path,
-    rule_name: &str,
-    listen: SocketAddr,
-    host: &str,
-    target: &str,
-    cert: &Path,
-    key: &Path,
-    hsts: bool,
-) {
+/// Write a fresh self-signed PEM pair for `hostname` into the
+/// `cert_dir/<hostname>/{fullchain,privkey}.pem` convention so the
+/// supervisor's three-rung resolver picks it up at startup.
+fn issue_cert_convention(cert_dir: &Path, hostname: &str) {
+    let host_dir = cert_dir.join(hostname);
+    std::fs::create_dir_all(&host_dir).unwrap();
+    issue_self_signed_pem(
+        &host_dir.join("fullchain.pem"),
+        &host_dir.join("privkey.pem"),
+        hostname,
+    );
+}
+
+/// Write a top-level `[[route]]` TOML file with one route, optionally
+/// emitting `hsts = true`. The cert is loaded from disk through the
+/// node-wide cert-dir convention (the caller writes the PEM via
+/// [`issue_cert_convention`]).
+fn write_route_one_with_hsts(rules_dir: &Path, host: &str, target: &str, hsts: bool) {
     let hsts_line = if hsts { "hsts = true\n" } else { "" };
     let toml = format!(
         r#"
-[[rule]]
-name = "{rule_name}"
-protocol = "https"
-listen = "{listen}"
-
-[[rule.route]]
+[[route]]
 hostname = "{host}"
 target = "{target}"
-cert = "{}"
-key = "{}"
 {hsts_line}"#,
-        cert.display(),
-        key.display(),
     );
-    std::fs::write(rules_dir.join("https.toml"), toml).unwrap();
+    std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
 }
 
 /// Write a fresh self-signed PEM pair on disk. Uses `rcgen` directly so
@@ -391,13 +381,10 @@ struct TwoRouteFixture {
 
 impl TwoRouteFixture {
     async fn spawn() -> Self {
-        Self::spawn_with_options("", Vec::new()).await
+        Self::spawn_with_options(TwoRouteOpts::default()).await
     }
 
-    async fn spawn_with_options(
-        rule_options: &str,
-        api_response_headers: Vec<(&'static str, &'static str)>,
-    ) -> Self {
+    async fn spawn_with_options(opts: TwoRouteOpts) -> Self {
         init_tracing();
         // Each test gets unique hostnames so they can't collide when
         // running in parallel (they all share `127.0.0.1`).
@@ -405,7 +392,7 @@ impl TwoRouteFixture {
         let api_host = format!("api{suffix}.localhost");
         let app_host = format!("app{suffix}.localhost");
 
-        let api = EchoBackend::spawn_with_headers("api", api_response_headers).await;
+        let api = EchoBackend::spawn_with_headers("api", opts.api_response_headers).await;
         let app = EchoBackend::spawn("app").await;
 
         let tmpdir = tempfile::tempdir().unwrap();
@@ -414,23 +401,24 @@ impl TwoRouteFixture {
         std::fs::create_dir_all(&rules_dir).unwrap();
         std::fs::create_dir_all(&cert_dir).unwrap();
 
+        // Pre-issue per-host PEMs into the cert-convention directory so
+        // the supervisor's three-rung resolver picks them up at startup.
+        issue_cert_convention(&cert_dir, &api_host);
+        issue_cert_convention(&cert_dir, &app_host);
+
         // Pick free ephemeral ports for both the HTTPS frontend and the
         // HTTP→HTTPS redirect listener. The supervisor binds to whatever
-        // `redirect_port` we hand it, so tests don't need privileged-port
-        // access.
+        // ports we hand it, so tests don't need privileged-port access.
         let frontend_port = pick_free_tcp_port().await;
         let redirect_port = pick_free_tcp_port().await;
         let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
 
-        write_https_rule_two_routes_with_options(
+        write_routes_two(
             &rules_dir,
-            "front",
-            frontend_addr,
             &api_host,
             &api.upstream_url(),
             &app_host,
             &app.upstream_url(),
-            rule_options,
         );
 
         let shutdown = CancellationToken::new();
@@ -439,6 +427,9 @@ impl TwoRouteFixture {
             default_cert: None,
             default_key: None,
             redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: opts.http3,
+            https_alt_svc: opts.alt_svc,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -475,6 +466,52 @@ impl TwoRouteFixture {
         // would also `supervisor.stop().await` but the Drop on tmpdir is
         // sufficient for the assertions we've already made.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Per-test knobs for [`TwoRouteFixture::spawn_with_options`]. Defaults
+/// match the production HTTPS frontend (h3 + alt-svc both on).
+struct TwoRouteOpts {
+    /// Operator's `[server].https_http3` for this test (default: `true`).
+    http3: bool,
+    /// Operator's `[server].https_alt_svc` for this test (default: `true`).
+    alt_svc: bool,
+    /// Additional response headers the API echo backend should set on
+    /// every response. Used by `upstream_alt_svc_header_is_preserved`
+    /// to assert that an upstream-supplied `Alt-Svc` is not overwritten.
+    api_response_headers: Vec<(&'static str, &'static str)>,
+}
+
+impl Default for TwoRouteOpts {
+    fn default() -> Self {
+        Self {
+            http3: true,
+            alt_svc: true,
+            api_response_headers: Vec::new(),
+        }
+    }
+}
+
+impl TwoRouteOpts {
+    fn no_alt_svc() -> Self {
+        Self {
+            alt_svc: false,
+            ..Self::default()
+        }
+    }
+
+    fn no_http3() -> Self {
+        Self {
+            http3: false,
+            ..Self::default()
+        }
+    }
+
+    fn with_api_headers(api_response_headers: Vec<(&'static str, &'static str)>) -> Self {
+        Self {
+            api_response_headers,
+            ..Self::default()
+        }
     }
 }
 
@@ -618,7 +655,7 @@ async fn default_https_responses_include_alt_svc() {
 
 #[tokio::test]
 async fn alt_svc_false_suppresses_alt_svc_header() {
-    let fx = TwoRouteFixture::spawn_with_options("alt_svc = false\n", Vec::new()).await;
+    let fx = TwoRouteFixture::spawn_with_options(TwoRouteOpts::no_alt_svc()).await;
     let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
@@ -631,7 +668,7 @@ async fn alt_svc_false_suppresses_alt_svc_header() {
 
 #[tokio::test]
 async fn http3_false_suppresses_alt_svc_header() {
-    let fx = TwoRouteFixture::spawn_with_options("http3 = false\n", Vec::new()).await;
+    let fx = TwoRouteFixture::spawn_with_options(TwoRouteOpts::no_http3()).await;
     let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
@@ -645,7 +682,11 @@ async fn http3_false_suppresses_alt_svc_header() {
 #[tokio::test]
 async fn upstream_alt_svc_header_is_preserved() {
     let upstream_alt_svc = "h3=\":9443\"; ma=123";
-    let fx = TwoRouteFixture::spawn_with_options("", vec![("alt-svc", upstream_alt_svc)]).await;
+    let fx = TwoRouteFixture::spawn_with_options(TwoRouteOpts::with_api_headers(vec![(
+        "alt-svc",
+        upstream_alt_svc,
+    )]))
+    .await;
     let mut tls = dial_tls(fx.frontend_addr, &fx.api_host, vec![b"http/1.1".to_vec()])
         .await
         .unwrap();
@@ -684,7 +725,7 @@ async fn unknown_host_404_includes_alt_svc() {
 /// §6h(8): the route's backend is unreachable → 502.
 #[tokio::test]
 async fn dead_backend_returns_502() {
-    // Build a fixture where one route points at a never-bound port.
+    init_tracing();
     let tmpdir = tempfile::tempdir().unwrap();
     let rules_dir = tmpdir.path().join("rules");
     let cert_dir = tmpdir.path().join("certs");
@@ -698,20 +739,16 @@ async fn dead_backend_returns_502() {
     // the test is the only thing on this loopback host that knows it, so
     // the dial will return ECONNREFUSED.
     let host = format!("dead{}.localhost", rand::random::<u32>());
+    issue_cert_convention(&cert_dir, &host);
+
     let toml = format!(
         r#"
-[[rule]]
-name = "dead"
-protocol = "https"
-listen = "{frontend_addr}"
-
-[[rule.route]]
+[[route]]
 hostname = "{host}"
 target = "http://127.0.0.1:{dead_port}"
-cert = "ephemeral"
 "#,
     );
-    std::fs::write(rules_dir.join("https.toml"), toml).unwrap();
+    std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
 
     let shutdown = CancellationToken::new();
     let redirect_port = pick_free_tcp_port().await;
@@ -723,6 +760,9 @@ cert = "ephemeral"
             default_cert: None,
             default_key: None,
             redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: true,
+            https_alt_svc: true,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -775,8 +815,10 @@ async fn alpn_negotiates_h2_when_client_prefers_h2() {
 /// header on successful responses; an HSTS-less route does not.
 #[tokio::test]
 async fn hsts_header_emitted_when_opted_in() {
+    init_tracing();
     // Build a single-route fixture with HSTS enabled on a disk-loaded
-    // cert (proves the disk-cert path also injects HSTS).
+    // cert. Cert comes from the [server].default_cert + default_key
+    // path so we exercise the second rung of the resolver chain.
     let api = EchoBackend::spawn("api").await;
     let tmpdir = tempfile::tempdir().unwrap();
     let rules_dir = tmpdir.path().join("rules");
@@ -789,16 +831,7 @@ async fn hsts_header_emitted_when_opted_in() {
     issue_self_signed_pem(&cert_path, &key_path, &host);
     let frontend_port = pick_free_tcp_port().await;
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
-    write_https_rule_one_route_with_paths(
-        &rules_dir,
-        "hsts",
-        frontend_addr,
-        &host,
-        &api.upstream_url(),
-        &cert_path,
-        &key_path,
-        true,
-    );
+    write_route_one_with_hsts(&rules_dir, &host, &api.upstream_url(), true);
     let shutdown = CancellationToken::new();
     let redirect_port = pick_free_tcp_port().await;
     let supervisor = spawn_terminal_supervisor_with_certs(
@@ -806,9 +839,12 @@ async fn hsts_header_emitted_when_opted_in() {
         Duration::from_millis(50),
         CertConfig {
             cert_dir,
-            default_cert: None,
-            default_key: None,
+            default_cert: Some(cert_path),
+            default_key: Some(key_path),
             redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: true,
+            https_alt_svc: true,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -963,22 +999,15 @@ async fn disk_backed_cert_reloads_on_change() {
     let cert_dir = tmpdir.path().join("certs");
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::create_dir_all(&cert_dir).unwrap();
-    let cert_path = cert_dir.join("cert.pem");
-    let key_path = cert_dir.join("key.pem");
     let host = format!("reload{}.localhost", rand::random::<u32>());
+    let host_dir = cert_dir.join(&host);
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let cert_path = host_dir.join("fullchain.pem");
+    let key_path = host_dir.join("privkey.pem");
     issue_self_signed_pem(&cert_path, &key_path, &host);
     let frontend_port = pick_free_tcp_port().await;
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
-    write_https_rule_one_route_with_paths(
-        &rules_dir,
-        "reload",
-        frontend_addr,
-        &host,
-        &api.upstream_url(),
-        &cert_path,
-        &key_path,
-        false,
-    );
+    write_route_one_with_hsts(&rules_dir, &host, &api.upstream_url(), false);
     let shutdown = CancellationToken::new();
     let redirect_port = pick_free_tcp_port().await;
     let supervisor = spawn_terminal_supervisor_with_certs(
@@ -989,6 +1018,9 @@ async fn disk_backed_cert_reloads_on_change() {
             default_cert: None,
             default_key: None,
             redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: true,
+            https_alt_svc: true,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -1030,28 +1062,22 @@ async fn disk_backed_cert_reloads_on_change() {
 /// `metrics.rs` unit tests.
 #[tokio::test]
 async fn malformed_cert_reload_keeps_old_cert_serving() {
+    init_tracing();
     let api = EchoBackend::spawn("api").await;
     let tmpdir = tempfile::tempdir().unwrap();
     let rules_dir = tmpdir.path().join("rules");
     let cert_dir = tmpdir.path().join("certs");
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::create_dir_all(&cert_dir).unwrap();
-    let cert_path = cert_dir.join("cert.pem");
-    let key_path = cert_dir.join("key.pem");
     let host = format!("bad{}.localhost", rand::random::<u32>());
+    let host_dir = cert_dir.join(&host);
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let cert_path = host_dir.join("fullchain.pem");
+    let key_path = host_dir.join("privkey.pem");
     issue_self_signed_pem(&cert_path, &key_path, &host);
     let frontend_port = pick_free_tcp_port().await;
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
-    write_https_rule_one_route_with_paths(
-        &rules_dir,
-        "bad",
-        frontend_addr,
-        &host,
-        &api.upstream_url(),
-        &cert_path,
-        &key_path,
-        false,
-    );
+    write_route_one_with_hsts(&rules_dir, &host, &api.upstream_url(), false);
     let shutdown = CancellationToken::new();
     let redirect_port = pick_free_tcp_port().await;
     let supervisor = spawn_terminal_supervisor_with_certs(
@@ -1062,6 +1088,9 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
             default_cert: None,
             default_key: None,
             redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: true,
+            https_alt_svc: true,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -1190,10 +1219,8 @@ async fn leaf_fingerprint(frontend_addr: SocketAddr, sni: &str) -> [u8; 32] {
 // runner can't do without root + netns. That branch is covered by the
 // `LanCidrs::contains` unit tests + the manual call site review.
 
-fn write_https_rule_with_cert_less_route(
+fn write_routes_cert_d_and_cert_less(
     rules_dir: &Path,
-    rule_name: &str,
-    listen: SocketAddr,
     cert_d_host: &str,
     cert_d_target: &str,
     cert_less_host: &str,
@@ -1201,23 +1228,16 @@ fn write_https_rule_with_cert_less_route(
 ) {
     let toml = format!(
         r#"
-[[rule]]
-name = "{rule_name}"
-protocol = "https"
-listen = "{listen}"
-
-[[rule.route]]
+[[route]]
 hostname = "{cert_d_host}"
 target = "{cert_d_target}"
-cert = "ephemeral"
 
-[[rule.route]]
+[[route]]
 hostname = "{cert_less_host}"
 target = "{cert_less_target}"
-# No cert source — this route is served on :80 plaintext only.
 "#,
     );
-    std::fs::write(rules_dir.join("https.toml"), toml).unwrap();
+    std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
 }
 
 struct CertLessFixture {
@@ -1252,10 +1272,13 @@ impl CertLessFixture {
         let redirect_port = pick_free_tcp_port().await;
         let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
 
-        write_https_rule_with_cert_less_route(
+        // Issue a convention cert for the cert-d host. The cert-less
+        // host intentionally has no PEM on disk → load_routes_into_store
+        // returns it in the cert-less list and the route lives on `:80`.
+        issue_cert_convention(&cert_dir, &cert_d_host);
+
+        write_routes_cert_d_and_cert_less(
             &rules_dir,
-            "front",
-            frontend_addr,
             &cert_d_host,
             &cert_d.upstream_url(),
             &cert_less_host,
@@ -1268,6 +1291,9 @@ impl CertLessFixture {
             default_cert: None,
             default_key: None,
             redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: true,
+            https_alt_svc: true,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),

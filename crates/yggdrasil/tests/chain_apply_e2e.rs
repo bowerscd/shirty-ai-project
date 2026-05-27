@@ -42,14 +42,9 @@ fn terminal_rule(name: &str, listen_port: u16, target: &str) -> Rule {
         listen: format!("127.0.0.1:{listen_port}").parse().unwrap(),
         protocol: Protocol::Tcp,
         target_port: None,
-        target_addr: Some(target.parse().unwrap()),
-        target_host: None,
+        target: Some(target.to_string()),
         idle_timeout: None,
         proxy_protocol: None,
-        routes: None,
-        cert_dir: None,
-        http3: None,
-        alt_svc: None,
     }
 }
 

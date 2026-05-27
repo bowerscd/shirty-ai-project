@@ -1,7 +1,7 @@
 //! End-to-end integration tests for `Request::ChainCanary`.
 //!
 //! Spins up a terminal-mode supervisor with a TCP and a UDP rule whose
-//! `target_addr` deliberately points at an unreachable backend, then
+//! `target` deliberately points at an unreachable backend, then
 //! invokes `Request::ChainCanary` over the UDS. With the canary
 //! arm-table shared between the supervisor and the control server,
 //! the probe traffic prefixed with the random arming token is
@@ -111,14 +111,9 @@ fn terminal_tcp_rule(name: &str, listen_port: u16, target: &str) -> Rule {
         listen: format!("127.0.0.1:{listen_port}").parse().unwrap(),
         protocol: Protocol::Tcp,
         target_port: None,
-        target_addr: Some(target.parse().unwrap()),
-        target_host: None,
+        target: Some(target.to_string()),
         idle_timeout: None,
         proxy_protocol: None,
-        routes: None,
-        cert_dir: None,
-        http3: None,
-        alt_svc: None,
     }
 }
 
@@ -128,14 +123,9 @@ fn terminal_udp_rule(name: &str, listen_port: u16, target: &str) -> Rule {
         listen: format!("127.0.0.1:{listen_port}").parse().unwrap(),
         protocol: Protocol::Udp,
         target_port: None,
-        target_addr: Some(target.parse().unwrap()),
-        target_host: None,
+        target: Some(target.to_string()),
         idle_timeout: None,
         proxy_protocol: None,
-        routes: None,
-        cert_dir: None,
-        http3: None,
-        alt_svc: None,
     }
 }
 
@@ -156,7 +146,7 @@ async fn tcp_canary_ok_against_unreachable_backend() {
             .await;
 
     // Push a TCP rule via the supervisor's external apply channel
-    // (avoids needing a hot-reload trigger). target_addr is
+    // (avoids needing a hot-reload trigger). target is
     // 127.0.0.1:1 (privileged unreachable port).
     let listen_port = pick_free_tcp_port().await;
     let rule = terminal_tcp_rule("tcp-canary", listen_port, "127.0.0.1:1");

@@ -160,7 +160,7 @@ target_port = {target_port}
     std::fs::write(rules_dir.join(filename), toml).unwrap();
 }
 
-/// Write a terminal-mode TOML rule (`target_addr` form) into
+/// Write a terminal-mode TOML rule (`target` form) into
 /// `rules_dir/<filename>`. Caller is responsible for first creating
 /// `rules_dir`. Terminal rules dial a static `host:port` on the LAN; the
 /// `target` arg is passed through verbatim (e.g. `"127.0.0.1:9001"`).
@@ -178,7 +178,7 @@ pub fn write_terminal_rule(
 name = "{name}"
 protocol = "{protocol}"
 listen = "127.0.0.1:{listen_port}"
-target_addr = "{target}"
+target = "{target}"
 "#,
     );
     std::fs::write(rules_dir.join(filename), toml).unwrap();
@@ -245,7 +245,7 @@ pub async fn spawn_supervisor(
 }
 
 /// Spawn a proxy supervisor in **terminal** mode. The supervisor uses a
-/// static resolver factory; each rule must carry `target_addr` (the helper
+/// static resolver factory; each rule must carry `target` (the helper
 /// [`write_terminal_rule`] writes rules of that shape).
 pub async fn spawn_terminal_supervisor(
     rules_dir: PathBuf,

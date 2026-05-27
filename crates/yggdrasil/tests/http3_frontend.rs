@@ -11,7 +11,6 @@ mod common;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +25,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, SignatureScheme};
 use tokio::net::TcpListener;
 
-use yggdrasil::proxy::certs::{load_rule_into_store, CertStore};
+use yggdrasil::proxy::certs::{load_routes_into_store, CertStore};
 use yggdrasil::proxy::h3_frontend::H3Frontend;
 
 /// Test-only `ServerCertVerifier` that accepts any chain. The H3 frontend's
@@ -138,25 +137,44 @@ fn build_h3_client_endpoint() -> quinn::Endpoint {
 }
 
 async fn build_frontend(backend: SocketAddr) -> H3Frontend {
-    let store = Arc::new(CertStore::new());
-    let rule_toml = format!(
-        r#"
-        [[rule]]
-        name = "h3-int"
-        listen = "127.0.0.1:0"
-        protocol = "https"
+    // Build a one-route HttpRoute pointing at `backend` and a per-host
+    // cert via the cert convention. The H3 frontend will pick this up
+    // through the shared cert store at startup.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let cert_dir = tmp.path().to_path_buf();
+    let host = "localhost";
+    let host_dir = cert_dir.join(host);
+    std::fs::create_dir_all(&host_dir).expect("mkdir host");
+    let mut params = rcgen::CertificateParams::new(vec![host.to_string()]).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    std::fs::write(host_dir.join("fullchain.pem"), cert.pem()).unwrap();
+    std::fs::write(host_dir.join("privkey.pem"), key.serialize_pem()).unwrap();
 
-        [[rule.route]]
-        hostname = "localhost"
-        target = "http://{backend}"
-        cert = "ephemeral"
-        hsts = true
-        "#,
-    );
-    let f = ratatoskr::rule::RuleFile::from_toml("int.toml", &rule_toml).unwrap();
-    let rule = f.rule.into_iter().next().unwrap();
-    load_rule_into_store(&rule, store.as_ref(), Path::new("."), None).unwrap();
-    H3Frontend::spawn(rule, store).await.expect("spawn h3")
+    let target = url::Url::parse(&format!("http://{backend}/")).unwrap();
+    let routes = vec![ratatoskr::rule::HttpRoute {
+        hostname: host.to_string(),
+        target,
+        hsts: Some(ratatoskr::rule::HstsConfig::default()),
+    }];
+
+    let store = Arc::new(CertStore::new());
+    let _cert_less = load_routes_into_store("h3-int", &routes, store.as_ref(), &cert_dir, None)
+        .expect("load route certs");
+
+    // Tmpdir is kept alive for the test duration via `std::mem::forget`.
+    // The cert paths sit inside it; once the test exits the OS cleans up.
+    std::mem::forget(tmp);
+
+    H3Frontend::spawn(
+        "h3-int".to_string(),
+        "127.0.0.1:0".parse().unwrap(),
+        &routes,
+        store,
+    )
+    .await
+    .expect("spawn h3")
 }
 
 async fn h3_request(
