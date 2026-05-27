@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use ratatoskr::rule::HttpRoute;
 
-/// Errors produced while loading or generating per-route TLS material.
+/// Errors produced while loading per-route TLS material.
 #[derive(Debug, Error)]
 pub enum CertError {
     #[error("rule {rule:?}: route {route:?}: cert file {path}: {source}")]
@@ -58,15 +58,9 @@ pub enum CertError {
         route: String,
         detail: String,
     },
-    #[error("rule {rule:?}: route {route:?}: failed to generate ephemeral cert: {detail}")]
-    Ephemeral {
-        rule: String,
-        route: String,
-        detail: String,
-    },
     #[error(
         "rule {rule:?}: route {route:?}: no cert source matched the resolution chain \
-         (no explicit cert, no ephemeral, no convention-dir match, no server.default_cert)"
+         (no convention-dir match, no server.default_cert)"
     )]
     NoSource { rule: String, route: String },
 }
@@ -76,49 +70,27 @@ pub enum CertError {
 /// status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertOrigin {
-    /// Operator-supplied PEM files on disk.
-    Path { cert: PathBuf, key: PathBuf },
-    /// In-memory self-signed leaf generated at startup. Never persisted.
-    Ephemeral,
     /// Loaded from the convention directory (`<cert_dir>/<host>/fullchain.pem`).
     Convention { cert: PathBuf, key: PathBuf },
     /// Loaded from `[server] default_cert` + `default_key`.
     Default { cert: PathBuf, key: PathBuf },
-    /// ACME-issued and -managed: PEM files live at the convention path
-    /// but their lifecycle (issue, renew, atomic replace) is owned by
-    /// the daemon's `AcmeManager`.
-    Acme { cert: PathBuf, key: PathBuf },
-    /// ACME route whose first issuance hasn't completed yet. The cert
-    /// served is the same in-memory ephemeral as the `Ephemeral`
-    /// variant, but its presence is a signal to the operator and the
-    /// renewer that a real cert is pending at the recorded paths.
-    AcmePending { cert: PathBuf, key: PathBuf },
 }
 
 impl CertOrigin {
     /// Short label suitable for tabular output in `yggdrasilctl local status`.
     pub fn as_label(&self) -> String {
         match self {
-            Self::Path { cert, .. } => format!("path:{}", cert.display()),
-            Self::Ephemeral => "ephemeral".to_string(),
             Self::Convention { cert, .. } => format!("convention:{}", cert.display()),
             Self::Default { cert, .. } => format!("default:{}", cert.display()),
-            Self::Acme { cert, .. } => format!("acme:{}", cert.display()),
-            Self::AcmePending { cert, .. } => format!("acme-pending:{}", cert.display()),
         }
     }
 
     /// PEM file paths that should be wired into the hot-reload watcher.
-    /// `Ephemeral` and `AcmePending` have no on-disk paths (yet); the
-    /// pending variant relies on the AcmeManager driving an explicit
-    /// `reload_host` once it writes the first issuance.
     pub fn watched_paths(&self) -> Vec<PathBuf> {
         match self {
-            Self::Path { cert, key }
-            | Self::Convention { cert, key }
-            | Self::Default { cert, key }
-            | Self::Acme { cert, key } => vec![cert.clone(), key.clone()],
-            Self::Ephemeral | Self::AcmePending { .. } => Vec::new(),
+            Self::Convention { cert, key } | Self::Default { cert, key } => {
+                vec![cert.clone(), key.clone()]
+            }
         }
     }
 }
@@ -154,7 +126,6 @@ impl std::fmt::Debug for CertEntry {
 pub struct ReloadSpec {
     pub rule_name: String,
     pub route: HttpRoute,
-    pub rule_cert_dir: Option<PathBuf>,
     pub server_cert_dir: PathBuf,
     pub server_default: Option<(PathBuf, PathBuf)>,
 }
@@ -164,26 +135,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cert_origin_watched_paths_skips_ephemeral() {
-        let eph = CertOrigin::Ephemeral;
-        assert!(eph.watched_paths().is_empty());
-        let p = CertOrigin::Path {
+    fn cert_origin_watched_paths_includes_both() {
+        let c = CertOrigin::Convention {
             cert: PathBuf::from("/a"),
             key: PathBuf::from("/b"),
         };
-        assert_eq!(p.watched_paths().len(), 2);
+        assert_eq!(c.watched_paths().len(), 2);
     }
 
     #[test]
     fn cert_origin_label_format() {
-        assert_eq!(CertOrigin::Ephemeral.as_label(), "ephemeral");
         assert_eq!(
-            CertOrigin::Path {
+            CertOrigin::Default {
                 cert: PathBuf::from("/etc/a.pem"),
                 key: PathBuf::from("/etc/a.key"),
             }
             .as_label(),
-            "path:/etc/a.pem"
+            "default:/etc/a.pem"
         );
     }
 }

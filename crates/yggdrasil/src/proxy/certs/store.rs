@@ -111,7 +111,6 @@ impl CertStore {
             .map(|(c, k)| (c.as_path(), k.as_path()));
         let ctx = CertContext {
             rule_name: &spec.rule_name,
-            rule_cert_dir: spec.rule_cert_dir.as_deref(),
             server_cert_dir: &spec.server_cert_dir,
             server_default,
         };
