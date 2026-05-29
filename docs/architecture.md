@@ -445,8 +445,11 @@ timeout is 30 s with 15 s keep-alive PINGs; concurrent bidi streams cap is
 
 Per-request handling mirrors the TCP path byte-for-byte: extract
 `:authority`, look up the route, sanitise inbound headers, inject
-`X-Forwarded-For/Proto/Host` + `X-Real-IP`, rewrite the URI authority to
-the backend, dispatch via the shared `hyper-util` `LegacyClient`
+`X-Forwarded-For` + `X-Real-IP` + `X-Forwarded-Proto` +
+`X-Forwarded-Protocol` (older synonym; Jellyfin's recommended config
+and a long tail of Microsoft-stack-derived backends read this
+spelling) + `X-Forwarded-Host`, rewrite the URI authority to the
+backend, dispatch via the shared `hyper-util` `LegacyClient`
 (HTTP/1.1 cleartext to LAN). Request bodies are buffered up to 16 MiB
 (`H3_REQUEST_BODY_LIMIT`); larger uploads get 413. Response bodies stream
 back in 8 KiB chunks via `send_data`.

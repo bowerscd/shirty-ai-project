@@ -542,6 +542,12 @@ async fn sni_api_dispatches_and_xforwarded_headers_are_injected() {
     assert_eq!(captured.header("x-real-ip"), Some("127.0.0.1"));
     assert_eq!(captured.header("x-forwarded-proto"), Some("https"));
     assert_eq!(
+        captured.header("x-forwarded-protocol"),
+        Some("https"),
+        "Jellyfin's recommended config (and a long tail of Microsoft-stack \
+         backends) reads X-Forwarded-Protocol; must be emitted alongside Proto"
+    );
+    assert_eq!(
         captured.header("x-forwarded-host"),
         Some(fx.api_host.as_str())
     );
@@ -580,6 +586,8 @@ async fn client_supplied_xforwarded_for_is_replaced_with_real_ip() {
         Some(&fx.api_host),
         &[
             ("X-Forwarded-For", "10.10.10.10"),
+            ("X-Forwarded-Proto", "http"),
+            ("X-Forwarded-Protocol", "http"),
             ("X-Real-IP", "10.10.10.10"),
             ("Forwarded", "for=10.10.10.10"),
         ],
@@ -590,6 +598,17 @@ async fn client_supplied_xforwarded_for_is_replaced_with_real_ip() {
     let captured = fx.api.last_request().await.unwrap();
     assert_eq!(captured.header("x-forwarded-for"), Some("127.0.0.1"));
     assert_eq!(captured.header("x-real-ip"), Some("127.0.0.1"));
+    assert_eq!(
+        captured.header("x-forwarded-proto"),
+        Some("https"),
+        "client-supplied X-Forwarded-Proto must be replaced with the real scheme"
+    );
+    assert_eq!(
+        captured.header("x-forwarded-protocol"),
+        Some("https"),
+        "client-supplied X-Forwarded-Protocol synonym must be stripped and \
+         replaced — leaving it would let a request spoof its origin scheme"
+    );
     assert!(
         captured.header("forwarded").is_none(),
         "Forwarded header should be stripped, got {:?}",

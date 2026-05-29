@@ -382,7 +382,9 @@ it before the rustls handshake. On the UDP/QUIC leg, the relay sends a
 PROXY-v2 header as a standalone first datagram on each new flow; the
 terminal's HTTP/3 endpoint interposes on its UDP socket
 (`proxy/h3_interpose.rs`) to strip these and recover the real client
-addr for `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Host` stamping.
+addr for `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Proto` (and
+its `X-Forwarded-Protocol` synonym, for backends that read the older
+spelling) / `X-Forwarded-Host` stamping.
 Operators do not configure this — there is no `proxy_protocol` field on
 `[[route]]`, no `[server]` knob, and no `[[rule]]` opt-in for the
 HTTPS path. The L4 `[[rule]] proxy_protocol = "v1"|"v2"` knob remains

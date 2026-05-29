@@ -36,6 +36,7 @@ pub fn strip_untrusted_forwarding(headers: &mut HeaderMap) {
     let to_remove = [
         HeaderName::from_static("x-forwarded-for"),
         HeaderName::from_static("x-forwarded-proto"),
+        HeaderName::from_static("x-forwarded-protocol"),
         HeaderName::from_static("x-forwarded-host"),
         HeaderName::from_static("x-forwarded-port"),
         HeaderName::from_static("x-real-ip"),
@@ -75,12 +76,18 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// Inject `X-Forwarded-For` + `X-Real-IP` + `X-Forwarded-Proto` +
-/// `X-Forwarded-Host` for a forwarded request. `client_ip` is the
-/// original client's IP (from PROXY-protocol header on TCP, or the
-/// immediate-peer IP for HTTP/3 until PROXY-over-UDP lands). `host` is
-/// the inbound `Host` header value. `scheme` is the client-facing
-/// scheme as seen on the wire — `"https"` for the TLS / QUIC frontend,
-/// `"http"` for the companion listener's plaintext path on `:80`.
+/// `X-Forwarded-Protocol` + `X-Forwarded-Host` for a forwarded request.
+/// `client_ip` is the original client's IP (from PROXY-protocol header
+/// on TCP, or from the h3 interpose map on UDP / QUIC). `host` is the
+/// inbound `Host` header value. `scheme` is the client-facing scheme
+/// as seen on the wire — `"https"` for the TLS / QUIC frontend, `"http"`
+/// for the companion listener's plaintext path on `:80`.
+///
+/// `X-Forwarded-Protocol` is emitted alongside the canonical
+/// `X-Forwarded-Proto` because the Jellyfin recommended reverse-proxy
+/// posture (and a long tail of older Microsoft-stack-derived backends)
+/// reads the `Protocol`-spelt variant. The two values are always
+/// identical; backends should prefer `Proto`.
 pub fn inject_forwarded(
     headers: &mut HeaderMap,
     client_ip: IpAddr,
@@ -92,7 +99,8 @@ pub fn inject_forwarded(
         headers.insert(HeaderName::from_static("x-real-ip"), v);
     }
     if let Ok(v) = HeaderValue::from_str(scheme) {
-        headers.insert(HeaderName::from_static("x-forwarded-proto"), v);
+        headers.insert(HeaderName::from_static("x-forwarded-proto"), v.clone());
+        headers.insert(HeaderName::from_static("x-forwarded-protocol"), v);
     }
     if let Some(h) = host {
         if let Ok(v) = HeaderValue::from_str(h) {
@@ -146,6 +154,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
         h.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        h.insert("x-forwarded-protocol", HeaderValue::from_static("http"));
         h.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
         h.insert("x-forwarded-port", HeaderValue::from_static("1234"));
         h.insert("x-real-ip", HeaderValue::from_static("5.6.7.8"));
@@ -156,6 +165,11 @@ mod tests {
 
         assert!(!h.contains_key("x-forwarded-for"));
         assert!(!h.contains_key("x-forwarded-proto"));
+        assert!(
+            !h.contains_key("x-forwarded-protocol"),
+            "the X-Forwarded-Protocol synonym must be stripped too — leaving a \
+             client-supplied value would let a request spoof its origin scheme"
+        );
         assert!(!h.contains_key("x-forwarded-host"));
         assert!(!h.contains_key("x-forwarded-port"));
         assert!(!h.contains_key("x-real-ip"));
@@ -213,6 +227,12 @@ mod tests {
         assert_eq!(h.get("x-forwarded-for").unwrap(), "203.0.113.7");
         assert_eq!(h.get("x-real-ip").unwrap(), "203.0.113.7");
         assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(
+            h.get("x-forwarded-protocol").unwrap(),
+            "https",
+            "Jellyfin recommended config and older Microsoft-stack backends read \
+             X-Forwarded-Protocol; must be emitted alongside the canonical Proto"
+        );
         assert_eq!(h.get("x-forwarded-host").unwrap(), "api.example.com");
     }
 
@@ -226,6 +246,7 @@ mod tests {
         assert_eq!(h.get("x-forwarded-for").unwrap(), "2001:db8::1");
         assert_eq!(h.get("x-real-ip").unwrap(), "2001:db8::1");
         assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(h.get("x-forwarded-protocol").unwrap(), "https");
         assert_eq!(h.get("x-forwarded-host").unwrap(), "api.example.com");
     }
 
@@ -242,6 +263,12 @@ mod tests {
             h.get("x-forwarded-proto").unwrap(),
             "http",
             "companion listener must inject http, not https"
+        );
+        assert_eq!(
+            h.get("x-forwarded-protocol").unwrap(),
+            "http",
+            "the X-Forwarded-Protocol synonym must track Proto on the plaintext \
+             path too"
         );
         assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.janus.local");
     }

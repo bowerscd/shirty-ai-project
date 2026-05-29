@@ -98,10 +98,12 @@ async fn spawn_backend() -> SocketAddr {
                             .unwrap_or("")
                     };
                     let body = format!(
-                        "ok xff={} xri={} xfh={}\n",
+                        "ok xff={} xri={} xfh={} xfp={} xfpsyn={}\n",
                         header("x-forwarded-for"),
                         header("x-real-ip"),
                         header("x-forwarded-host"),
+                        header("x-forwarded-proto"),
+                        header("x-forwarded-protocol"),
                     );
                     Ok::<_, Infallible>(
                         HResponse::builder()
@@ -246,6 +248,11 @@ async fn h3_get_round_trip() {
     assert!(body.contains("xff=127.0.0.1"), "body missing xff: {body}");
     assert!(body.contains("xri=127.0.0.1"), "body missing xri: {body}");
     assert!(body.contains("xfh=localhost"), "body missing xfh: {body}");
+    assert!(body.contains("xfp=https"), "body missing xfp: {body}");
+    assert!(
+        body.contains("xfpsyn=https"),
+        "body missing X-Forwarded-Protocol synonym: {body}"
+    );
 
     frontend.stop(None).await;
 }
