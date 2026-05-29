@@ -408,6 +408,7 @@ async fn dispatch(
                 hostname: bare_host.to_string(),
                 target,
                 hsts: None,
+                headers: std::collections::BTreeMap::new(),
             }];
             let route_table = Arc::new(RouteTable::build(&single_route, &rule_name));
             let ctx = Arc::new(ConnContext {

@@ -139,7 +139,7 @@ fn rejects_idle_timeout_on_tcp_rule() {
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("idle_timeout")));
+    assert!(matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("idle_timeout")));
 }
 
 #[test]
@@ -181,7 +181,9 @@ fn rejects_proxy_protocol_v1_on_udp_rule() {
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("v1") && s.contains("udp")));
+    assert!(
+        matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("v1") && s.contains("udp"))
+    );
 }
 
 #[test]
@@ -197,7 +199,7 @@ fn rejects_zero_listen_port() {
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("listen port")));
+    assert!(matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("listen port")));
 }
 
 #[test]
@@ -213,7 +215,7 @@ fn rejects_zero_target_port() {
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("target_port")));
+    assert!(matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("target_port")));
 }
 
 #[test]
@@ -347,7 +349,7 @@ fn rejects_empty_name() {
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("empty")));
+    assert!(matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("empty")));
 }
 
 #[test]
@@ -363,7 +365,7 @@ fn rejects_name_with_whitespace() {
     )
     .unwrap();
     let err = f.validate_each().err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("whitespace")));
+    assert!(matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("whitespace")));
 }
 
 #[test]
@@ -431,7 +433,7 @@ fn rule_set_rejects_duplicate_names() {
     )
     .unwrap();
     let err = RuleSet::from_files([a, b]).err();
-    assert!(matches!(err, Some(Error::InvalidRule(s)) if s.contains("duplicate rule name")));
+    assert!(matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("duplicate rule name")));
 }
 
 fn l4_rule_file(name: &str, listen: &str, protocol: Protocol) -> RuleFile {
@@ -867,4 +869,152 @@ fn https_protocol_serialises_as_lowercase() {
     // serialise a top-level enum, so check via serde_json.
     let s = serde_json::to_string(&Protocol::Https).unwrap();
     assert_eq!(s, "\"https\"");
+}
+
+#[test]
+fn http_route_static_headers_round_trip_and_validate() {
+    let f = parse(
+        r#"
+            [[route]]
+            hostname = "app.example.com"
+            target = "http://192.168.1.10:8080"
+
+            [route.headers]
+            "X-Robots-Tag" = "noindex, nofollow, nosnippet, noarchive"
+            "X-Frame-Options" = "DENY"
+            "Content-Security-Policy" = "default-src 'self'"
+            "#,
+    )
+    .unwrap();
+    assert_eq!(f.route.len(), 1);
+    let r = &f.route[0];
+    assert_eq!(r.headers.len(), 3);
+    assert_eq!(
+        r.headers.get("X-Robots-Tag").map(String::as_str),
+        Some("noindex, nofollow, nosnippet, noarchive"),
+    );
+    assert_eq!(
+        r.headers.get("X-Frame-Options").map(String::as_str),
+        Some("DENY"),
+    );
+    f.validate_each().unwrap();
+}
+
+#[test]
+fn http_route_static_headers_default_to_empty() {
+    let f = parse(
+        r#"
+            [[route]]
+            hostname = "minimal.example.com"
+            target = "http://10.0.0.1:80"
+            "#,
+    )
+    .unwrap();
+    assert!(f.route[0].headers.is_empty());
+    f.validate_each().unwrap();
+}
+
+#[test]
+fn http_route_rejects_hop_by_hop_static_header() {
+    let f = parse(
+        r#"
+            [[route]]
+            hostname = "bad.example.com"
+            target = "http://10.0.0.1:80"
+
+            [route.headers]
+            "Connection" = "close"
+            "#,
+    )
+    .unwrap();
+    let err = f.validate_each().err();
+    assert!(
+        matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("reserved") && s.to_ascii_lowercase().contains("connection")),
+        "expected hop-by-hop rejection, got {err:?}",
+    );
+}
+
+#[test]
+fn http_route_rejects_hsts_static_header() {
+    let f = parse(
+        r#"
+            [[route]]
+            hostname = "hsts.example.com"
+            target = "http://10.0.0.1:80"
+
+            [route.headers]
+            "Strict-Transport-Security" = "max-age=63072000"
+            "#,
+    )
+    .unwrap();
+    let err = f.validate_each().err();
+    assert!(
+        matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("reserved") && s.to_ascii_lowercase().contains("strict-transport-security")),
+        "expected HSTS rejection (use `hsts` field instead), got {err:?}",
+    );
+}
+
+#[test]
+fn http_route_rejects_forwarding_static_header() {
+    let f = parse(
+        r#"
+            [[route]]
+            hostname = "fwd.example.com"
+            target = "http://10.0.0.1:80"
+
+            [route.headers]
+            "X-Forwarded-For" = "1.2.3.4"
+            "#,
+    )
+    .unwrap();
+    let err = f.validate_each().err();
+    assert!(
+        matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("reserved") && s.to_ascii_lowercase().contains("x-forwarded-for")),
+        "expected forwarding-header rejection, got {err:?}",
+    );
+}
+
+#[test]
+fn http_route_rejects_invalid_header_name_character() {
+    let f = parse(
+        r#"
+            [[route]]
+            hostname = "x.example.com"
+            target = "http://10.0.0.1:80"
+
+            [route.headers]
+            "Has Space" = "ok"
+            "#,
+    )
+    .unwrap();
+    let err = f.validate_each().err();
+    assert!(
+        matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("not allowed in an HTTP field name")),
+        "expected invalid-name rejection, got {err:?}",
+    );
+}
+
+#[test]
+fn http_route_rejects_crlf_in_header_value() {
+    // CRLF in a header value would be header-injection; reject loudly
+    // at config load. Use a hand-built HttpRoute since TOML strips
+    // some control characters at parse time.
+    use super::HttpRoute;
+    use std::collections::BTreeMap;
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        "X-Custom".to_string(),
+        "ok\r\nInjected-Header: pwn".to_string(),
+    );
+    let route = HttpRoute {
+        hostname: "x.example.com".to_string(),
+        target: "http://10.0.0.1:80".parse().unwrap(),
+        hsts: None,
+        headers,
+    };
+    let err = super::validate::validate_http_route("<route>", &route).err();
+    assert!(
+        matches!(err, Some(Error::InvalidRule(ref s)) if s.contains("invalid value")),
+        "expected CRLF-injection rejection, got {err:?}",
+    );
 }

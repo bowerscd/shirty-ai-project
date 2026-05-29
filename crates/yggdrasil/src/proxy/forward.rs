@@ -129,6 +129,31 @@ pub fn maybe_inject_hsts(headers: &mut HeaderMap, hsts: Option<&HstsConfig>) {
     }
 }
 
+/// Stamp the per-route `[[route]].headers` map onto the outbound
+/// response. Operator-set values OVERRIDE any header of the same name
+/// already in `headers` (i.e. backend-set values lose), matching
+/// nginx's `add_header ... always` posture: the configured policy
+/// always wins.
+///
+/// Names and values are pre-validated at config load
+/// (`validate_http_route`); failures here are silent skips rather
+/// than panics because parse errors at runtime would otherwise be the
+/// header-injection surface that validation already gates.
+pub fn apply_static_response_headers(
+    response_headers: &mut HeaderMap,
+    static_headers: &std::collections::BTreeMap<String, String>,
+) {
+    for (name, value) in static_headers {
+        let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(hv) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        response_headers.insert(hn, hv);
+    }
+}
+
 /// Rewrite the client-facing request URI to target the selected upstream.
 pub fn build_upstream_uri(orig: &Uri, upstream: &Url) -> anyhow::Result<Uri> {
     let path_and_query = orig.path_and_query().map(|p| p.as_str()).unwrap_or("/");

@@ -432,6 +432,7 @@ where
     };
     let upstream_url = route.target.clone();
     let hsts_cfg = route.hsts;
+    let static_headers = route.headers.clone();
 
     // WebSocket-over-h3 (RFC 9220 extended CONNECT) is not supported.
     // h3 0.0.8 does not surface the `:protocol` pseudo-header through
@@ -494,6 +495,9 @@ where
     let (mut resp_parts, mut resp_body) = upstream_resp.into_parts();
     sanitise_response_headers(&mut resp_parts.headers);
     super::forward::maybe_inject_hsts(&mut resp_parts.headers, hsts_cfg.as_ref());
+    // Per-route static response headers stamp last so the configured
+    // policy overrides any same-name header the backend returned.
+    super::forward::apply_static_response_headers(&mut resp_parts.headers, &static_headers);
 
     let resp_head = http::Response::from_parts(resp_parts, ());
     let mut stream = stream;
@@ -678,6 +682,7 @@ mod tests {
             hostname: host.to_string(),
             target,
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let q = H3Frontend::spawn(
             "h3-smoke".to_string(),

@@ -2,7 +2,7 @@
 //!
 //! Split out from the original monolithic `http_frontend.rs` (Phase B4).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use url::Url;
 
@@ -15,6 +15,10 @@ pub struct RouteTable {
 pub(crate) struct RouteEntry {
     pub(crate) target: Url,
     pub(crate) hsts: Option<HstsConfig>,
+    /// Static response headers to stamp on every response from this
+    /// route. Operator-set values OVERRIDE any header of the same name
+    /// returned by the backend. Empty map means no extra headers.
+    pub(crate) headers: BTreeMap<String, String>,
     /// Name of the rule this route was authored under. Used for
     /// tracing / metrics labels so observability survives the
     /// companion-listener's cross-rule aggregation (the companion
@@ -47,6 +51,7 @@ impl RouteTable {
             let new = RouteEntry {
                 target: r.target.clone(),
                 hsts: r.hsts,
+                headers: r.headers.clone(),
                 rule_name: rule_name.to_string(),
             };
             if self.by_host.insert(key.clone(), new).is_some() {
@@ -106,6 +111,7 @@ mod tests {
             hostname: "API.example.com".into(),
             target: "http://10.0.0.1:8080".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let t = RouteTable::build(&routes, "test-rule");
         assert!(t.lookup("api.example.com").is_some());
@@ -122,11 +128,13 @@ mod tests {
             hostname: "a.example".into(),
             target: "http://10.0.0.1:80".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let route_b = vec![HttpRoute {
             hostname: "b.example".into(),
             target: "http://10.0.0.2:80".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let mut t = RouteTable::build(&route_a, "rule-a");
         let replaced = t.extend(&route_b, "rule-b");
@@ -142,11 +150,13 @@ mod tests {
             hostname: "shared.example".into(),
             target: "http://10.0.0.1:80".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let route_b = vec![HttpRoute {
             hostname: "shared.example".into(),
             target: "http://10.0.0.2:80".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let mut t = RouteTable::build(&route_a, "rule-a");
         let replaced = t.extend(&route_b, "rule-b");
@@ -160,12 +170,14 @@ mod tests {
             hostname: "x.example".into(),
             target: "http://10.0.0.1:80".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         let mut t = RouteTable::build(&routes, "rule-a");
         let extra = vec![HttpRoute {
             hostname: "y.example".into(),
             target: "http://10.0.0.2:80".parse().unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }];
         t.extend(&extra, "rule-b");
         assert_eq!(t.len(), 2);

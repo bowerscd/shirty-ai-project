@@ -351,6 +351,30 @@ target = "{target}"
     std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
 }
 
+/// Write a top-level `[[route]]` TOML file with one route plus a
+/// `[route.headers]` table of static response headers. Mirrors the
+/// nginx `add_header NAME VALUE` shape that every server block in the
+/// operator's `server/` deployment ships.
+fn write_route_one_with_static_headers(
+    rules_dir: &Path,
+    host: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+) {
+    let mut header_block = String::from("\n[route.headers]\n");
+    for (name, value) in headers {
+        header_block.push_str(&format!("{name:?} = {value:?}\n"));
+    }
+    let toml = format!(
+        r#"
+[[route]]
+hostname = "{host}"
+target = "{target}"
+{header_block}"#,
+    );
+    std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
+}
+
 /// Write a fresh self-signed PEM pair on disk. Uses `rcgen` directly so
 /// the test owns the issuance.
 fn issue_self_signed_pem(out_cert: &Path, out_key: &Path, hostname: &str) {
@@ -889,6 +913,125 @@ async fn hsts_header_emitted_when_opted_in() {
         lower.contains("strict-transport-security: max-age="),
         "HSTS header missing, got: {body}"
     );
+    shutdown.cancel();
+}
+
+/// Per-route `[[route]].headers` stamps configured names + values on
+/// every response over the h1/h2 path. Operator-set values OVERRIDE
+/// any header of the same name returned by the backend, matching
+/// nginx `add_header ... always` semantics — which is what every
+/// L7 backend in the operator's `server/` deployment relies on
+/// (`X-Robots-Tag` on all blocks, plus jellyfin / sites adding CSP /
+/// X-Frame-Options / X-Content-Type-Options / Origin-Agent-Cluster).
+#[tokio::test]
+async fn static_response_headers_reach_client_and_override_backend() {
+    init_tracing();
+    // Backend returns its own X-Frame-Options that the operator config
+    // should override. Also returns a header NOT in the route config to
+    // confirm we don't strip unrelated backend headers.
+    let api = EchoBackend::spawn_with_headers(
+        "api",
+        vec![
+            ("x-frame-options", "ALLOW-FROM https://evil.example"),
+            ("x-backend-tag", "kept"),
+        ],
+    )
+    .await;
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rules_dir = tmpdir.path().join("rules");
+    let cert_dir = tmpdir.path().join("certs");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    let cert_path = cert_dir.join("cert.pem");
+    let key_path = cert_dir.join("key.pem");
+    let host = format!("hdrs{}.localhost", rand::random::<u32>());
+    issue_self_signed_pem(&cert_path, &key_path, &host);
+    let frontend_port = pick_free_tcp_port().await;
+    let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
+    write_route_one_with_static_headers(
+        &rules_dir,
+        &host,
+        &api.upstream_url(),
+        &[
+            ("X-Robots-Tag", "noindex, nofollow, nosnippet, noarchive"),
+            ("X-Frame-Options", "DENY"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Content-Security-Policy", "default-src 'self'"),
+        ],
+    );
+    let shutdown = CancellationToken::new();
+    let redirect_port = pick_free_tcp_port().await;
+    let supervisor = spawn_terminal_supervisor_with_certs(
+        rules_dir,
+        Duration::from_millis(50),
+        CertConfig {
+            cert_dir,
+            default_cert: Some(cert_path),
+            default_key: Some(key_path),
+            redirect_port: Some(redirect_port),
+            https_listen: frontend_addr,
+            https_http3: true,
+            https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
+            acme: None,
+            lan_cidrs: std::sync::Arc::new(
+                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+            ),
+        },
+        shutdown.clone(),
+    )
+    .await;
+    assert!(supervisor.wait_for_nonempty(Duration::from_secs(2)).await);
+    let mut tls = dial_tls(frontend_addr, &host, vec![b"http/1.1".to_vec()])
+        .await
+        .unwrap();
+    let resp = http1_request(&mut tls, Some(&host), &[], "/")
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&resp);
+    assert!(body.starts_with("HTTP/1.1 200"), "got: {body}");
+    let lower = body.to_ascii_lowercase();
+
+    // All four configured static headers reached the client.
+    assert!(
+        lower.contains("x-robots-tag: noindex, nofollow, nosnippet, noarchive"),
+        "X-Robots-Tag missing, got: {body}"
+    );
+    assert!(
+        lower.contains("x-content-type-options: nosniff"),
+        "X-Content-Type-Options missing, got: {body}"
+    );
+    assert!(
+        lower.contains("content-security-policy: default-src 'self'"),
+        "CSP missing, got: {body}"
+    );
+
+    // Operator's X-Frame-Options overrode the backend's. We must see
+    // exactly one X-Frame-Options line and it must be "DENY", not the
+    // backend's "ALLOW-FROM https://evil.example".
+    let xfo_count = lower
+        .lines()
+        .filter(|line| line.starts_with("x-frame-options:"))
+        .count();
+    assert_eq!(
+        xfo_count, 1,
+        "expected exactly one X-Frame-Options line (operator overrides backend), got {xfo_count} in: {body}"
+    );
+    assert!(
+        lower.contains("x-frame-options: deny"),
+        "operator X-Frame-Options didn't win, got: {body}"
+    );
+    assert!(
+        !lower.contains("allow-from"),
+        "backend's X-Frame-Options leaked through, got: {body}"
+    );
+
+    // Unrelated backend headers still pass through.
+    assert!(
+        lower.contains("x-backend-tag: kept"),
+        "non-conflicting backend header was stripped, got: {body}"
+    );
+
     shutdown.cancel();
 }
 

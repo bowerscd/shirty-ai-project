@@ -21,8 +21,8 @@ use tracing::debug;
 use url::Url;
 
 use crate::proxy::forward::{
-    build_upstream_uri, inject_forwarded, maybe_inject_hsts, strip_hop_by_hop,
-    strip_untrusted_forwarding,
+    apply_static_response_headers, build_upstream_uri, inject_forwarded, maybe_inject_hsts,
+    strip_hop_by_hop, strip_untrusted_forwarding,
 };
 
 use super::backend::BackendClient;
@@ -132,6 +132,7 @@ pub(crate) async fn serve_request(
 
     let upstream_url = route.target.clone();
     let hsts_header = route.hsts;
+    let static_headers = route.headers.clone();
 
     // -------------------------------------------------------------------
     // Forward.
@@ -160,6 +161,12 @@ pub(crate) async fn serve_request(
     // HSTS opt-in. Safe to inject even on error responses we generated; in
     // practice 502s won't be flagged by browsers for HSTS purposes anyway.
     maybe_inject_hsts(resp.headers_mut(), hsts_header.as_ref());
+
+    // Per-route static response headers (X-Robots-Tag, CSP,
+    // X-Frame-Options, ...). Applied AFTER HSTS so operator-set headers
+    // get the final word; HSTS uses its own reserved name and is
+    // disallowed from `[[route]].headers` at config-load time anyway.
+    apply_static_response_headers(resp.headers_mut(), &static_headers);
 
     maybe_inject_alt_svc(&mut resp, &ctx);
     record_request_metrics(&ctx.rule_name, &route_label, &resp, started);

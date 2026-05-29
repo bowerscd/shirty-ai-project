@@ -80,14 +80,23 @@ impl ServerCertVerifier for AcceptAnyCert {
 }
 
 async fn spawn_backend() -> SocketAddr {
-    spawn_backend_with(false).await
+    spawn_backend_with(false, &[]).await
 }
 
 async fn spawn_echo_length_backend() -> SocketAddr {
-    spawn_backend_with(true).await
+    spawn_backend_with(true, &[]).await
 }
 
-async fn spawn_backend_with(echo_body_length: bool) -> SocketAddr {
+async fn spawn_backend_emitting_headers(
+    extra_headers: &'static [(&'static str, &'static str)],
+) -> SocketAddr {
+    spawn_backend_with(false, extra_headers).await
+}
+
+async fn spawn_backend_with(
+    echo_body_length: bool,
+    extra_response_headers: &'static [(&'static str, &'static str)],
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _accept_loop = tokio::spawn(async move {
@@ -125,13 +134,13 @@ async fn spawn_backend_with(echo_body_length: bool) -> SocketAddr {
                         header("x-forwarded-proto"),
                         header("x-forwarded-protocol"),
                     );
-                    Ok::<_, Infallible>(
-                        HResponse::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "text/plain")
-                            .body(Full::new(Bytes::from(body)))
-                            .unwrap(),
-                    )
+                    let mut builder = HResponse::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/plain");
+                    for (name, value) in extra_response_headers {
+                        builder = builder.header(*name, *value);
+                    }
+                    Ok::<_, Infallible>(builder.body(Full::new(Bytes::from(body))).unwrap())
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, svc)
@@ -159,10 +168,25 @@ fn build_h3_client_endpoint() -> quinn::Endpoint {
 }
 
 async fn build_frontend(backend: SocketAddr) -> H3Frontend {
-    build_frontend_with_body_limit(backend, 16 * 1024 * 1024).await
+    build_frontend_with(backend, 16 * 1024 * 1024, std::collections::BTreeMap::new()).await
 }
 
 async fn build_frontend_with_body_limit(backend: SocketAddr, body_limit: usize) -> H3Frontend {
+    build_frontend_with(backend, body_limit, std::collections::BTreeMap::new()).await
+}
+
+async fn build_frontend_with_static_headers(
+    backend: SocketAddr,
+    static_headers: std::collections::BTreeMap<String, String>,
+) -> H3Frontend {
+    build_frontend_with(backend, 16 * 1024 * 1024, static_headers).await
+}
+
+async fn build_frontend_with(
+    backend: SocketAddr,
+    body_limit: usize,
+    static_headers: std::collections::BTreeMap<String, String>,
+) -> H3Frontend {
     // Build a one-route HttpRoute pointing at `backend` and a per-host
     // cert via the cert convention. The H3 frontend will pick this up
     // through the shared cert store at startup.
@@ -183,6 +207,7 @@ async fn build_frontend_with_body_limit(backend: SocketAddr, body_limit: usize) 
         hostname: host.to_string(),
         target,
         hsts: Some(ratatoskr::rule::HstsConfig::default()),
+        headers: static_headers,
     }];
 
     let store = Arc::new(CertStore::new());
@@ -498,6 +523,85 @@ async fn h3_post_within_custom_body_limit_succeeds() {
     assert!(
         body.contains(&format!("body_len={payload_len}")),
         "backend did not receive the full body; got body: {body}"
+    );
+
+    frontend.stop(None).await;
+}
+
+/// Per-route `[[route]].headers` stamps the configured names + values
+/// onto every h3 response, and operator-set values OVERRIDE backend-set
+/// values of the same name (mirrors the h1/h2 behaviour). The backend
+/// here returns its own `X-Frame-Options` that the route config
+/// overrides, plus an unrelated `X-Backend-Tag` that passes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn h3_static_response_headers_reach_client_and_override_backend() {
+    let backend = spawn_backend_emitting_headers(&[
+        ("x-frame-options", "ALLOW-FROM https://evil.example"),
+        ("x-backend-tag", "kept"),
+    ])
+    .await;
+    let mut static_headers = std::collections::BTreeMap::new();
+    static_headers.insert(
+        "X-Robots-Tag".to_string(),
+        "noindex, nofollow, nosnippet, noarchive".to_string(),
+    );
+    static_headers.insert("X-Frame-Options".to_string(), "DENY".to_string());
+    static_headers.insert("X-Content-Type-Options".to_string(), "nosniff".to_string());
+    static_headers.insert(
+        "Content-Security-Policy".to_string(),
+        "default-src 'self'".to_string(),
+    );
+    let frontend = build_frontend_with_static_headers(backend, static_headers).await;
+
+    let (resp, _body) = h3_request(
+        frontend.local_addr(),
+        "https://localhost/",
+        http::Method::GET,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // All four configured static headers reached the client.
+    assert_eq!(
+        resp.headers()
+            .get("x-robots-tag")
+            .and_then(|v| v.to_str().ok()),
+        Some("noindex, nofollow, nosnippet, noarchive"),
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff"),
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("default-src 'self'"),
+    );
+
+    // Operator's X-Frame-Options overrode the backend's: exactly one
+    // value, and it's DENY.
+    let xfo_values: Vec<_> = resp
+        .headers()
+        .get_all("x-frame-options")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        xfo_values,
+        vec!["DENY"],
+        "operator X-Frame-Options should override backend"
+    );
+
+    // Unrelated backend header still flows through.
+    assert_eq!(
+        resp.headers()
+            .get("x-backend-tag")
+            .and_then(|v| v.to_str().ok()),
+        Some("kept"),
     );
 
     frontend.stop(None).await;

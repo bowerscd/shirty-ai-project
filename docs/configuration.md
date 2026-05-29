@@ -398,6 +398,7 @@ yggdrasil and always agree.
 | `hostname` | DNS name    | **required**   | SNI / `Host:` value. Case-insensitive. Globally unique across all routes in all files.                       |
 | `target`   | `http://…`  | **required**   | Backend URL. Cleartext HTTP only — the encrypted leg ends at the terminal's HTTPS frontend.                |
 | `hsts`     | bool/table  | `false`        | `true` ⇒ default `Strict-Transport-Security` header. Table form (`max_age`, `include_subdomains`, `preload`) gives fine control. Cert-less routes reject `hsts`. |
+| `headers`  | table       | `{}`           | Static response headers stamped onto every response from this route (proxied OR proxy-generated). Operator-set values **override** any header of the same name returned by the backend — mirrors nginx's `add_header NAME VALUE always` posture. Configure as a TOML table: `[route.headers]\n"X-Robots-Tag" = "noindex"`. Reserved names (hop-by-hop, `Strict-Transport-Security`, `Alt-Svc`, every `X-Forwarded-*` / `X-Real-IP` / `Forwarded`) are rejected at config load — use the `hsts` field for HSTS, and the request-forwarding headers are owned by the daemon. |
 
 **Cert resolution is node-wide, not per-route.** Routes do not carry
 a `cert` / `key` field. The supervisor walks a three-rung chain per
@@ -430,6 +431,13 @@ hostname = "api.example.com"
 target   = "http://10.0.0.10:8080"
 hsts     = true
 # Cert comes from `[server].default_cert` (the wildcard *.example.com).
+# Stamp a few static response headers on every response — equivalent
+# to nginx `add_header NAME VALUE always`.
+[route.headers]
+"X-Robots-Tag"            = "noindex, nofollow, nosnippet, noarchive"
+"X-Frame-Options"         = "DENY"
+"X-Content-Type-Options"  = "nosniff"
+"Content-Security-Policy" = "default-src 'self'"
 
 [[route]]
 hostname = "app.example.com"

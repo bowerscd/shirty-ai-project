@@ -451,6 +451,7 @@ mod tests {
                 hostname: format!("{name}.localhost"),
                 target: Url::parse("http://127.0.0.1:8080").unwrap(),
                 hsts: None,
+                headers: std::collections::BTreeMap::new(),
             }],
         )
         .expect("source HTTPS rule set must validate")

@@ -3,6 +3,8 @@
 //!
 //! Split out from the original monolithic `rule.rs` (Phase B1).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
@@ -31,6 +33,19 @@ pub struct HttpRoute {
     /// shorthand-vs-table TOML shapes. `None` means no header is emitted.
     #[serde(default, deserialize_with = "deserialize_optional_hsts")]
     pub hsts: Option<HstsConfig>,
+    /// Static response headers stamped onto every response the route
+    /// produces — proxied or proxy-generated alike. Operator-set values
+    /// OVERRIDE any header of the same name returned by the backend, so
+    /// the configured policy always wins (matches nginx's `add_header
+    /// ... always` semantics).
+    ///
+    /// The header **name** is validated at config load: hop-by-hop
+    /// names, the request-forwarding names yggdrasil owns
+    /// (`X-Forwarded-*`, `X-Real-IP`, `Forwarded`), and
+    /// `Strict-Transport-Security` (use `hsts` instead) are rejected.
+    /// Empty map means no extra headers (default).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// `hsts = false` and absence both deserialise to `None`. Any other value

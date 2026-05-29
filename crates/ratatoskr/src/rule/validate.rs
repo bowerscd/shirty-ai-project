@@ -56,7 +56,116 @@ pub(super) fn validate_http_route(rule_name: &str, route: &HttpRoute) -> Result<
         )));
     }
 
+    for (name, value) in &route.headers {
+        validate_static_header(rule_name, &route.hostname, name, value)?;
+    }
+
     Ok(())
+}
+
+/// Reserved header names that the operator MUST NOT set via
+/// `[[route]].headers`. Split between two concerns:
+///  * **hop-by-hop** (RFC 7230 §6.1 + the proxy-specific names) — these
+///    apply only to a single connection and would be misleading if set
+///    on a forwarded response;
+///  * **yggdrasil-owned** — names that the daemon stamps itself, so
+///    a route-level override would silently lose to the daemon's late
+///    write (and operators would chase phantom bugs). HSTS is the
+///    headline example — use the `hsts` route field instead.
+///
+/// Names are compared case-insensitively (HTTP headers are
+/// case-insensitive). Request-forwarding headers (`X-Forwarded-*`,
+/// `X-Real-IP`, `Forwarded`) appear here too even though they're
+/// nominally request-side: the field name implies request semantics, so
+/// allowing them on a response would be confusing and we'd rather a
+/// loud config-load error than a silent mis-interpretation downstream.
+fn reserved_static_header(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        // hop-by-hop
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        // yggdrasil-owned response headers
+        "strict-transport-security",
+        "alt-svc",
+        // forwarding (request-side; never makes sense on a response)
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-protocol",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-real-ip",
+        "forwarded",
+    ];
+    let lower = name.to_ascii_lowercase();
+    RESERVED.iter().any(|r| *r == lower)
+}
+
+fn validate_static_header(rule_name: &str, hostname: &str, name: &str, value: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidRule(format!(
+            "rule {:?}: route {:?}: static response header name is empty",
+            rule_name, hostname
+        )));
+    }
+    // RFC 7230 token: ALPHA / DIGIT / "!#$%&'*+-.^_`|~"
+    if !name.bytes().all(is_token_byte) {
+        return Err(Error::InvalidRule(format!(
+            "rule {:?}: route {:?}: static response header name {:?} \
+             contains characters not allowed in an HTTP field name",
+            rule_name, hostname, name
+        )));
+    }
+    if reserved_static_header(name) {
+        return Err(Error::InvalidRule(format!(
+            "rule {:?}: route {:?}: static response header {:?} is \
+             reserved (hop-by-hop, yggdrasil-owned, or request-only); \
+             use the dedicated field (e.g. `hsts`) or pick a different name",
+            rule_name, hostname, name
+        )));
+    }
+    // RFC 7230 field-value: visible ASCII (0x21..=0x7E), HTAB, SP.
+    // No CR / LF (those would be header injection).
+    if !value.bytes().all(is_field_value_byte) {
+        return Err(Error::InvalidRule(format!(
+            "rule {:?}: route {:?}: static response header {:?} has an \
+             invalid value (must be visible ASCII, no CR / LF)",
+            rule_name, hostname, name
+        )));
+    }
+    Ok(())
+}
+
+fn is_token_byte(b: u8) -> bool {
+    matches!(
+        b,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
+}
+
+fn is_field_value_byte(b: u8) -> bool {
+    b == b'\t' || (0x20..=0x7E).contains(&b)
 }
 
 /// Loose RFC-1123 DNS-name validator. Accepts:

@@ -185,6 +185,7 @@ mod tests {
             hostname: host.to_string(),
             target: Url::parse("http://127.0.0.1:8080").unwrap(),
             hsts: None,
+            headers: std::collections::BTreeMap::new(),
         }
     }
 
