@@ -430,6 +430,7 @@ impl TwoRouteFixture {
             https_listen: frontend_addr,
             https_http3: opts.http3,
             https_alt_svc: opts.alt_svc,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -782,6 +783,7 @@ target = "http://127.0.0.1:{dead_port}"
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -864,6 +866,7 @@ async fn hsts_header_emitted_when_opted_in() {
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -1040,6 +1043,7 @@ async fn disk_backed_cert_reloads_on_change() {
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -1110,6 +1114,7 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
@@ -1313,6 +1318,7 @@ impl CertLessFixture {
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: std::sync::Arc::new(
                 yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),

@@ -161,6 +161,27 @@ pub struct ServerSection {
     /// is a footgun).
     #[serde(default = "default_true")]
     pub https_alt_svc: bool,
+    /// Maximum bytes of an inbound HTTP/3 request body that the
+    /// terminal buffers before forwarding to the backend. Larger
+    /// requests get `413 Payload Too Large`. Default 16 MiB.
+    ///
+    /// Bumping this is the operator's recourse when an app needs a
+    /// larger client-max-body-size than the default. Jellyfin's
+    /// recommended nginx config sets `client_max_body_size 20M` for
+    /// poster uploads; an operator hosting Jellyfin should set
+    /// `https_request_body_limit = 20971520` (or higher) so that
+    /// poster uploads succeed once a browser caches the Alt-Svc and
+    /// upgrades to HTTP/3.
+    ///
+    /// HTTP/1.1 and HTTP/2 stream request bodies through hyper
+    /// without an explicit cap — this knob applies only to the
+    /// HTTP/3 path, which has to buffer the whole body before
+    /// dispatching to the backend (the h3 stream's body is
+    /// available only as a sequence of `recv_data` chunks). A
+    /// future change may extend this to h1 / h2 for symmetry; for
+    /// now it's h3-only.
+    #[serde(default = "default_https_request_body_limit")]
+    pub https_request_body_limit: usize,
     /// Maximum wall-clock time the daemon will wait, after receiving
     /// `SIGTERM`, for in-flight TCP connections / HTTPS requests to
     /// complete naturally before letting the tokio runtime abort
@@ -347,6 +368,15 @@ fn default_https_listen() -> SocketAddr {
 }
 fn default_true() -> bool {
     true
+}
+/// Default cap on inbound HTTP/3 request body sizes. Sized to
+/// comfortably cover typical web-form POSTs without enabling
+/// DoS-by-large-upload through HTTP/3. Operators hosting backends
+/// that need larger bodies (e.g. Jellyfin poster uploads, which
+/// the recommended nginx config sets to 20 MiB) bump
+/// `[server].https_request_body_limit` accordingly.
+fn default_https_request_body_limit() -> usize {
+    16 * 1024 * 1024
 }
 fn default_rekey_interval() -> Duration {
     Duration::from_secs(3600)

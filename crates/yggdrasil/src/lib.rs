@@ -182,6 +182,7 @@ pub async fn run_relay(
             config.server.https_listen,
             config.server.https_http3,
             config.server.https_alt_svc,
+            config.server.https_request_body_limit,
             resolve_lan_cidrs(&config),
         ),
         Arc::new(crate::proxy::certs::CertStore::new()),
@@ -505,6 +506,7 @@ pub async fn run_terminal(
         config.server.https_listen,
         config.server.https_http3,
         config.server.https_alt_svc,
+        config.server.https_request_body_limit,
         resolve_lan_cidrs(&config),
     );
     if let Some(acme_mgr) = acme_manager.clone() {

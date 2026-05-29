@@ -37,6 +37,10 @@ pub struct CertConfig {
     /// from `[server].https_alt_svc` (default `true`). Validation
     /// rejects `alt_svc = true` combined with `http3 = false`.
     pub https_alt_svc: bool,
+    /// Node-wide HTTP/3 request body cap, in bytes. Sourced from
+    /// `[server].https_request_body_limit` (default 16 MiB). Inbound
+    /// h3 bodies larger than this get `413 Payload Too Large`.
+    pub https_request_body_limit: usize,
     /// ACME manager (when `[acme]` is configured). When set, the
     /// supervisor:
     ///   * attaches the manager's HTTP-01 responder to every per-IP
@@ -60,6 +64,7 @@ impl Default for CertConfig {
             https_listen: "0.0.0.0:443".parse().unwrap(),
             https_http3: true,
             https_alt_svc: true,
+            https_request_body_limit: 16 * 1024 * 1024,
             acme: None,
             lan_cidrs: Arc::new(
                 LanCidrs::resolve(None).expect("DEFAULT_LAN_CIDR_STRINGS is parseable"),
@@ -78,6 +83,7 @@ impl CertConfig {
         https_listen: SocketAddr,
         https_http3: bool,
         https_alt_svc: bool,
+        https_request_body_limit: usize,
         lan_cidrs: Arc<LanCidrs>,
     ) -> Self {
         Self {
@@ -88,6 +94,7 @@ impl CertConfig {
             https_listen,
             https_http3,
             https_alt_svc,
+            https_request_body_limit,
             acme: None,
             lan_cidrs,
         }

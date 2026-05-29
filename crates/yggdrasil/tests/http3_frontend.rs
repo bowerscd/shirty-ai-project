@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request as HRequest, Response as HResponse, StatusCode};
@@ -80,6 +80,14 @@ impl ServerCertVerifier for AcceptAnyCert {
 }
 
 async fn spawn_backend() -> SocketAddr {
+    spawn_backend_with(false).await
+}
+
+async fn spawn_echo_length_backend() -> SocketAddr {
+    spawn_backend_with(true).await
+}
+
+async fn spawn_backend_with(echo_body_length: bool) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _accept_loop = tokio::spawn(async move {
@@ -90,7 +98,19 @@ async fn spawn_backend() -> SocketAddr {
             };
             let io = TokioIo::new(stream);
             let _conn = tokio::spawn(async move {
-                let svc = service_fn(|req: HRequest<Incoming>| async move {
+                let svc = service_fn(move |req: HRequest<Incoming>| async move {
+                    if echo_body_length {
+                        let collected = req.into_body().collect().await.expect("collect body");
+                        let bytes = collected.to_bytes();
+                        let body = format!("body_len={}\n", bytes.len());
+                        return Ok::<_, Infallible>(
+                            HResponse::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/plain")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        );
+                    }
                     let header = |name: &str| {
                         req.headers()
                             .get(name)
@@ -139,6 +159,10 @@ fn build_h3_client_endpoint() -> quinn::Endpoint {
 }
 
 async fn build_frontend(backend: SocketAddr) -> H3Frontend {
+    build_frontend_with_body_limit(backend, 16 * 1024 * 1024).await
+}
+
+async fn build_frontend_with_body_limit(backend: SocketAddr, body_limit: usize) -> H3Frontend {
     // Build a one-route HttpRoute pointing at `backend` and a per-host
     // cert via the cert convention. The H3 frontend will pick this up
     // through the shared cert store at startup.
@@ -174,6 +198,7 @@ async fn build_frontend(backend: SocketAddr) -> H3Frontend {
         "127.0.0.1:0".parse().unwrap(),
         &routes,
         store,
+        body_limit,
     )
     .await
     .expect("spawn h3")
@@ -184,7 +209,16 @@ async fn h3_request(
     uri: &str,
     method: http::Method,
 ) -> (http::Response<()>, String) {
-    tokio::time::timeout(Duration::from_secs(5), async move {
+    h3_request_with_body(server_addr, uri, method, Vec::new()).await
+}
+
+async fn h3_request_with_body(
+    server_addr: SocketAddr,
+    uri: &str,
+    method: http::Method,
+    body: Vec<u8>,
+) -> (http::Response<()>, String) {
+    tokio::time::timeout(Duration::from_secs(10), async move {
         let endpoint = build_h3_client_endpoint();
         let conn = endpoint
             .connect(server_addr, "localhost")
@@ -198,12 +232,18 @@ async fn h3_request(
             let _ = futures::future::poll_fn(|cx| h3_conn.poll_close(cx)).await;
         });
 
-        let req = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .body(())
-            .unwrap();
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        if !body.is_empty() {
+            builder = builder.header("content-length", body.len().to_string());
+        }
+        let req = builder.body(()).unwrap();
         let mut stream = send.send_request(req).await.expect("send_request");
+        if !body.is_empty() {
+            stream
+                .send_data(Bytes::from(body))
+                .await
+                .expect("send_data");
+        }
         stream.finish().await.expect("finish");
 
         let resp = stream.recv_response().await.expect("recv_response");
@@ -424,6 +464,67 @@ async fn h3_chain_proxy_v2_propagates_real_client_ip_to_xff() {
         "X-Forwarded-For leaked the kernel-observed peer (127.0.0.1) \
          instead of the PROXY-v2-recovered real client; interpose did \
          not fire. body: {body}"
+    );
+
+    frontend.stop(None).await;
+}
+
+/// Operator raises `[server].https_request_body_limit` above the default;
+/// a POST that previously would have been rejected by the old hard 16 MiB
+/// cap now succeeds and the full body reaches the backend. Uses a tiny
+/// custom limit (32 KiB) and a body just under it to keep the test cheap
+/// while still exercising the knob.
+#[tokio::test(flavor = "multi_thread")]
+async fn h3_post_within_custom_body_limit_succeeds() {
+    let backend = spawn_echo_length_backend().await;
+    let body_limit = 32 * 1024;
+    let frontend = build_frontend_with_body_limit(backend, body_limit).await;
+
+    let payload = vec![b'x'; 16 * 1024];
+    let payload_len = payload.len();
+    let (resp, body) = h3_request_with_body(
+        frontend.local_addr(),
+        "https://localhost/upload",
+        http::Method::POST,
+        payload,
+    )
+    .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200 for body under configured limit ({body_limit} bytes); body: {body}"
+    );
+    assert!(
+        body.contains(&format!("body_len={payload_len}")),
+        "backend did not receive the full body; got body: {body}"
+    );
+
+    frontend.stop(None).await;
+}
+
+/// Operator-configured body limit is enforced: a POST exceeding the
+/// configured cap returns 413 Payload Too Large and is NOT forwarded to
+/// the backend.
+#[tokio::test(flavor = "multi_thread")]
+async fn h3_post_over_custom_body_limit_returns_413() {
+    let backend = spawn_echo_length_backend().await;
+    let body_limit = 8 * 1024;
+    let frontend = build_frontend_with_body_limit(backend, body_limit).await;
+
+    let payload = vec![b'x'; 16 * 1024];
+    let (resp, _body) = h3_request_with_body(
+        frontend.local_addr(),
+        "https://localhost/upload",
+        http::Method::POST,
+        payload,
+    )
+    .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "expected 413 for body over configured limit ({body_limit} bytes)"
     );
 
     frontend.stop(None).await;

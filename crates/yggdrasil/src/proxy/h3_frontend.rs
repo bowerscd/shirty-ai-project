@@ -19,7 +19,8 @@
 //! shape sent to backends matches the TCP HTTPS path byte-for-byte.
 //!
 //! Body handling: the h3 request body is buffered (up to
-//! [`H3_REQUEST_BODY_LIMIT`]) and passed to the backend as a single
+//! `[server].https_request_body_limit`, default 16 MiB; plumbed through
+//! to [`H3Frontend::spawn`]) and passed to the backend as a single
 //! `Full<Bytes>`. The backend response body is streamed back in chunks
 //! via `h3::server::RequestStream::send_data`. WebSocket-over-h3
 //! (RFC 9220 extended CONNECT) is **not** supported here — requests
@@ -49,11 +50,6 @@ use super::http_frontend::{
     sanitise_response_headers, BackendClient, RouteTable,
 };
 
-/// Maximum bytes of an inbound h3 request body that this proxy will
-/// buffer before forwarding. Sized to comfortably cover typical web-form
-/// POSTs without enabling DoS-by-large-upload through HTTP/3.
-const H3_REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
-
 /// Chunk size for streaming backend response bodies back into h3
 /// `send_data`. Sized close to a typical jumbogram so we get one frame
 /// per QUIC packet under common MTU.
@@ -79,11 +75,16 @@ impl H3Frontend {
     /// resolving certs through `cert_store`. `name` is operator-facing
     /// (used in logs); for the node-wide HTTPS frontend it's
     /// conventionally `"public-https"`.
+    ///
+    /// `request_body_limit` is the maximum buffered inbound h3 request
+    /// body in bytes; oversized requests get `413 Payload Too Large`.
+    /// Sourced from `[server].https_request_body_limit`.
     pub async fn spawn(
         name: String,
         listen: SocketAddr,
         routes: &[ratatoskr::rule::HttpRoute],
         cert_store: Arc<CertStore>,
+        request_body_limit: usize,
     ) -> Result<Self> {
         // The internal run_accept_loop / serve_connection / handle_stream
         // pipeline still threads a `Rule` through for logging context.
@@ -195,6 +196,7 @@ impl H3Frontend {
                 task_routes,
                 task_client,
                 task_interpose_map,
+                request_body_limit,
                 task_cancel,
                 task_tracker,
             )
@@ -265,12 +267,14 @@ impl H3Frontend {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     rule: Rule,
     endpoint: Endpoint,
     routes: Arc<RouteTable>,
     client: BackendClient,
     interpose_map: InterposeMap,
+    request_body_limit: usize,
     cancel: CancellationToken,
     conn_tracker: TaskTracker,
 ) {
@@ -323,6 +327,7 @@ async fn run_accept_loop(
                         task_routes,
                         task_client,
                         quic_conn,
+                        request_body_limit,
                     )
                     .await
                     {
@@ -346,6 +351,7 @@ async fn serve_connection(
     routes: Arc<RouteTable>,
     client: BackendClient,
     quic_conn: quinn::Connection,
+    request_body_limit: usize,
 ) -> Result<()> {
     let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(quic_conn))
         .await
@@ -358,9 +364,15 @@ async fn serve_connection(
                 let task_routes = Arc::clone(&routes);
                 let task_client = client.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_stream(task_rule, peer_addr, task_routes, task_client, resolver)
-                            .await
+                    if let Err(e) = handle_stream(
+                        task_rule,
+                        peer_addr,
+                        task_routes,
+                        task_client,
+                        resolver,
+                        request_body_limit,
+                    )
+                    .await
                     {
                         debug!("h3 stream ended: {e}");
                     }
@@ -384,6 +396,7 @@ async fn handle_stream<C>(
     routes: Arc<RouteTable>,
     client: BackendClient,
     resolver: h3::server::RequestResolver<C, Bytes>,
+    request_body_limit: usize,
 ) -> Result<()>
 where
     C: h3::quic::Connection<Bytes>,
@@ -453,7 +466,7 @@ where
     parts.uri = outbound_uri;
     parts.version = http::Version::HTTP_11;
 
-    let (body_bytes, stream) = match collect_h3_request_body(stream, H3_REQUEST_BODY_LIMIT).await {
+    let (body_bytes, stream) = match collect_h3_request_body(stream, request_body_limit).await {
         Ok(pair) => pair,
         Err(BodyCollectError::TooLarge(s)) => {
             return send_short_response(
@@ -671,6 +684,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             &routes,
             store,
+            16 * 1024 * 1024,
         )
         .await
         .expect("spawn h3 endpoint");
@@ -687,6 +701,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             &routes,
             store,
+            16 * 1024 * 1024,
         )
         .await;
         let err = match res {

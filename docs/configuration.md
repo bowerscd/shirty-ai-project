@@ -37,6 +37,7 @@ hex is rejected on parse.
 | `https_listen`     | `host:port`            | `0.0.0.0:443`                    | HTTPS only. Node-wide HTTPS listener address. Every top-level `[[route]]` lands on this socket; per-route `listen` overrides aren't supported in v1. Set to e.g. `0.0.0.0:8443` when running unprivileged. |
 | `https_http3`      | bool                   | `true`                           | HTTPS only. Whether the node binds the HTTP/3 UDP companion on the same `(ip, port)` as `https_listen`. Set `false` to opt out of HTTP/3 — saves a UDP socket plus a NAT mapping. The `Alt-Svc: h3=":<port>"` advertisement is suppressed automatically when this is `false`. |
 | `https_alt_svc`    | bool                   | `true`                           | HTTPS only. Whether HTTPS responses include the `Alt-Svc: h3=":<port>"; ma=86400` header that advertises the HTTP/3 alternative. Set `false` to suppress the header while still serving HTTP/3 (useful when a CDN in front of the terminal would re-write the advertisement). `https_alt_svc = true` combined with `https_http3 = false` is rejected at config load — there's no h3 listener to advertise. |
+| `https_request_body_limit` | bytes (usize)  | `16777216` (16 MiB)              | HTTPS only. Maximum buffered inbound HTTP/3 request body. Oversized requests get `413 Payload Too Large` before any backend dial. Raise when a backend expects larger uploads (e.g. Jellyfin recommends `client_max_body_size 20M` for poster uploads — set this to `20971520`). Applies to the HTTP/3 path only; the HTTP/1.1 + HTTP/2 path streams uncapped. Note: setting `[server].https_http3 = false` disables HTTP/3 daemon-wide, so raising this knob is the right knob for the body-size case where you still want h3. |
 | `http_redirect_port` | optional u16         | unset (`None` → `80`)            | HTTPS only. Port for the per-IP HTTP→HTTPS redirect listener the supervisor auto-spawns. Default `80`. Set to a non-privileged port when running unprivileged (no `CAP_NET_BIND_SERVICE`), or to `0` for an ephemeral kernel-assigned port (useful in containers / dev / bench harnesses). |
 | `graceful_drain_timeout` | optional humantime duration | unset                            | When set, on `SIGTERM` the daemon stops accepting new TCP / HTTPS connections immediately but waits up to this duration for in-flight conversations to finish naturally before cancelling them. UDP is per-datagram and unaffected. systemd users should pair this with a matching `TimeoutStopSec=` in the unit file. Default unset = preserve the historical abrupt-cancel behaviour (in-flight conns die when the runtime drops them). |
 | `nat_traversal`    | enum (`off` / `pcp` / `natpmp` / `auto`) | `off`                  | Opt-in NAT port-mapping for home-hosted gateways / relays / standalone terminals. See [NAT traversal](#nat-traversal) below. |
@@ -511,7 +512,8 @@ completeness:
   restart the daemon (`systemctl restart yggdrasil`). Only `conf.d/*.toml`
   files are picked up live. In particular, the `[dial]`, `[accept]`, `[acme]`,
   and HTTPS-related `[server]` knobs (`https_listen`, `https_http3`,
-  `https_alt_svc`, `default_cert`, `default_key`, `cert_dir`) are read
+  `https_alt_svc`, `https_request_body_limit`, `default_cert`,
+  `default_key`, `cert_dir`) are read
   once at startup — `yggdrasilctl identity add-dial` / `add-accept` /
   `remove-*` mutations require a restart to take effect.
 * `yggdrasilctl local rules reload` forces a re-scan in case you suspect

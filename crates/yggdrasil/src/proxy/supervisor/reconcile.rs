@@ -556,6 +556,7 @@ async fn spawn_https_frontend(
             listen,
             routes,
             Arc::clone(cert_store),
+            cert_config.https_request_body_limit,
         )
         .await
         {
