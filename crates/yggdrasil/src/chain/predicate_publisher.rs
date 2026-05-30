@@ -317,14 +317,19 @@ async fn publish_one(
             )
             .increment(1);
             // VERSION_STALE means the upstream already has a higher
-            // version recorded under our `origin`. This is a recoverable
-            // condition once we add persistence in 3C — until then a
-            // restart that loses the counter trips it. Log loudly so
-            // operators notice during 3B testing.
+            // version recorded under our `origin`. The persisted
+            // counter at `<state_dir>/chain-predicate-version.toml`
+            // is the recovery mechanism; this only fires when that
+            // file was lost or rolled back, or when the upstream
+            // recorded a higher version under our origin for any
+            // other reason (e.g. an operator-managed state copy
+            // across hosts).
             if code == predicate_reject::VERSION_STALE {
                 tracing::warn!(
-                    "version-stale reject — restart-induced counter regression \
-                     (persistence is wired in Phase 3C)"
+                    "version-stale reject — persisted counter at \
+                     <state_dir>/chain-predicate-version.toml may have \
+                     been lost or rolled back, or upstream recorded a \
+                     higher version under our origin out-of-band"
                 );
             }
             None

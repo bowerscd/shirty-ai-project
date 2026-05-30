@@ -4,7 +4,9 @@
 //! per syscall. Used by the per-rule UDP worker loops to amortise syscall cost
 //! under high pps. On non-Linux targets the module does not exist; callers
 //! must gate `use proxy::udp::recvmmsg_linux::*` behind their own
-//! `#[cfg(target_os = "linux")]` or use the shim added in a follow-up todo.
+//! `#[cfg(target_os = "linux")]` or go through [`super::batch_recv`], which
+//! is the cross-platform abstraction (Linux: this module's `recvmmsg`;
+//! non-Linux: per-datagram `tokio::net::UdpSocket::recv_from`).
 //!
 //! The receive path uses `MSG_DONTWAIT` (we have already awaited readiness
 //! via `AsyncFd`; the syscall must never block). On `ENOSYS` / `EPERM`
