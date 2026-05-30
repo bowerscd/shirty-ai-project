@@ -257,9 +257,6 @@ fn clone_acme_error(e: &AcmeError) -> AcmeError {
             host: host.clone(),
             detail: detail.clone(),
         },
-        AcmeError::NotYetImplemented { host } => {
-            AcmeError::NotYetImplemented { host: host.clone() }
-        }
     }
 }
 

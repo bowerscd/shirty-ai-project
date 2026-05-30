@@ -67,9 +67,7 @@ use crate::proxy::certs::CertStore;
 /// schema-cleanup that removed per-route cert sources from
 /// `ratatoskr::rule::HttpRoute`. Kept as a stable shape so the
 /// renewer/client/storage layers continue to compile against the
-/// existing API; a follow-up batch replaces per-route registration
-/// with a single per-terminal wildcard issuance driven by
-/// `[acme].domain`.
+/// existing API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcmeRouteConfig {
     pub challenge: AcmeChallenge,
@@ -108,12 +106,6 @@ pub enum AcmeError {
     Storage { host: String, detail: String },
     #[error("ACME route {host:?}: directory client error: {detail}")]
     Client { host: String, detail: String },
-    /// The actual `instant-acme` integration is deferred behind a
-    /// follow-up sub-task (`d-acme-renewer`'s issuance leg). Until
-    /// that lands, the renewer logs at warn and returns this error
-    /// rather than silently doing nothing.
-    #[error("ACME route {host:?}: issuance flow not yet wired (instant-acme integration pending)")]
-    NotYetImplemented { host: String },
 }
 
 /// Public handle: the supervisor owns one of these, and registers each
