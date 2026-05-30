@@ -282,7 +282,7 @@ Compare the local terminal's published predicate set with what each upstream nod
 
 ###### **Options:**
 
-* `--timeout <DURATION>` — Overall budget for the daemon to assemble its chain summary reply. Applies once across the whole walk; multi-hop fanout (a follow-up increment) will respect it as a per-hop deadline. Local-only replies return synchronously and effectively ignore this value
+* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Terminals with no `[dial]` upstream return synchronously and effectively ignore this value
 
   Default value: `5s`
 
@@ -296,7 +296,7 @@ One-line-per-hop overview of the chain (pubkey, role, version, uptime, rule coun
 
 ###### **Options:**
 
-* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Local-only replies effectively ignore this
+* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Terminals with no `[dial]` upstream return synchronously and effectively ignore this value
 
   Default value: `5s`
 
@@ -310,7 +310,7 @@ Per-hop health (healthy / degraded / down / starting), aggregated to a chain-wid
 
 ###### **Options:**
 
-* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Local-only replies effectively ignore this
+* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Terminals with no `[dial]` upstream return synchronously and effectively ignore this value
 
   Default value: `5s`
 
@@ -324,7 +324,7 @@ Per-hop control-plane round-trip time. Walks the chain via the same `Request::Ch
 
 ###### **Options:**
 
-* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Local-only replies effectively ignore this
+* `--timeout <DURATION>` — Overall budget for assembling the chain summary across all hops. Terminals with no `[dial]` upstream return synchronously and effectively ignore this value
 
   Default value: `5s`
 * `--hop <PUBKEY>` — If set, restrict the rendered output to a single hop matching this tagged x25519 pubkey (`x25519:<hex>`). The whole chain is still walked — only the rendering is filtered. Useful in scripts that probe a specific hop without needing to compute its index

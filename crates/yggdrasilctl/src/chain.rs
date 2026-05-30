@@ -4,9 +4,9 @@
 //! terminal daemon without touching its on-disk rules directory.
 //!
 //! `chain diff`: compare the local terminal's published predicate
-//! set with what each upstream node believes it accepted. Currently
-//! served from a single-RPC `ChainSummary` reply over UDS; multi-hop
-//! fanout is a follow-up increment.
+//! set with what each upstream node believes it accepted. Served
+//! from a single-RPC `ChainSummary` reply over UDS; the daemon
+//! handles the recursive upstream walk via the chain control plane.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -278,9 +278,8 @@ struct DiffReport {
     /// exit code reflects this so CI pipelines can gate on it.
     drift_detected: bool,
     /// Whether the daemon's chain summary was incomplete (some
-    /// upstream hop could not be reached within the timeout). Always
-    /// `false` for local-only summaries; multi-hop fanout flips it
-    /// when the walk truncates.
+    /// upstream hop could not be reached within the timeout, or the
+    /// walk truncated below the depth budget).
     partial: bool,
 }
 
@@ -288,13 +287,12 @@ struct DiffReport {
 /// derived-rules snapshot, and emit a structured diff. See module
 /// docstring for the operator-facing semantics.
 ///
-/// Wire path (B3b): the CLI sends a single
-/// [`Request::ChainSummary`] over UDS; the daemon assembles a
-/// [`ChainSummaryResponse`] containing one [`ChainHop`] per chain
-/// node it can reach (today only the local hop; multi-hop fanout via
-/// the chain control plane is a follow-up increment). The diff is a
-/// pure function over the resulting `Vec<ChainHop>` — no HTTP, no
-/// tunnel, no per-hop dialing from the CLI.
+/// Wire path: the CLI sends a single [`Request::ChainSummary`] over
+/// UDS; the daemon assembles a [`ChainSummaryResponse`] containing
+/// one [`ChainHop`] per chain node it can reach (the daemon does the
+/// recursive upstream walk via `ChainHopQuery` / `ChainHopReply`).
+/// The diff is a pure function over the resulting `Vec<ChainHop>` —
+/// no HTTP, no tunnel, no per-hop dialing from the CLI.
 async fn diff(socket: &Path, args: &DiffArgs, json_output: bool) -> Result<()> {
     let summary = fetch_chain_summary(socket, args.timeout)
         .await

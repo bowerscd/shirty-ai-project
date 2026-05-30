@@ -91,11 +91,9 @@ pub struct ApplyArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffArgs {
-    /// Overall budget for the daemon to assemble its chain summary
-    /// reply. Applies once across the whole walk; multi-hop fanout (a
-    /// follow-up increment) will respect it as a per-hop deadline.
-    /// Local-only replies return synchronously and effectively ignore
-    /// this value.
+    /// Overall budget for assembling the chain summary across all
+    /// hops. Terminals with no `[dial]` upstream return synchronously
+    /// and effectively ignore this value.
     #[arg(
         long,
         value_name = "DURATION",
@@ -108,7 +106,8 @@ pub struct DiffArgs {
 #[derive(Debug, Args)]
 pub struct SummaryArgs {
     /// Overall budget for assembling the chain summary across all
-    /// hops. Local-only replies effectively ignore this.
+    /// hops. Terminals with no `[dial]` upstream return synchronously
+    /// and effectively ignore this value.
     #[arg(
         long,
         value_name = "DURATION",
@@ -121,7 +120,8 @@ pub struct SummaryArgs {
 #[derive(Debug, Args)]
 pub struct HealthArgs {
     /// Overall budget for assembling the chain summary across all
-    /// hops. Local-only replies effectively ignore this.
+    /// hops. Terminals with no `[dial]` upstream return synchronously
+    /// and effectively ignore this value.
     #[arg(
         long,
         value_name = "DURATION",
@@ -134,7 +134,8 @@ pub struct HealthArgs {
 #[derive(Debug, Args)]
 pub struct PingArgs {
     /// Overall budget for assembling the chain summary across all
-    /// hops. Local-only replies effectively ignore this.
+    /// hops. Terminals with no `[dial]` upstream return synchronously
+    /// and effectively ignore this value.
     #[arg(
         long,
         value_name = "DURATION",

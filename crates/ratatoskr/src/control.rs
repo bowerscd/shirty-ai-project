@@ -115,16 +115,16 @@ pub enum Request {
     /// subcommands project the slices they care about (CP23 in the
     /// config-UX plan).
     ///
-    /// In B3a-local this returns only the local hop synchronously
-    /// from [`crate::control::DerivedRulesResponse`] plus the
-    /// daemon's mode and uptime. Multi-hop fanout via the chain
-    /// control plane is a follow-up increment; the wire shape is
-    /// deliberately a `Vec<ChainHop>` so the upgrade is additive.
+    /// The daemon always returns its own local hop; when a chain
+    /// upstream is configured (`[dial]` set), it additionally
+    /// forwards a `ChainHopQuery` upstream and aggregates the
+    /// returned hops into the reply. Terminals with no upstream
+    /// return only the local hop and `partial = false`.
     ChainSummary {
         /// Optional overall budget in milliseconds the operator is
-        /// willing to wait for replies. `None` means "use the daemon
-        /// default". Local-only replies ignore this; multi-hop
-        /// fanout will respect it.
+        /// willing to wait for the upstream walk. `None` means "use
+        /// the daemon default". Daemons with no upstream return
+        /// synchronously and effectively ignore this.
         timeout_ms: Option<u64>,
     },
     /// Push a candidate rule set into the daemon's running supervisor
@@ -548,12 +548,13 @@ pub struct ChainIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainSummaryResponse {
     /// One entry per chain hop, ordered from local (index 0) outward
-    /// to the head-of-chain. In B3a-local this is always exactly one
-    /// element.
+    /// to the head-of-chain. On terminals with no chain upstream this
+    /// is always exactly one element (the local hop).
     pub hops: Vec<ChainHop>,
     /// Whether the daemon was unable to collect every upstream hop
-    /// before the budget expired. Local-only replies always set this
-    /// to `false`; multi-hop fanout flips it when partial.
+    /// before the budget expired. `false` when no fanout happened
+    /// (terminal with no upstream); set to `true` when the upstream
+    /// walk timed out, errored, or truncated below the depth budget.
     pub partial: bool,
 }
 
@@ -572,9 +573,6 @@ pub struct ChainHop {
     /// Human-readable label for this hop, sourced from the hop's
     /// `[server].name` config (falling back to `gethostname(3)`).
     /// Renderers prefer this over [`ChainIdentity::local`] for display.
-    /// Carried as `#[serde(default)]` so old peers that never wrote
-    /// the field continue to deserialise.
-    #[serde(default)]
     pub name: Option<String>,
     /// Predicates, derived rule set, and chain identity facts. Every
     /// field of [`DerivedRulesResponse`] is wire-stable across hops.
@@ -584,12 +582,10 @@ pub struct ChainHop {
     /// this entry. `None` on the local hop (index 0 in any reply, no
     /// RTT applies — it's the responder itself) and on hops further
     /// upstream that were already known to the responder via cached
-    /// state. Carried as `#[serde(default)]` so older daemons sending
-    /// replies without this field continue to deserialise.
+    /// state.
     ///
     /// Backs `chain ping` and lets `chain summary --json` expose
     /// per-hop RTT for monitoring.
-    #[serde(default)]
     pub query_rtt_ms: Option<u64>,
 }
 
