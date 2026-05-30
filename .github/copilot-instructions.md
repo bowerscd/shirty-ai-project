@@ -30,6 +30,22 @@ Agents working on this codebase are expected to **read those docs first**.
 This file only contains the agent-specific behaviour overrides that humans
 don't need to know about.
 
+## Project status
+
+yggdrasil is **greenfield** — no deployed nodes, no release tags, no
+operators in the field. The "deployed nodes that haven't restarted yet"
+framing in the wire-format-stability bullet below is not currently
+binding: any wire-shape change can land in a single coordinated commit
+without a back-compat shim, and `#[serde(default)]` markers existing
+solely as forward-compat for nonexistent old peers are agent-removable.
+The *coordination* (does the change ship at all?) still belongs to the
+human owner; the *mechanics* (back-compat shim, multi-step rollout) do
+not.
+
+When the project tags its first release, this section's qualifier no
+longer applies and the wire-format bullet recovers its literal reading.
+A future maintainer can drop this section in a one-line commit then.
+
 ## Git commit trailers
 
 Never add a `Co-authored-by:` trailer to commit messages, regardless of
