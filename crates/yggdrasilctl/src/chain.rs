@@ -385,10 +385,12 @@ async fn fetch_chain_summary(socket: &Path, timeout: Duration) -> Result<ChainSu
 }
 
 /// Compare two hops' predicate sets. Returns `None` when no comparison
-/// is meaningful at this boundary (no predicates on either side, or the
-/// origins point at different terminals — which means the upstream is
-/// driven by a different chain branch and a diff would be apples to
-/// oranges).
+/// is meaningful at this boundary: either neither side has any
+/// predicates yet, or the origins disagree. Origin disagreement should
+/// only show up transiently while a terminal-rotation push is
+/// propagating up the chain — every node has at most one upstream and
+/// at most one downstream by design, so in steady state every hop
+/// reports the same origin pubkey.
 fn compute_diff(
     publisher: &IntrospectionView,
     receiver: &IntrospectionView,
@@ -399,9 +401,10 @@ fn compute_diff(
     }
 
     // If both sides have origins recorded, they must agree for the
-    // comparison to be meaningful. If they disagree the receiver is
-    // driven by a different terminal — skip rather than report
-    // misleading "drift".
+    // comparison to be meaningful. Disagreement should only happen
+    // transiently (e.g. a terminal-rotation push catching up to the
+    // upper hops); skip rather than report misleading "drift" while
+    // propagation is in flight.
     let pub_origin = publisher.chain.predicate_origin;
     let recv_origin = receiver.chain.predicate_origin;
     if let (Some(p), Some(r)) = (pub_origin, recv_origin) {
@@ -463,10 +466,13 @@ fn compute_diff(
 ///   derived_rules: 2 active
 /// hop 1 (upstream x25519:def…): predicates=2 v=12 origin=x25519:abc…
 ///   in sync with hop 0
-/// hop 2 (upstream x25519:fff…): predicates=0
-///   no predicates on this hop (deeper relays may not receive pushes
-///   under v1 — relays do not re-publish)
+/// hop 2 (upstream x25519:fff…): predicates=2 v=12 origin=x25519:abc…
+///   in sync with hop 1
 /// ```
+///
+/// Mid-chain relays forward the original push bytes verbatim upstream,
+/// so every settled hop reports the same origin + version + predicate
+/// content as the terminal at hop 0.
 fn render_human(report: &DiffReport) {
     let labels = hop_labels(
         report
@@ -499,15 +505,16 @@ fn render_human(report: &DiffReport) {
             None => {
                 if v.predicates.is_empty() {
                     println!(
-                        "  no predicates on this hop (under v1 only the \
-                         immediate upstream of a terminal carries the \
-                         pushed set; deeper hops are reported for chain \
-                         identity only)"
+                        "  no predicates on this hop yet (push has not \
+                         propagated this far — chain may still be coming \
+                         up, or this hop's chain client is down; check \
+                         yggdrasil_chain_predicate_recv_total / \
+                         yggdrasil_chain_predicate_forward_total)"
                     );
                 } else {
                     println!(
                         "  no comparison performed (origin mismatch with \
-                         previous hop)"
+                         previous hop — terminal rotation in flight)"
                     );
                 }
             }
@@ -657,7 +664,7 @@ async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result
 /// ```text
 /// hop 0  terminal  x25519:abc…  uptime=12s  rules=2  predicates=2 v=7
 /// hop 1  relay     x25519:def…  uptime=304s rules=2  predicates=2 v=7
-/// hop 2  gateway   x25519:fff…  uptime=304s rules=0  predicates=0
+/// hop 2  gateway   x25519:fff…  uptime=304s rules=2  predicates=2 v=7
 /// ```
 fn render_summary_human(report: &SummaryReport) {
     let labels = hop_labels(report.hops.iter().map(|h| (h.name.as_deref(), &h.pubkey)));
@@ -801,9 +808,10 @@ fn classify_hop(hop: &ratatoskr::control::ChainHop, now_unix: i64) -> HealthHop 
     let mut tier = HealthTier::Healthy;
 
     // Predicate freshness — only meaningful if a push has ever
-    // happened. Hops that never receive predicates (deeper relays in
-    // v1) legitimately report `last_apply_unix = None` and are not
-    // penalised.
+    // happened. Hops that have not yet received any push
+    // (`last_apply_unix = None`) legitimately report no predicates and
+    // are not penalised; this is the normal state during fresh boot
+    // before the chain converges.
     if let Some(last_apply) = hop.view.chain.last_apply_unix {
         let age = now_unix.saturating_sub(last_apply);
         if age >= PREDICATE_DOWN_AGE_SECS {

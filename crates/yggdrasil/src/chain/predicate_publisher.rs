@@ -14,7 +14,8 @@
 //!
 //! Run only on terminal nodes (mode = `terminal`). Spawned by
 //! [`crate::run_terminal`] when both a chain upstream *and* a supervisor
-//! are configured; relays do not author predicates in v1.
+//! are configured; relays do not author predicates — they only derive
+//! and forward what the terminal published.
 //!
 //! [`RuleSet`]: ratatoskr::rule::RuleSet
 //! [`PredicateSet`]: ratatoskr::predicate::PredicateSet

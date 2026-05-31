@@ -3,8 +3,9 @@
 //! When a relay receives a [`PredicateSet`] from its downstream over the
 //! chain control channel, it synthesises a local [`RuleSet`] that
 //! forwards traffic for each predicate back down toward the downstream.
-//! The derived rules are then handed to the existing reload pipeline
-//! (Phase 3B will wire that side); this module is the pure projection.
+//! The derived rules are then handed to the proxy supervisor via
+//! [`crate::proxy::supervisor::SupervisorHandle::apply_ruleset`]; this
+//! module is the pure projection.
 //!
 //! ## What the relay supplies (per-node local)
 //!

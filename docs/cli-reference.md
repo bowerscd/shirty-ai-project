@@ -243,9 +243,10 @@ actually accepted.
 | ----------- | ----------- | ------- | -------------------------------------------------- |
 | `--timeout` | `humantime` | `5s`    | End-to-end deadline for the upstream walk.        |
 
-Exit codes: `0` if every hop is in sync (or all `Predicates::None` /
-origin-mismatch sentinels are documented expected drift), `1` if drift
-is detected on at least one hop, `2` for protocol-level errors.
+Exit codes: `0` if every hop is in sync (transient skipped comparisons —
+neither side has predicates yet, or origin mismatch while a terminal
+rotation propagates — do not count as drift), `1` if drift is detected
+on at least one hop, `2` for protocol-level errors.
 
 Human-readable output:
 
@@ -254,13 +255,15 @@ hop 0 (local x25519:abc…): predicates=2 v=12 origin=x25519:abc…
   derived_rules: 2 active
 hop 1 (upstream x25519:def…): predicates=2 v=12 origin=x25519:abc…
   in sync with hop 0
-hop 2 (upstream x25519:fff…): predicates=0
-  no predicates on this hop (under v1 only the immediate upstream of a
-  terminal carries the pushed set; deeper hops are reported for chain
-  identity only)
+hop 2 (upstream x25519:fff…): predicates=2 v=12 origin=x25519:abc…
+  in sync with hop 1
 
 in sync across 3 hop(s).
 ```
+
+Mid-chain relays forward the original push bytes verbatim upstream, so
+every settled hop reports the same origin + version + predicate content
+as the terminal at hop 0.
 
 With `--json`, the same data is emitted as a structured `DiffReport`
 suitable for piping into `jq`.

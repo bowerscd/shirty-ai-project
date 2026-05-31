@@ -3,9 +3,10 @@
 //! The chain is the directional spine of yggdrasil's deployment topology:
 //! every node has at most one upstream (whom it dials and sends
 //! heartbeats to) and at most one downstream (whom it accepts inbound
-//! chain traffic from) in v1. Terminal nodes are chain leaves with only
-//! an upstream; mid-chain relays have both; the root relay has only a
-//! downstream.
+//! chain traffic from) — single-destination by design, not a v1 limit
+//! awaiting a v2 generalisation. Terminal nodes are chain leaves with
+//! only an upstream; mid-chain relays have both; the root relay has
+//! only a downstream.
 //!
 //! Module layout:
 //! * [`client`] — outbound side: dial upstream, run Noise_IK, send heartbeats

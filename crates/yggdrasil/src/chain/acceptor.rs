@@ -20,12 +20,14 @@
 //! does not reset the persisted versions. The persistence layer uses an
 //! atomic tmp+rename write keyed off `state_dir/chain-predicates.toml`.
 //!
-//! Phase 3C invariant: terminals are the only authors of predicates, so
-//! `PredicateSet.origin` always identifies a terminal. Mid-chain relays
-//! forwarding upstream are a future-phase concern; until then the relay
-//! does not validate that `origin == downstream_pubkey` so that test
-//! drivers and future multi-tenant relays can issue pushes from synthetic
-//! origins.
+//! Terminals are the only authors of predicates, so `PredicateSet.origin`
+//! always identifies a terminal. The relay deliberately does not
+//! validate that `origin == downstream_pubkey`: in a multi-hop chain,
+//! a mid-chain relay receives the predicate set forwarded by the
+//! immediate downstream relay, whose body still carries the original
+//! terminal's pubkey as `origin` (forwarding is byte-identical; see
+//! `handle_predicate_set_update` below). Test drivers also rely on
+//! this looseness to push synthetic origins.
 //!
 //! [`PredicateSet`]: ratatoskr::predicate::PredicateSet
 //! [`ControlBodyType::PredicateSetUpdate`]: ratatoskr::control_frame::ControlBodyType::PredicateSetUpdate

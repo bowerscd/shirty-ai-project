@@ -211,18 +211,27 @@ Each hop reports its predicate version + origin + derived-rule count.
 the relay accepted. Drift surfaces as a `~` (changed), `+` (missing
 upstream), or `-` (extra upstream) entry.
 
-Exit code is `1` if drift is detected on at least one hop. There are
-two **expected** patterns under v1 that *don't* count as drift:
+Exit code is `1` if drift is detected on at least one hop. In a healthy
+steady-state chain every hop reports the same `origin` + `version` +
+predicate content: mid-chain relays forward the original push bytes
+verbatim upstream
+(`crates/yggdrasil/src/chain/acceptor.rs::handle_predicate_set_update`),
+so the gateway sees byte-identically what the terminal published.
 
-1. A hop with `predicates=0` deep in the chain. Under v1, relays do not
-   re-publish predicates onward; only the terminal's immediate upstream
-   carries the pushed set.
-2. An origin mismatch with the previous hop, which is also normal across
-   chain boundaries where a relay aggregates multiple downstream terminals.
+Transient inconsistencies — a hop briefly behind the others, or one
+reporting `predicates=0` — are normal while a fresh push is propagating
+up the chain or right after a node restarts. If a hop stays empty after
+the chain has settled, check that hop's chain-client status and the
+`yggdrasil_chain_predicate_recv_total` /
+`yggdrasil_chain_predicate_forward_total` counters: empty means either
+its downstream hasn't pushed yet or its own outbound chain session is
+down. Origin mismatch between adjacent hops should only appear
+transiently while a terminal rotation propagates; persistent mismatch
+means the chain is in an inconsistent state.
 
 If a hop genuinely diverges (different version + same origin, or
-content drift), investigate the publisher / acceptor metrics on that
-hop.
+content drift) after the chain has settled, investigate the publisher /
+acceptor metrics on that hop.
 
 ### Debugging a rule end-to-end with `chain canary`
 
