@@ -46,6 +46,128 @@ When the project tags its first release, this section's qualifier no
 longer applies and the wire-format bullet recovers its literal reading.
 A future maintainer can drop this section in a one-line commit then.
 
+## Scope: single-destination homelab relay
+
+yggdrasil is a **single-destination relay for homelab setups**. The
+canonical deployment is one terminal behind a residential
+(likely-rotating) IP, dialing one relay/gateway that lives on a stable
+public IP. End-users only ever see the gateway's address; the
+terminal's current IP is internal operational state and is never an
+externally-published surface. Chaining additional mid-chain relays
+between the terminal and the gateway is still permitted — what
+"single-destination" constrains is *fan-out at any node*, not the
+number of hops in the chain.
+
+The following topologies are **explicitly out of scope** and should not
+be proposed, designed for, or accommodated by speculative hooks:
+
+- **Fan-in / load balancing.** One relay being dialed by more than one
+  peer — multiple terminals, multiple mid-chain relays, or any mix.
+  Every node accepts from exactly one peer; this is not a v1 limitation
+  awaiting a v2 generalisation, it is the intended shape.
+- **Fan-out / gateway redundancy.** One terminal (or mid-chain relay)
+  dialing more than one peer: HA/failover across gateways, anycast
+  frontends, multi-homed terminals, etc. Every node dials at most one
+  peer; cross-gateway redundancy is not a yggdrasil concern.
+
+If a task, refactor, or design discussion seems to require either
+shape, **stop and ask** rather than building speculative groundwork.
+Config fields, type parameters, `Vec<…>`s where a single value would
+do, or comments that exist solely to "leave the door open" for fan-in
+or fan-out are noise and should be flagged for removal, not preserved.
+This override takes precedence over any fan-in or fan-out framing —
+e.g. references to "aggregating multiple downstreams", "multi-tenant
+relays", or "gateway failover" — that may still appear in
+`docs/architecture.md` or elsewhere. Surface such stale framing for
+the human owner to reconcile rather than treating it as a roadmap.
+
+## Terminology: "upstream" / "downstream" — two conventions, avoid in new code
+
+The terms **"upstream"** and **"downstream"** carry *two distinct,
+context-dependent meanings* in yggdrasil, **both contextually correct**.
+Agents should still **avoid the terms entirely in new code, comments,
+commit messages, docs, and PR descriptions** because the same node can
+be "X's upstream" under one convention and "X's downstream" under the
+other — that's a real footgun for readers who don't know which plane
+they're in. Prefer:
+
+- **Role names**: `terminal`, `mid-chain relay`, `relay`, `gateway`.
+- **Relational phrases anchored in dial direction**: "the relay this
+  terminal dials", "the terminal that dialed this relay", "the gateway
+  at the root of the chain".
+- **Geographic anchors** when an abstract direction matters: "closer to
+  the home network" vs. "closer to the public internet".
+- **Reverse-proxy role names** when the data plane needs it: "the
+  backend", "the client", "the resolved target".
+
+### Convention 1 — control plane (chain topology)
+
+Applies to the chain control plane: `crates/ratatoskr/src/{control,
+control_frame, canary, chain_query, predicate, wire}.rs`,
+`crates/yggdrasil/src/chain/*`, the control-plane fields on
+`ServerInfoResponse` (`upstream: Option<PubKey>`, `downstream:
+Option<PubKey>`, `downstream_ip`, `downstream_enrolled`), the
+`DownstreamShow` / `DownstreamPending` / `DownstreamApprove` request
+variants and their `yggdrasilctl` subcommands, and chain docs
+including `docs/architecture.md`.
+
+- **upstream(X)** = the node X *dials* (and sends heartbeats to) =
+  closer to the gateway / public internet.
+- **downstream(X)** = the node that *dials X* = closer to the terminal
+  / home network.
+
+Grounded in dial direction (which is unambiguous in a NAT-traversal
+system: the home-side always dials out). This is the
+telco/ISP/networking-infrastructure framing — `upstream` = toward the
+backbone — and it's the right framing for code that reasons about
+chain topology itself.
+
+### Convention 2 — data plane (reverse-proxy direction)
+
+Applies to the proxy / data plane: `crates/yggdrasil/src/proxy/*`,
+data-plane types like `proxy::resolver::UpstreamResolver`, data-plane
+metric names like `yggdrasil_tcp_upstream_connect_seconds`, the
+binary's `--help` "residential upstreams" `about` string, and proxy
+log messages such as `"upstream failure"`.
+
+- **upstream** = the backend the proxy talks to on behalf of the
+  client (= the *terminal-side* direction, since yggdrasil's real
+  services live at the terminal).
+- **downstream** = the client-facing side (= the *gateway-side*
+  direction).
+
+This is the app-layer reverse-proxy framing — nginx's `upstream {}`
+block, HAProxy backends, Envoy clusters, Apache `mod_proxy`. It's the
+right framing for data-plane code because that's the vocabulary any
+operator coming from the proxy ecosystem already knows.
+
+### The two conventions are inverse on the same node
+
+A relay's *control-plane upstream* is the gateway it dials; that same
+relay's *data-plane upstream* is the terminal-side backend it forwards
+client traffic toward. Mixing the two without context will get the
+direction wrong. Rules for agents:
+
+- Do **not** introduce control-plane "upstream"/"downstream" in a file
+  that lives under `crates/yggdrasil/src/proxy/`, and do **not**
+  introduce reverse-proxy "upstream"/"downstream" in a file under
+  `crates/yggdrasil/src/chain/` or in chain control-plane types.
+  Pick role names instead, per the primary rule above.
+- Do **not** "fix" one plane's convention to match the other; both are
+  correct in their own context. The previous framing in earlier
+  revisions of this file (which called for a project-wide swap) was
+  wrong and has been retracted.
+- Do **not** rely on context-free grep to interpret a hit — determine
+  which plane the file/identifier belongs to first.
+
+External meanings — Rust crate-ecosystem usage ("downstream crates
+that match on it" in `crates/ratatoskr/src/pubkey.rs`), build-system
+"downstream consumers" (`CMakeLists.txt`), "downstream call-sites"
+(`crates/yggdrasil/src/cli.rs`), or quotes of nginx's *own*
+`upstream`/`downstream` vocabulary (`bench/lib/common.sh`) — are
+*neither* convention and must also be left alone. They are not about
+yggdrasil chain or proxy direction at all.
+
 ## Git commit trailers
 
 Never add a `Co-authored-by:` trailer to commit messages, regardless of
