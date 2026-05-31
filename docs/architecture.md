@@ -95,8 +95,10 @@ handshake, and runs the heartbeat / predicate-push tasks against it.
 Chain orientation rule: for any node X, `upstream(X)` is the node X dials
 (and sends heartbeats to); `downstream(X)` is the node that dials X. The
 terminal has only an upstream; the root gateway has only a downstream;
-mid-chain relays have both. v1 supports exactly one upstream and one
-downstream per node, so each chain is a single path.
+mid-chain relays have both. Each node has at most one upstream and at
+most one downstream — that's the intended shape, not a v1 limitation
+awaiting a v2 generalisation — so each chain is a single path of hops
+between one terminal and one gateway.
 
 `Predicates propagate hop-by-hop up the chain.` A predicate set
 originating at a terminal lands on its immediate upstream (its
@@ -108,12 +110,6 @@ top of the chain receives them, derives its own `RuleSet`, and binds
 the public listeners. Forwarding is byte-identical: origin pubkey and
 monotone version are preserved so each hop applies the same
 version-staleness invariant against the terminal's identity.
-
-What `v1` does **not** do is *aggregate* predicates from multiple
-downstreams (mid-chain relays only support one downstream in v1, so
-there's nothing to aggregate yet). A future v2 relay supporting
-multiple downstreams would need to merge their predicate sets before
-forwarding.
 
 Real client IPs propagate alongside the bytes: each hop that emits
 chain HTTPS PROXY-v2 (TCP prepend or UDP first-datagram) reads any
