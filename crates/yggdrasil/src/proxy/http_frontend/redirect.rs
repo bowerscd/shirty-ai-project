@@ -83,8 +83,6 @@ pub struct RedirectListener {
     /// Optional ACME HTTP-01 responder. Attached at supervisor startup
     /// when an `[acme]` section is configured.
     acme: Arc<parking_lot::RwLock<Option<AcmeResponder>>>,
-    /// Hyper client used to dial cert-less route backends.
-    backend_client: BackendClient,
 }
 
 impl std::fmt::Debug for RedirectListener {
@@ -141,14 +139,13 @@ impl RedirectListener {
             Arc::new(parking_lot::RwLock::new(None));
         let acme: Arc<parking_lot::RwLock<Option<AcmeResponder>>> =
             Arc::new(parking_lot::RwLock::new(None));
-        let backend_client = build_backend_client();
+        let task_client = build_backend_client();
         let cancel = parent.child_token();
 
         let task_hosts = Arc::clone(&hosts);
         let task_plaintext = Arc::clone(&plaintext_routes);
         let task_lan = Arc::clone(&lan_cidrs);
         let task_acme = Arc::clone(&acme);
-        let task_client = backend_client.clone();
         let task_cancel = cancel.clone();
         let task_local = local_addr;
 
@@ -177,7 +174,6 @@ impl RedirectListener {
             plaintext_routes,
             lan_cidrs,
             acme,
-            backend_client,
         })
     }
 

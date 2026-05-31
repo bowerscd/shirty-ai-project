@@ -18,12 +18,8 @@
 //! thing, no amount of UDP traffic on the heartbeat port can move flows
 //! unless the source IP truly changed.
 
-#![allow(dead_code)] // wired into run() once the proxies in Phase 4/5 land
-
 mod peer_state;
 mod server;
 
-#[allow(unused_imports)]
 pub use peer_state::{HeartbeatEffect, PeerState, UNENROLLED_PEER_KEY};
-#[allow(unused_imports)]
 pub use server::{HeartbeatServer, OutboundHandle};

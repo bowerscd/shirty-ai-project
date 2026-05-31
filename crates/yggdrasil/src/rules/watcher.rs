@@ -16,10 +16,6 @@
 //! failures) are logged at `warn` and the previous good set is retained — a
 //! single malformed file must never take down the running proxy.
 
-// Wired into run() in Phase 4 / Phase 9 (control socket force_reload). The
-// targeted allows mirror the pattern in mod.rs::load_dir.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

@@ -477,7 +477,10 @@ where
             )
             .await;
         }
-        Err(BodyCollectError::Recv(_)) => return Ok(()),
+        Err(BodyCollectError::Recv(e)) => {
+            debug!(rule = %rule.name, error = %e, "h3 request body recv failed");
+            return Ok(());
+        }
     };
 
     let body = Full::new(body_bytes).map_err(|e| match e {}).boxed();
