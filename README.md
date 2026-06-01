@@ -1,19 +1,26 @@
 # yggdrasil
 
-A residential reverse proxy with a chain control plane. One binary, two modes:
+A residential reverse proxy with a chain control plane. One binary, three
+modes (terminal at home, gateway at the public-facing root, mid-chain
+relay between them):
 
-* **relay** — runs on a VPS with a stable public IP. Accepts inbound TCP and
-  UDP from the internet, forwards each rule to whatever current address its
-  downstream peer most recently authenticated from.
 * **terminal** — runs on a home box behind a dynamic IP / CGNAT. Dials a
-  relay upstream over UDP, sends authenticated heartbeats, publishes the
-  local TCP, UDP, and HTTPS rule set as predicates the relay derives its own
-  listeners from.
+  gateway (or mid-chain relay) upstream over UDP, sends authenticated
+  heartbeats, publishes the local TCP, UDP, and HTTPS rule set as
+  predicates the chain's gateway derives its own listeners from.
+* **gateway** — runs on a VPS with a stable public IP. Accepts inbound
+  TCP and UDP from the internet, forwards each rule to whatever current
+  address its downstream peer most recently authenticated from. Only
+  accepts inbound chain traffic, never dials upstream.
+* **mid-chain relay** — both accepts an inbound chain session from a
+  downstream and dials further upstream toward a gateway. Mode name in
+  config: `relay`.
 
-Both modes are the same `yggdrasil` binary; the difference is section shape:
-`[dial]` only => terminal, `[accept]` only or both => relay. A
-deployment is a chain of one or more relays terminating in exactly one
-terminal — `home -> midbox -> vps` works the same way `home -> vps` does
+All three modes are the same `yggdrasil` binary; the difference is
+section shape: `[dial]` only => terminal, `[accept]` only => gateway,
+`[dial]` + `[accept]` => relay. A deployment is a chain of one or more
+relay-side nodes terminating in exactly one terminal — `home -> midbox
+-> vps` works the same way `home -> vps` does
 (the 3-hop chain is exercised by
 [`tests/e2e/run-chain.sh`](tests/e2e/run-chain.sh) end-to-end and by
 [`chain_predicate_e2e`](crates/yggdrasil/tests/chain_predicate_e2e.rs)
@@ -116,10 +123,10 @@ listeners on its end.
 # /etc/yggdrasil/conf.d/ssh.toml — terminal rule pointing at the local sshd.
 sudo tee /etc/yggdrasil/conf.d/ssh.toml >/dev/null <<'EOF'
 [[rule]]
-name          = "ssh"
-listen        = "0.0.0.0:2222"
-protocol      = "tcp"
-target_addr = "127.0.0.1:22"
+name     = "ssh"
+listen   = "0.0.0.0:2222"
+protocol = "tcp"
+target   = "127.0.0.1:22"
 EOF
 ```
 
@@ -133,7 +140,7 @@ treats inbound chain TCP as connections destined for `127.0.0.1:22`.
 ```bash
 # Relay:
 sudo yggdrasilctl local status
-# mode:                 relay
+# mode:                 gateway
 # downstream_ip:        203.0.113.42        (the home box's public IP)
 # last_heartbeat:       423 ms ago
 # rule_count:           1                   (derived from terminal's predicate)
@@ -165,8 +172,8 @@ ssh -p 2222 user@vps.example.net
 
 | Crate           | Output                              | Role                                                     |
 | --------------- | ----------------------------------- | -------------------------------------------------------- |
-| `yggdrasil`     | bin `yggdrasil` (daemon)            | The proxy / chain node. Same binary in relay or terminal. |
-| `yggdrasilctl`  | bin `yggdrasilctl`                  | Admin CLI. Three scopes: `local`, `chain`, `identity`.    |
+| `yggdrasil`     | bin `yggdrasil` (daemon)            | The proxy / chain node. Same binary; three modes (terminal, gateway, mid-chain relay) derived from `[dial]` / `[accept]` shape. |
+| `yggdrasilctl`  | bin `yggdrasilctl`                  | Admin CLI. Four scopes: `local` (daemon-local over UDS), `chain` (cross-chain introspection), `identity` (offline identity + request/grant), and `validate` (offline config + rules check). |
 | `ratatoskr`     | (lib only)                          | Shared protocol types, wire format, Noise_IK auth.        |
 | `cli-defs`      | (lib only)                          | Shared clap-derive structs both binaries + their `build.rs` scripts consume to keep the auto-generated reference in [docs/cli-reference/](docs/cli-reference/) drift-free. |
 | `bench-tools`   | bins `loadgen`, `bench-echo` (workspace-internal) | Helpers used by [bench/](bench/README.md): UDP/TCP load generator and a native echo backend. |

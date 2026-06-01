@@ -1,8 +1,13 @@
 # Configuration reference
 
-There are two config artefacts. Both are TOML with
-`#[serde(deny_unknown_fields)]`, so a typo is a hard parse error — there
-are no silently-ignored keys.
+There are two config artefacts; both are TOML. `config.toml` is strict:
+`[server]`, `[control]`, `[dial]`, `[accept]`, and `[acme]` all carry
+`#[serde(deny_unknown_fields)]`, so a typo at the top level is a hard
+parse error. The rule files in `conf.d/*.toml` are more permissive at
+the parse layer — unknown keys are silently dropped — but the post-parse
+validator rejects any rule that ends up missing a required field (e.g.
+neither `target` nor `target_port` set), so a typo'd key name (`target_addr`
+instead of `target`, say) surfaces at validation rather than parse.
 
 | File                                  | Owner                | Purpose                                  |
 | ------------------------------------- | -------------------- | ---------------------------------------- |
@@ -45,8 +50,8 @@ hex is rejected on parse.
 Mode is derived from section presence:
 
 * `[dial]` only => `terminal`
-* `[accept]` only => `relay` (root relay)
-* `[dial]` + `[accept]` => `relay` (mid-chain relay)
+* `[accept]` only => `gateway` (root-of-chain VPS)
+* `[dial]` + `[accept]` => `relay` (mid-chain hop)
 * neither => invalid config
 
 There is no `[metrics]` section. Prometheus text, `/healthz`-equivalent
@@ -80,7 +85,9 @@ this section; pure root relays omit it.
 
 Pins the single enrolled downstream identity. When set, this node accepts
 inbound chain traffic only from `pubkey` and binds UDP `listen` for that
-session. Presence of `[accept]` makes the effective mode `relay`.
+session. Presence of `[accept]` makes the effective mode `gateway`
+(`[accept]`-only, root-of-chain VPS) or `relay` (when `[dial]` is also
+set, mid-chain hop).
 
 | Key                  | Type           | Default | Notes                                                                  |
 | -------------------- | -------------- | ------- | ---------------------------------------------------------------------- |

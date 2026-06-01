@@ -28,7 +28,7 @@ You'll get three release binaries under `target/release/`:
 
 | Binary          | Belongs on            | Purpose                                                  |
 | --------------- | --------------------- | -------------------------------------------------------- |
-| `yggdrasil`     | every chain node      | The chain daemon. Same binary in relay or terminal mode.  |
+| `yggdrasil`     | every chain node      | The chain daemon. Same binary; three modes (terminal, gateway, mid-chain relay) derived from `[dial]` / `[accept]` shape. |
 | `yggdrasilctl`  | every chain node      | Admin CLI: `local`, `chain`, and `identity` scopes.       |
 | `loadgen`       | (only on bench hosts) | UDP/TCP load generator used by [bench/](../bench/). Built by `cargo build -p bench-tools`. |
 | `bench-echo`    | (only on bench hosts) | Native TCP/UDP echo backend used by [bench/](../bench/). Built by `cargo build -p bench-tools`. |

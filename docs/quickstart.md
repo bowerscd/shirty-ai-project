@@ -132,7 +132,7 @@ sudo rm /tmp/home.request /tmp/home.grant
 ## 5. Add a forwarding rule (terminal side)
 
 Rules live in `[server].rules_dir` on the **terminal** node — the
-terminal publishes them upstream as predicates, and the relay derives
+terminal publishes them upstream as predicates, and the gateway derives
 matching listeners on its side.
 
 ```bash
@@ -148,7 +148,12 @@ EOF
 Schema reference: [configuration.md → rules](configuration.md#rule-files).
 
 The watcher debounces 250 ms before reloading, so you can drop several
-files in quick succession and only one reload fires.
+files in quick succession and only one reload fires. Validation failures
+leave the previously-loaded rule set serving — check the journal for
+the parse / validation error. To force a re-scan without waiting on
+inotify (NFS, container bind mounts, FUSE), run
+`sudo yggdrasilctl local rules reload`; it blocks until the supervisor
+swaps to the new set and returns the post-swap rule count.
 
 ## 6. Start both daemons
 
@@ -173,7 +178,7 @@ On the VPS:
 ```bash
 sudo yggdrasilctl local status
 # version:              0.1.0
-# mode:                 relay
+# mode:                 gateway
 # downstream_ip:        203.0.113.42
 # last_heartbeat:       423 ms ago
 # rule_count:           1

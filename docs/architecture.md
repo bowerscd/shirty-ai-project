@@ -17,13 +17,14 @@ control sessions.
 
 ## Cast of characters
 
-There is exactly one daemon binary, `yggdrasil`, running in one of two modes
+There is exactly one daemon binary, `yggdrasil`, running in one of three modes
 derived from the `[dial]` / `[accept]` tables:
 
-| Mode       | Accepts inbound chain traffic | Dials upstream | Typical role                               |
-| ---------- | ----------------------------- | -------------- | ------------------------------------------ |
-| `relay`    | Yes (when `[accept]` set) | Optional   | Root VPS, or mid-chain forwarder.          |
-| `terminal` | No                            | Yes (required) | Home box / chain leaf.                     |
+| Mode       | `[dial]` | `[accept]` | Typical role                                        |
+| ---------- | -------- | ---------- | --------------------------------------------------- |
+| `terminal` | present  | absent     | Home box / chain leaf.                              |
+| `gateway`  | absent   | present    | Public-facing root VPS (accepts only, never dials). |
+| `relay`    | present  | present    | Mid-chain forwarder (both accepts and dials).       |
 
 The auxiliary binaries are:
 
@@ -47,7 +48,7 @@ ratatoskr is the squirrel who runs messages up and down it.
                 v                                                      |
         +-----------------+                                   +-----------------+
 clients |   yggdrasil     |   forwarded TCP / UDP             |   yggdrasil     | home services
-------> | (VPS, "relay")  | --------------------------------> | ("terminal")    | --------------> 22, 25565, ...
+------> | (VPS, "gateway")| --------------------------------> | ("terminal")    | --------------> 22, 25565, ...
         +-----------------+                                   +-----------------+
             ^      ^
             |      |
@@ -59,9 +60,10 @@ clients |   yggdrasil     |   forwarded TCP / UDP             |   yggdrasil     
 
 Both nodes bind:
 
-1. **Chain listener** (relay only, when `[accept]` is set). UDP.
-   Carries Noise_IK-protected control frames — heartbeats, predicate pushes,
-   and recursive chain-summary queries. No application bytes.
+1. **Chain listener** (gateway and mid-chain relay, when `[accept]` is
+   set). UDP. Carries Noise_IK-protected control frames — heartbeats,
+   predicate pushes, and recursive chain-summary queries. No application
+   bytes.
 2. **Per-rule data-plane sockets**. Each rule (on the terminal: from
    `conf.d/*.toml`; on the relay: derived from the terminal's published
    predicate set) creates exactly one TCP listener or one UDP listener.

@@ -74,16 +74,31 @@
 
 # ================================================================ ACME
 #
-# Terminal-only. Required if any [[rule.route]] declares
-# `cert = "acme"`. See docs/configuration.md for the full DNS-01
-# provider matrix; HTTP-01 needs no provider sub-table.
+# Terminal-only. Configure this section to have yggdrasil issue and
+# renew a single wildcard certificate (SANs `[<domain>, *.<domain>]`)
+# via RFC 8555 + DNS-01. The renewer writes the issued PEMs to
+# `<storage_dir>/<domain>/{fullchain,privkey}.pem` (defaults to
+# `[server].cert_dir`); point `[server].default_cert` / `default_key`
+# at those paths so the cert watcher hot-reloads on each renewal.
+#
+# Status: implemented and unit-tested, but has not been driven against
+# a live CA in tree — see docs/operations.md → "Driving ACME issuance
+# and renewal" for the deployment walkthrough, the Cloudflare API
+# token scopes, and the systemd EnvironmentFile pattern.
 
 # [acme]
+# domain                  = "REPLACE_WITH_APEX_DOMAIN"     # required: e.g. "example.com"
+# contact_email           = "admin@example.com"            # required
+# terms_of_service_agreed = true                           # required, must be true
 # directory_url           = "https://acme-v02.api.letsencrypt.org/directory"
-# contact_email           = "admin@example.com"
-# terms_of_service_agreed = true
+# # LE staging while shaking out a deployment:
+# # directory_url         = "https://acme-staging-v02.api.letsencrypt.org/directory"
 # renew_before            = "30d"
 # renew_jitter            = "12h"
+
+# Exactly one [acme.dns.<provider>] sub-table is required. The only
+# provider implemented today is `cloudflare`. The API token must be
+# scoped to `Zone.DNS:Edit` for the apex zone.
 
 # [acme.dns.cloudflare]
 # api_token_env = "CLOUDFLARE_API_TOKEN"

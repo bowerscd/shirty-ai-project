@@ -65,7 +65,7 @@ type, labels, meaning.
 | Metric                                            | Type    | Labels                          | Notes                                                                  |
 | ------------------------------------------------- | ------- | ------------------------------- | ---------------------------------------------------------------------- |
 | `yggdrasil_build_info`                            | gauge   | `version`                       | Constant `1`. Used to join other metrics with the deployed build.       |
-| `yggdrasil_mode`                                  | gauge   | `mode` (`relay`/`terminal`)     | Constant `1`. Lets dashboards branch on mode.                          |
+| `yggdrasil_mode`                                  | gauge   | `mode` (`gateway`/`relay`/`terminal`) | Constant `1`. Lets dashboards branch on mode.                          |
 | `yggdrasil_rules_loaded`                          | gauge   | (none)                          | Number of rules currently in the live rule set.                         |
 | `yggdrasil_https_routes`                          | gauge   | (none)                          | Number of cert'd top-level `[[route]]` entries currently loaded.        |
 | `yggdrasil_certless_routes`                       | gauge   | `rule`, `hostname`              | One per cert-less route. Constant `1` per live entry.                   |
@@ -199,6 +199,134 @@ sudo yggdrasilctl chain apply --file /tmp/candidate-rules.toml
 
 Terminal mode only. The daemon re-validates server-side and rejects the
 apply as a unit on any conflict.
+
+### Driving ACME issuance and renewal
+
+> **Status.** The ACME pipeline — DNS-01 challenge via Cloudflare,
+> wildcard cert issuance, atomic on-disk writeout, scheduled renewal —
+> is implemented and unit-tested but has **never been driven against a
+> live CA in tree** (`README.md → What's in the box`,
+> [`docs/configuration.md → [acme]`](configuration.md#acme--optional-terminal-mode-only)).
+> The procedure below is the operator-facing surface as the code
+> implements it, not a verified deployment recipe. The first operator
+> through this path is the first end-to-end test; treat the LE staging
+> directory (`https://acme-staging-v02.api.letsencrypt.org/directory`)
+> as a non-optional pre-prod step.
+
+ACME is **terminal-only** — gateways and mid-chain relays pass TLS
+through and never terminate. Enable it by:
+
+1. Add `[acme]` + `[acme.dns.cloudflare]` to the terminal's
+   `/etc/yggdrasil/config.toml`. See
+   [configuration.md → `[acme]`](configuration.md#acme--optional-terminal-mode-only)
+   for the full field list. Minimum:
+
+   ```toml
+   [acme]
+   domain                  = "example.com"
+   contact_email           = "ops@example.com"
+   terms_of_service_agreed = true
+   # directory_url defaults to Let's Encrypt production. Override to
+   # staging while shaking out a deployment:
+   # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+   [acme.dns.cloudflare]
+   api_token_env = "CLOUDFLARE_API_TOKEN"
+   ```
+
+2. Mint a Cloudflare API token scoped to **`Zone.DNS:Edit`** on the
+   one zone yggdrasil should touch (Cloudflare → My Profile → API
+   Tokens → Create Token → "Edit zone DNS" template, narrowed to the
+   apex zone). Broader scopes work but the daemon never needs them.
+   The token string itself is the value of `CLOUDFLARE_API_TOKEN` in
+   the daemon's environment.
+
+3. Inject the token into the daemon's environment. The shipped
+   systemd unit
+   ([`contrib/systemd/yggdrasil.service`](../contrib/systemd/yggdrasil.service))
+   does not declare an `EnvironmentFile=` — operators add one via
+   `systemctl edit`:
+
+   ```bash
+   # Create a 0600 file owned by root for the secret itself.
+   sudo install -m 0600 /dev/null /etc/yggdrasil/acme.env
+   sudo tee /etc/yggdrasil/acme.env >/dev/null <<'EOF'
+   CLOUDFLARE_API_TOKEN=cf-token-goes-here
+   EOF
+
+   # Wire it into the unit via a drop-in override (preserves package upgrades).
+   sudo systemctl edit yggdrasil
+   # ...the editor opens an empty override; add exactly:
+   # [Service]
+   # EnvironmentFile=/etc/yggdrasil/acme.env
+
+   sudo systemctl restart yggdrasil
+   ```
+
+   The unit runs as the unprivileged `yggdrasil` user, so the
+   `acme.env` file must be readable by that user — `chmod 0640` +
+   `chgrp yggdrasil` works, or keep it `0600 root:root` and use
+   `LoadCredential=` instead (see `systemd.exec(5)`).
+
+4. Point `[server].default_cert` / `default_key` at the renewer's
+   output so the cert watcher picks up renewals automatically.
+   The renewer writes atomically to
+   `{storage_dir}/{domain}/{fullchain,privkey}.pem`. `storage_dir`
+   defaults to `[server].cert_dir` (default `/etc/yggdrasil/certs`).
+   For the example above with default paths and
+   `domain = "example.com"`, that's:
+
+   ```toml
+   [server]
+   default_cert = "/etc/yggdrasil/certs/example.com/fullchain.pem"
+   default_key  = "/etc/yggdrasil/certs/example.com/privkey.pem"
+   ```
+
+**When issuance fires.** At daemon startup the manager checks for an
+existing PEM at the storage path. If present and `not_after` is
+further out than `[acme].renew_before` (default `30d`), the renewer
+schedules itself for `not_after - renew_before ± renew_jitter` and
+otherwise stays idle. If absent or stale, it issues immediately.
+Subsequent renewals run on that same schedule until daemon stop.
+The wildcard cert covers SANs `[<domain>, *.<domain>]` — one cert
+for the apex and every immediate subdomain.
+
+**Inspecting status:**
+
+```bash
+sudo yggdrasilctl local acme list
+# hostname           provider     state       next_renewal           not_after              last_error
+# example.com        cloudflare   active      2026-07-30T04:12:00Z   2026-08-29T04:12:00Z   -
+```
+
+States are the `HostStatus` snapshot
+(`crates/yggdrasil/src/proxy/acme/mod.rs::HostStatus`):
+
+* `pending` — first issuance hasn't completed yet (ephemeral cert
+  or no cert serving meanwhile).
+* `active` — PEM on disk, in active rotation.
+* `error` — last issuance attempt failed; whatever cert was previously
+  in place is still serving.
+
+The `last_error` column is populated whenever the last issuance attempt
+failed.
+
+**Forcing an out-of-band renewal:**
+
+```bash
+sudo yggdrasilctl local acme renew example.com
+```
+
+This kicks the renewer's bounded (16-deep) channel; the call blocks
+until the ACME order completes (5–60 s typical for LE) and returns
+the issuance result. The cert watcher then hot-reloads the new PEM
+in place — no daemon restart, no HTTPS-frontend respawn for a cert
+swap (`docs/configuration.md → Hot reload semantics`).
+
+**Observability:** `yggdrasil_acme_renew_total{hostname,result}`
+counts issuance outcomes; `yggdrasil_acme_expiry_seconds{hostname}`
+exposes the live `not_after` for "stuck renewal" alerts. See
+[Suggested alerts](#suggested-alerts) above.
 
 ### Inspecting chain drift
 
