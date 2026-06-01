@@ -105,7 +105,13 @@ pub(crate) async fn serve_request(
     // write-guard) is never blocked behind an in-flight request, and
     // so the (parking_lot, !Send) guard never crosses an `.await`.
     // -------------------------------------------------------------------
-    let route_data: Option<(String, Url, Option<ratatoskr::rule::HstsConfig>, std::collections::BTreeMap<String, String>)> = {
+    type RouteSnapshot = (
+        String,
+        Url,
+        Option<ratatoskr::rule::HstsConfig>,
+        std::collections::BTreeMap<String, String>,
+    );
+    let route_data: Option<RouteSnapshot> = {
         let routes = ctx.routes.read();
         routes.lookup(&host).map(|r| {
             let label = host

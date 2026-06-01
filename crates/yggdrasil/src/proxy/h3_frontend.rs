@@ -462,7 +462,12 @@ where
     // read-guard so the supervisor's hot-swap path is never blocked
     // behind an in-flight request, and so the (parking_lot, !Send)
     // guard never crosses an `.await`.
-    let route_data: Option<(url::Url, Option<ratatoskr::rule::HstsConfig>, std::collections::BTreeMap<String, String>)> = {
+    type RouteSnapshot = (
+        url::Url,
+        Option<ratatoskr::rule::HstsConfig>,
+        std::collections::BTreeMap<String, String>,
+    );
+    let route_data: Option<RouteSnapshot> = {
         let routes = routes.read();
         routes
             .lookup(&host)

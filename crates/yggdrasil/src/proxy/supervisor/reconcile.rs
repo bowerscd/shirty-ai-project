@@ -394,6 +394,37 @@ async fn reconcile_https(
         return;
     }
 
+    // Per-route hot reload: if a frontend is alive and only the route
+    // set differs (listener config is stable across reconcile calls in
+    // a given supervisor lifetime), hot-swap the route tables in
+    // place. New TLS handshakes / HTTP requests on EXISTING routes
+    // see the same listener — no connection-drop, no rebind. Falls
+    // through to the teardown + respawn path on any error (e.g.
+    // cert-load failure for a newly-added route).
+    if let Some(ap) = https_active.as_mut() {
+        if matches!(&ap.handle, ProxyHandle::Https(_)) {
+            match try_hot_swap_routes(
+                ap,
+                prev_routes,
+                redirect_listeners,
+                &desired,
+                cert_config,
+                cert_store,
+                cert_watcher,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "HTTPS route hot-swap failed; falling back to teardown + respawn"
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(old) = https_active.take() {
         if let ProxyHandle::Https(h) = &old.handle {
             if let Some(rl) = redirect_listeners.get(&h.redirect_ip) {
@@ -436,6 +467,179 @@ async fn reconcile_https(
             prev_routes.clear();
         }
     }
+}
+
+/// Hot-swap the HTTPS frontend's route set in place. Used when only
+/// the route table differs between the previous and desired state —
+/// no listener rebind, no TLS-connection drop, no h3 endpoint
+/// recreation. Returns `Err` if the hot-swap can't proceed (e.g. a
+/// newly-added route's cert failed to load); the caller falls back
+/// to teardown + respawn.
+///
+/// Side effects on success:
+///   - cert_store gains entries for newly-added cert'd routes,
+///     loses entries for removed routes.
+///   - cert_watcher gains registrations for newly-added cert'd
+///     routes, loses registrations for removed routes.
+///   - redirect listener's host set + cert-less plaintext route
+///     table reflect the new state.
+///   - `HttpFrontend::update_routes` and `H3Frontend::update_routes`
+///     atomically swap their route tables.
+///   - `https_active.cert_less_route_count` and
+///     `HttpsHandle::redirect_hosts` are updated in place.
+///   - `*prev_routes` is replaced with `desired`.
+#[allow(clippy::too_many_arguments)]
+async fn try_hot_swap_routes(
+    https_active: &mut ActiveProxy,
+    prev_routes: &mut Vec<HttpRoute>,
+    redirect_listeners: &mut HashMap<IpAddr, RedirectListener>,
+    desired: &[HttpRoute],
+    cert_config: &CertConfig,
+    cert_store: &Arc<CertStore>,
+    cert_watcher: &Arc<CertWatcher>,
+) -> Result<()> {
+    // Defensive: only valid for an active HTTPS handle.
+    if !matches!(&https_active.handle, ProxyHandle::Https(_)) {
+        anyhow::bail!("try_hot_swap_routes called on non-HTTPS handle");
+    }
+
+    let old_hosts: HashSet<String> = prev_routes
+        .iter()
+        .map(|r| r.hostname.to_ascii_lowercase())
+        .collect();
+    let new_hosts: HashSet<String> = desired
+        .iter()
+        .map(|r| r.hostname.to_ascii_lowercase())
+        .collect();
+    let removed: Vec<String> = old_hosts.difference(&new_hosts).cloned().collect();
+    let added: Vec<String> = new_hosts.difference(&old_hosts).cloned().collect();
+
+    // 1. Load certs for any newly-added routes through the same
+    //    three-rung resolver as the spawn path. Failure to load a
+    //    cert is non-fatal at this layer — the new route just ends
+    //    up cert-less and is served only on the companion :80 path.
+    //    But propagation of a hard error (e.g. invalid PEM in
+    //    `default_cert`) bubbles up so the caller falls back to
+    //    respawn rather than leaving a half-loaded cert_store.
+    let added_routes: Vec<HttpRoute> = desired
+        .iter()
+        .filter(|r| added.contains(&r.hostname.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    if !added_routes.is_empty() {
+        load_routes_into_store(
+            HTTPS_FRONTEND_NAME,
+            &added_routes,
+            cert_store,
+            &cert_config.cert_dir,
+            cert_config
+                .default_cert
+                .as_deref()
+                .zip(cert_config.default_key.as_deref()),
+        )
+        .with_context(|| {
+            format!(
+                "hot-load certs for {} added top-level [[route]] entries",
+                added_routes.len()
+            )
+        })?;
+    }
+
+    // 2. Recompute the cert-less set from the new desired routes. We
+    //    consult `cert_store` because load_routes_into_store may have
+    //    failed to resolve a cert source for one of the added routes,
+    //    in which case it's silently demoted to cert-less. Same logic
+    //    as `HttpFrontend::spawn` / `spawn_https_frontend`.
+    let cert_less_in_new: Vec<String> = desired
+        .iter()
+        .filter(|r| !cert_store.contains(&r.hostname))
+        .map(|r| r.hostname.clone())
+        .collect();
+
+    // 3. cert_watcher: unregister removed, register all currently-
+    //    cert'd hosts (no-op on already-registered).
+    for host in &removed {
+        cert_watcher.unregister(host);
+    }
+    let mut new_loaded_hosts: Vec<String> = Vec::new();
+    for r in desired {
+        let host = r.hostname.to_ascii_lowercase();
+        if cert_less_in_new
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&host))
+        {
+            continue;
+        }
+        let paths = cert_store.watched_paths_for(&host);
+        cert_watcher.register(&host, &paths);
+        new_loaded_hosts.push(host);
+    }
+
+    // 4. Drop certs for removed hosts AFTER cert_watcher unregister
+    //    (otherwise a watcher event could race with the remove and
+    //    fire `reload_host` on a host we've just dropped).
+    for host in &removed {
+        cert_store.remove(host);
+    }
+
+    // 5. Redirect listener: unregister cert'd hosts that left, register
+    //    cert'd hosts that arrived. Reset the cert-less plaintext
+    //    route table to the new set (full reset is cheap and matches
+    //    the spawn path's idempotent register-after-clear pattern).
+    let ProxyHandle::Https(https_handle) = &https_active.handle else {
+        unreachable!("https_active is HTTPS per the guard above");
+    };
+    let rl_ip = https_handle.redirect_ip;
+    let rl = redirect_listeners
+        .get(&rl_ip)
+        .context("redirect listener missing for active HTTPS handle's IP")?;
+    let old_loaded_hosts: HashSet<String> = https_handle.redirect_hosts.iter().cloned().collect();
+    let new_loaded_set: HashSet<String> = new_loaded_hosts.iter().cloned().collect();
+    for host in old_loaded_hosts.difference(&new_loaded_set) {
+        rl.unregister_host(host);
+    }
+    for host in new_loaded_set.difference(&old_loaded_hosts) {
+        rl.register_host(host);
+    }
+    rl.unregister_plaintext_routes(HTTPS_FRONTEND_NAME);
+    if !cert_less_in_new.is_empty() {
+        let cert_less_routes: Vec<HttpRoute> = desired
+            .iter()
+            .filter(|r| {
+                cert_less_in_new
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&r.hostname))
+            })
+            .cloned()
+            .collect();
+        rl.register_plaintext_routes(&cert_less_routes, HTTPS_FRONTEND_NAME);
+    }
+
+    // 6. Atomically hot-swap both frontends' route tables. After this
+    //    point, the next request on the listener (h1/h2 or h3) sees
+    //    the new route set; in-flight requests on routes that
+    //    survived continue to completion against the same backend.
+    https_handle.frontend.update_routes(desired, cert_store);
+    if let Some(h3) = &https_handle.h3 {
+        h3.update_routes(desired, cert_store);
+    }
+
+    // 7. Bookkeeping.
+    let new_cert_less_count = cert_less_in_new.len();
+    if let ProxyHandle::Https(h) = &mut https_active.handle {
+        h.redirect_hosts = new_loaded_hosts;
+    }
+    https_active.cert_less_route_count = new_cert_less_count;
+    https_active.upstream_description = format!("https:{} routes", desired.len());
+    *prev_routes = desired.to_vec();
+    tracing::info!(
+        added = added.len(),
+        removed = removed.len(),
+        total = desired.len(),
+        cert_less = new_cert_less_count,
+        "HTTPS routes hot-swapped in place (no listener disturbance)"
+    );
+    Ok(())
 }
 
 async fn spawn_https_frontend(

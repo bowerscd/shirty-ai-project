@@ -1905,3 +1905,223 @@ target = "{}"
     shutdown.cancel();
     let _ = fast.last_request().await; // suppress unused warning
 }
+
+/// Per-route hot reload (no listener disturbance) for a route
+/// addition. Adds a second route while a slow request is in flight on
+/// the first; verifies that:
+///
+///   - A FRESH TLS connection + HTTP/1.1 request to the unchanged
+///     route succeeds in well under the drain budget — proving the
+///     :443 listener never closed and never had to wait for the
+///     drain to complete. With the old teardown-and-respawn
+///     behaviour, the listener stays unbindable for the duration of
+///     the drain (≥ the slow backend's 1 s) so a fresh dial would
+///     either fail-connect or block until the rebind. The hot-swap
+///     path keeps the same listener bound throughout, so a fresh
+///     dial succeeds within milliseconds.
+///   - The in-flight request on the unchanged route still completes
+///     with 200 OK.
+///
+/// This is the load-bearing assertion for
+/// `route-hot-reload-fix-per-route-diff`: per-route diffing on the
+/// HTTPS frontend means a route addition / removal / edit doesn't
+/// disturb in-flight or newly-arriving requests on the other routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn route_addition_does_not_disturb_new_inflight_requests() {
+    use ratatoskr::rule::{HttpRoute, RuleSet};
+    use url::Url;
+    use yggdrasil::proxy::resolver::ResolverFactory;
+    use yggdrasil::proxy::supervisor::ProxySupervisor;
+
+    init_tracing();
+
+    let suffix: u32 = rand::random();
+    let host_a = format!("a{suffix}.localhost");
+    let host_b = format!("b{suffix}.localhost");
+
+    // Slow backend (1 s response latency) keeps the in-flight request
+    // straddling the route addition.
+    let slow = SlowBackend::spawn(Duration::from_millis(1_000)).await;
+    let fast = EchoBackend::spawn("b").await;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rules_dir = tmpdir.path().join("rules");
+    let cert_dir = tmpdir.path().join("certs");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    issue_cert_convention(&cert_dir, &host_a);
+    issue_cert_convention(&cert_dir, &host_b);
+
+    let frontend_guard = reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
+    let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
+
+    let initial_routes = format!(
+        r#"
+[[route]]
+hostname = "{host_a}"
+target = "{}"
+"#,
+        slow.upstream_url(),
+    );
+    std::fs::write(rules_dir.join("routes.toml"), initial_routes).unwrap();
+
+    let shutdown = CancellationToken::new();
+    let cert_config = CertConfig {
+        cert_dir: cert_dir.clone(),
+        default_cert: None,
+        default_key: None,
+        redirect_port: Some(0),
+        https_listen: frontend_addr,
+        https_http3: false,
+        https_alt_svc: false,
+        https_request_body_limit: 16 * 1024 * 1024,
+        acme: None,
+        lan_cidrs: Arc::new(yggdrasil::lan_cidrs::LanCidrs::resolve(None).unwrap()),
+    };
+    let drain_budget = Duration::from_secs(5);
+    drop(frontend_guard);
+    let supervisor = ProxySupervisor::spawn(
+        rules_dir,
+        Duration::from_millis(50),
+        ResolverFactory::new_terminal(),
+        None,
+        None,
+        cert_config,
+        Some(drain_budget),
+        shutdown.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        supervisor.wait_for_nonempty(Duration::from_secs(3)).await,
+        "HTTPS frontend never came up"
+    );
+
+    // Kick off a slow request on host_a so a request is in flight at
+    // the backend when we trigger the route addition.
+    let tls = dial_tls(frontend_addr, &host_a, vec![b"http/1.1".to_vec()])
+        .await
+        .expect("TLS handshake for the slow in-flight request");
+    let host_a_for_task = host_a.clone();
+    let inflight = tokio::spawn(async move {
+        let mut tls = tls;
+        http1_request(&mut tls, Some(&host_a_for_task), &[], "/").await
+    });
+    // Wait for the slow request to actually reach the backend before
+    // we apply the new ruleset; otherwise we'd be racing the request
+    // against the apply rather than asserting on what happens DURING a
+    // drain. SlowBackend has no observable "received" hook; 200 ms is
+    // generous on loopback (< 5 ms typical).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Apply the route addition (host_b alongside host_a).
+    let new_set = RuleSet::from_parts(
+        vec![],
+        vec![
+            HttpRoute {
+                hostname: host_a.clone(),
+                target: Url::parse(&slow.upstream_url()).unwrap(),
+                hsts: None,
+                headers: Default::default(),
+            },
+            HttpRoute {
+                hostname: host_b.clone(),
+                target: Url::parse(&fast.upstream_url()).unwrap(),
+                hsts: None,
+                headers: Default::default(),
+            },
+        ],
+    )
+    .unwrap();
+    supervisor.handle().apply_ruleset(new_set).await.unwrap();
+
+    // Wait for the route table swap to land. Poll until host_b is
+    // recognised (= no longer 404) or the deadline expires.
+    let host_b_ready_deadline = Instant::now() + Duration::from_secs(2);
+    let host_b_ready = async {
+        loop {
+            let dial = tokio::time::timeout(
+                Duration::from_millis(200),
+                dial_tls(frontend_addr, &host_b, vec![b"http/1.1".to_vec()]),
+            )
+            .await;
+            if let Ok(Ok(mut s)) = dial {
+                let r = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    http1_request(&mut s, Some(&host_b), &[], "/"),
+                )
+                .await;
+                if let Ok(Ok(body)) = r {
+                    let text = String::from_utf8_lossy(&body);
+                    if text.starts_with("HTTP/1.1 200") {
+                        return Ok::<(), &'static str>(());
+                    }
+                }
+            }
+            if Instant::now() >= host_b_ready_deadline {
+                return Err("host_b never started routing");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    .await;
+    let host_b_ready_ts = Instant::now();
+    host_b_ready.expect("host_b should route within 2s of apply");
+
+    // The load-bearing assertion: a FRESH TCP-connect + TLS handshake
+    // to host_a succeeds well under the slow backend's 1 s. If the
+    // supervisor had torn the listener down to do teardown + respawn,
+    // the dial would have blocked until the drain ran out (≥ 1 s,
+    // since the in-flight request is still pending on the slow
+    // backend). The backend's response latency doesn't enter this
+    // measurement — we only time `dial_tls` (connect + TLS
+    // handshake), not the subsequent request/response which would
+    // (legitimately) wait the slow backend's full delay.
+    let dial_start = Instant::now();
+    let mut fresh_tls = tokio::time::timeout(
+        Duration::from_millis(500),
+        dial_tls(frontend_addr, &host_a, vec![b"http/1.1".to_vec()]),
+    )
+    .await
+    .expect("fresh TLS dial to host_a took > 500 ms (listener torn down?)")
+    .expect("fresh TLS dial to host_a errored out");
+    let dial_elapsed = dial_start.elapsed();
+    // Sanity: confirm the fresh connection actually serves a request
+    // (even if it has to wait the slow backend's 1 s for the response).
+    // The 3 s outer bound is the slow_delay + a margin for the
+    // single-thread test runtime.
+    let fresh_request = tokio::time::timeout(
+        Duration::from_secs(3),
+        http1_request(&mut fresh_tls, Some(&host_a), &[], "/"),
+    )
+    .await
+    .expect("fresh request on fresh TLS connection exceeded 3 s")
+    .expect("fresh request on fresh TLS connection errored out");
+    let fresh_text = String::from_utf8_lossy(&fresh_request);
+    assert!(
+        fresh_text.starts_with("HTTP/1.1 200"),
+        "fresh request to host_a did not return 200: {fresh_text}"
+    );
+    tracing::info!(
+        host_b_ready_ms = (host_b_ready_ts - dial_start).as_millis(),
+        fresh_dial_ms = dial_elapsed.as_millis(),
+        "per-route hot-reload acceptance: fresh dial completed without listener disturbance"
+    );
+
+    // The original in-flight request must still complete with 200 OK
+    // (the route it depends on survived the swap).
+    let inflight_resp = tokio::time::timeout(Duration::from_secs(8), inflight)
+        .await
+        .expect("in-flight request task exceeded outer timeout")
+        .expect("in-flight request task panicked")
+        .expect("in-flight request errored out");
+    let inflight_text = String::from_utf8_lossy(&inflight_resp);
+    assert!(
+        inflight_text.starts_with("HTTP/1.1 200"),
+        "in-flight request did not complete with 200: {inflight_text}"
+    );
+
+    shutdown.cancel();
+    let _ = fast.last_request().await;
+}

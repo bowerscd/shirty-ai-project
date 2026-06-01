@@ -206,11 +206,10 @@ impl HttpFrontend {
             proxy_protocol: None,
         });
 
-        let route_table =
-            Arc::new(parking_lot::RwLock::new(route::RouteTable::build(
-                &cert_d_routes,
-                &name,
-            )));
+        let route_table = Arc::new(parking_lot::RwLock::new(route::RouteTable::build(
+            &cert_d_routes,
+            &name,
+        )));
 
         let server_config = build_rustls_server_config(cert_store, &[b"h2", b"http/1.1"]);
         let acceptor = TlsAcceptor::from(server_config);
