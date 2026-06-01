@@ -160,11 +160,6 @@ ssh -p 2222 user@vps.example.net
 * [docs/security.md](docs/security.md) — threat model, crypto, request/grant
 * [tests/e2e/run.sh](tests/e2e/run.sh) — 2-node podman-compose smoke
 * [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain smoke
-* [tests/e2e/run-acme.sh](tests/e2e/run-acme.sh) — ACME-issuance e2e
-  scaffold against a local pebble CA. **Currently a stub**: the script
-  brings pebble up and exits 0 without running the daemon. End-to-end
-  issuance is unit-tested only; the live-CA path has not been exercised
-  in tree.
 
 ## What's in the box
 
@@ -181,12 +176,11 @@ with Alt-Svc advertising enabled by default (see
 [`tests/http_frontend.rs`](crates/yggdrasil/tests/http_frontend.rs) and
 [`tests/http3_frontend.rs`](crates/yggdrasil/tests/http3_frontend.rs)).
 Certs can be sourced from disk, an in-memory ephemeral self-signed CA
-(test fixtures), or ACME (RFC 8555) — both HTTP-01 and DNS-01 (Cloudflare)
-are implemented, with `yggdrasilctl local acme {list,renew}` for
-inspection and on-demand issuance. **The ACME pipeline is unit-tested
+(test fixtures), or ACME (RFC 8555) — issuance is DNS-01 wildcard only
+today (via Cloudflare); `yggdrasilctl local acme {list,renew}` exposes
+inspection and on-demand renewal. **The ACME pipeline is unit-tested
 only**: there is no end-to-end test that issues a real cert from any
-CA in tree today (see [`tests/e2e/run-acme.sh`](tests/e2e/run-acme.sh)
-for the scaffold).
+CA in tree.
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 
@@ -203,10 +197,18 @@ itself. Full details in [docs/security.md](docs/security.md).
 
 ## Status
 
-The control protocol, configuration formats, and CLI surface are stable
-enough to deploy in low-stakes self-hosted setups. New contributors should
-start with [docs/development.md](docs/development.md); contribution
-mechanics live in [CONTRIBUTING.md](CONTRIBUTING.md).
+**Greenfield**: no deployed nodes, no release tags, no operators
+running it in the field. The control protocol, configuration
+formats, and CLI surface have stabilised enough for self-hosted
+experimentation, but every claim about operational behaviour is
+backed only by the in-tree test corpus, not by elapsed wall-clock
+production uptime. Treat accordingly: fine for a homelab where you
+own the downtime, not yet appropriate for anything you'd page
+yourself for at 3am.
+
+New contributors should start with
+[docs/development.md](docs/development.md); contribution mechanics
+live in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

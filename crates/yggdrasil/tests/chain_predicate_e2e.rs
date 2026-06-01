@@ -41,7 +41,7 @@ use yggdrasil::pending_peers::PendingPeerStore;
 use yggdrasil::proxy::resolver::ResolverFactory;
 use yggdrasil::proxy::supervisor::{CertConfig, ProxySupervisor};
 
-use common::{clone_kp, drive_handshake, pick_free_tcp_port};
+use common::{drive_handshake, pick_free_tcp_port};
 
 /// One-shot helper that fires a single `Control` envelope and returns
 /// the (decoded) `ControlAck`.
@@ -102,7 +102,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
     let hb_cancel = cancel.clone();
     let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
-        clone_kp(&server_keys),
+        server_keys.clone(),
         peer_state.clone(),
         pending_store,
         Some(acceptor),
@@ -241,7 +241,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path()).unwrap();
     let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
-        clone_kp(&server_keys),
+        server_keys.clone(),
         peer_state.clone(),
         pending_store,
         Some(acceptor),

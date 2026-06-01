@@ -24,14 +24,6 @@ use yggdrasil::pending_peers::PendingPeerStore;
 use yggdrasil::proxy::resolver::ResolverFactory;
 use yggdrasil::proxy::supervisor::{CertConfig, ProxySupervisor};
 
-/// Test-only `StaticKeyPair` clone via raw bytes.
-///
-/// `StaticKeyPair` intentionally does not implement `Clone` to discourage
-/// passing the secret around at runtime. Test code is fine to do this.
-pub fn clone_kp(k: &StaticKeyPair) -> StaticKeyPair {
-    StaticKeyPair::from_raw(*k.secret_bytes(), *k.public_key())
-}
-
 /// Bind a UDP echo socket on loopback. Returns the socket and its address.
 pub async fn echo_udp_socket() -> (UdpSocket, SocketAddr) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();

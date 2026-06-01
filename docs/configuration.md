@@ -90,6 +90,12 @@ session. Presence of `[accept]` makes the effective mode `relay`.
 
 ### `[acme]` — optional (terminal mode only)
 
+> **Implementation status.** The renewer / storage / DNS-01 client are
+> unit-tested but no end-to-end test in tree has ever issued a cert
+> against a live (or local pebble) CA. Treat the issuance pipeline
+> documented below as "implemented but operationally unverified" until
+> an e2e harness lands.
+
 Configures ACME (RFC 8555) issuance + renewal of a **single wildcard
 certificate** for the terminal's apex domain. Only meaningful on
 terminal nodes — relays passthrough TLS without terminating. When
