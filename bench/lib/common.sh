@@ -354,10 +354,10 @@ EOF
 
     cat > "$tmp/rules/scenario.toml" <<EOF
 [[rule]]
-name        = "bench"
-listen      = "$tm_bind:$listen_port"
-protocol    = "$proto"
-target_addr = "127.0.0.1:$upstream_port"
+name     = "bench"
+listen   = "$tm_bind:$listen_port"
+protocol = "$proto"
+target   = "127.0.0.1:$upstream_port"
 $extra
 EOF
 
@@ -454,10 +454,10 @@ EOF
 
     cat > "$tmp/rules/scenario.toml" <<EOF
 [[rule]]
-name        = "bench"
-listen      = "$tm_bind:$listen_port"
-protocol    = "$proto"
-target_addr = "127.0.0.1:$upstream_port"
+name     = "bench"
+listen   = "$tm_bind:$listen_port"
+protocol = "$proto"
+target   = "127.0.0.1:$upstream_port"
 $extra
 EOF
 

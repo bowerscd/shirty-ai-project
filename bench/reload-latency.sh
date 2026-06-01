@@ -125,10 +125,10 @@ run_yggdrasil() {
         local t0_ns; t0_ns="$(date +%s%N)"
         cat > "$tmp/rules/iter-$i.toml" <<EOF
 [[rule]]
-name = "iter-$i"
-listen = "127.0.0.1:$p"
+name     = "iter-$i"
+listen   = "127.0.0.1:$p"
 protocol = "tcp"
-target_addr = "127.0.0.1:$echo_port_b"
+target   = "127.0.0.1:$echo_port_b"
 EOF
         if ! probe_tcp_until_serving 127.0.0.1 "$p" 3; then
             die "yggdrasil iter $i: listener never came up"

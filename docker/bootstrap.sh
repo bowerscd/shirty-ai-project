@@ -121,10 +121,10 @@ rm -f "$REQUEST_PATH" "$GRANT_PATH"
 echo "[init] writing home rules: tcp-echo, udp-echo, dns-echo"
 cat >/etc/yggdrasil-home/rules/tcp-echo.toml <<'EOF'
 [[rule]]
-name        = "tcp-echo"
-listen      = "0.0.0.0:7000"
-protocol    = "tcp"
-target_addr = "127.0.0.1:7100"
+name     = "tcp-echo"
+listen   = "0.0.0.0:7000"
+protocol = "tcp"
+target   = "127.0.0.1:7100"
 EOF
 
 cat >/etc/yggdrasil-home/rules/udp-echo.toml <<'EOF'
@@ -132,18 +132,18 @@ cat >/etc/yggdrasil-home/rules/udp-echo.toml <<'EOF'
 name         = "udp-echo"
 listen       = "0.0.0.0:7001"
 protocol     = "udp"
-target_addr  = "127.0.0.1:7101"
+target       = "127.0.0.1:7101"
 idle_timeout = "30s"
 EOF
 
-# DNS-resolved target_host: pinned via home's `extra_hosts:` entry to the
+# DNS-resolved target: pinned via home's `extra_hosts:` entry to the
 # home container's own IP. Exercises the OS-resolver path on the terminal.
 cat >/etc/yggdrasil-home/rules/dns-echo.toml <<'EOF'
 [[rule]]
-name        = "dns-echo"
-listen      = "0.0.0.0:7200"
-protocol    = "tcp"
-target_host = "home-echo-dns:7100"
+name     = "dns-echo"
+listen   = "0.0.0.0:7200"
+protocol = "tcp"
+target   = "home-echo-dns:7100"
 EOF
 
 echo "[init] done"

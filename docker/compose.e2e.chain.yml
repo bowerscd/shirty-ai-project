@@ -156,7 +156,7 @@ services:
       YGGDRASIL_LOG: info
       YGGDRASIL_LOG_FORMAT: pretty
       # home's loopback echo is the local backend for the terminal-mode
-      # rule (listen=:7200, target_addr=127.0.0.1:7100).
+      # rule (listen=:7200, target=127.0.0.1:7100).
       ECHO_TCP_PORT: "7100"
     volumes:
       - home_chain_etc:/etc/yggdrasil

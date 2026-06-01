@@ -27,7 +27,7 @@
 #   It also runs the python echo backends in the same network
 #   namespace so vps's rule-dial target lands on a real listener.
 #   home additionally hosts a `dns-echo` rule on :7200 that exercises
-#   the DNS resolver path (target_host="home-echo-dns:7100", with
+#   the DNS resolver path (target="home-echo-dns:7100", with
 #   home-echo-dns pinned to home's own IP via `extra_hosts`).
 # - The `init` service performs one-shot key generation + offline
 #   intro/invite handshake via `yggdrasilctl identity`. vps/home
@@ -118,7 +118,7 @@ services:
       - home_state:/var/lib/yggdrasil
     # `home-echo-dns` resolves to home's own IP — the python TCP echo on
     # :7100 lives in the same network namespace. Used by the dns-echo
-    # rule (listen=:7200, target_host=home-echo-dns:7100) to exercise
+    # rule (listen=:7200, target=home-echo-dns:7100) to exercise
     # the OS resolver path in the proxy.
     extra_hosts:
       - "home-echo-dns:172.30.0.20"

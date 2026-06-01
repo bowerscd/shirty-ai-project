@@ -150,10 +150,10 @@ echo "==> [hot-reload] dropping a new branch file"
 
 "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T home bash -c "cat >/etc/yggdrasil/rules/tcp-echo-alt.toml" <<'EOF'
 [[rule]]
-name        = "tcp-echo-alt"
-listen      = "0.0.0.0:7010"
-protocol    = "tcp"
-target_addr = "127.0.0.1:7100"
+name     = "tcp-echo-alt"
+listen   = "0.0.0.0:7010"
+protocol = "tcp"
+target   = "127.0.0.1:7100"
 EOF
 
 rule_visible() {
@@ -293,9 +293,9 @@ if (( age < 0 || age > 30 )); then
 fi
 echo "    [ok] yggdrasil_last_heartbeat_timestamp_seconds fresh (age ${age}s)"
 
-# -------- test 8: DNS-resolved target_host (terminal mode) ------------------
+# -------- test 8: DNS-resolved target (terminal mode) ----------------------
 
-echo "==> [dns-upstream] terminal-mode rule with target_host"
+echo "==> [dns-upstream] terminal-mode rule with DNS-resolved target"
 
 # home hosts a TCP rule on :7200 whose upstream is `home-echo-dns:7100`.
 # `home-echo-dns` is pinned to home's own IP (172.30.0.20) via

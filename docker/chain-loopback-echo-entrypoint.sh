@@ -4,7 +4,7 @@
 # for two nodes:
 #
 #   * home-chain: the echo on 127.0.0.1:$ECHO_TCP_PORT is the local backend
-#     for home's terminal-mode rule (listen=:7200, target_addr=127.0.0.1:
+#     for home's terminal-mode rule (listen=:7200, target=127.0.0.1:
 #     7100). Without it, traffic that arrives at home via midbox's derived
 #     listener would have nothing to forward to.
 #
