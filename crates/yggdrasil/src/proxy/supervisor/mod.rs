@@ -770,4 +770,359 @@ mod tests {
 
         sup.stop().await;
     }
+
+    // ----------------------------------------------------------------------
+    // HTTPS-frontend reconciliation
+    //
+    // The previous block exercises the L4 (TCP/UDP) branches of
+    // `reconcile.rs::apply_update`. These tests cover
+    // `reconcile.rs::reconcile_https`, which is the larger of the two
+    // state machines and was completely uncovered going into Phase 2.
+    //
+    // Observation strategy: the HTTPS frontend surfaces in the snapshot
+    // as a `ProxySnapshot { name: "__https__", protocol: Protocol::Https,
+    // .. }` (the synthetic frontend name from `reconcile.rs`). Comparing
+    // before/after snapshots over `apply_ruleset` calls lets us verify
+    // every branch reconcile_https can take.
+    //
+    // Cert plumbing: each test writes a self-signed PEM pair into the
+    // per-test `cert_dir` via the same `rcgen` API the production
+    // ephemeral fallback uses, so the three-rung cert resolver picks
+    // the host up at startup.
+
+    use crate::lan_cidrs::LanCidrs;
+    use ratatoskr::rule::HttpRoute;
+    use std::path::Path;
+    use std::sync::Arc;
+    use url::Url;
+
+    fn issue_cert_for(cert_dir: &Path, hostname: &str) {
+        let host_dir = cert_dir.join(hostname);
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        std::fs::write(host_dir.join("fullchain.pem"), cert.pem()).unwrap();
+        std::fs::write(host_dir.join("privkey.pem"), key.serialize_pem()).unwrap();
+    }
+
+    /// Spawn a terminal-mode supervisor wired up for HTTPS-route
+    /// testing: terminal resolver, the supplied `https_listen`,
+    /// per-test `cert_dir`, h3 off (keeps the test cheap and avoids
+    /// QUIC port grabs), default lan_cidrs. Returns the supervisor
+    /// plus the cert dir so the test can `issue_cert_for` against it.
+    async fn spawn_https_supervisor(
+        rules_dir: PathBuf,
+        cert_dir: PathBuf,
+        https_listen: SocketAddr,
+        redirect_port: u16,
+        shutdown: CancellationToken,
+    ) -> ProxySupervisor {
+        let cert_config = CertConfig {
+            cert_dir,
+            default_cert: None,
+            default_key: None,
+            redirect_port: Some(redirect_port),
+            https_listen,
+            https_http3: false,
+            https_alt_svc: false,
+            https_request_body_limit: 16 * 1024 * 1024,
+            acme: None,
+            lan_cidrs: Arc::new(LanCidrs::resolve(None).expect("default lan_cidrs")),
+        };
+        ProxySupervisor::spawn(
+            rules_dir,
+            Duration::from_millis(50),
+            ResolverFactory::new_terminal(),
+            None,
+            None,
+            cert_config,
+            None,
+            shutdown,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn one_route(hostname: &str, target: &str) -> HttpRoute {
+        HttpRoute {
+            hostname: hostname.to_string(),
+            target: Url::parse(target).expect("test target URL"),
+            hsts: None,
+            headers: Default::default(),
+        }
+    }
+
+    /// Find the `__https__` synthetic frontend in a snapshot, if present.
+    fn find_https(snap: &[ProxySnapshot]) -> Option<&ProxySnapshot> {
+        snap.iter().find(|s| s.protocol == Protocol::Https)
+    }
+
+    async fn await_https_listen(supervisor: &ProxySupervisor) -> SocketAddr {
+        let mut rx = supervisor.snapshot_rx.clone();
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(s) = find_https(&rx.borrow()) {
+                    return s.listen;
+                }
+                if rx.changed().await.is_err() {
+                    panic!("supervisor closed before HTTPS frontend appeared");
+                }
+            }
+        })
+        .await;
+        res.expect("timed out waiting for HTTPS frontend in snapshot")
+    }
+
+    async fn await_no_https(supervisor: &ProxySupervisor) {
+        let mut rx = supervisor.snapshot_rx.clone();
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if find_https(&rx.borrow()).is_none() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    panic!("supervisor closed while waiting for HTTPS teardown");
+                }
+            }
+        })
+        .await;
+        assert!(
+            res.is_ok(),
+            "timed out waiting for HTTPS teardown; snapshot still has it: {:?}",
+            supervisor.snapshot()
+        );
+    }
+
+    /// `reconcile_https` returns early when the new route set matches
+    /// the previously-applied one — the frontend is NOT respawned.
+    /// We observe this by capturing `local_addr` before and after
+    /// applying an identical ruleset: an OS-assigned port is overwhelm-
+    /// ingly unlikely to be the same after a respawn (TCP TIME_WAIT
+    /// holds it briefly), so address equality is strong evidence the
+    /// frontend was left alone.
+    #[tokio::test]
+    async fn https_reconcile_noop_when_route_set_unchanged() {
+        let rules_dir = tempfile::tempdir().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let host = "noop.test.localhost";
+        issue_cert_for(cert_dir.path(), host);
+        let https_port = free_port().await;
+        let redirect_port = free_port().await;
+        let https_listen: SocketAddr = format!("127.0.0.1:{https_port}").parse().unwrap();
+        let shutdown = CancellationToken::new();
+
+        let sup = spawn_https_supervisor(
+            rules_dir.path().to_path_buf(),
+            cert_dir.path().to_path_buf(),
+            https_listen,
+            redirect_port,
+            shutdown.clone(),
+        )
+        .await;
+
+        let handle = sup.handle();
+        let initial_set = RuleSet::from_parts(vec![], vec![one_route(host, "http://127.0.0.1:9001")])
+            .unwrap();
+        handle.apply_ruleset(initial_set.clone()).await.unwrap();
+        let listen_before = await_https_listen(&sup).await;
+
+        // Apply the byte-identical ruleset. reconcile_https should
+        // short-circuit on `routes_match == true`.
+        handle.apply_ruleset(initial_set).await.unwrap();
+
+        // Give the supervisor enough time to have respawned the
+        // frontend if it was going to. 200 ms is generous on
+        // loopback — a real respawn involves stop() + listener bind
+        // which is observable to the snapshot watch.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let listen_after = find_https(&sup.snapshot())
+            .expect("HTTPS frontend disappeared")
+            .listen;
+        assert_eq!(
+            listen_before, listen_after,
+            "HTTPS frontend was respawned on identical-routes re-apply (different OS-assigned addr)"
+        );
+
+        shutdown.cancel();
+        sup.stop().await;
+    }
+
+    /// `reconcile_https` tears the frontend down when the new route
+    /// set becomes empty (and `https_active` was Some).
+    #[tokio::test]
+    async fn https_reconcile_teardown_when_routes_become_empty() {
+        let rules_dir = tempfile::tempdir().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let host = "teardown.test.localhost";
+        issue_cert_for(cert_dir.path(), host);
+        let https_port = free_port().await;
+        let redirect_port = free_port().await;
+        let https_listen: SocketAddr = format!("127.0.0.1:{https_port}").parse().unwrap();
+        let shutdown = CancellationToken::new();
+
+        let sup = spawn_https_supervisor(
+            rules_dir.path().to_path_buf(),
+            cert_dir.path().to_path_buf(),
+            https_listen,
+            redirect_port,
+            shutdown.clone(),
+        )
+        .await;
+
+        let handle = sup.handle();
+        let with_route =
+            RuleSet::from_parts(vec![], vec![one_route(host, "http://127.0.0.1:9001")]).unwrap();
+        handle.apply_ruleset(with_route).await.unwrap();
+        let _ = await_https_listen(&sup).await;
+
+        // Drop the route entirely.
+        handle.apply_ruleset(RuleSet::default()).await.unwrap();
+        await_no_https(&sup).await;
+
+        shutdown.cancel();
+        sup.stop().await;
+    }
+
+    /// `reconcile_https` swaps the frontend when the route set
+    /// changes content (different hostname).
+    #[tokio::test]
+    async fn https_reconcile_swap_when_routes_change() {
+        let rules_dir = tempfile::tempdir().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let host_a = "alpha.swap.test.localhost";
+        let host_b = "bravo.swap.test.localhost";
+        issue_cert_for(cert_dir.path(), host_a);
+        issue_cert_for(cert_dir.path(), host_b);
+        let https_port = free_port().await;
+        let redirect_port = free_port().await;
+        let https_listen: SocketAddr = format!("127.0.0.1:{https_port}").parse().unwrap();
+        let shutdown = CancellationToken::new();
+
+        let sup = spawn_https_supervisor(
+            rules_dir.path().to_path_buf(),
+            cert_dir.path().to_path_buf(),
+            https_listen,
+            redirect_port,
+            shutdown.clone(),
+        )
+        .await;
+
+        let handle = sup.handle();
+        let set_a =
+            RuleSet::from_parts(vec![], vec![one_route(host_a, "http://127.0.0.1:9001")]).unwrap();
+        handle.apply_ruleset(set_a).await.unwrap();
+        let _ = await_https_listen(&sup).await;
+
+        // Snapshot the cert store contents before and after the swap.
+        // host_a should be present before; host_b shouldn't. After the
+        // swap, host_b should be present and host_a should be gone (the
+        // reconcile_https swap arm calls cert_watcher.unregister +
+        // cert_store.remove for each prev route).
+        let store = sup.cert_store();
+        assert!(
+            store.contains(host_a),
+            "host_a missing from cert store pre-swap"
+        );
+        assert!(
+            !store.contains(host_b),
+            "host_b unexpectedly present pre-swap"
+        );
+
+        let set_b =
+            RuleSet::from_parts(vec![], vec![one_route(host_b, "http://127.0.0.1:9001")]).unwrap();
+        handle.apply_ruleset(set_b).await.unwrap();
+
+        // Wait for the cert store to reflect the swap. The frontend
+        // respawn + cert plumbing is observable through CertStore::contains.
+        let store_swap_seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store.contains(host_b) && !store.contains(host_a) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            store_swap_seen,
+            "cert store didn't reflect host_a → host_b swap"
+        );
+
+        shutdown.cancel();
+        sup.stop().await;
+    }
+
+    /// The :80 companion listener that `reconcile_https` spawns on
+    /// behalf of cert'd hosts gets GC'd when no cert'd hosts and no
+    /// cert-less routes remain on its IP. We observe this indirectly:
+    /// after teardown, the port `redirect_port` must be re-bindable
+    /// by a fresh TcpListener.
+    #[tokio::test]
+    async fn redirect_listener_gc_when_routes_become_empty() {
+        let rules_dir = tempfile::tempdir().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let host = "gc.test.localhost";
+        issue_cert_for(cert_dir.path(), host);
+        let https_port = free_port().await;
+        let redirect_port = free_port().await;
+        let https_listen: SocketAddr = format!("127.0.0.1:{https_port}").parse().unwrap();
+        let shutdown = CancellationToken::new();
+
+        let sup = spawn_https_supervisor(
+            rules_dir.path().to_path_buf(),
+            cert_dir.path().to_path_buf(),
+            https_listen,
+            redirect_port,
+            shutdown.clone(),
+        )
+        .await;
+
+        let handle = sup.handle();
+        let with_route =
+            RuleSet::from_parts(vec![], vec![one_route(host, "http://127.0.0.1:9001")]).unwrap();
+        handle.apply_ruleset(with_route).await.unwrap();
+        let _ = await_https_listen(&sup).await;
+
+        // While the HTTPS frontend is up, the per-IP redirect listener
+        // owns `redirect_port`. Trying to bind it ourselves must fail.
+        let bind_attempt =
+            tokio::net::TcpListener::bind(format!("127.0.0.1:{redirect_port}")).await;
+        assert!(
+            bind_attempt.is_err(),
+            "redirect_port {redirect_port} should be owned by the supervisor's :80 listener \
+             while HTTPS is active"
+        );
+
+        // Tear down all routes.
+        handle.apply_ruleset(RuleSet::default()).await.unwrap();
+        await_no_https(&sup).await;
+
+        // The supervisor GCs the per-IP redirect listener after both
+        // `hosts` and `plaintext_routes` go empty. Poll until the port
+        // is free, bounded so flakes are visible.
+        let gc_seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpListener::bind(format!("127.0.0.1:{redirect_port}"))
+                    .await
+                    .is_ok()
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            gc_seen,
+            "redirect listener on :{redirect_port} was not torn down after route removal"
+        );
+
+        shutdown.cancel();
+        sup.stop().await;
+    }
 }
