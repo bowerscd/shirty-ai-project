@@ -1,4 +1,4 @@
-//! PROXY-protocol header emission for upstream connections.
+//! PROXY-protocol header emission + decoding for chain traffic.
 //!
 //! Implements both [v1] (ASCII, human-readable, max 107 bytes) and [v2]
 //! (binary, fixed 16-byte header + variable address block). For TCP, the
@@ -10,6 +10,11 @@
 //! [`decode_v2_from_datagram`] on every received datagram and gates on
 //! the v2 magic; valid QUIC datagrams cannot be mis-classified (see the
 //! magic-byte non-collision tests in this module).
+//!
+//! For inbound TCP from a chain peer, [`read_optional_header`] consumes
+//! either flavour off the stream and surfaces the decoded endpoints
+//! along with any leftover bytes that need re-feeding into the
+//! application stream.
 //!
 //! [v1]: https://www.haproxy.org/download/2.6/doc/proxy-protocol.txt §2.1
 //! [v2]: https://www.haproxy.org/download/2.6/doc/proxy-protocol.txt §2.2

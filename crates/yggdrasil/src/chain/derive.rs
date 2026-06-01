@@ -18,9 +18,9 @@
 //!   wireguard tunnel address).
 //! * `proxy_protocol` — applied to derived **TCP** rules so the relay
 //!   emits a PROXY-protocol header before forwarding. UDP and any other
-//!   protocol ignore this field. The plan envisions every relay-to-
-//!   downstream TCP flow carrying a PROXY header so the terminal sees
-//!   the original client IP.
+//!   protocol ignore this field. Every chain-derived HTTPS rule has
+//!   this set so the terminal sees the original client IP via the
+//!   header rather than the relay's source IP.
 //!
 //! ## What the derive function fills in
 //!
