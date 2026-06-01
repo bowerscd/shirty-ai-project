@@ -930,20 +930,25 @@ mod tests {
         .await;
 
         let handle = sup.handle();
+        let mut current_set_rx = handle.current_set_rx();
+        let _ = current_set_rx.borrow_and_update(); // consume initial empty
         let initial_set = RuleSet::from_parts(vec![], vec![one_route(host, "http://127.0.0.1:9001")])
             .unwrap();
         handle.apply_ruleset(initial_set.clone()).await.unwrap();
+        current_set_rx.changed().await.unwrap(); // first apply landed
         let listen_before = await_https_listen(&sup).await;
 
         // Apply the byte-identical ruleset. reconcile_https should
         // short-circuit on `routes_match == true`.
         handle.apply_ruleset(initial_set).await.unwrap();
 
-        // Give the supervisor enough time to have respawned the
-        // frontend if it was going to. 200 ms is generous on
-        // loopback — a real respawn involves stop() + listener bind
-        // which is observable to the snapshot watch.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Deterministic synchronisation: apply_set always sends the
+        // applied set through current_set_tx, even on a no-op. Waiting
+        // for that watch tick proves reconcile_https has executed
+        // for the second apply. If it had respawned the frontend,
+        // local_addr would now differ (a fresh bind picks a new
+        // OS-assigned port).
+        current_set_rx.changed().await.unwrap();
 
         let listen_after = find_https(&sup.snapshot())
             .expect("HTTPS frontend disappeared")

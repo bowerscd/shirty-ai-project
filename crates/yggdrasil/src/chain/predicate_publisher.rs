@@ -470,7 +470,11 @@ mod tests {
     }
 
     /// Pop the next captured op (with a generous timeout for parallel
-    /// test execution).
+    /// test execution). The 10 ms poll is unavoidable here: the test
+    /// fundamentally has to wait for a future event to land in the
+    /// sink, and the sink isn't `Notify`-backed today. Tight enough
+    /// to keep tests fast, loose enough to not burn CPU when several
+    /// tests run in parallel.
     async fn next_op(sink: &Arc<Mutex<Vec<ControlOp>>>) -> ControlOp {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -522,20 +526,24 @@ mod tests {
         // Identical re-send — supervisor reapplies the same set (e.g.
         // file touch with unchanged content reaching the watcher). The
         // publisher should dedup and NOT call send_control again.
+        //
+        // We assert this with the marker-pattern: send the duplicate,
+        // then send a DIFFERENT set, then wait for that set's op.
+        // If the duplicate had erroneously been pushed, the sink
+        // would emit it BEFORE the distinct set; the first op we
+        // see must therefore be the distinct one. Deterministic; no
+        // sleep-based negative assertion.
         tx.send(set1.clone()).unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        {
-            let g = sink.lock().await;
-            assert!(g.is_empty(), "duplicate set should be deduped");
-        }
-
-        // A NEW set — version should bump to 2.
         let set2 =
             RuleSet::from_rules(vec![tcp_rule("alpha", 8080), tcp_rule("beta", 9090)]).unwrap();
         tx.send(set2).unwrap();
         let op2 = next_op(&sink).await;
         let decoded2: PredicateSet = postcard::from_bytes(&op2.body).unwrap();
-        assert_eq!(decoded2.predicates.len(), 2);
+        assert_eq!(
+            decoded2.predicates.len(),
+            2,
+            "first op after duplicate must be the DISTINCT set (proving the duplicate was deduped)"
+        );
         assert_eq!(decoded2.version, 2);
         op2.completion.send(Ok(())).unwrap();
 
@@ -592,7 +600,7 @@ mod tests {
     async fn does_not_push_for_initial_default_value() {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
-        let (_tx, rx) = watch::channel(RuleSet::default());
+        let (tx, rx) = watch::channel(RuleSet::default());
         let state_dir = tempfile::tempdir().unwrap();
         let publisher = spawn(
             rx,
@@ -604,11 +612,24 @@ mod tests {
             cancel.clone(),
         );
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        {
-            let g = sink.lock().await;
-            assert!(g.is_empty(), "initial RuleSet::default should not push");
-        }
+        // Marker-pattern negative assertion: push a real update on the
+        // same channel. The publisher processes its watch::Receiver
+        // serially, so the FIRST op landing in the sink must be the
+        // real update — if the initial default value had erroneously
+        // been pushed, it would have arrived first.
+        tx.send(RuleSet::from_rules(vec![tcp_rule("marker", 1)]).unwrap())
+            .unwrap();
+        let op = next_op(&sink).await;
+        let decoded: PredicateSet = postcard::from_bytes(&op.body).unwrap();
+        assert_eq!(decoded.predicates.len(), 1);
+        assert_eq!(
+            decoded.predicates[0].name, "marker",
+            "first op must be the marker (proving initial default was NOT pushed)"
+        );
+        assert_eq!(
+            decoded.version, 1,
+            "version must be 1 — the initial default value didn't bump it"
+        );
 
         cancel.cancel();
         let _ = publisher.await;
@@ -641,9 +662,14 @@ mod tests {
             let decoded: PredicateSet = postcard::from_bytes(&op.body).unwrap();
             assert_eq!(decoded.version, 1);
             op.completion.send(Ok(())).unwrap();
-            // Give the publisher a moment to land the persist call after
-            // resolving the ack.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Synchronize on persist completion via the marker pattern:
+            // push a second update and wait for its op to land in the
+            // sink. Since the publisher processes events serially, the
+            // marker op landing means the previous push's persist
+            // call has already returned.
+            tx.send(RuleSet::from_rules(vec![tcp_rule("marker", 1)]).unwrap())
+                .unwrap();
+            let _ = next_op(&sink).await;
             cancel.cancel();
             let _ = publisher.await;
         }
