@@ -89,7 +89,6 @@ pub fn extract(
             version,
             origin,
         },
-        skipped_https: Vec::new(),
     }
 }
 
@@ -101,10 +100,6 @@ pub struct ExtractOutcome {
     ///
     /// [`ControlEnvelope`]: ratatoskr::control_frame::ControlEnvelope
     pub set: PredicateSet,
-    /// Compatibility field for control responses that used to report HTTPS
-    /// rules skipped by projection. New extraction keeps HTTPS rules, so this
-    /// is always empty.
-    pub skipped_https: Vec<String>,
 }
 
 fn project_rule(rule: &Rule) -> Predicate {

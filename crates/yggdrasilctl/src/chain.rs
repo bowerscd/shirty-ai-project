@@ -129,21 +129,11 @@ async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
     match response {
         Response::ChainApplied(b) => {
             println!(
-                "applied {} rule{} ({} projected predicate{}{})",
+                "applied {} rule{} ({} projected predicate{})",
                 b.applied_rule_count,
                 if b.applied_rule_count == 1 { "" } else { "s" },
                 b.predicate_count,
                 if b.predicate_count == 1 { "" } else { "s" },
-                if b.skipped_https.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "; {} HTTPS rule{} skipped from projection: {}",
-                        b.skipped_https.len(),
-                        if b.skipped_https.len() == 1 { "" } else { "s" },
-                        b.skipped_https.join(", ")
-                    )
-                }
             );
             Ok(())
         }

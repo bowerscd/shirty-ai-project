@@ -598,10 +598,6 @@ pub struct ChainAppliedResponse {
     /// set, if the daemon has a chain upstream. Zero on terminals
     /// without `[dial]` and on pure-local nodes.
     pub predicate_count: usize,
-    /// Compatibility list for rules skipped by older HTTPS-unaware predicate
-    /// projection. Current daemons emit HTTPS predicates, so this is empty;
-    /// it is also empty on nodes without an upstream because no projection is run.
-    pub skipped_https: Vec<String>,
 }
 
 /// Successful response to [`Request::AcmeList`]. Empty when `[acme]`
@@ -1121,7 +1117,6 @@ mod tests {
         let resp = Response::ChainApplied(ChainAppliedResponse {
             applied_rule_count: 3,
             predicate_count: 2,
-            skipped_https: vec!["api-l7".into()],
         });
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("\"kind\":\"chain_applied\""), "got: {s}");

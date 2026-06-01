@@ -67,7 +67,7 @@ pub(in crate::control) async fn dispatch_chain_apply(
     // Predicate projection + wire-size pre-check are only meaningful
     // when this terminal actually pushes upstream. Pure-local terminals
     // skip the projection and report `predicate_count = 0`.
-    let (predicate_count, skipped_https) = if state.has_chain_upstream {
+    let predicate_count = if state.has_chain_upstream {
         // The pre-check is sizing-only; the origin and version don't
         // affect whether the body fits under the cap (origin is 32B,
         // version is 8B; both are constant-sized regardless of value).
@@ -104,9 +104,9 @@ pub(in crate::control) async fn dispatch_chain_apply(
                 ),
             };
         }
-        (outcome.set.predicates.len(), outcome.skipped_https)
+        outcome.set.predicates.len()
     } else {
-        (0usize, Vec::new())
+        0usize
     };
 
     if let Err(e) = state.supervisor_handle.apply_ruleset(ruleset).await {
@@ -119,14 +119,12 @@ pub(in crate::control) async fn dispatch_chain_apply(
     tracing::info!(
         applied_rule_count,
         predicate_count,
-        skipped_https = skipped_https.len(),
         "chain apply enqueued via control surface"
     );
 
     Response::ChainApplied(ChainAppliedResponse {
         applied_rule_count,
         predicate_count,
-        skipped_https,
     })
 }
 
