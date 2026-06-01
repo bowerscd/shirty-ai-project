@@ -494,9 +494,6 @@ async fn spawn_https_frontend(
         let rl = RedirectListener::spawn(ip, port, parent_cancel.clone())
             .await
             .with_context(|| format!("spawn HTTP→HTTPS redirect listener on {ip}:{port}"))?;
-        if let Some(acme) = cert_config.acme.as_ref() {
-            rl.set_acme_responder(acme.responder());
-        }
         rl.set_lan_cidrs(Some(Arc::clone(&cert_config.lan_cidrs)));
         e.insert(rl);
     }

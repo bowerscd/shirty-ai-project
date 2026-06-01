@@ -1,5 +1,6 @@
-//! ACME (RFC 8555) issuance and renewal for routes that declare
-//! `cert = "acme"`.
+//! ACME (RFC 8555) issuance and renewal of a single wildcard cert per
+//! terminal node. Issuance is **DNS-01 only**, because wildcards
+//! (`*.example.com`) require it per RFC 8555 §7.1.3.
 //!
 //! ## Architecture
 //!
@@ -8,21 +9,20 @@
 //! the shared [`CertStore`] handle so it can drive
 //! [`CertStore::reload_host`] after writing each freshly-issued cert.
 //!
-//! Per ACME route (i.e. each `[[rule.route]]` whose `cert = "acme"`):
+//! The terminal daemon calls [`AcmeManager::start_wildcard`] at startup
+//! when `[acme]` is configured. The manager:
 //!
-//! 1. The supervisor invokes `AcmeManager::register(host, AcmeRouteConfig)`
-//!    at rule-load time.
-//! 2. The manager spawns (or reuses) a [`renewer::Renewer`] task scoped
-//!    to that host. The renewer's first action is to check the
-//!    convention path: if `fullchain.pem` exists and `not_after` is
-//!    further out than `renew_before`, schedule renewal at
+//! 1. Spawns a [`renewer::Renewer`] task scoped to `[acme].domain`.
+//!    The renewer's first action is to check the convention path: if
+//!    `fullchain.pem` exists and `not_after` is further out than
+//!    `renew_before`, schedule renewal at
 //!    `not_after - renew_before ± jitter`. Otherwise: issue now.
-//! 3. Issuance drives the ACME order against the operator-configured
-//!    directory URL via [`client::AcmeClient`]; HTTP-01 challenges land
-//!    on the shared [`http01::AcmeResponder`] (registered with the
-//!    `:80` `RedirectListener`); DNS-01 challenges go through the
-//!    [`provider::DnsProvider`] resolved from the [`provider::ProviderRegistry`].
-//! 4. On success, the renewer writes `{storage_dir}/{host}/{fullchain,
+//! 2. Issuance drives the ACME order against the operator-configured
+//!    directory URL via [`client::AcmeClient`]; the single configured
+//!    DNS provider sub-table (`[acme.dns.<name>]`) drives the DNS-01
+//!    challenge via [`provider::DnsProvider`] resolved from the
+//!    [`provider::ProviderRegistry`].
+//! 3. On success, the renewer writes `{storage_dir}/{host}/{fullchain,
 //!    privkey}.pem` atomically (tempfile + rename) and calls
 //!    `cert_store.reload_host(host)` plus re-registers the host with
 //!    `cert_watcher` so subsequent operator-side rewrites also hot-reload.
@@ -31,7 +31,6 @@
 //!
 //! - [`account`] — long-lived ACME account key load/persist.
 //! - [`client`] — ACME directory client (issuance, finalisation, polling).
-//! - [`http01`] — token responder hooked into the `:80` redirect listener.
 //! - [`dns01`] — DNS-01 challenge driver + propagation poll.
 //! - [`provider`] — [`provider::DnsProvider`] trait + registry.
 //! - [`providers::cloudflare`] — Cloudflare REST-API DNS provider.
@@ -44,13 +43,11 @@
 pub mod account;
 pub mod client;
 pub mod dns01;
-pub mod http01;
 pub mod provider;
 pub mod providers;
 pub mod renewer;
 pub mod storage;
 
-pub use http01::AcmeResponder;
 pub use provider::{DnsProvider, ProviderRegistry, TxtHandle};
 
 use std::path::PathBuf;
@@ -63,32 +60,17 @@ use tokio_util::sync::CancellationToken;
 use crate::config::AcmeSection;
 use crate::proxy::certs::CertStore;
 
-/// Per-route ACME configuration. Owned by this module after the
-/// schema-cleanup that removed per-route cert sources from
-/// `ratatoskr::rule::HttpRoute`. Kept as a stable shape so the
-/// renewer/client/storage layers continue to compile against the
-/// existing API.
+/// Per-route ACME configuration. After the HTTP-01 deletion this only
+/// carries the DNS-01 provider selector; the variant is kept as a
+/// struct rather than collapsing to a bare `Option<String>` so that
+/// adding back a challenge selector in the future (e.g. when per-route
+/// non-wildcard ACME lands) doesn't churn the renewer/client API
+/// surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcmeRouteConfig {
-    pub challenge: AcmeChallenge,
-    pub provider: Option<String>,
-}
-
-impl AcmeRouteConfig {
-    pub fn http01() -> Self {
-        Self {
-            challenge: AcmeChallenge::Http01,
-            provider: None,
-        }
-    }
-}
-
-/// Challenge selector for an ACME-managed route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AcmeChallenge {
-    Http01,
-    Dns01,
+    /// DNS-01 provider name from `[acme.dns.<name>]`. Required —
+    /// DNS-01 is the only challenge type the renewer can drive today.
+    pub provider: String,
 }
 
 /// Errors produced anywhere in the ACME pipeline.
@@ -96,8 +78,6 @@ pub enum AcmeChallenge {
 pub enum AcmeError {
     #[error("ACME route {host:?}: provider {provider:?} is not registered in [acme.dns]")]
     UnknownProvider { host: String, provider: String },
-    #[error("ACME route {host:?}: HTTP-01 requires the daemon's :80 redirect listener to be online (no HTTPS rule loaded yet)")]
-    NoHttp01Responder { host: String },
     #[error("ACME route {host:?}: DNS provider error: {detail}")]
     Dns { host: String, detail: String },
     #[error("ACME route {host:?}: account-key error: {detail}")]
@@ -124,9 +104,6 @@ struct AcmeManagerInner {
     storage_dir: PathBuf,
     /// Provider registry built from `[acme.dns.*]` at startup.
     providers: ProviderRegistry,
-    /// HTTP-01 token responder. Hooked into the `:80` redirect listener
-    /// by the supervisor when the first HTTPS rule loads.
-    responder: AcmeResponder,
     /// Shared cert store: we call `reload_host` after each successful
     /// issuance/renewal so the new PEM bytes go live without a daemon
     /// restart.
@@ -187,9 +164,8 @@ pub(crate) struct KickRequest {
 
 impl AcmeManager {
     /// Build an `AcmeManager` from the operator config and the shared
-    /// cert store. The HTTP-01 responder is created here but stays
-    /// dormant until the supervisor wires it into the `:80` redirect
-    /// listener.
+    /// cert store. Renewer tasks are not started until
+    /// [`AcmeManager::start_wildcard`] is called.
     pub fn spawn(
         config: AcmeSection,
         server_cert_dir: PathBuf,
@@ -198,7 +174,6 @@ impl AcmeManager {
     ) -> Result<Self, AcmeError> {
         let storage_dir = config.storage_dir.clone().unwrap_or(server_cert_dir);
         let providers = ProviderRegistry::from_config(&config.dns)?;
-        let responder = AcmeResponder::new();
         let renew_before = config.renew_before;
         let renew_jitter = config.renew_jitter;
         Ok(Self {
@@ -206,7 +181,6 @@ impl AcmeManager {
                 config,
                 storage_dir,
                 providers,
-                responder,
                 cert_store,
                 cancel,
                 renew_before,
@@ -214,24 +188,6 @@ impl AcmeManager {
                 hosts: parking_lot::RwLock::new(std::collections::HashMap::new()),
             }),
         })
-    }
-
-    /// Read-only handle to the shared HTTP-01 responder. The supervisor
-    /// passes this to the per-IP redirect listener so
-    /// `/.well-known/acme-challenge/<token>` requests get matched
-    /// against active challenges.
-    pub fn responder(&self) -> AcmeResponder {
-        self.inner.responder.clone()
-    }
-
-    /// Register an ACME-managed hostname. Spawns (or reuses) a renewer
-    /// task and returns immediately — issuance happens asynchronously
-    /// on the renewer task.
-    ///
-    /// Idempotent: registering the same `host` twice is a no-op (the
-    /// existing renewer task stays in charge).
-    pub async fn register(&self, host: &str, route_cfg: &AcmeRouteConfig) -> Result<(), AcmeError> {
-        renewer::register_host(self, host, route_cfg).await
     }
 
     /// Bootstrap the wildcard issuance loop for the operator-configured
@@ -254,10 +210,7 @@ impl AcmeManager {
                 host: host.clone(),
                 detail: "no [acme.dns.<provider>] sub-table configured (validator gap)".into(),
             })?;
-        let route_cfg = AcmeRouteConfig {
-            challenge: AcmeChallenge::Dns01,
-            provider: Some(provider),
-        };
+        let route_cfg = AcmeRouteConfig { provider };
         renewer::register_host(self, &host, &route_cfg).await
     }
 
@@ -270,10 +223,6 @@ impl AcmeManager {
             .iter()
             .map(|(host, st)| ratatoskr::control::AcmeHostInfo {
                 hostname: host.clone(),
-                challenge: match st.route_cfg.challenge {
-                    AcmeRouteChallengeEcho::Http01 => "http01".to_string(),
-                    AcmeRouteChallengeEcho::Dns01 => "dns01".to_string(),
-                },
                 provider: st.route_cfg.provider.clone(),
                 state: st.state.as_str().to_string(),
                 last_error: st.last_error.clone(),
@@ -367,8 +316,3 @@ impl AcmeManager {
         }
     }
 }
-
-// AcmeChallenge is now defined locally above (was previously
-// `ratatoskr::rule::AcmeChallenge`). The alias is kept so renewer
-// code referring to `AcmeRouteChallengeEcho` keeps compiling.
-pub(crate) use AcmeChallenge as AcmeRouteChallengeEcho;

@@ -285,18 +285,17 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                 println!("(no ACME-managed hosts)");
             } else {
                 println!(
-                    "{:<32}  {:<7}  {:<10}  {:<10}  next_renewal",
-                    "hostname", "chall", "provider", "state",
+                    "{:<32}  {:<12}  {:<10}  next_renewal",
+                    "hostname", "provider", "state",
                 );
                 for h in &a.hosts {
                     let next = match h.next_renewal_unix {
                         Some(ts) => format_unix_secs(ts),
                         None => "(unscheduled)".to_string(),
                     };
-                    let provider = h.provider.as_deref().unwrap_or("-");
                     println!(
-                        "{:<32}  {:<7}  {:<10}  {:<10}  {}",
-                        h.hostname, h.challenge, provider, h.state, next,
+                        "{:<32}  {:<12}  {:<10}  {}",
+                        h.hostname, h.provider, h.state, next,
                     );
                     if let Some(err) = &h.last_error {
                         println!("    last_error: {err}");

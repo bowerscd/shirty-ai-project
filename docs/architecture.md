@@ -484,7 +484,7 @@ A top-level `[[route]]` block whose hostname doesn't resolve to a
 cert via the three-rung resolver is a **cert-less route**, served
 only on the per-IP companion listener's plaintext `:80` path
 (`proxy/http_frontend/redirect.rs`). The companion's pipeline is
-three-step (no ACME HTTP-01 — wildcard issuance uses DNS-01):
+three-step:
 
 1. **Cert-less route serving** — if `peer_addr.ip() ∈ lan_cidrs` and
    `Host` matches a cert-less route on this IP, proxy plaintext via

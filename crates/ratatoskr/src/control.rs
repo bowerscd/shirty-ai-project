@@ -617,12 +617,8 @@ pub struct AcmeListResponse {
 pub struct AcmeHostInfo {
     /// Lowercased route hostname.
     pub hostname: String,
-    /// Either `"http01"` or `"dns01"`. Stable string so older
-    /// `yggdrasilctl` builds don't break when newer challenge types
-    /// land.
-    pub challenge: String,
-    /// DNS-01 provider name, if `challenge == "dns01"`.
-    pub provider: Option<String>,
+    /// DNS-01 provider name driving the challenge.
+    pub provider: String,
     /// State of the current cert. One of `"pending"` (renewer hasn't
     /// completed first issuance), `"active"` (PEM on disk, in use),
     /// `"error"` (last issuance attempt failed; stand-in still serving).

@@ -1,31 +1,27 @@
 //! Per-IP `:80` companion listener.
 //!
 //! Originally a minimal HTTP→HTTPS redirector (the old
-//! `RedirectListener`); now broadened into a four-step pipeline that
+//! `RedirectListener`); now broadened into a three-step pipeline that
 //! also serves cert-less route plaintext traffic to LAN peers. One
 //! instance per `(supervisor, IpAddr)`.
 //!
 //! ## Pipeline
 //!
-//! 1. **ACME** — `GET /.well-known/acme-challenge/<token>` is served
-//!    regardless of source IP (per Let's Encrypt's HTTP-01 docs the
-//!    challenge can only be done on port 80, and the CA's prober must
-//!    reach this from the public internet).
-//! 2. **Cert-less route** — if the inbound TCP peer's IP is in the
+//! 1. **Cert-less route** — if the inbound TCP peer's IP is in the
 //!    resolved [`LanCidrs`] set AND `Host` matches a cert-less route
 //!    in [`Self::plaintext_routes`], proxy plaintext via
 //!    [`crate::proxy::http_frontend::request::serve_request`] with
 //!    `ConnContext { tls: false, .. }`. Reuses the full HTTPS request
 //!    pipeline (`sanitise_request_headers`, `inject_forwarded`,
 //!    `build_upstream_uri`, hop-by-hop strip, WebSocket upgrade).
-//! 3. **Cert'd-host redirect** — else if `Host` matches a cert'd
+//! 2. **Cert'd-host redirect** — else if `Host` matches a cert'd
 //!    hostname in the per-IP [`HostSet`], emit
 //!    `301 Location: https://<host><path>` regardless of source IP
 //!    (a WAN browser that typed `http://` deserves the redirect; the
 //!    response leaks no backend bytes).
-//! 4. **404** — else.
+//! 3. **404** — else.
 //!
-//! Step 2's source-IP filter is the trust boundary for cert-less
+//! Step 1's source-IP filter is the trust boundary for cert-less
 //! routes; see [`crate::lan_cidrs`] for the criterion and its
 //! grounding.
 
@@ -38,7 +34,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -48,7 +44,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::lan_cidrs::LanCidrsSnapshot;
-use crate::proxy::acme::http01::{parse_challenge_path, AcmeResponder};
 
 use super::backend::{build_backend_client, BackendClient};
 use super::request::{extract_host, serve_request, short_response, ConnContext};
@@ -80,9 +75,6 @@ pub struct RedirectListener {
     /// while `None`, cert-less route serving is suppressed (the
     /// safe default).
     lan_cidrs: Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
-    /// Optional ACME HTTP-01 responder. Attached at supervisor startup
-    /// when an `[acme]` section is configured.
-    acme: Arc<parking_lot::RwLock<Option<AcmeResponder>>>,
 }
 
 impl std::fmt::Debug for RedirectListener {
@@ -137,15 +129,12 @@ impl RedirectListener {
         let plaintext_routes = Arc::new(parking_lot::RwLock::new(RouteTable::build(&[], "")));
         let lan_cidrs: Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>> =
             Arc::new(parking_lot::RwLock::new(None));
-        let acme: Arc<parking_lot::RwLock<Option<AcmeResponder>>> =
-            Arc::new(parking_lot::RwLock::new(None));
         let task_client = build_backend_client();
         let cancel = parent.child_token();
 
         let task_hosts = Arc::clone(&hosts);
         let task_plaintext = Arc::clone(&plaintext_routes);
         let task_lan = Arc::clone(&lan_cidrs);
-        let task_acme = Arc::clone(&acme);
         let task_cancel = cancel.clone();
 
         let handle = tokio::spawn(async move {
@@ -154,7 +143,6 @@ impl RedirectListener {
                 task_hosts,
                 task_plaintext,
                 task_lan,
-                task_acme,
                 task_client,
                 task_cancel,
             )
@@ -171,7 +159,6 @@ impl RedirectListener {
             hosts,
             plaintext_routes,
             lan_cidrs,
-            acme,
         })
     }
 
@@ -230,28 +217,17 @@ impl RedirectListener {
         *self.lan_cidrs.write() = snapshot;
     }
 
-    /// Attach (or replace) the ACME HTTP-01 responder for this listener.
-    /// When set, inbound `/.well-known/acme-challenge/<token>` requests
-    /// are answered with the registered key-authorization (status `200
-    /// text/plain`) instead of falling through to the redirect / 404
-    /// branches.
-    pub fn set_acme_responder(&self, responder: AcmeResponder) {
-        *self.acme.write() = Some(responder);
-    }
-
     pub async fn stop(self) {
         self.cancel.cancel();
         let _ = self.handle.await;
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn companion_accept_loop(
     listener: TcpListener,
     hosts: Arc<parking_lot::RwLock<HostSet>>,
     plaintext_routes: Arc<parking_lot::RwLock<RouteTable>>,
     lan_cidrs: Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
-    acme: Arc<parking_lot::RwLock<Option<AcmeResponder>>>,
     backend_client: BackendClient,
     cancel: CancellationToken,
 ) {
@@ -270,12 +246,11 @@ async fn companion_accept_loop(
                 let h = Arc::clone(&hosts);
                 let pr = Arc::clone(&plaintext_routes);
                 let lc = Arc::clone(&lan_cidrs);
-                let a = Arc::clone(&acme);
                 let bc = backend_client.clone();
                 let c = cancel.child_token();
                 tokio::spawn(async move {
                     if let Err(e) = serve_companion(
-                        tcp, peer, h, pr, lc, a, bc, c,
+                        tcp, peer, h, pr, lc, bc, c,
                     ).await {
                         debug!(client = %peer, error = %e, "companion connection ended");
                     }
@@ -285,14 +260,12 @@ async fn companion_accept_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn serve_companion(
     tcp: TcpStream,
     peer: SocketAddr,
     hosts: Arc<parking_lot::RwLock<HostSet>>,
     plaintext_routes: Arc<parking_lot::RwLock<RouteTable>>,
     lan_cidrs: Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
-    acme: Arc<parking_lot::RwLock<Option<AcmeResponder>>>,
     backend_client: BackendClient,
     _cancel: CancellationToken,
 ) -> io::Result<()> {
@@ -301,10 +274,9 @@ async fn serve_companion(
         let h = Arc::clone(&hosts);
         let pr = Arc::clone(&plaintext_routes);
         let lc = Arc::clone(&lan_cidrs);
-        let a = Arc::clone(&acme);
         let bc = backend_client.clone();
         async move {
-            let resp = dispatch(req, peer, &h, &pr, &lc, &a, &bc).await;
+            let resp = dispatch(req, peer, &h, &pr, &lc, &bc).await;
             Ok::<_, Infallible>(resp)
         }
     });
@@ -321,37 +293,14 @@ async fn serve_companion(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     req: Request<Incoming>,
     peer: SocketAddr,
     hosts: &Arc<parking_lot::RwLock<HostSet>>,
     plaintext_routes: &Arc<parking_lot::RwLock<RouteTable>>,
     lan_cidrs: &Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
-    acme: &Arc<parking_lot::RwLock<Option<AcmeResponder>>>,
     backend_client: &BackendClient,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
-    // ---- Step 1: ACME ------------------------------------------------
-    let path = req.uri().path();
-    if let Some(token) = parse_challenge_path(path) {
-        if let Some(responder) = acme.read().as_ref() {
-            if let Some(key_auth) = responder.lookup(token) {
-                let body = Full::new(Bytes::from(key_auth))
-                    .map_err(|e| match e {})
-                    .boxed();
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(body)
-                    .expect("acme-challenge response builds");
-            }
-        }
-        // Path looked like a challenge but the token is unknown —
-        // explicitly 404 rather than 301-ing to HTTPS, which would
-        // confuse the CA.
-        return short_response(StatusCode::NOT_FOUND, "");
-    }
-
     let host = match extract_host(&req) {
         Some(h) => h,
         None => return short_response(StatusCode::BAD_REQUEST, ""),

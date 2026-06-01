@@ -2,9 +2,10 @@
 //!
 //! Drives the RFC 8555 order/finalise/poll flow against any ACME
 //! directory via `instant-acme`. The renewer calls
-//! [`AcmeClient::issue`] per `(host, challenge_type)` pair; this
-//! module wires up HTTP-01 (via the shared [`super::AcmeResponder`])
-//! or DNS-01 (via the resolved [`super::DnsProvider`]).
+//! [`AcmeClient::issue`] per host; this module wires up DNS-01 via the
+//! resolved [`super::DnsProvider`]. HTTP-01 is intentionally not
+//! supported — wildcard issuance (the only mode the renewer drives)
+//! requires DNS-01 per RFC 8555 §7.1.3.
 
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use instant_acme::{ChallengeType, Identifier, KeyAuthorization, NewOrder, OrderS
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
 use super::account::AccountKey;
-use super::{dns01, AcmeChallenge, AcmeError, AcmeManager, AcmeRouteConfig};
+use super::{dns01, AcmeError, AcmeManager, AcmeRouteConfig};
 
 /// Outcome of a successful issuance: the cert chain and matching
 /// private key, both as PEM bytes ready to write to disk.
@@ -35,16 +36,15 @@ impl<'a> AcmeClient<'a> {
         Self { manager }
     }
 
-    /// Run the full ACME flow for `host` using the challenge type and
-    /// optional DNS provider from `route_cfg`. Returns the issued cert
-    /// chain + private key as PEM bytes.
+    /// Run the full ACME flow for `host` using the DNS-01 provider
+    /// named in `route_cfg`. Returns the issued cert chain + private
+    /// key as PEM bytes.
     ///
     /// `extra_sans` lists additional SAN identifiers to include in the
     /// CSR alongside `host`. For wildcard issuance the caller passes
     /// `[format!("*.{host}")]`; for non-wildcard issuance pass an
     /// empty slice. All SAN identifiers go through the per-host
-    /// authorization loop (each gets its own DNS-01 / HTTP-01
-    /// challenge).
+    /// authorization loop (each gets its own DNS-01 challenge).
     pub async fn issue(
         &self,
         host: &str,
@@ -89,14 +89,10 @@ impl<'a> AcmeClient<'a> {
                 detail: format!("order.authorizations: {e}"),
             })?;
 
-        let want_type = match route_cfg.challenge {
-            AcmeChallenge::Http01 => ChallengeType::Http01,
-            AcmeChallenge::Dns01 => ChallengeType::Dns01,
-        };
+        let want_type = ChallengeType::Dns01;
         let mut ready_urls: Vec<String> = Vec::new();
         let mut dns_handles: Vec<(std::sync::Arc<dyn super::DnsProvider>, super::TxtHandle)> =
             Vec::new();
-        let mut http_tokens: Vec<String> = Vec::new();
 
         for authz in authorizations.iter_mut() {
             let Identifier::Dns(authz_host) = &authz.identifier;
@@ -111,39 +107,23 @@ impl<'a> AcmeClient<'a> {
                     ),
                 })?;
             let key_auth: KeyAuthorization = order.key_authorization(challenge);
-            match route_cfg.challenge {
-                AcmeChallenge::Http01 => {
-                    self.manager
-                        .responder()
-                        .register(&challenge.token, key_auth.as_str());
-                    http_tokens.push(challenge.token.clone());
-                }
-                AcmeChallenge::Dns01 => {
-                    let provider_name =
-                        route_cfg
-                            .provider
-                            .as_deref()
-                            .ok_or_else(|| AcmeError::Client {
-                                host: host.to_string(),
-                                detail: "dns-01 challenge requested but no provider configured"
-                                    .into(),
-                            })?;
-                    let provider = self.manager.providers().get(host, provider_name)?;
-                    let txt_handle = dns01::place_challenge(
-                        &provider,
-                        authz_host,
-                        key_auth.dns_value().as_str(),
-                    )
-                    .await?;
-                    dns01::wait_for_propagation(
-                        &provider,
-                        authz_host,
-                        key_auth.dns_value().as_str(),
-                    )
-                    .await?;
-                    dns_handles.push((provider, txt_handle));
-                }
-            }
+            let provider = self
+                .manager
+                .providers()
+                .get(host, route_cfg.provider.as_str())?;
+            let txt_handle = dns01::place_challenge(
+                &provider,
+                authz_host,
+                key_auth.dns_value().as_str(),
+            )
+            .await?;
+            dns01::wait_for_propagation(
+                &provider,
+                authz_host,
+                key_auth.dns_value().as_str(),
+            )
+            .await?;
+            dns_handles.push((provider, txt_handle));
             ready_urls.push(challenge.url.clone());
         }
 
@@ -187,9 +167,6 @@ impl<'a> AcmeClient<'a> {
         };
 
         // Always tear challenges down — success or fail.
-        for tok in &http_tokens {
-            self.manager.responder().deregister(tok);
-        }
         for (provider, handle) in dns_handles {
             if let Err(e) = dns01::remove_challenge(&provider, handle).await {
                 tracing::warn!(host, error = %e, "dns-01 TXT cleanup failed; record may linger");

@@ -238,9 +238,6 @@ fn clone_acme_error(e: &AcmeError) -> AcmeError {
             host: host.clone(),
             provider: provider.clone(),
         },
-        AcmeError::NoHttp01Responder { host } => {
-            AcmeError::NoHttp01Responder { host: host.clone() }
-        }
         AcmeError::Dns { host, detail } => AcmeError::Dns {
             host: host.clone(),
             detail: detail.clone(),

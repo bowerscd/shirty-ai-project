@@ -15,7 +15,7 @@
 //!   dispatch live here.
 //! * [`certs`] — three-rung cert store + watcher (per-route convention →
 //!   node-wide default → cert-less LAN-only fallback).
-//! * [`acme`] — RFC 8555 ACME issuance for HTTP-01 + DNS-01.
+//! * [`acme`] — RFC 8555 ACME issuance: DNS-01 wildcard only.
 //! * [`canary`] — in-process probe arm table used by `chain canary`.
 //! * [`forward`] — shared header-rewriting helpers used by both L7
 //!   frontends so backends see identical `X-Forwarded-*` regardless of

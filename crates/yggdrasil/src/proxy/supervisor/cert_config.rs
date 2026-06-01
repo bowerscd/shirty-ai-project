@@ -41,11 +41,11 @@ pub struct CertConfig {
     /// h3 bodies larger than this get `413 Payload Too Large`.
     pub https_request_body_limit: usize,
     /// ACME manager (when `[acme]` is configured). When set, the
-    /// supervisor:
-    ///   * attaches the manager's HTTP-01 responder to every per-IP
-    ///     redirect listener it spawns, and
-    ///   * the manager has its wildcard issuance bootstrapped by
-    ///     [`crate::run_terminal`] at startup.
+    /// manager has its wildcard issuance bootstrapped by
+    /// [`crate::run_terminal`] at startup. The manager runs
+    /// independently of the per-IP companion listener; it does not
+    /// require any per-listener wiring after the HTTP-01 path was
+    /// removed.
     pub acme: Option<AcmeManager>,
     /// Resolved LAN-CIDR snapshot (see [`crate::lan_cidrs`]). Plumbed
     /// onto every per-IP companion listener spawned by the supervisor
