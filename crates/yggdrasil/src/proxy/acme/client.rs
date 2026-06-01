@@ -111,18 +111,11 @@ impl<'a> AcmeClient<'a> {
                 .manager
                 .providers()
                 .get(host, route_cfg.provider.as_str())?;
-            let txt_handle = dns01::place_challenge(
-                &provider,
-                authz_host,
-                key_auth.dns_value().as_str(),
-            )
-            .await?;
-            dns01::wait_for_propagation(
-                &provider,
-                authz_host,
-                key_auth.dns_value().as_str(),
-            )
-            .await?;
+            let txt_handle =
+                dns01::place_challenge(&provider, authz_host, key_auth.dns_value().as_str())
+                    .await?;
+            dns01::wait_for_propagation(&provider, authz_host, key_auth.dns_value().as_str())
+                .await?;
             dns_handles.push((provider, txt_handle));
             ready_urls.push(challenge.url.clone());
         }

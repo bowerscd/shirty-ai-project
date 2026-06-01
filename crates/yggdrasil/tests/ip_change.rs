@@ -202,8 +202,8 @@ async fn ip_change_drains_inflight_udp_flow() {
         // Best-effort recv with short timeout; an old-flow route still
         // produces a reply via echo_a, so observing a reply is not by
         // itself evidence the drain happened.
-        let _ = tokio::time::timeout(Duration::from_millis(100), client_sock.recv(&mut reply))
-            .await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(100), client_sock.recv(&mut reply)).await;
         if !seen_b.lock().await.is_empty() {
             break;
         }

@@ -269,7 +269,17 @@ async fn h3_request_with_body(
                 .await
                 .expect("send_data");
         }
-        stream.finish().await.expect("finish");
+        // `finish` races with the server's stream close in error paths
+        // (e.g. CONNECT → 501): the server returns a response and resets
+        // the stream before our finish() lands. Tolerate the resulting
+        // RemoteTerminate; the request body is empty for the methods
+        // this races on, so there's nothing left to send and the close
+        // is semantically benign.
+        match stream.finish().await {
+            Ok(()) => {}
+            Err(e) if format!("{e:?}").contains("RemoteTerminate") => {}
+            Err(e) => panic!("finish: {e}"),
+        }
 
         let resp = stream.recv_response().await.expect("recv_response");
         let mut buf = Vec::new();

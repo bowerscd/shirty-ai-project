@@ -936,8 +936,8 @@ mod tests {
         let handle = sup.handle();
         let mut current_set_rx = handle.current_set_rx();
         let _ = current_set_rx.borrow_and_update(); // consume initial empty
-        let initial_set = RuleSet::from_parts(vec![], vec![one_route(host, "http://127.0.0.1:9001")])
-            .unwrap();
+        let initial_set =
+            RuleSet::from_parts(vec![], vec![one_route(host, "http://127.0.0.1:9001")]).unwrap();
         handle.apply_ruleset(initial_set.clone()).await.unwrap();
         current_set_rx.changed().await.unwrap(); // first apply landed
         let listen_before = await_https_listen(&sup).await;

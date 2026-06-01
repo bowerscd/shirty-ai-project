@@ -20,6 +20,21 @@ cargo clippy --workspace --all-targets --benches -- -D warnings
 cargo test  --workspace --all-targets
 ```
 
+For changes touching the proxy supervisor, the chain control plane, the
+UDP frontend, or any test that uses sleep-based synchronisation, also run
+the **stress runner** before pushing:
+
+```bash
+scripts/stress.sh             # default: 10 consecutive runs at --test-threads=2*nproc
+STRESS_RUNS=25 scripts/stress.sh
+```
+
+The stress runner surfaces flaky tests that single-pass `cargo test`
+won't reproduce (port races, ordering assumptions across tasks, missing
+synchronisation). See [`scripts/stress.sh`](scripts/stress.sh) for the
+script and exit-code semantics. If a stress run is red, reproduce the
+specific failed test with `--nocapture` for full output before pushing.
+
 For changes touching CLI surfaces (anything under `crates/cli-defs/`),
 also confirm the auto-generated reference didn't drift:
 

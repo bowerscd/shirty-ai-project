@@ -89,6 +89,51 @@ pub async fn pick_free_tcp_port() -> u16 {
     s.local_addr().unwrap().port()
 }
 
+/// RAII guard that holds a TCP port reserved on loopback until dropped.
+///
+/// Use this in preference to `pick_free_tcp_port` when the port number is
+/// going to be handed to production code that will bind it itself. The
+/// guard holds a real `TcpListener` on the port, preventing another
+/// concurrent test from claiming it via the OS's ephemeral-port allocator.
+/// Drop the guard immediately before the production code binds; the race
+/// window between `drop(guard)` and the production bind is on the order of
+/// a few syscalls, well under what the kernel needs to recycle the port.
+///
+/// Without the guard, under heavy parallelism (e.g. `scripts/stress.sh`),
+/// the kernel can hand the same ephemeral port to two concurrent
+/// `bind(:0)` calls if the first has been dropped, causing EADDRINUSE in
+/// the production bind.
+pub struct ReservedTcpPort {
+    listener: Option<TcpListener>,
+    port: u16,
+}
+
+impl ReservedTcpPort {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Drop the inner listener, releasing the port. The caller's
+    /// subsequent bind on `self.port()` should happen on the very next
+    /// statement to minimise the race window.
+    pub fn release(mut self) -> u16 {
+        self.listener = None;
+        self.port
+    }
+}
+
+/// Reserve a free TCP port by binding a loopback listener and holding it
+/// until the returned guard is dropped. See [`ReservedTcpPort`] for the
+/// rationale.
+pub async fn reserve_tcp_port() -> ReservedTcpPort {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    ReservedTcpPort {
+        listener: Some(listener),
+        port,
+    }
+}
+
 /// Drive a full Noise_IK handshake against an already-running
 /// `HeartbeatServer`. Returns the resulting transport session and the
 /// connected UDP socket bound for further heartbeats.

@@ -165,4 +165,3 @@ fn bench_fast_path(c: &mut Criterion) {
 
 criterion_group!(benches, bench_fast_path);
 criterion_main!(benches);
-

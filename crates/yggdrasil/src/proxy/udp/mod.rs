@@ -726,15 +726,13 @@ impl UdpWorker {
                 for d in recv.iter(&scratch, n) {
                     if arm_active
                         && d.payload.len() >= CANARY_TOKEN_LEN
-                        && self.arm_table.match_token(
-                            self.local_addr,
-                            Protocol::Udp,
-                            &{
+                        && self
+                            .arm_table
+                            .match_token(self.local_addr, Protocol::Udp, &{
                                 let mut prefix = [0u8; CANARY_TOKEN_LEN];
                                 prefix.copy_from_slice(&d.payload[..CANARY_TOKEN_LEN]);
                                 prefix
-                            },
-                        )
+                            })
                     {
                         // Echo the entire datagram (token included)
                         // back to the source from this worker's
@@ -852,11 +850,7 @@ impl UdpWorker {
                 false
             }
             Err(e) => {
-                increment_udp_send_errors(
-                    &self.rule.name,
-                    self.worker_id,
-                    "client_to_upstream",
-                );
+                increment_udp_send_errors(&self.rule.name, self.worker_id, "client_to_upstream");
                 tracing::debug!(
                     rule = %self.rule.name,
                     client = %client_addr,

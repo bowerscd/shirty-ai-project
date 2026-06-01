@@ -38,15 +38,12 @@ async fn wait_for_requests(gateway: &MockNatGateway, target: usize, timeout: Dur
             return;
         }
         if std::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for ≥ {target} gateway requests; have {n}"
-            );
+            panic!("timed out waiting for ≥ {target} gateway requests; have {n}");
         }
         // 5 ms backoff between request-count polls; deadline gates the loop.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
-
 
 fn loopback_rule(name: &str, port: u16) -> Rule {
     Rule {

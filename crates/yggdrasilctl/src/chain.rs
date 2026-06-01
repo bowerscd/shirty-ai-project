@@ -995,9 +995,7 @@ fn render_ping_human(report: &PingReport) {
 // `chain canary` — probe a rule's L4 forwarding end-to-end
 // =============================================================================
 
-use ratatoskr::control::{
-    CanaryStatus, ChainCanaryResponse, DerivedRulesResponse as DerivedRules,
-};
+use ratatoskr::control::{CanaryStatus, ChainCanaryResponse, DerivedRulesResponse as DerivedRules};
 use ratatoskr::rule::Protocol;
 
 /// Exit code map matching the cli-reference docs.

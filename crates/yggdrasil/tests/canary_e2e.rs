@@ -157,7 +157,9 @@ async fn tcp_canary_ok_against_unreachable_backend() {
         let mut rx = supervisor.snapshot_receiver();
         tokio::time::timeout(Duration::from_secs(2), async {
             while rx.borrow().is_empty() {
-                rx.changed().await.expect("supervisor snapshot watch closed");
+                rx.changed()
+                    .await
+                    .expect("supervisor snapshot watch closed");
             }
         })
         .await
@@ -231,7 +233,9 @@ async fn udp_canary_ok_against_unreachable_backend() {
         let mut rx = supervisor.snapshot_receiver();
         tokio::time::timeout(Duration::from_secs(2), async {
             while rx.borrow().is_empty() {
-                rx.changed().await.expect("supervisor snapshot watch closed");
+                rx.changed()
+                    .await
+                    .expect("supervisor snapshot watch closed");
             }
         })
         .await
@@ -314,7 +318,9 @@ async fn canary_no_such_rule_reports_close_matches() {
         let mut rx = supervisor.snapshot_receiver();
         tokio::time::timeout(Duration::from_secs(2), async {
             while rx.borrow().len() < 3 {
-                rx.changed().await.expect("supervisor snapshot watch closed");
+                rx.changed()
+                    .await
+                    .expect("supervisor snapshot watch closed");
             }
         })
         .await

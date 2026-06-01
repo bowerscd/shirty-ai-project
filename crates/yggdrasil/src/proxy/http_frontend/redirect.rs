@@ -120,9 +120,45 @@ impl HostSet {
 impl RedirectListener {
     pub async fn spawn(ip: IpAddr, port: u16, parent: CancellationToken) -> Result<Self> {
         let bind = SocketAddr::new(ip, port);
-        let listener = TcpListener::bind(bind)
-            .await
-            .with_context(|| format!("bind :{port} companion listener on {bind}"))?;
+        // Brief retry on EADDRINUSE. The kernel can race two
+        // concurrent bind(:0)s onto the same ephemeral port if both
+        // close their probe socket before the other binds; the same
+        // also happens on a fast daemon restart where the previous
+        // listener's socket is still in TIME_WAIT. 3 retries × 25 ms
+        // covers both within typical kernel-recycle latency without
+        // adding user-visible startup delay in the common case.
+        let listener = {
+            let mut attempt = 0;
+            loop {
+                match TcpListener::bind(bind).await {
+                    Ok(l) => break l,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::AddrInUse
+                            && attempt < 3
+                            // port=0 means "OS picks"; on EADDRINUSE
+                            // the kernel just picks a different port,
+                            // so a retry would be free — but we never
+                            // hit AddrInUse for port=0 in practice
+                            // (the OS guarantees the assigned port is
+                            // free at bind time). The retry only
+                            // matters for explicit ports.
+                            && port != 0 =>
+                    {
+                        attempt += 1;
+                        tracing::warn!(
+                            bind = %bind,
+                            attempt,
+                            "redirect listener bind hit EADDRINUSE; retrying in 25 ms"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("bind :{port} companion listener on {bind}"));
+                    }
+                }
+            }
+        };
         let local_addr = listener.local_addr().context("read companion local_addr")?;
 
         let hosts = Arc::new(parking_lot::RwLock::new(HostSet::default()));

@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use yggdrasil::proxy::supervisor::CertConfig;
 
-use crate::common::{pick_free_tcp_port, spawn_terminal_supervisor_with_certs};
+use crate::common::{reserve_tcp_port, spawn_terminal_supervisor_with_certs};
 
 /// Initialise a `tracing_subscriber` once per test binary so logs surface
 /// when `RUST_LOG` is set. Test failures otherwise eat all `tracing::*`
@@ -430,13 +430,6 @@ impl TwoRouteFixture {
         issue_cert_convention(&cert_dir, &api_host);
         issue_cert_convention(&cert_dir, &app_host);
 
-        // Pick free ephemeral ports for both the HTTPS frontend and the
-        // HTTP→HTTPS redirect listener. The supervisor binds to whatever
-        // ports we hand it, so tests don't need privileged-port access.
-        let frontend_port = pick_free_tcp_port().await;
-        let redirect_port = pick_free_tcp_port().await;
-        let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
-
         write_routes_two(
             &rules_dir,
             &api_host,
@@ -445,32 +438,58 @@ impl TwoRouteFixture {
             &app.upstream_url(),
         );
 
-        let shutdown = CancellationToken::new();
-        let cert_config = CertConfig {
-            cert_dir: cert_dir.clone(),
-            default_cert: None,
-            default_key: None,
-            redirect_port: Some(redirect_port),
-            https_listen: frontend_addr,
-            https_http3: opts.http3,
-            https_alt_svc: opts.alt_svc,
-            https_request_body_limit: 16 * 1024 * 1024,
-            acme: None,
-            lan_cidrs: std::sync::Arc::new(
-                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
-            ),
+        // Reserve free ephemeral ports for both the HTTPS frontend and
+        // the HTTP→HTTPS redirect listener; retry the supervisor spawn
+        // on EADDRINUSE up to 5 times with fresh ports. The reservation
+        // guards hold the ports until just before the supervisor binds,
+        // narrowing the race window against other parallel tests'
+        // bind(:0) calls (see `common::ReservedTcpPort`). The retry
+        // closes the residual race when even the guard's microsecond
+        // window loses to the kernel's port allocator under stress
+        // (`scripts/stress.sh`).
+        let mut attempt = 0;
+        let (supervisor, frontend_addr, redirect_port, shutdown) = loop {
+            attempt += 1;
+            let frontend_guard = reserve_tcp_port().await;
+            let frontend_port = frontend_guard.port();
+            let redirect_guard = reserve_tcp_port().await;
+            let redirect_port = redirect_guard.port();
+            let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
+
+            let shutdown = CancellationToken::new();
+            let cert_config = CertConfig {
+                cert_dir: cert_dir.clone(),
+                default_cert: None,
+                default_key: None,
+                redirect_port: Some(redirect_port),
+                https_listen: frontend_addr,
+                https_http3: opts.http3,
+                https_alt_svc: opts.alt_svc,
+                https_request_body_limit: 16 * 1024 * 1024,
+                acme: None,
+                lan_cidrs: std::sync::Arc::new(
+                    yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+                ),
+            };
+            drop(frontend_guard);
+            drop(redirect_guard);
+            let supervisor = spawn_terminal_supervisor_with_certs(
+                rules_dir.clone(),
+                Duration::from_millis(50),
+                cert_config,
+                shutdown.clone(),
+            )
+            .await;
+            if supervisor.wait_for_nonempty(Duration::from_secs(2)).await {
+                break (supervisor, frontend_addr, redirect_port, shutdown);
+            }
+            shutdown.cancel();
+            assert!(
+                attempt < 5,
+                "TwoRouteFixture: supervisor never spawned its HTTPS proxy \
+                 after {attempt} attempts (port collision under stress)"
+            );
         };
-        let supervisor = spawn_terminal_supervisor_with_certs(
-            rules_dir,
-            Duration::from_millis(50),
-            cert_config,
-            shutdown.clone(),
-        )
-        .await;
-        assert!(
-            supervisor.wait_for_nonempty(Duration::from_secs(2)).await,
-            "supervisor never spawned its HTTPS proxy"
-        );
 
         Self {
             frontend_addr,
@@ -779,13 +798,32 @@ async fn dead_backend_returns_502() {
     let cert_dir = tmpdir.path().join("certs");
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::create_dir_all(&cert_dir).unwrap();
-    let frontend_port = pick_free_tcp_port().await;
+    let frontend_guard = reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
 
-    let dead_port = pick_free_tcp_port().await;
-    // dead_port is free *right now* — by the time the frontend dials it,
-    // the test is the only thing on this loopback host that knows it, so
-    // the dial will return ECONNREFUSED.
+    // Bind a real listener at the "dead" address but accept-and-drop
+    // every connection. The frontend's backend client will see the
+    // connection close before the HTTP response arrives → 502.
+    //
+    // Why not just `reserve_tcp_port` and let the supervisor's dial
+    // hit a closed socket? Because we need a real listener actively
+    // receiving on that port for the test's full lifetime, not just
+    // a port-reservation guard dropped before the supervisor binds.
+    // Without the active listener, another concurrent test could
+    // bind the port and the request would route to *that* test's
+    // backend instead of failing. Found by the local stress runner.
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    let dead_task = tokio::spawn(async move {
+        loop {
+            match dead_listener.accept().await {
+                Ok((stream, _)) => drop(stream),
+                Err(_) => return,
+            }
+        }
+    });
+
     let host = format!("dead{}.localhost", rand::random::<u32>());
     issue_cert_convention(&cert_dir, &host);
 
@@ -799,7 +837,7 @@ target = "http://127.0.0.1:{dead_port}"
     std::fs::write(rules_dir.join("routes.toml"), toml).unwrap();
 
     let shutdown = CancellationToken::new();
-    let redirect_port = pick_free_tcp_port().await;
+    drop(frontend_guard);
     let supervisor = spawn_terminal_supervisor_with_certs(
         rules_dir,
         Duration::from_millis(50),
@@ -807,7 +845,10 @@ target = "http://127.0.0.1:{dead_port}"
             cert_dir,
             default_cert: None,
             default_key: None,
-            redirect_port: Some(redirect_port),
+            // This test never dials the redirect listener; let the OS
+            // pick a free port (Some(0)) so it never races against
+            // other parallel tests' bind(:0) calls.
+            redirect_port: Some(0),
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
@@ -838,6 +879,7 @@ target = "http://127.0.0.1:{dead_port}"
         Some(expected.as_str())
     );
     shutdown.cancel();
+    dead_task.abort();
 }
 
 /// §6h(9): ALPN advertises both `h2` and `http/1.1`; a client that prefers
@@ -878,11 +920,12 @@ async fn hsts_header_emitted_when_opted_in() {
     let key_path = cert_dir.join("key.pem");
     let host = format!("hsts{}.localhost", rand::random::<u32>());
     issue_self_signed_pem(&cert_path, &key_path, &host);
-    let frontend_port = pick_free_tcp_port().await;
+    let frontend_guard = common::reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
     write_route_one_with_hsts(&rules_dir, &host, &api.upstream_url(), true);
     let shutdown = CancellationToken::new();
-    let redirect_port = pick_free_tcp_port().await;
+    drop(frontend_guard);
     let supervisor = spawn_terminal_supervisor_with_certs(
         rules_dir,
         Duration::from_millis(50),
@@ -890,7 +933,10 @@ async fn hsts_header_emitted_when_opted_in() {
             cert_dir,
             default_cert: Some(cert_path),
             default_key: Some(key_path),
-            redirect_port: Some(redirect_port),
+            // This test never dials the redirect listener; let the OS
+            // pick a free port (Some(0)) so it never races against
+            // other parallel tests' bind(:0) calls.
+            redirect_port: Some(0),
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
@@ -950,7 +996,8 @@ async fn static_response_headers_reach_client_and_override_backend() {
     let key_path = cert_dir.join("key.pem");
     let host = format!("hdrs{}.localhost", rand::random::<u32>());
     issue_self_signed_pem(&cert_path, &key_path, &host);
-    let frontend_port = pick_free_tcp_port().await;
+    let frontend_guard = reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
     write_route_one_with_static_headers(
         &rules_dir,
@@ -964,7 +1011,7 @@ async fn static_response_headers_reach_client_and_override_backend() {
         ],
     );
     let shutdown = CancellationToken::new();
-    let redirect_port = pick_free_tcp_port().await;
+    drop(frontend_guard);
     let supervisor = spawn_terminal_supervisor_with_certs(
         rules_dir,
         Duration::from_millis(50),
@@ -972,7 +1019,10 @@ async fn static_response_headers_reach_client_and_override_backend() {
             cert_dir,
             default_cert: Some(cert_path),
             default_key: Some(key_path),
-            redirect_port: Some(redirect_port),
+            // This test never dials the redirect listener; let the OS
+            // pick a free port (Some(0)) so it never races against
+            // other parallel tests' bind(:0) calls.
+            redirect_port: Some(0),
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
@@ -1171,11 +1221,12 @@ async fn disk_backed_cert_reloads_on_change() {
     let cert_path = host_dir.join("fullchain.pem");
     let key_path = host_dir.join("privkey.pem");
     issue_self_signed_pem(&cert_path, &key_path, &host);
-    let frontend_port = pick_free_tcp_port().await;
+    let frontend_guard = reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
     write_route_one_with_hsts(&rules_dir, &host, &api.upstream_url(), false);
     let shutdown = CancellationToken::new();
-    let redirect_port = pick_free_tcp_port().await;
+    drop(frontend_guard);
     let supervisor = spawn_terminal_supervisor_with_certs(
         rules_dir,
         Duration::from_millis(50),
@@ -1183,7 +1234,10 @@ async fn disk_backed_cert_reloads_on_change() {
             cert_dir,
             default_cert: None,
             default_key: None,
-            redirect_port: Some(redirect_port),
+            // This test never dials the redirect listener; let the OS
+            // pick a free port (Some(0)) so it never races against
+            // other parallel tests' bind(:0) calls.
+            redirect_port: Some(0),
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
@@ -1248,11 +1302,12 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
     let cert_path = host_dir.join("fullchain.pem");
     let key_path = host_dir.join("privkey.pem");
     issue_self_signed_pem(&cert_path, &key_path, &host);
-    let frontend_port = pick_free_tcp_port().await;
+    let frontend_guard = reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
     write_route_one_with_hsts(&rules_dir, &host, &api.upstream_url(), false);
     let shutdown = CancellationToken::new();
-    let redirect_port = pick_free_tcp_port().await;
+    drop(frontend_guard);
     let supervisor = spawn_terminal_supervisor_with_certs(
         rules_dir,
         Duration::from_millis(50),
@@ -1260,7 +1315,10 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
             cert_dir,
             default_cert: None,
             default_key: None,
-            redirect_port: Some(redirect_port),
+            // This test never dials the redirect listener; let the OS
+            // pick a free port (Some(0)) so it never races against
+            // other parallel tests' bind(:0) calls.
+            redirect_port: Some(0),
             https_listen: frontend_addr,
             https_http3: true,
             https_alt_svc: true,
@@ -1445,10 +1503,6 @@ impl CertLessFixture {
         std::fs::create_dir_all(&rules_dir).unwrap();
         std::fs::create_dir_all(&cert_dir).unwrap();
 
-        let frontend_port = pick_free_tcp_port().await;
-        let redirect_port = pick_free_tcp_port().await;
-        let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
-
         // Issue a convention cert for the cert-d host. The cert-less
         // host intentionally has no PEM on disk → load_routes_into_store
         // returns it in the cert-less list and the route lives on `:80`.
@@ -1462,32 +1516,51 @@ impl CertLessFixture {
             &cert_less.upstream_url(),
         );
 
-        let shutdown = CancellationToken::new();
-        let cert_config = CertConfig {
-            cert_dir,
-            default_cert: None,
-            default_key: None,
-            redirect_port: Some(redirect_port),
-            https_listen: frontend_addr,
-            https_http3: true,
-            https_alt_svc: true,
-            https_request_body_limit: 16 * 1024 * 1024,
-            acme: None,
-            lan_cidrs: std::sync::Arc::new(
-                yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
-            ),
+        // Reserve ports + retry the supervisor spawn on EADDRINUSE.
+        // See `TwoRouteFixture::spawn_with_options` for the rationale.
+        let mut attempt = 0;
+        let (supervisor, frontend_addr, redirect_port, shutdown) = loop {
+            attempt += 1;
+            let frontend_guard = reserve_tcp_port().await;
+            let frontend_port = frontend_guard.port();
+            let redirect_guard = reserve_tcp_port().await;
+            let redirect_port = redirect_guard.port();
+            let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
+
+            let shutdown = CancellationToken::new();
+            let cert_config = CertConfig {
+                cert_dir: cert_dir.clone(),
+                default_cert: None,
+                default_key: None,
+                redirect_port: Some(redirect_port),
+                https_listen: frontend_addr,
+                https_http3: true,
+                https_alt_svc: true,
+                https_request_body_limit: 16 * 1024 * 1024,
+                acme: None,
+                lan_cidrs: std::sync::Arc::new(
+                    yggdrasil::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs"),
+                ),
+            };
+            drop(frontend_guard);
+            drop(redirect_guard);
+            let supervisor = spawn_terminal_supervisor_with_certs(
+                rules_dir.clone(),
+                Duration::from_millis(50),
+                cert_config,
+                shutdown.clone(),
+            )
+            .await;
+            if supervisor.wait_for_nonempty(Duration::from_secs(2)).await {
+                break (supervisor, frontend_addr, redirect_port, shutdown);
+            }
+            shutdown.cancel();
+            assert!(
+                attempt < 5,
+                "CertLessFixture: supervisor never spawned its HTTPS proxy \
+                 after {attempt} attempts (port collision under stress)"
+            );
         };
-        let supervisor = spawn_terminal_supervisor_with_certs(
-            rules_dir,
-            Duration::from_millis(50),
-            cert_config,
-            shutdown.clone(),
-        )
-        .await;
-        assert!(
-            supervisor.wait_for_nonempty(Duration::from_secs(2)).await,
-            "supervisor never spawned its HTTPS proxy"
-        );
 
         Self {
             frontend_addr,
@@ -1722,8 +1795,8 @@ async fn route_addition_drains_inflight_request_within_budget() {
     issue_cert_convention(&cert_dir, &host_a);
     issue_cert_convention(&cert_dir, &host_b);
 
-    let frontend_port = pick_free_tcp_port().await;
-    let redirect_port = pick_free_tcp_port().await;
+    let frontend_guard = reserve_tcp_port().await;
+    let frontend_port = frontend_guard.port();
     let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
 
     // Initial ruleset: host_a only.
@@ -1742,7 +1815,8 @@ target = "{}"
         cert_dir: cert_dir.clone(),
         default_cert: None,
         default_key: None,
-        redirect_port: Some(redirect_port),
+        // This test never dials the redirect listener; let the OS pick.
+        redirect_port: Some(0),
         https_listen: frontend_addr,
         https_http3: false,
         https_alt_svc: false,
@@ -1751,6 +1825,7 @@ target = "{}"
         lan_cidrs: Arc::new(yggdrasil::lan_cidrs::LanCidrs::resolve(None).unwrap()),
     };
     let drain_budget = Duration::from_secs(5);
+    drop(frontend_guard);
     let supervisor = ProxySupervisor::spawn(
         rules_dir,
         Duration::from_millis(50),
