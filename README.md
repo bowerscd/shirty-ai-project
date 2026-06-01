@@ -13,12 +13,19 @@ A residential reverse proxy with a chain control plane. One binary, two modes:
 Both modes are the same `yggdrasil` binary; the difference is section shape:
 `[dial]` only => terminal, `[accept]` only or both => relay. A
 deployment is a chain of one or more relays terminating in exactly one
-terminal — `home -> midbox -> vps` works the same way `home -> vps` does.
+terminal — `home -> midbox -> vps` works the same way `home -> vps` does
+(the 3-hop chain is exercised by
+[`tests/e2e/run-chain.sh`](tests/e2e/run-chain.sh) end-to-end and by
+[`chain_predicate_e2e`](crates/yggdrasil/tests/chain_predicate_e2e.rs)
+at the unit-integration layer).
 
 It is **not** a tunnel. There is no overlay network, no kernel module, no
 userspace TUN. The L4 data plane learns where to send traffic from
 authenticated heartbeats; when the home box's residential IP changes, the
-next heartbeat updates the mapping and traffic keeps flowing.
+next heartbeat updates the mapping and traffic keeps flowing (the
+[`ip_change`](crates/yggdrasil/tests/ip_change.rs) +
+[`heartbeat_invariance`](crates/yggdrasil/tests/heartbeat_invariance_udp.rs)
+integration tests cover the drain-and-resume property).
 
 ```text
 internet clients -- TCP/TLS or UDP/QUIC --> relay derived listeners
@@ -153,7 +160,11 @@ ssh -p 2222 user@vps.example.net
 * [docs/security.md](docs/security.md) — threat model, crypto, request/grant
 * [tests/e2e/run.sh](tests/e2e/run.sh) — 2-node podman-compose smoke
 * [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain smoke
-* [tests/e2e/run-acme.sh](tests/e2e/run-acme.sh) — ACME issuance smoke against a local pebble CA
+* [tests/e2e/run-acme.sh](tests/e2e/run-acme.sh) — ACME-issuance e2e
+  scaffold against a local pebble CA. **Currently a stub**: the script
+  brings pebble up and exits 0 without running the daemon. End-to-end
+  issuance is unit-tested only; the live-CA path has not been exercised
+  in tree.
 
 ## What's in the box
 
@@ -166,11 +177,16 @@ ssh -p 2222 user@vps.example.net
 | `bench-tools`   | bins `loadgen`, `bench-echo` (workspace-internal) | Helpers used by [bench/](bench/README.md): UDP/TCP load generator and a native echo backend. |
 
 HTTPS rules include an L7 frontend for HTTP/1.1, HTTP/2, and HTTP/3 / QUIC,
-with Alt-Svc advertising enabled by default. Certs can be sourced from
-disk, an in-memory ephemeral self-signed CA (test fixtures), or ACME
-(RFC 8555) — both HTTP-01 and DNS-01 (Cloudflare) are supported, with
-`yggdrasilctl local acme {list,renew}` for inspection and on-demand
-issuance.
+with Alt-Svc advertising enabled by default (see
+[`tests/http_frontend.rs`](crates/yggdrasil/tests/http_frontend.rs) and
+[`tests/http3_frontend.rs`](crates/yggdrasil/tests/http3_frontend.rs)).
+Certs can be sourced from disk, an in-memory ephemeral self-signed CA
+(test fixtures), or ACME (RFC 8555) — both HTTP-01 and DNS-01 (Cloudflare)
+are implemented, with `yggdrasilctl local acme {list,renew}` for
+inspection and on-demand issuance. **The ACME pipeline is unit-tested
+only**: there is no end-to-end test that issues a real cert from any
+CA in tree today (see [`tests/e2e/run-acme.sh`](tests/e2e/run-acme.sh)
+for the scaffold).
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 
