@@ -118,6 +118,13 @@ async fn terminal_chain_apply_enqueues_and_reports() {
             assert_eq!(body.applied_rule_count, 2);
             // Pure-local terminal: no projection, no predicates reported.
             assert_eq!(body.predicate_count, 0);
+            // Structural-invariant tripwire: `predicate_extractor::extract`
+            // currently always returns an empty `skipped_https` (the field
+            // exists for wire-format back-compat; see the docstring on
+            // `ExtractOutcome::skipped_https`). This assertion will fire
+            // and prompt a re-think if the extractor ever starts skipping
+            // rules — at which point a positive-case companion test must
+            // accompany the implementation change.
             assert!(body.skipped_https.is_empty());
         }
         other => panic!("expected ChainApplied, got {other:?}"),

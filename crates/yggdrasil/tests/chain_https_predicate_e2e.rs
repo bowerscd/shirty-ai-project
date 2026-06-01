@@ -49,6 +49,9 @@ async fn https_predicate_with_http3_derives_tcp_and_udp_on_relay() {
         http3: true,
     };
     let outcome = predicate_extractor::extract(&rules, meta, origin(), 1);
+    // Structural-invariant tripwire: see chain_apply_e2e.rs for the
+    // same assertion's rationale. `extract` always returns an empty
+    // `skipped_https`; this asserts the implementation hasn't drifted.
     assert!(outcome.skipped_https.is_empty());
 
     let predicates = outcome.set;
@@ -106,6 +109,7 @@ async fn https_predicate_with_http3_disabled_derives_tcp_only() {
         http3: false,
     };
     let outcome = predicate_extractor::extract(&rules, meta, origin(), 1);
+    // Structural-invariant tripwire (see same-named assert above).
     assert!(outcome.skipped_https.is_empty());
 
     let predicates = outcome.set;
