@@ -166,9 +166,16 @@ impl ProxySupervisor {
     /// supervisor and all child proxies.
     ///
     /// `graceful_drain_timeout` (sourced from `[server].graceful_drain_timeout`)
-    /// is consulted on shutdown only — hot rule-reload always stops the
-    /// affected proxy instantly so the new rule set can take effect. See
-    /// [`crate::proxy::tcp::TcpProxy::stop`] for the per-proxy mechanics.
+    /// is the budget the supervisor honours when stopping any proxy or the
+    /// node-wide HTTPS frontend, including on rule-reload swaps. Hot
+    /// reload that adds, changes, or removes a rule or route stops the
+    /// affected proxy via this drain budget so in-flight TCP / UDP / TLS
+    /// connections get up to `graceful_drain_timeout` to finish before
+    /// the listener tears down. Note that HTTPS route reload tears down
+    /// the entire node-wide HTTPS frontend (per-route diffing is a
+    /// `route-hot-reload-fix-per-route-diff` follow-up); the drain budget
+    /// is what bounds the impact on in-flight TLS work in the meantime.
+    /// See [`crate::proxy::tcp::TcpProxy::stop`] for the per-proxy mechanics.
     ///
     /// Equivalent to [`ProxySupervisor::spawn_with_cert_store`] with a
     /// freshly-built empty store; callers that need to share the store

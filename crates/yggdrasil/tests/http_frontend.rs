@@ -1601,3 +1601,200 @@ async fn unknown_host_yields_404_on_companion() {
     assert_eq!(code, 404, "unknown host should 404");
     fx.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Route hot-reload: in-flight request drains across a route swap
+// ---------------------------------------------------------------------------
+
+/// Backend that holds the response for `delay` before replying with a
+/// fixed 200 OK. Used by `route_addition_drains_inflight_request_within_budget`
+/// to keep one request in-flight while the supervisor rotates the
+/// HTTPS frontend.
+struct SlowBackend {
+    addr: SocketAddr,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl SlowBackend {
+    async fn spawn(delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: HyperReq<Incoming>| async move {
+                        // Drain body so hyper doesn't close on us.
+                        let _ = req.into_body().collect().await;
+                        tokio::time::sleep(delay).await;
+                        let resp = HyperResp::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/plain")
+                            .body(Full::new(Bytes::from_static(b"slow-ok\n")))
+                            .unwrap();
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let io = TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(false)
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        Self {
+            addr,
+            _handle: handle,
+        }
+    }
+
+    fn upstream_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+}
+
+/// `reconcile_https` tears down and respawns the entire HTTPS frontend
+/// on any route diff today; per-route diffing is the
+/// `route-hot-reload-fix-per-route-diff` follow-up. What this test
+/// pins is the weaker — but explicit — claim: an in-flight TLS request
+/// against an existing route SHOULD complete within the configured
+/// `graceful_drain_timeout`, even when the supervisor decides to swap
+/// the frontend out from under it (e.g. because the operator dropped
+/// a second route into `conf.d`).
+///
+/// We pick a 1 s backend delay and a 5 s drain budget so the in-flight
+/// request is in a comfortable middle of the drain window. If
+/// reconcile_https ever reverts to `stop(None)` (no drain), this test
+/// fails because hyper sees the listener close with the request still
+/// awaiting bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn route_addition_drains_inflight_request_within_budget() {
+    use ratatoskr::rule::{HttpRoute, RuleSet};
+    use url::Url;
+    use yggdrasil::proxy::resolver::ResolverFactory;
+    use yggdrasil::proxy::supervisor::ProxySupervisor;
+
+    init_tracing();
+
+    let suffix: u32 = rand::random();
+    let host_a = format!("a{suffix}.localhost");
+    let host_b = format!("b{suffix}.localhost");
+
+    // Slow backend: 1 s response latency.
+    let slow = SlowBackend::spawn(Duration::from_millis(1_000)).await;
+    let fast = EchoBackend::spawn("b").await;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rules_dir = tmpdir.path().join("rules");
+    let cert_dir = tmpdir.path().join("certs");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    issue_cert_convention(&cert_dir, &host_a);
+    issue_cert_convention(&cert_dir, &host_b);
+
+    let frontend_port = pick_free_tcp_port().await;
+    let redirect_port = pick_free_tcp_port().await;
+    let frontend_addr: SocketAddr = format!("127.0.0.1:{frontend_port}").parse().unwrap();
+
+    // Initial ruleset: host_a only.
+    let initial_routes = format!(
+        r#"
+[[route]]
+hostname = "{host_a}"
+target = "{}"
+"#,
+        slow.upstream_url(),
+    );
+    std::fs::write(rules_dir.join("routes.toml"), initial_routes).unwrap();
+
+    let shutdown = CancellationToken::new();
+    let cert_config = CertConfig {
+        cert_dir: cert_dir.clone(),
+        default_cert: None,
+        default_key: None,
+        redirect_port: Some(redirect_port),
+        https_listen: frontend_addr,
+        https_http3: false,
+        https_alt_svc: false,
+        https_request_body_limit: 16 * 1024 * 1024,
+        acme: None,
+        lan_cidrs: Arc::new(yggdrasil::lan_cidrs::LanCidrs::resolve(None).unwrap()),
+    };
+    let drain_budget = Duration::from_secs(5);
+    let supervisor = ProxySupervisor::spawn(
+        rules_dir,
+        Duration::from_millis(50),
+        ResolverFactory::new_terminal(),
+        None,
+        None,
+        cert_config,
+        Some(drain_budget),
+        shutdown.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        supervisor.wait_for_nonempty(Duration::from_secs(3)).await,
+        "HTTPS frontend never came up"
+    );
+
+    // Open a TLS connection and kick off the slow request on a task so
+    // we can apply the route addition in parallel.
+    let tls = dial_tls(frontend_addr, &host_a, vec![b"http/1.1".to_vec()])
+        .await
+        .expect("TLS handshake to slow backend route");
+    let host_a_for_task = host_a.clone();
+    let req_handle = tokio::spawn(async move {
+        let mut tls = tls;
+        http1_request(&mut tls, Some(&host_a_for_task), &[], "/").await
+    });
+
+    // Give the request a moment to reach the slow backend so it's
+    // genuinely in-flight when we swap the frontend.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Apply the route addition via the supervisor handle.
+    let new_set = RuleSet::from_parts(
+        vec![],
+        vec![
+            HttpRoute {
+                hostname: host_a.clone(),
+                target: Url::parse(&slow.upstream_url()).unwrap(),
+                hsts: None,
+                headers: Default::default(),
+            },
+            HttpRoute {
+                hostname: host_b.clone(),
+                target: Url::parse(&fast.upstream_url()).unwrap(),
+                hsts: None,
+                headers: Default::default(),
+            },
+        ],
+    )
+    .unwrap();
+    supervisor.handle().apply_ruleset(new_set).await.unwrap();
+
+    // The in-flight request must complete within (drain_budget +
+    // slow_delay + slack). If reconcile_https ever stops honouring
+    // graceful_drain_timeout on the route-reload path, this read fails.
+    let resp = tokio::time::timeout(Duration::from_secs(8), req_handle)
+        .await
+        .expect("in-flight request task exceeded outer timeout")
+        .expect("in-flight request task panicked")
+        .expect("in-flight request errored out (drain budget not honoured?)");
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK"),
+        "in-flight request did not complete with 200 OK: {text}"
+    );
+    assert!(
+        text.contains("slow-ok"),
+        "in-flight response missing expected body: {text}"
+    );
+
+    shutdown.cancel();
+    let _ = fast.last_request().await; // suppress unused warning
+}
