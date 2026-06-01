@@ -24,7 +24,6 @@
 //! removed so it doesn't outlive the canary command.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hdrhistogram::Histogram;
@@ -42,7 +41,6 @@ use ratatoskr::control::{
 use ratatoskr::rule::Protocol;
 
 use super::super::ControlState;
-use crate::proxy::canary::CanaryArmTable;
 
 /// Grace window added to the probe duration when computing the arm
 /// expiry: ensures the terminal's intercept stays armed slightly
@@ -580,13 +578,6 @@ fn classify(p: &ProbeResults, protocol: Protocol) -> CanaryStatus {
     }
     CanaryStatus::Ok
 }
-
-/// Unused-prevention: this re-export keeps the `Arc<CanaryArmTable>`
-/// import surfaced so dead-code lints stay quiet even if the table is
-/// referenced only via `ControlState`. Removing this once the handler
-/// is fully wired into production paths is safe.
-#[allow(dead_code)]
-fn _suppress_dead_import(_t: Arc<CanaryArmTable>) {}
 
 #[cfg(test)]
 mod tests {

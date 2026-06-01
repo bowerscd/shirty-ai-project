@@ -1,4 +1,4 @@
-//! Rules subsystem — directory loading and (later) hot reloading.
+//! Rules subsystem — directory loading + hot reloading.
 //!
 //! This module bridges the on-disk `/etc/yggdrasil/conf.d/*.toml` layout to
 //! the schema types in [`ratatoskr::rule`]. The file-by-file parsing,
@@ -7,15 +7,15 @@
 //! aggregated [`RuleSet`].
 //!
 //! The hot-reload watcher lives in [`watcher`]; consumers typically interact
-//! with this subsystem through [`RuleWatcher`].
+//! with this subsystem through [`RuleWatcher`]. [`load_dir`] is also called
+//! directly by `yggdrasilctl validate` for the offline-config check.
 
 mod watcher;
 
-#[allow(unused_imports)] // re-exports used by Phase 4/5 proxy modules
 pub use ratatoskr::rule::{
     Protocol, ProxyProto, Rule, RuleChange, RuleDiff, RuleFile, RuleSet, DEFAULT_UDP_IDLE_TIMEOUT,
 };
-#[allow(unused_imports)]
+
 pub use watcher::{ReloadTrigger, RuleUpdate, RuleWatcher};
 
 use std::path::{Path, PathBuf};
@@ -29,7 +29,6 @@ use ratatoskr::Error;
 /// A missing directory is a hard error — operators should provision an empty
 /// directory rather than leave it absent. An empty directory is OK and
 /// produces an empty [`RuleSet`].
-#[allow(dead_code)] // wired into run() in Phase 4
 pub fn load_dir(dir: &Path) -> ProtoResult<RuleSet> {
     let files = read_toml_files(dir)?;
     let parsed: Vec<RuleFile> = files
@@ -40,9 +39,8 @@ pub fn load_dir(dir: &Path) -> ProtoResult<RuleSet> {
 }
 
 /// List `*.toml` files in `dir` (non-recursive), return `(path, contents)`
-/// pairs sorted by path. Exposed for the future hot-reload watcher to share
-/// file-listing logic.
-#[allow(dead_code)] // used by Phase 3.2 watcher
+/// pairs sorted by path. Shared between [`load_dir`] and the hot-reload
+/// watcher so both honour the same filename filter + ordering.
 pub fn read_toml_files(dir: &Path) -> ProtoResult<Vec<(PathBuf, String)>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|source| Error::ReadFile {

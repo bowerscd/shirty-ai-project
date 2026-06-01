@@ -120,11 +120,9 @@ pub(in crate::control) struct ControlState {
     pub(in crate::control) acme: Option<crate::proxy::acme::AcmeManager>,
     /// Optional NAT-traversal mapper handle. `None` when
     /// `[server].nat_traversal = "off"` (the default) or when the
-    /// mapper's startup discovery failed. Used by `Request::Status`
-    /// to surface the NAT block when the subsystem is live.
-    // Read by the dispatcher in `dispatch.rs` once the
-    // `nat-status-handler` phase wires the projection up.
-    #[allow(dead_code)]
+    /// mapper's startup discovery failed. Read by `Request::Status`
+    /// in `dispatch.rs::project_nat_status` to surface the NAT block
+    /// when the subsystem is live.
     pub(in crate::control) nat: Option<crate::nat::NatMapperHandle>,
     /// Shared per-daemon canary arm table. The `ChainCanary` handler
     /// installs an arm here when this node is the terminal hop for

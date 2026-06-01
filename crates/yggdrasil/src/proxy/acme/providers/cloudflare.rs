@@ -79,7 +79,7 @@ impl CloudflareProvider {
         Ok(Self { api_token, http })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn api_token(&self) -> &str {
         &self.api_token
     }
@@ -303,8 +303,11 @@ struct CfZone {
     id: String,
 }
 
+/// Cloudflare's `{ "errors": [{ code, message }, ...] }` response shape.
+/// Both fields are surfaced only via `Debug` (in `tracing::warn!` output
+/// when a CF API call fails), so the dead-code lint can't see the reads.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // populated by CF; kept for debug output
+#[allow(dead_code)]
 struct CfErrorEntry {
     code: u64,
     message: String,

@@ -10,15 +10,7 @@ use tokio::net::UnixStream;
 
 use ratatoskr::control::{Mode, Request, Response};
 
-// The `ApproveArgs` and `TraceArgs` re-exports are unused by the bin's
-// own production code path (the dispatch deconstructs via `Cmd::Trace`
-// / `AcceptAction::Approve`) but are referenced by name in this file's
-// unit tests. Allow the dead re-export at lint time so both targets
-// build clean under `-D warnings`.
-#[allow(unused_imports)]
-pub use cli_defs::yggdrasilctl::local::{
-    AcceptAction, AcmeAction, AcmeRenewArgs, ApproveArgs, Cmd, RuleAction, TraceArgs,
-};
+pub use cli_defs::yggdrasilctl::local::{AcceptAction, AcmeAction, Cmd, RuleAction};
 
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     let request = build_request(&cmd);
@@ -361,6 +353,7 @@ fn format_unix_secs(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cli_defs::yggdrasilctl::local::{AcmeRenewArgs, ApproveArgs, TraceArgs};
 
     /// Each `Cmd` variant must map to the expected `Request` so the CLI
     /// surface stays in sync with the wire surface. A regression in

@@ -996,7 +996,7 @@ fn render_ping_human(report: &PingReport) {
 // =============================================================================
 
 use ratatoskr::control::{
-    CanaryStatus, ChainCanaryResponse, DerivedRulesResponse as DerivedRules, DirectionStats,
+    CanaryStatus, ChainCanaryResponse, DerivedRulesResponse as DerivedRules,
 };
 use ratatoskr::rule::Protocol;
 
@@ -1345,11 +1345,6 @@ fn hop_label_for(hop: &ratatoskr::canary::CanaryHop) -> String {
         None => short_pubkey(&hop.pubkey),
     }
 }
-
-// Suppress the dead-imports warning when these aliases aren't reached
-// from other call sites in the file.
-#[allow(dead_code)]
-fn _suppress_dead(_d: &DirectionStats) {}
 
 #[cfg(test)]
 mod tests {

@@ -147,12 +147,10 @@ impl RedirectListener {
         let task_lan = Arc::clone(&lan_cidrs);
         let task_acme = Arc::clone(&acme);
         let task_cancel = cancel.clone();
-        let task_local = local_addr;
 
         let handle = tokio::spawn(async move {
             companion_accept_loop(
                 listener,
-                task_local,
                 task_hosts,
                 task_plaintext,
                 task_lan,
@@ -250,7 +248,6 @@ impl RedirectListener {
 #[allow(clippy::too_many_arguments)]
 async fn companion_accept_loop(
     listener: TcpListener,
-    local_addr: SocketAddr,
     hosts: Arc<parking_lot::RwLock<HostSet>>,
     plaintext_routes: Arc<parking_lot::RwLock<RouteTable>>,
     lan_cidrs: Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
@@ -278,7 +275,7 @@ async fn companion_accept_loop(
                 let c = cancel.child_token();
                 tokio::spawn(async move {
                     if let Err(e) = serve_companion(
-                        tcp, peer, local_addr, h, pr, lc, a, bc, c,
+                        tcp, peer, h, pr, lc, a, bc, c,
                     ).await {
                         debug!(client = %peer, error = %e, "companion connection ended");
                     }
@@ -292,7 +289,6 @@ async fn companion_accept_loop(
 async fn serve_companion(
     tcp: TcpStream,
     peer: SocketAddr,
-    local_addr: SocketAddr,
     hosts: Arc<parking_lot::RwLock<HostSet>>,
     plaintext_routes: Arc<parking_lot::RwLock<RouteTable>>,
     lan_cidrs: Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
@@ -308,7 +304,7 @@ async fn serve_companion(
         let a = Arc::clone(&acme);
         let bc = backend_client.clone();
         async move {
-            let resp = dispatch(req, peer, local_addr, &h, &pr, &lc, &a, &bc).await;
+            let resp = dispatch(req, peer, &h, &pr, &lc, &a, &bc).await;
             Ok::<_, Infallible>(resp)
         }
     });
@@ -329,7 +325,6 @@ async fn serve_companion(
 async fn dispatch(
     req: Request<Incoming>,
     peer: SocketAddr,
-    local_addr: SocketAddr,
     hosts: &Arc<parking_lot::RwLock<HostSet>>,
     plaintext_routes: &Arc<parking_lot::RwLock<RouteTable>>,
     lan_cidrs: &Arc<parking_lot::RwLock<Option<LanCidrsSnapshot>>>,
@@ -411,7 +406,6 @@ async fn dispatch(
                 rule: None,
                 rule_name: rule_name.clone(),
                 client_addr: peer,
-                local_addr,
                 routes: route_table,
                 client: backend_client.clone(),
                 tls: false,

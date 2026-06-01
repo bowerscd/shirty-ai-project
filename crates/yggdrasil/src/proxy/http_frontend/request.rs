@@ -37,8 +37,6 @@ pub(crate) struct ConnContext {
     pub(crate) rule: Option<Arc<ratatoskr::rule::Rule>>,
     pub(crate) rule_name: String,
     pub(crate) client_addr: SocketAddr,
-    #[allow(dead_code)]
-    pub(crate) local_addr: SocketAddr,
     pub(crate) routes: Arc<RouteTable>,
     pub(crate) client: BackendClient,
     /// `true` when this connection was accepted on a TLS-terminated

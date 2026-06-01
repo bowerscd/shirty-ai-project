@@ -225,7 +225,6 @@ impl HttpFrontend {
                 task_rule_name,
                 task_rule,
                 listener,
-                local_addr,
                 acceptor,
                 task_routes,
                 backend_client,

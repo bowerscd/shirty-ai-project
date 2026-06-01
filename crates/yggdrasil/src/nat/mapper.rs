@@ -48,7 +48,7 @@ use futures::future::join_all;
 use parking_lot::RwLock;
 use rand::RngCore;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
@@ -292,7 +292,6 @@ impl NatMapper {
             last_error: None,
         };
         let snapshot_arc = Arc::new(RwLock::new(initial_snapshot));
-        let (snapshot_req_tx, snapshot_req_rx) = mpsc::channel::<SnapshotRequest>(8);
 
         let release_timeout = params
             .shutdown_release_timeout
@@ -307,15 +306,12 @@ impl NatMapper {
             params.rule_set_rx,
             params.shutdown.clone(),
             snapshot_arc.clone(),
-            snapshot_req_rx,
             release_timeout,
         );
 
         let handle = NatMapperHandle {
             snapshot: snapshot_arc,
-            snapshot_req_tx,
             mode: params.mode,
-            shutdown: params.shutdown.clone(),
         };
 
         let join = tokio::spawn(reconciler.run());
@@ -341,11 +337,7 @@ impl NatMapper {
 #[derive(Clone)]
 pub struct NatMapperHandle {
     snapshot: Arc<RwLock<NatSnapshot>>,
-    #[allow(dead_code)]
-    snapshot_req_tx: mpsc::Sender<SnapshotRequest>,
     mode: NatTraversalMode,
-    #[allow(dead_code)]
-    shutdown: CancellationToken,
 }
 
 impl NatMapperHandle {
@@ -364,14 +356,6 @@ impl NatMapperHandle {
     pub fn mode(&self) -> NatTraversalMode {
         self.mode
     }
-}
-
-/// Snapshot request channel (currently unused — kept around for a
-/// future async snapshot path with side effects, e.g. forcing a
-/// re-probe).
-struct SnapshotRequest {
-    #[allow(dead_code)]
-    respond_to: oneshot::Sender<NatSnapshot>,
 }
 
 /// Errors returned by [`NatMapper::spawn`]. The daemon converts these
@@ -666,8 +650,6 @@ struct Reconciler {
     /// Shared snapshot we publish into so handle holders can read
     /// the current state cheaply.
     snapshot: Arc<RwLock<NatSnapshot>>,
-    #[allow(dead_code)]
-    snapshot_req_rx: mpsc::Receiver<SnapshotRequest>,
 
     /// Active mappings keyed by `(protocol, internal_port)`. PCP
     /// allows multiple mappings on the same port with different
@@ -736,7 +718,6 @@ impl Reconciler {
         rule_set_rx: watch::Receiver<RuleSet>,
         shutdown: CancellationToken,
         snapshot: Arc<RwLock<NatSnapshot>>,
-        snapshot_req_rx: mpsc::Receiver<SnapshotRequest>,
         shutdown_release_timeout: Duration,
     ) -> Self {
         let initial_protocol = match mode {
@@ -753,7 +734,6 @@ impl Reconciler {
             rule_set_rx,
             shutdown,
             snapshot,
-            snapshot_req_rx,
             mappings: HashMap::new(),
             nonces: HashMap::new(),
             state: NatState::Discovering,
