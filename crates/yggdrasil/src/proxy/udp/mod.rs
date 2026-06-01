@@ -711,26 +711,37 @@ impl UdpWorker {
             // (no canary armed, the steady state) is one DashMap
             // shard probe per batch, not per datagram.
             let arm_active = self.arm_table.is_armed(self.local_addr, Protocol::Udp);
-            let owned: Vec<(Vec<u8>, SocketAddr)> = {
-                let _g = crate::profile::section("udp", "frontend_copy_owned");
-                recv.iter(&scratch, n)
-                    .map(|d| (d.payload.to_vec(), d.from))
-                    .collect()
-            };
-            for (payload, client_addr) in owned {
-                if arm_active && payload.len() >= CANARY_TOKEN_LEN {
-                    let mut prefix = [0u8; CANARY_TOKEN_LEN];
-                    prefix.copy_from_slice(&payload[..CANARY_TOKEN_LEN]);
-                    if self
-                        .arm_table
-                        .match_token(self.local_addr, Protocol::Udp, &prefix)
+
+            // The hot path runs synchronously against borrowed slices
+            // from the recvmmsg scratch buffer (zero per-packet alloc).
+            // Datagrams that need an `await` — flow creation, PROXY
+            // header decoding, sending under WOULD_BLOCK back-pressure
+            // — are collected into `slow_path` and serviced after the
+            // borrow-borrow scope. This pattern keeps the steady-state
+            // every-packet-hits-existing-flow case allocation-free
+            // (the dominant case for any UDP rule once it's warm).
+            let mut slow_path: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+            {
+                let _g = crate::profile::section("udp", "frontend_dispatch_batch");
+                for d in recv.iter(&scratch, n) {
+                    if arm_active
+                        && d.payload.len() >= CANARY_TOKEN_LEN
+                        && self.arm_table.match_token(
+                            self.local_addr,
+                            Protocol::Udp,
+                            &{
+                                let mut prefix = [0u8; CANARY_TOKEN_LEN];
+                                prefix.copy_from_slice(&d.payload[..CANARY_TOKEN_LEN]);
+                                prefix
+                            },
+                        )
                     {
                         // Echo the entire datagram (token included)
                         // back to the source from this worker's
                         // frontend socket. The originator strips the
                         // token prefix on receive. The datagram does
                         // not consume a flow-table slot.
-                        match self.frontend.send_to(&payload, client_addr).await {
+                        match self.frontend.try_send_to(d.payload, d.from) {
                             Ok(_) => {
                                 metrics::counter!(
                                     "yggdrasil_udp_canary_echo_total",
@@ -739,11 +750,17 @@ impl UdpWorker {
                                 )
                                 .increment(1);
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // Kernel socket buffer full — fall back to the
+                                // async send below so we don't drop the canary
+                                // echo silently.
+                                slow_path.push((d.payload.to_vec(), d.from));
+                            }
                             Err(e) => {
                                 tracing::debug!(
                                     rule = %self.rule.name,
                                     worker_id = self.worker_id,
-                                    client = %client_addr,
+                                    client = %d.from,
                                     error = %e,
                                     "UDP canary echo send_to failed"
                                 );
@@ -751,8 +768,105 @@ impl UdpWorker {
                         }
                         continue;
                     }
+                    if !self.try_handle_inbound_fast(d.payload, d.from) {
+                        slow_path.push((d.payload.to_vec(), d.from));
+                    }
+                }
+            }
+
+            for (payload, client_addr) in slow_path {
+                // Re-classify: the canary table is sampled once per
+                // batch on the hot path; a slow-path entry that got
+                // here via try_send_to WOULD_BLOCK is still a canary
+                // echo. The cold-path send through `frontend.send_to`
+                // applies kernel back-pressure.
+                if arm_active && payload.len() >= CANARY_TOKEN_LEN {
+                    let mut prefix = [0u8; CANARY_TOKEN_LEN];
+                    prefix.copy_from_slice(&payload[..CANARY_TOKEN_LEN]);
+                    if self
+                        .arm_table
+                        .match_token(self.local_addr, Protocol::Udp, &prefix)
+                    {
+                        if let Err(e) = self.frontend.send_to(&payload, client_addr).await {
+                            tracing::debug!(
+                                rule = %self.rule.name,
+                                worker_id = self.worker_id,
+                                client = %client_addr,
+                                error = %e,
+                                "UDP canary echo async send_to failed"
+                            );
+                        } else {
+                            metrics::counter!(
+                                "yggdrasil_udp_canary_echo_total",
+                                "rule" => self.rule.name.clone(),
+                                "worker" => self.worker_id.to_string(),
+                            )
+                            .increment(1);
+                        }
+                        continue;
+                    }
                 }
                 self.handle_inbound(&payload, client_addr).await;
+            }
+        }
+    }
+
+    /// Synchronous fast path for the steady-state existing-flow case.
+    /// Returns `true` if the datagram was fully handled here; `false`
+    /// when the caller must fall back to the async [`Self::handle_inbound`]
+    /// (new flow, WOULD_BLOCK back-pressure, or any other path that
+    /// needs to await).
+    ///
+    /// Keeping this synchronous + slice-borrowing is what lets the
+    /// outer batch loop iterate over `recvmmsg`'s scratch buffer
+    /// without allocating per packet. The cold path (new flow, PROXY
+    /// header decode, etc.) is unchanged and runs async on owned bytes.
+    fn try_handle_inbound_fast(&self, payload: &[u8], client_addr: SocketAddr) -> bool {
+        let _g = crate::profile::section("udp", "handle_inbound_fast");
+        let entry = {
+            let _g = crate::profile::section("udp", "flow_lookup");
+            match self.flows.get(&client_addr) {
+                Some(e) => e.clone(),
+                None => return false,
+            }
+        };
+        entry.last_seen_ms.store(self.now_ms(), Ordering::Relaxed);
+        let send_result = {
+            let _g = crate::profile::section("udp", "upstream_try_send");
+            entry.upstream_sock.try_send(payload)
+        };
+        match send_result {
+            Ok(_) => {
+                increment_udp_bytes(
+                    &self.rule.name,
+                    self.worker_id,
+                    "client_to_upstream",
+                    payload.len(),
+                );
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Kernel send buffer full — fall back to the async
+                // path so the datagram gets sent with back-pressure
+                // rather than dropped silently.
+                false
+            }
+            Err(e) => {
+                increment_udp_send_errors(
+                    &self.rule.name,
+                    self.worker_id,
+                    "client_to_upstream",
+                );
+                tracing::debug!(
+                    rule = %self.rule.name,
+                    client = %client_addr,
+                    error = %e,
+                    "upstream try_send failed; flow may be stale (will be reaped)"
+                );
+                // Don't fall back to async — the error is terminal
+                // (flow's stale upstream, kernel reset, etc.), and
+                // retrying via async-send hits the same error path.
+                true
             }
         }
     }

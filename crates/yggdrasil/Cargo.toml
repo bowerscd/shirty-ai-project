@@ -108,3 +108,7 @@ harness = false
 [[bench]]
 name    = "h3_forward"
 harness = false
+
+[[bench]]
+name    = "udp_fast_path"
+harness = false
