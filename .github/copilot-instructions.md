@@ -33,18 +33,24 @@ don't need to know about.
 ## Project status
 
 yggdrasil is **greenfield** — no deployed nodes, no release tags, no
-operators in the field. The "deployed nodes that haven't restarted yet"
-framing in the wire-format-stability bullet below is not currently
-binding: any wire-shape change can land in a single coordinated commit
-without a back-compat shim, and `#[serde(default)]` markers existing
-solely as forward-compat for nonexistent old peers are agent-removable.
-The *coordination* (does the change ship at all?) still belongs to the
-human owner; the *mechanics* (back-compat shim, multi-step rollout) do
-not.
+operators in the field. While the project is greenfield, wire-format
+stability is not a reserved decision: any wire-shape change can land
+in a single coordinated commit without a back-compat shim, and
+`#[serde(default)]` markers existing solely as forward-compat for
+nonexistent old peers are agent-removable. The *coordination* (does
+the change ship at all?) still belongs to the human owner via the
+normal task-authorization flow; the *mechanics* (back-compat shim,
+multi-step rollout) do not.
 
-When the project tags its first release, this section's qualifier no
-longer applies and the wire-format bullet recovers its literal reading.
-A future maintainer can drop this section in a one-line commit then.
+When the project tags its first release, restore the following
+bullet to the "Decisions reserved for the human owner" list below
+and delete this whole "Project status" section:
+
+> - **Public API / wire format stability commitments.** Don't add or
+>   remove `#[non_exhaustive]`, change a serde field's name or
+>   representation without a back-compat shim, or rename a control-frame
+>   variant. These are observable to deployed nodes that haven't restarted
+>   yet, and the rollout strategy is a human-managed decision.
 
 ## Scope: single-destination homelab relay
 
@@ -205,18 +211,23 @@ implementing.
   `repository = "https://github.com/example/yggdrasil"`), surface the
   inconsistency and ask for the right value — don't guess from context.
 
-- **Public API / wire format stability commitments.** Don't add or
-  remove `#[non_exhaustive]`, change a serde field's name or
-  representation without a back-compat shim, or rename a control-frame
-  variant. These are observable to deployed nodes that haven't restarted
-  yet, and the rollout strategy is a human-managed decision.
+- **Cryptographic implementation and Noise-pattern selection.**
 
-- **Cryptographic primitives.** Don't swap the Noise pattern, the AEAD
-  suite, the hash, or the public-key curve. Even "obviously equivalent"
-  substitutions (e.g. BLAKE2s → BLAKE3) change the wire format and the
-  security argument. Surface options if asked; don't pick.
+  - **Never implement cryptographic operations.** Don't write your own
+    AEAD, curve arithmetic, KDF, constant-time comparison, or RNG. Use
+    audited crates (`ring`, `snow`, `x25519-dalek`, `chacha20poly1305`,
+    `blake2`, `subtle`, etc.). This applies to "obvious" helpers too —
+    compare hash outputs with `subtle::ConstantTimeEq`, not `==`.
+  - **Don't change the Noise handshake pattern.** Noise IK vs XK vs NK
+    aren't interchangeable: they encode different identity-hiding and
+    forward-secrecy properties that belong to the system's threat
+    model, not its primitive table. Surface options if asked; don't
+    pick.
 
-The shared thread: these are decisions where the *act of proposing
-options is itself a form of influence* the agent shouldn't have. "I'll
-change X to Y and you can revert if you don't like it" is the wrong
-default — the right default is "X looks suspicious, what should it be?".
+  *Other* cryptographic primitive choices (hash family, AEAD suite,
+  public-key curve, KDF) are not reserved on principle — a crypto-agile
+  design accommodates substitution by construction. Whether *this*
+  codebase accommodates a given substitution today is an implementation-
+  reality question handled by the same byproduct-vs-standalone task-
+  authorization flow as other wire-shape changes; it doesn't get a
+  separate reservation on top.
