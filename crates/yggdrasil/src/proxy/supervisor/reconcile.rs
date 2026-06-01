@@ -91,6 +91,7 @@ pub(super) async fn supervisor_loop(
                             &cert_store,
                             &cert_watcher,
                             &arm_table,
+                            graceful_drain_timeout,
                             &cancel,
                         )
                         .await;
@@ -124,6 +125,7 @@ pub(super) async fn supervisor_loop(
                         &cert_store,
                         &cert_watcher,
                         &arm_table,
+                        graceful_drain_timeout,
                         &cancel,
                     )
                     .await;
@@ -167,6 +169,7 @@ async fn apply_set(
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
     arm_table: &Arc<CanaryArmTable>,
+    graceful_drain_timeout: Option<Duration>,
     parent_cancel: &CancellationToken,
 ) {
     let diff = current_set.diff(&new_set);
@@ -191,6 +194,7 @@ async fn apply_set(
         cert_store,
         cert_watcher,
         arm_table,
+        graceful_drain_timeout,
         parent_cancel,
     )
     .await;
@@ -203,6 +207,7 @@ async fn apply_set(
         cert_config,
         cert_store,
         cert_watcher,
+        graceful_drain_timeout,
         parent_cancel,
     )
     .await;
@@ -236,6 +241,7 @@ async fn apply_update(
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
     arm_table: &Arc<CanaryArmTable>,
+    graceful_drain_timeout: Option<Duration>,
     parent_cancel: &CancellationToken,
 ) {
     let RuleUpdate { set, diff } = update;
@@ -248,7 +254,7 @@ async fn apply_update(
                 listen = %ap.handle.local_addr(),
                 "stopping removed rule"
             );
-            ap.handle.stop(None).await;
+            ap.handle.stop(graceful_drain_timeout).await;
         }
     }
 
@@ -261,7 +267,7 @@ async fn apply_update(
                 new_listen = %change.new.listen,
                 "swapping changed rule"
             );
-            old.handle.stop(None).await;
+            old.handle.stop(graceful_drain_timeout).await;
         }
         match spawn_proxy_for_rule(
             change.new.clone(),
@@ -340,10 +346,13 @@ async fn apply_update(
 /// Reconcile the node-wide HTTPS frontend against the desired route
 /// set extracted from `[[route]]` blocks.
 ///
-/// Post-schema-cleanup, HTTPS is **node-wide**: one frontend on
-/// `[server].https_listen` serves every `[[route]]`. Hot reload that
-/// changes the route set stops and respawns the frontend; per-route
-/// diffing is deferred to a follow-up.
+/// HTTPS is **node-wide**: one frontend on `[server].https_listen`
+/// serves every `[[route]]`. Hot reload that changes the route set
+/// stops the existing frontend (draining in-flight connections up to
+/// `graceful_drain_timeout`, the same budget SIGTERM honours) and
+/// respawns it. Per-route diffing — adding or removing a single
+/// route without disturbing the others — is deferred to the
+/// `route-hot-reload-fix` follow-up.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_https(
     https_active: &mut Option<ActiveProxy>,
@@ -353,6 +362,7 @@ async fn reconcile_https(
     cert_config: &CertConfig,
     cert_store: &Arc<CertStore>,
     cert_watcher: &Arc<CertWatcher>,
+    graceful_drain_timeout: Option<Duration>,
     parent_cancel: &CancellationToken,
 ) {
     let desired: Vec<HttpRoute> = routes.to_vec();
@@ -374,7 +384,7 @@ async fn reconcile_https(
                 cert_watcher.unregister(&host);
                 cert_store.remove(&host);
             }
-            old.handle.stop(None).await;
+            old.handle.stop(graceful_drain_timeout).await;
         }
         prev_routes.clear();
         return;
@@ -398,7 +408,7 @@ async fn reconcile_https(
             cert_watcher.unregister(&host);
             cert_store.remove(&host);
         }
-        old.handle.stop(None).await;
+        old.handle.stop(graceful_drain_timeout).await;
     }
 
     match spawn_https_frontend(
