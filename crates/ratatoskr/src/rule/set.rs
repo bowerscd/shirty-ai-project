@@ -1,7 +1,6 @@
 //! `RuleSet`: cross-file-validated aggregate of rules + HTTPS routes plus
 //! the reload-diff (`RuleChange`, `RuleDiff`).
 //!
-//! Split out from the original monolithic `rule.rs` (Phase B1).
 
 use std::net::SocketAddr;
 

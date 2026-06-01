@@ -1,6 +1,5 @@
 //! Exact (case-insensitive) hostname → route mapping.
 //!
-//! Split out from the original monolithic `http_frontend.rs` (Phase B4).
 
 use std::collections::{BTreeMap, HashMap};
 

@@ -18,13 +18,14 @@
 //!
 //! ## Control channel
 //!
-//! Phase 2 plumbing: the loop owns a per-session [`ControlChannel`] that
-//! sequences, retransmits, and dedups `Control` / `ControlAck` packets. The
-//! client task pulls outbound sends from an `mpsc` fed by callers holding a
-//! [`ChainClientHandle`], and dispatches inbound envelopes through an
-//! optional [`BodyHandler`] (production default: ack everything `Unknown`).
+//! The loop owns a per-session [`ControlChannel`] that sequences,
+//! retransmits, and dedups `Control` / `ControlAck` packets. The
+//! client task pulls outbound sends from an `mpsc` fed by callers
+//! holding a [`ChainClientHandle`], and dispatches inbound envelopes
+//! through an optional [`BodyHandler`] (production default: ack
+//! everything `Unknown`).
 //!
-//! ## Module layout (Phase B6 split)
+//! ## Module layout
 //!
 //! - [`backoff`] — reconnect-loop constants + cancel-aware sleep helper.
 //! - [`body_handler`] — `BodyHandler` typedef plus the externally-facing

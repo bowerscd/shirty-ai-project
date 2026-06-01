@@ -1,6 +1,5 @@
 //! Async dispatchers for `Request::ChainApply` and `Request::ChainSummary`.
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 use ratatoskr::control::{
     error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse, Mode, Response,

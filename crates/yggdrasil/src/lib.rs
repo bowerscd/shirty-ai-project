@@ -193,10 +193,10 @@ pub async fn run_relay(
     .await
     .context("spawning proxy supervisor")?;
 
-    // 5a. Phase 5B introspection state. Constructed now that the
-    //     supervisor exists. Passed by reference into the UDS control
-    //     server (for `Request::DerivedRules`) and into the chain
-    //     acceptor (`record_apply` writer on a relay).
+    // 5a. Introspection state. Constructed now that the supervisor
+    //     exists. Passed by reference into the UDS control server (for
+    //     `Request::DerivedRules`) and into the chain acceptor
+    //     (`record_apply` writer on a relay).
     let introspection_state = crate::chain::IntrospectionState::new(
         ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
         config.dial.as_ref().map(|d| d.pubkey),
@@ -534,9 +534,9 @@ pub async fn run_terminal(
     .context("spawning proxy supervisor")?;
     let _ = &acme_manager; // kept alive for the supervisor's lifetime
 
-    // 4a. Phase 5B introspection state. Terminals have no inbound
-    //     chain listener, so `record_apply` is exclusively driven by
-    //     the predicate publisher's success branch. `downstream` is
+    // 4a. Introspection state. Terminals have no inbound chain
+    //     listener, so `record_apply` is exclusively driven by the
+    //     predicate publisher's success branch. `downstream` is
     //     always `None` here (terminals don't accept downstream
     //     connections).
     let introspection_state = crate::chain::IntrospectionState::new(

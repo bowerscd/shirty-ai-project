@@ -1,7 +1,6 @@
 //! `HttpRoute`: a single per-hostname HTTPS route attached to a
 //! `Protocol::Https` rule, plus its bespoke HSTS deserialisation.
 //!
-//! Split out from the original monolithic `rule.rs` (Phase B1).
 
 use std::collections::BTreeMap;
 

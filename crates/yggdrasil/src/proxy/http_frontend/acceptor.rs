@@ -1,6 +1,5 @@
 //! TCP accept loop + per-connection PROXY-protocol/TLS/HTTP dispatch.
 //!
-//! Split out from the original monolithic `http_frontend.rs` (Phase B4).
 
 use std::convert::Infallible;
 use std::io;

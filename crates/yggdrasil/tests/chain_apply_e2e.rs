@@ -1,4 +1,4 @@
-//! Phase 5C end-to-end test for `Request::ChainApply`:
+//! End-to-end test for `Request::ChainApply`:
 //!
 //! 1. **Happy path (terminal mode)**: spin up a terminal-mode supervisor
 //!    with a control server, send `ChainApply { rules }` over the UDS,

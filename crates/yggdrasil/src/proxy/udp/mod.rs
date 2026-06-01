@@ -670,7 +670,7 @@ impl UdpWorker {
         let mut recv = batch_recv::BatchRecv::new(Arc::clone(&self.frontend));
         let mut scratch = batch_recv::BatchScratch::new();
         loop {
-            // Phase 1: wait for the next batch. Most of this section
+            // Step 1: wait for the next batch. Most of this section
             // is spent parked on epoll readiness; the time recorded
             // here is wall-clock until recv.recv() returns.
             let res = {
@@ -689,7 +689,7 @@ impl UdpWorker {
                 }
             };
 
-            // Phase 2: copy + dispatch the batch.
+            // Step 2: copy + dispatch the batch.
             let _g = crate::profile::section("udp", "frontend_process_batch");
             let n = match res {
                 Ok(n) => n,
@@ -1218,7 +1218,7 @@ async fn upstream_to_client_loop_batched(
     sender: Option<&sendmmsg_linux::BatchSender>,
 ) {
     loop {
-        // Phase 1: wait for the upstream to deliver a batch. Most of
+        // Step 1: wait for the upstream to deliver a batch. Most of
         // this section is spent parked on epoll readiness.
         let res = {
             let _g = crate::profile::section("udp", "upstream_wait");
@@ -1228,7 +1228,7 @@ async fn upstream_to_client_loop_batched(
                 res = reader.recv_batch(buf) => res,
             }
         };
-        // Phase 2: forward the batch back to the client.
+        // Step 2: forward the batch back to the client.
         let _g = crate::profile::section("udp", "upstream_process_batch");
         let n = match res {
             Ok(n) => n,

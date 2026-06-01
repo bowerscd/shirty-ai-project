@@ -1,6 +1,6 @@
 //! `CertStore`: hostname-keyed map implementing `rustls::server::ResolvesServerCert`.
 //!
-//! Split out from the original monolithic `certs.rs` (Phase B5). Holds
+//! Holds
 //! the runtime cert table plus per-host `ReloadSpec` entries; mutation
 //! is serialised through a single `RwLock` so reads (every TLS
 //! handshake) and writes (rare hot reloads) cannot tear.

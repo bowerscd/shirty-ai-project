@@ -1,7 +1,7 @@
 //! Cert-store data types: errors, origin labels, loaded-entry struct,
 //! reload-spec snapshot.
 //!
-//! Split out from the original monolithic `certs.rs` (Phase B5). No
+//! No
 //! behavioural change — the types and their impls move verbatim.
 
 use std::io;

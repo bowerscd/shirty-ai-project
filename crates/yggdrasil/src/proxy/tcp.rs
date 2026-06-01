@@ -12,14 +12,13 @@
 //! 1. `accept()` returns `(client, client_addr)`.
 //! 2. Resolve the current dial target via [`UpstreamResolver::current_target`].
 //!    `None` (relay before first heartbeat) → accept-then-close with a `debug`
-//!    log so listeners stay up for debugging. Bump `tcp_connect_no_peer_total`
-//!    (Phase 9).
+//!    log so listeners stay up for debugging. Bump `tcp_connect_no_peer_total`.
 //! 3. `TcpStream::connect(target)`. On error, log + close the client. Bump
 //!    `tcp_connect_failed_total`.
 //! 4. If `rule.proxy_protocol` is set, write the header to the upstream
 //!    stream before any application bytes.
 //! 5. `tokio::io::copy_bidirectional(client, upstream)` until either side
-//!    EOFs or errors. Bump byte counters in both directions (Phase 9).
+//!    EOFs or errors. Bump byte counters in both directions.
 //!
 //! On dial-target change (relay IP-change), in-flight TCP connections are
 //! **left alone** — the application layer is already broken because the
@@ -717,7 +716,7 @@ async fn handle_connection(
 
     // Disable Nagle on both sides for latency-sensitive payloads. Most game
     // protocols want this; bulk-transfer cases will be measurement-driven
-    // (Phase 11 benches will tell us if this hurts iperf-style tests, in
+    // (the bench harness will tell us if this hurts iperf-style tests, in
     // which case we'll gate it behind a per-rule option).
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);

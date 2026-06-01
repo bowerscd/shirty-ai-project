@@ -1,7 +1,6 @@
 //! Small leaf types shared across the rule module: `Protocol`,
 //! `ProxyProto`, `HstsConfig`.
 //!
-//! Split out from the original monolithic `rule.rs` (Phase B1).
 
 use serde::{Deserialize, Deserializer, Serialize};
 

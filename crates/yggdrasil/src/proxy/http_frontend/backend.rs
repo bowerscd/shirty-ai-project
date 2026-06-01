@@ -1,7 +1,6 @@
 //! Backend dialer for HTTPS rules — a hyper-util `legacy::Client` that
 //! pools connections per `(host, port)`.
 //!
-//! Split out from the original monolithic `http_frontend.rs` (Phase B4).
 
 use std::time::Duration;
 

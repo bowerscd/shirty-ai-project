@@ -1,7 +1,6 @@
 //! Backoff constants and the cancel-aware sleep helper used by the
 //! reconnect loop.
 //!
-//! Split out from the original monolithic `client.rs` (Phase B6).
 
 use std::time::Duration;
 

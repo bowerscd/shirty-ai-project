@@ -14,7 +14,7 @@
 //!
 //! ## Field deliberations
 //!
-//! Phase 3 ships a deliberately small predicate shape:
+//! The predicate shape is deliberately small:
 //! * `name` is operator-facing; it must survive across the chain because
 //!   `chain diff` and `chain trace` rely on stable identifiers.
 //! * `listen_port` is chain-invariant; every node in the chain listens on
@@ -132,7 +132,8 @@ pub struct PredicateSet {
     /// accepted `version` from the same `origin`.
     pub version: u64,
     /// Pubkey of the node that authored this predicate set. Always a
-    /// terminal in Phase 3 (relays cannot author predicates).
+    /// terminal: relays cannot author predicates, they only forward or
+    /// derive them.
     pub origin: PubKey,
 }
 
@@ -221,7 +222,7 @@ pub mod predicate_reject {
     pub const INVALID_PREDICATE: u16 = 102;
     /// The predicate set violates the relay's `[chain.locked_predicates]`
     /// policy. Enforcement details are deferred; the reason code is
-    /// reserved so the registry is stable from Phase 3 onward.
+    /// reserved so the registry is stable from initial release onward.
     pub const LOCKED_PREDICATES_VIOLATION: u16 = 103;
 }
 

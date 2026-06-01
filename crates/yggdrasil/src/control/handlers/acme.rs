@@ -1,7 +1,4 @@
 //! Async + sync dispatchers for `Request::AcmeList` and `Request::AcmeRenew`.
-//!
-//! Split out from the original monolithic `control.rs` (Phase B2);
-//! ACME-side surface added under d-acme-cli.
 
 use ratatoskr::control::{error_codes, AcmeListResponse, Response};
 

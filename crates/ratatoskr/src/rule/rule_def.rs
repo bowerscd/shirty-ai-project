@@ -1,6 +1,5 @@
 //! The `Rule` struct itself plus its per-rule validation.
 //!
-//! Split out from the original monolithic `rule.rs` (Phase B1).
 
 use std::net::SocketAddr;
 use std::time::Duration;

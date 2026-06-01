@@ -5,8 +5,8 @@
 //!
 //! 1. `notify` filesystem events on the rules directory (debounced via
 //!    `notify-debouncer-mini`, default 300 ms).
-//! 2. Explicit [`RuleWatcher::force_reload`] calls — wired to the
-//!    `yggdrasilctl rules reload` admin command in Phase 9.
+//! 2. Explicit [`RuleWatcher::force_reload`] calls, e.g. from the
+//!    `yggdrasilctl local rules reload` admin command.
 //!
 //! On startup the watcher emits one [`RuleUpdate`] immediately with the
 //! initial set treated as "everything added", so downstream consumers don't

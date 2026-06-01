@@ -54,7 +54,7 @@ metrics-exporter-prometheus = { workspace = true }
 # systemd readiness notification (no-op when NOTIFY_SOCKET unset).
 sd-notify   = { workspace = true }
 
-# L7 HTTP(S) frontend (Phase 6).
+# L7 HTTP(S) frontend.
 hyper           = { workspace = true }
 hyper-util      = { workspace = true }
 http            = { workspace = true }
@@ -69,7 +69,7 @@ url             = { workspace = true }
 bytes           = { workspace = true }
 pin-project-lite = { workspace = true }
 
-# ACME integration (Phase D)
+# ACME integration
 instant-acme    = { workspace = true }
 reqwest         = { workspace = true }
 hickory-resolver = { workspace = true }

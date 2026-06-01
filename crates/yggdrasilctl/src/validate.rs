@@ -26,7 +26,7 @@ struct ValidateReport {
 }
 
 pub async fn run(args: ValidateArgs, config_path: &Path, json: bool) -> anyhow::Result<ExitCode> {
-    // ---- Phase 1: load + validate config ----
+    // ---- Step 1: load + validate config ----
     let config = match yggdrasil::config::ServerConfig::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -43,7 +43,7 @@ pub async fn run(args: ValidateArgs, config_path: &Path, json: bool) -> anyhow::
         }
     };
 
-    // ---- Phase 2: load + validate rules ----
+    // ---- Step 2: load + validate rules ----
     let rules_dir = args
         .rules_dir
         .clone()

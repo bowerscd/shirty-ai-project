@@ -47,7 +47,7 @@
 //! application servers and giving away detailed error pages here would
 //! invite fingerprinting.
 //!
-//! ## Module layout (Phase B4 split)
+//! ## Module layout
 //!
 //! - [`acceptor`] — TCP accept loop + PROXY/TLS/HTTP per-connection
 //!   dispatch and `PrefixedStream`.

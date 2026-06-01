@@ -1,6 +1,5 @@
 //! Type-erased per-rule proxy handles.
 //!
-//! Split out from the original monolithic `supervisor.rs` (Phase B3).
 //! All types are `pub(super)` — visible to siblings under `supervisor/`
 //! (notably `reconcile.rs`) but not to external callers.
 

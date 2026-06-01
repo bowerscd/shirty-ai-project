@@ -30,7 +30,7 @@ Each is a widely-deployed L4 reverse proxy and the de-facto incumbent we have to
 
 Why two variants each? Yggdrasil's headline shape is a chain (gateway on a VPS dialing a terminal at home). Comparing chain-mode yggdrasil to a single nginx process gives yggdrasil two proxy hops while nginx has one — apples vs oranges. The `-chain` variants put the same number of hops on both sides for an honest comparison.
 
-The plan's acceptable-delta budgets (Phase 11.5) apply per-hop:
+The acceptable-delta budgets apply per-hop:
 
 | Scenario          | Metric           | vs nginx*         | vs HAProxy*       | vs Traefik*       |
 | ----------------- | ---------------- | ----------------- | ----------------- | ----------------- |
@@ -178,7 +178,7 @@ The "Subjects" column abbreviates the matrix above. UDP scenarios omit haproxy/h
 | `tcp-idle-conns.sh`  | direct, yggdrasil-{terminal,chain}, nginx, nginx-chain, haproxy, haproxy-chain, traefik, traefik-chain | proxy PSS while holding N idle TCP conns (per-conn memory cost; chain subjects sum PSS over both hops) |
 | `reload-latency.sh`  | yggdrasil-chain only                                                                                  | time from "config dropped" to "new listener serves a request" — yggdrasil-only regression signal (see Why these peers? above for why there's no peer leg) |
 
-A future `heartbeat-roundtrip.sh` (yggdrasil-only — none of the peer proxies has an analogous heartbeat) is tracked under Phase 12.
+A future `heartbeat-roundtrip.sh` (yggdrasil-only — none of the peer proxies has an analogous heartbeat) is on the wishlist.
 
 ## How each leg works
 

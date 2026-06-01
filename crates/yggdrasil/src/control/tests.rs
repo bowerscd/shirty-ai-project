@@ -1,6 +1,5 @@
 //! Integration tests for the UDS control surface.
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};

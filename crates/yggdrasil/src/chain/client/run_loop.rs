@@ -1,7 +1,6 @@
 //! The session run loop: `run_session_once`, `heartbeat_loop`, and
 //! per-envelope body dispatch.
 //!
-//! Split out from the original monolithic `client.rs` (Phase B6).
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

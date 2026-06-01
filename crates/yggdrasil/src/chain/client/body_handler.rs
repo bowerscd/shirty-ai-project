@@ -1,7 +1,6 @@
 //! `BodyHandler`, `ControlOp`, and the external-facing
 //! [`ChainClientHandle`] / [`QueryError`] / [`ChainClientShutDown`] types.
 //!
-//! Split out from the original monolithic `client.rs` (Phase B6).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,9 +19,10 @@ use crate::chain::reliability::SendError;
 /// the [`AckStatus`] to send back to the peer.
 ///
 /// In production builds the default is `None`, which acks every inbound
-/// envelope as [`AckStatus::Unknown`] — Phase 2 ships no real body types
-/// yet, so any non-`Reserved` body must come from a peer running a newer
-/// version of the protocol that this node has not yet been upgraded to.
+/// envelope as [`AckStatus::Unknown`] — the dispatcher itself ships no
+/// real body-type handlers, so any non-`Reserved` body must come from a
+/// peer running a newer version of the protocol that this node has not
+/// yet been upgraded to.
 ///
 /// [`ControlChannel`]: crate::chain::reliability::ControlChannel
 pub type BodyHandler = Arc<dyn Fn(u8, &[u8]) -> AckStatus + Send + Sync>;

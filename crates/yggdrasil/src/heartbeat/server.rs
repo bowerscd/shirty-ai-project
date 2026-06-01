@@ -4,8 +4,9 @@
 //! All authentication decisions are encapsulated here:
 //!
 //! * `Handshake1` is accepted only if the peer's static key matches the one
-//!   stored in [`PeerState`]. Anything else is dropped at `warn` level. (TOFU
-//!   staging via `yggdrasilctl peer approve` lands in Phase 8.)
+//!   stored in [`PeerState`]. Anything else is dropped at `warn` level.
+//!   (Pending-peer TOFU staging happens via `yggdrasilctl local accept
+//!   approve`; see [`crate::pending_peers`].)
 //! * `Heartbeat` is decrypted with the active session's transport state,
 //!   which enforces strict-monotonic replay protection. The cleartext
 //!   counter authenticates via the AEAD tag.
@@ -46,7 +47,7 @@ pub struct HeartbeatServer {
     pending_store: Arc<PendingPeerStore>,
     shutdown: CancellationToken,
     /// Chain-control receive dispatcher. `None` skips control envelope
-    /// dispatch (terminals / Phase 2 tests / drivers without a
+    /// dispatch (terminals + test drivers that don't supply a
     /// supervisor); when `Some`, inbound `Control` packets are decoded,
     /// dedup-classified, routed by body type, and acked.
     acceptor: Option<Arc<ChainAcceptor>>,
@@ -71,9 +72,9 @@ struct SessionState {
     /// control-frame protocol's session-local seq space.
     control_channel: ControlChannel,
     /// Per-session monotonic outbound `ControlEnvelope.seq` counter.
-    /// Phase 4B uses this for fire-and-forget relay-initiated frames;
-    /// reliability (retransmit / ack-tracking) will layer on top in a
-    /// later phase without changing the wire shape.
+    /// Today's relay-initiated frames are fire-and-forget; reliability
+    /// (retransmit / ack-tracking) would layer on top without changing
+    /// the wire shape.
     next_outbound_seq: u32,
 }
 
@@ -82,8 +83,8 @@ impl HeartbeatServer {
     /// call [`HeartbeatServer::run`] to actually start serving.
     ///
     /// `acceptor` is the chain-control dispatcher. Pass `None` to drop
-    /// inbound control packets (the Phase 2 behaviour, still used by
-    /// tests that do not exercise the relay-side dispatcher).
+    /// inbound control packets (used by tests that do not exercise the
+    /// relay-side dispatcher).
     ///
     /// The returned [`OutboundHandle`] is the **sender** side of the
     /// relay-initiated `Control` envelope channel (currently used by
@@ -447,9 +448,9 @@ impl HeartbeatServer {
     }
 
     /// Encode + send a relay-initiated [`ControlEnvelope`] on the active
-    /// session. Phase 4B is fire-and-forget: if there is no session
-    /// (handshake hasn't happened yet, or it expired) the envelope is
-    /// dropped with a debug log.
+    /// session. Fire-and-forget: if there is no session (handshake hasn't
+    /// happened yet, or it expired) the envelope is dropped with a debug
+    /// log.
     async fn handle_outbound(&mut self, mut env: ControlEnvelope) {
         let state = match self.session.as_mut() {
             Some(s) => s,

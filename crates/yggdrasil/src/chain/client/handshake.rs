@@ -1,6 +1,5 @@
 //! Noise_IK handshake driver and endpoint resolution.
 //!
-//! Split out from the original monolithic `client.rs` (Phase B6).
 
 use std::net::SocketAddr;
 

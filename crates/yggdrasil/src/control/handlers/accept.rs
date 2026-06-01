@@ -2,7 +2,6 @@
 //! rewrite `[accept].pubkey` in the daemon config, and swap the live
 //! `PeerState`'s peer-static-key.
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 use std::path::Path;
 

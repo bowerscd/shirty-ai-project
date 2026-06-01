@@ -26,7 +26,7 @@
 //! missing file, etc.) keeps the previous good entry in service and emits
 //! `yggdrasil_https_cert_reload_total{result="err"}`.
 //!
-//! ## Module layout (Phase B5 split)
+//! ## Module layout
 //!
 //! - [`origin`] — `CertError`, `CertOrigin`, `CertEntry`, `ReloadSpec`.
 //! - [`store`] — `CertStore` and its `RwLock`-guarded inner state.

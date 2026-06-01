@@ -2,7 +2,6 @@
 //! apply, chain summary, rules reload) plus the downstream-approve flow
 //! (which is synchronous but big enough to warrant its own file).
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 pub(super) mod accept;
 pub(super) mod acme;

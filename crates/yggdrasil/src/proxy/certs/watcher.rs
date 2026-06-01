@@ -1,6 +1,6 @@
 //! Filesystem watcher for disk-backed certificate PEM files.
 //!
-//! Split out from the original monolithic `certs.rs` (Phase B5). Sits
+//! Sits
 //! next to the rule-file watcher in [`ProxySupervisor`]: each HTTPS rule
 //! that loads at least one disk-backed route registers its
 //! `(hostname, [cert_path, key_path])` pairs via

@@ -182,7 +182,7 @@ async fn send_chain_apply(socket: &Path, request: &Request, timeout: Duration) -
 }
 
 // =============================================================================
-// Phase 5D: `chain diff`
+// `chain diff`
 // =============================================================================
 
 // CLI-side aliases for the wire types defined in

@@ -1,5 +1,5 @@
 //! Integration tests for the rule schema, validation, file loading, and
-//! diff. Split out from the original monolithic `rule.rs` (Phase B1).
+//! diff.
 
 use std::time::Duration;
 

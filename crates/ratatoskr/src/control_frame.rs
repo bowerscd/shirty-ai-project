@@ -9,10 +9,11 @@
 //!   TLS material distribution, allowlist sync, etc.
 //!
 //! This module defines only the **transport envelope**. Body-type semantics
-//! and the body-type registry of actual variants are added in later phases
-//! (Phase 3+). Phase 2 ships only the `Reserved` sentinel (so the registry's
-//! discriminator wire format is fixed early) and an internal-only `Noop` body
-//! gated behind `#[cfg(test)]` for round-tripping the reliability layer.
+//! and the body-type registry of actual variants live in `predicate.rs`,
+//! `canary.rs`, and `chain_query.rs`. The envelope itself carries an
+//! internal-only `Noop` body gated behind `#[cfg(test)]` for round-tripping
+//! the reliability layer, plus a `Reserved` sentinel so the registry's
+//! discriminator wire format is fixed.
 //!
 //! Wire shape (inside Noise AEAD ciphertext):
 //!
@@ -26,7 +27,7 @@
 //! by the sender. The receiver echoes it verbatim in `ControlAck.seq`. The
 //! per-channel sequence space resets when the underlying Noise session is
 //! renegotiated (rekey or reconnect); cross-session redelivery is out of
-//! scope for this phase.
+//! scope.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,9 +67,9 @@ pub enum AckStatus {
 /// Body-type registry. The repr is the on-the-wire `ControlEnvelope.body_type`
 /// byte. New variants append; existing values never shift.
 ///
-/// Phase 3 introduces [`PredicateSetUpdate`] for terminal→upstream rule
-/// pushes. The wire body for that variant is a postcard-encoded
-/// [`PredicateSet`]; reject reason codes live in
+/// [`PredicateSetUpdate`] is the downstream → upstream push of a
+/// terminal's [`PredicateSet`]; the wire body for that variant is a
+/// postcard-encoded set, and reject reason codes live in
 /// [`predicate_reject`](crate::predicate::predicate_reject).
 ///
 /// [`Reserved`]: ControlBodyType::Reserved

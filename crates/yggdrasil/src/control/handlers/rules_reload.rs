@@ -1,6 +1,5 @@
 //! Async dispatch for [`ratatoskr::control::Request::RulesReload`].
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 use std::time::Duration;
 

@@ -1,6 +1,5 @@
 //! UDS accept loop and per-connection request reader/writer.
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 use std::sync::Arc;
 

@@ -12,7 +12,7 @@
 //! buffered IO is the simplest correct design and trivially cancellable
 //! from the parent token.
 //!
-//! ## Module layout (Phase B2 split)
+//! ## Module layout
 //!
 //! - [`server`] — accept loop + per-connection request reader/writer.
 //! - [`dispatch`] — synchronous request → response dispatcher for the

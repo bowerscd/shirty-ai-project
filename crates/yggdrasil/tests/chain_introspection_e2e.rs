@@ -1,4 +1,4 @@
-//! Phase 5B end-to-end test: a `PredicateSetUpdate` accepted by the
+//! End-to-end test: a `PredicateSetUpdate` accepted by the
 //! relay surfaces in the introspection snapshot read by
 //! `Request::DerivedRules` over UDS.
 //!

@@ -1,7 +1,6 @@
 //! Certificate loading: the node-wide three-rung resolution chain plus
 //! PEM parsing.
 //!
-//! Split out from the original monolithic `certs.rs` (Phase B5).
 //!
 //! Cert resolution is **node-wide**, not per-route. The resolver chain is:
 //!

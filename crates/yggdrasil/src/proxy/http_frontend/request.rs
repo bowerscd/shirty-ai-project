@@ -1,7 +1,6 @@
 //! Per-request handling: route lookup, forward, header surgery, websocket
 //! upgrade bridging.
 //!
-//! Split out from the original monolithic `http_frontend.rs` (Phase B4).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

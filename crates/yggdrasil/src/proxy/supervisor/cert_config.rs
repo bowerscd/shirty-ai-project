@@ -1,6 +1,5 @@
 //! Certificate-loading configuration extracted from `ServerSection`.
 //!
-//! Split out from the original monolithic `supervisor.rs` (Phase B3).
 //! Held by [`super::ProxySupervisor`] and consulted whenever an HTTPS
 //! rule's routes need to be reified into the shared [`CertStore`].
 //!

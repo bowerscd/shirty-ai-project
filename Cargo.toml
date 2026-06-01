@@ -75,14 +75,14 @@ proptest        = { version = "1", default-features = false, features = ["std"] 
 sd-notify       = "0.4"
 socket2         = { version = "0.5", features = ["all"] }
 
-# ACME integration (Phase D)
+# ACME integration
 instant-acme    = { version = "0.7", default-features = false, features = ["hyper-rustls", "ring"] }
 reqwest         = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 x509-parser     = "0.16"
 async-trait     = "0.1"
 
-# L7 HTTP frontend (Phase 6)
+# L7 HTTP frontend
 hyper           = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util      = { version = "0.1", features = ["server", "client", "client-legacy", "http1", "http2", "tokio"] }
 http            = "1"

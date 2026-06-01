@@ -109,7 +109,7 @@
 //!   the same `(ip, port, protocol)` triple. TCP and UDP may share `(ip, port)`,
 //!   but HTTPS claims both TCP and UDP on its `(ip, port)` for HTTP/3.
 //!
-//! ## Module layout (Phase B1 split)
+//! ## Module layout
 //!
 //! - `types` — `Protocol`, `ProxyProto`, `HstsConfig`,
 //!   `DEFAULT_HSTS_MAX_AGE`.

@@ -1,6 +1,5 @@
 //! Integration tests for [`ChainClient`].
 //!
-//! Split out from the original monolithic `client.rs` (Phase B6).
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

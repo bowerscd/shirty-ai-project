@@ -1,4 +1,4 @@
-//! Phase 3C end-to-end test: terminal → relay PredicateSet push lands as
+//! End-to-end test: terminal → relay PredicateSet push lands as
 //! a derived RuleSet in the relay's proxy supervisor.
 //!
 //! Wire path exercised:

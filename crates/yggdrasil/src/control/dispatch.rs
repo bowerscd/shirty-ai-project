@@ -4,7 +4,6 @@
 //! `RulesReload`) are hoisted to dedicated handlers under `handlers/`
 //! by `server::handle_connection`.
 //!
-//! Split out from the original monolithic `control.rs` (Phase B2).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -170,10 +169,10 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                 .to_string(),
         },
         // Routed in `server::handle_connection` to the async
-        // `dispatch_chain_canary` handler (Phase 3) — the canary
-        // path's arm-phase + probe-phase both await across the
-        // chain client and the rule's listener. Hitting this arm
-        // means the hoist in `handle_connection` is missing.
+        // `dispatch_chain_canary` handler — the canary path's
+        // arm-phase + probe-phase both await across the chain client
+        // and the rule's listener. Hitting this arm means the hoist
+        // in `handle_connection` is missing.
         Request::ChainCanary { .. } => Response::Error {
             code: error_codes::INTERNAL_ERROR.into(),
             message: "internal routing error: ChainCanary reached \

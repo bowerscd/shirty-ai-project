@@ -1,7 +1,6 @@
 //! Reconcile loop: turn rule-set updates into start/stop/swap actions
 //! against the active proxy table.
 //!
-//! Split out from the original monolithic `supervisor.rs` (Phase B3).
 //! All entry points are `pub(super)` — only [`super::ProxySupervisor`]
 //! drives this code.
 

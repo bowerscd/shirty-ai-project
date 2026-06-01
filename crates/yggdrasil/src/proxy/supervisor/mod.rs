@@ -10,7 +10,7 @@
 //! heartbeats don't disturb the data plane" invariance: a hot reload that
 //! only touches rule A must not interrupt rule B.
 //!
-//! ## Module layout (Phase B3 split)
+//! ## Module layout
 //!
 //! - [`cert_config`] — `CertConfig` extracted from the server config.
 //! - [`handle`] — per-rule proxy handle enum (`ProxyHandle`,

@@ -1,6 +1,6 @@
 //! Shared rule-validation helpers.
 //!
-//! Split out from the original monolithic `rule.rs` (Phase B1). All
+//! All
 //! items are crate-private; the only entry points that escape the rule
 //! module subtree are `validate_http_route` (consumed by `Rule::validate_l7`)
 //! and `is_valid_dns_hostname` (consumed by `super::target::Target::parse`).

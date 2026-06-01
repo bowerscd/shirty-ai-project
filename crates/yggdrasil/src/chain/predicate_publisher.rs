@@ -293,8 +293,8 @@ async fn publish_one(
             )
             .increment(1);
             metrics::gauge!("yggdrasil_chain_predicate_version").set(predicate_set.version as f64);
-            // Phase 5B: notify the introspection sink with the set we
-            // just successfully pushed. `predicate_set` is moved into
+            // Notify the introspection sink with the set we just
+            // successfully pushed. `predicate_set` is moved into
             // `AppliedPush` below, so we record_apply BEFORE the
             // destructure.
             if let Some(ix) = introspection {

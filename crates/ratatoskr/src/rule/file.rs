@@ -1,6 +1,5 @@
 //! [`RuleFile`]: a single `conf.d/*.toml` deserialised from TOML.
 //!
-//! Split out from the original monolithic `rule.rs` (Phase B1).
 
 use serde::{Deserialize, Serialize};
 
