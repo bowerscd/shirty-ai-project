@@ -87,6 +87,56 @@ relays", or "gateway failover" — that may still appear in
 `docs/architecture.md` or elsewhere. Surface such stale framing for
 the human owner to reconcile rather than treating it as a roadmap.
 
+## Code is the source of truth
+
+The repository's docs (`README.md`, `docs/*.md`, `CONTRIBUTING.md`,
+`bench/README.md`, comments in `contrib/`, and any other prose surface)
+describe what the code does. When a doc and the code disagree, **the
+code is correct and the doc is wrong** — every time, for every kind of
+disagreement:
+
+- Field names, config keys, CLI flag names, environment variables,
+  default values, file paths, exit codes, error messages.
+- Mode enums, role names, protocol vocabulary, type names that appear
+  in errors.
+- Number of subcommands / scopes / sections, the names of those, and
+  what arguments each accepts.
+- Behavioural claims ("this is hot-reloadable", "this rejects X",
+  "this defaults to Y", "this section has `deny_unknown_fields`").
+
+When such a disagreement is detected — through your own reading, a
+sub-agent's audit, or a user-supplied report — **verify against the
+code first** before proposing or executing any change. An audit that
+has not been cross-checked against the code is a hypothesis, not a
+finding; treat it accordingly. If the audit named a doc as "wrong"
+but the code agrees with the doc, **the audit is the thing that was
+wrong** — flag it and re-scope rather than executing the audit's
+recommendation against the doc.
+
+Updating docs to match the code is **always in scope** and is **the
+highest-priority work** when discrepancies are found. A code change
+that renames a field, removes a mode, changes a default, or deletes
+a subcommand is not finished until every surface that references the
+old name has been updated — including docs, embedded examples,
+shell snippets, comments, README, CONTRIBUTING, `contrib/` config
+examples, and any operator-facing help text. Stragglers from an
+incomplete rename are bugs of the same severity as the original
+change. Flag them when you find them; fix them when authorised.
+
+This rule does **not** license the inverse. Do *not* propose
+changing the code to match what a doc says, except via the normal
+task-authorization flow. "The doc says the field should be called
+X" is not a reason to rename the code's field; it is a reason to
+update the doc.
+
+Test files, harnesses, examples, packaging, and operational scripts
+(`tests/`, `bench/`, `docker/`, `packaging/`, `contrib/config/`)
+are **code, not docs** — when they reference renamed fields or
+removed surfaces, they are bugs that go through the normal
+code-change flow, not silent doc-update fixups. Surface them as
+findings; do not silently re-scope a doc-update task into a
+code-fix task.
+
 ## Terminology: "upstream" / "downstream" — two conventions, avoid in new code
 
 The terms **"upstream"** and **"downstream"** carry *two distinct,
