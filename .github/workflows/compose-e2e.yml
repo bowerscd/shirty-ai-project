@@ -1,8 +1,9 @@
 name: e2e
 
 # End-to-end test: brings up the full network stack via podman-compose,
-# drives real TCP/UDP traffic through yggdrasil, verifies hot reload and
-# the control plane. Runs against a clean repo checkout — no host state.
+# drives real TCP/UDP/HTTPS traffic through yggdrasil, verifies chain
+# introspection, SNI dispatch, cert hot-reload, and network isolation.
+# Runs against a clean repo checkout — no host state.
 #
 # Decoupled from the unit/integration test workflow because the container
 # build is comparatively slow (cold ~3 min on GitHub-hosted runners,
@@ -42,8 +43,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e:
-    name: podman-compose stack
+  e2e-quickstart:
+    name: podman-compose 2-node quickstart
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -52,8 +53,8 @@ jobs:
 
       - name: Install podman + podman-compose
         # ubuntu-latest ships podman in apt; podman-compose comes from PyPI
-        # (the apt package lags upstream by several releases). Use a pinned
-        # podman-compose so the build is reproducible.
+        # (the apt package lags upstream by several releases). Pinned for
+        # reproducibility.
         run: |
           set -eux
           sudo apt-get update
@@ -72,25 +73,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-e2e-cargo-
 
-      - name: Build images
-        run: podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e build
-
-      - name: Run end-to-end tests
-        run: bash tests/e2e/run.sh
+      - name: Run quickstart end-to-end tests
+        # `run-quickstart.sh` handles its own build + bootstrap + teardown.
+        run: bash tests/e2e/run-quickstart.sh
 
       - name: Dump container logs on failure
         if: failure()
         run: |
-          echo '--- vps ---'
-          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 200 vps  || true
-          echo '--- home ---'
-          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 200 home || true
-          echo '--- init ---'
-          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 100 init || true
+          for svc in gateway terminal app-nginx app-nginx-alt app-tcp app-udp init-quickstart; do
+            echo "--- $svc ---"
+            podman-compose -f docker/compose.e2e.quickstart.yml -p yggdrasil-e2e-quickstart \
+              logs --tail 200 "$svc" || true
+          done
 
       - name: Tear down
         if: always()
-        run: podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e down -v --remove-orphans || true
+        run: |
+          podman-compose -f docker/compose.e2e.quickstart.yml -p yggdrasil-e2e-quickstart \
+            down --remove-orphans || true
 
   e2e-chain:
     name: podman-compose 3-node chain
@@ -120,68 +120,20 @@ jobs:
             ${{ runner.os }}-e2e-chain-cargo-
             ${{ runner.os }}-e2e-cargo-
 
-      - name: Build images
-        run: podman-compose -f docker/compose.e2e.chain.yml -p yggdrasil-e2e-chain build
-
       - name: Run chain end-to-end tests
         run: bash tests/e2e/run-chain.sh
 
       - name: Dump container logs on failure
         if: failure()
         run: |
-          for svc in vps-chain midbox home-chain client-chain init; do
+          for svc in gateway relay terminal app-nginx app-nginx-alt app-tcp app-udp init-chain; do
             echo "--- $svc ---"
-            podman-compose -f docker/compose.e2e.chain.yml -p yggdrasil-e2e-chain logs --tail 200 "$svc" || true
+            podman-compose -f docker/compose.e2e.chain.yml -p yggdrasil-e2e-chain \
+              logs --tail 200 "$svc" || true
           done
 
       - name: Tear down
         if: always()
-        run: podman-compose -f docker/compose.e2e.chain.yml -p yggdrasil-e2e-chain down -v --remove-orphans || true
-
-  e2e-l7:
-    name: podman-compose L7 HTTPS frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install podman + podman-compose
         run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends podman python3-pip
-          sudo pip3 install --break-system-packages 'podman-compose==1.5.0'
-          podman --version
-          podman-compose --version
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-e2e-l7-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-e2e-l7-cargo-
-            ${{ runner.os }}-e2e-cargo-
-
-      - name: Build images
-        run: podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e build
-
-      - name: Run L7 frontend end-to-end tests
-        run: bash tests/e2e/run-l7.sh
-
-      - name: Dump container logs on failure
-        if: failure()
-        run: |
-          echo '--- vps ---'
-          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 200 vps  || true
-          echo '--- home ---'
-          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 200 home || true
-          echo '--- init ---'
-          podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e logs --tail 100 init || true
-
-      - name: Tear down
-        if: always()
-        run: podman-compose -f docker/compose.e2e.yml -p yggdrasil-e2e down -v --remove-orphans || true
+          podman-compose -f docker/compose.e2e.chain.yml -p yggdrasil-e2e-chain \
+            down --remove-orphans || true

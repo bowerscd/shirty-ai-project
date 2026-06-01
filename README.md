@@ -165,8 +165,8 @@ ssh -p 2222 user@vps.example.net
 * [docs/architecture.md](docs/architecture.md) — why the design looks the
   way it does (chain plane, predicate projection, half-close)
 * [docs/security.md](docs/security.md) — threat model, crypto, request/grant
-* [tests/e2e/run.sh](tests/e2e/run.sh) — 2-node podman-compose smoke
-* [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain smoke
+* [tests/e2e/run-quickstart.sh](tests/e2e/run-quickstart.sh) — 2-node podman-compose smoke (`client → gateway → terminal → apps` on segmented networks; TCP / UDP / HTTPS + SNI dispatch + cert hot-reload)
+* [tests/e2e/run-chain.sh](tests/e2e/run-chain.sh) — 3-node chain podman-compose smoke (`client → gateway → relay → terminal → apps`; same scenario coverage)
 
 ## What's in the box
 

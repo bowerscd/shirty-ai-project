@@ -1,0 +1,253 @@
+# End-to-end test for the canonical 2-node quickstart deployment.
+#
+# Topology — faithful homelab segmentation, three networks each limited
+# to who should reach whom:
+#
+#   ┌────────┐  client_wan  ┌─────────┐  chain_link  ┌──────────┐  home_lan  ┌─────────────────┐
+#   │ client │ ────────────►│ gateway │ ◄──────────►│ terminal │ ◄─────────►│ app servers     │
+#   └────────┘              └─────────┘             └──────────┘            ├─────────────────┤
+#   172.31.0.10             172.31.0.20             172.31.1.20            │ nginx (primary) │
+#                           172.31.1.10             172.31.2.10            │ nginx (alt SNI) │
+#                                                                          │ tcp-echo        │
+#                                                                          │ udp-echo        │
+#                                                                          └─────────────────┘
+#
+# - `gateway` runs `[accept]`-only (gateway mode), bound on
+#   chain_link:51820/udp for the chain transport and serving the
+#   derived operator listeners (8443/tcp+udp, 7100/tcp, 7101/udp) on
+#   client_wan. It has NO route to home_lan — proves traffic only flows
+#   through the chain.
+# - `terminal` runs `[dial]`-only (terminal mode), dials gateway via
+#   chain_link, and reaches the app trio via home_lan. It holds the
+#   rule files (TCP, UDP, HTTPS) and the multi-SAN self-signed cert.
+# - `app-nginx` + `app-nginx-alt` serve plain HTTP with distinctive
+#   bodies, on home_lan only. The terminal's two `[[route]]` entries
+#   dispatch SNI `app.test.local` -> app-nginx and SNI
+#   `alt.test.local` -> app-nginx-alt.
+# - `app-tcp` and `app-udp` are the existing echo-server.py running in
+#   tcp-only / udp-only mode (the script gained a `--mode` flag).
+# - `client` is a vanilla python:3.12-slim on client_wan that drives
+#   the test traffic. Its `extra_hosts` map both HTTPS hostnames to the
+#   gateway's client_wan IP so SNI dispatch is the only routing signal.
+# - `init-quickstart` is a one-shot that generates both identities,
+#   drives the request/grant ceremony, mints the cert+key, and writes
+#   all configs and the terminal's `conf.d/*.toml`.
+#
+# Per podman-compose 1.5's broken
+# `depends_on.condition: service_completed_successfully`, the runner
+# script orchestrates init explicitly with `run --rm init-quickstart`
+# before bringing the daemons up.
+
+x-yggdrasil-image: &yggdrasil-image
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.e2e
+
+networks:
+  # Public-internet stand-in: client reaches gateway, nothing else.
+  client_wan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+  # Chain transport: gateway dials accept here for the Noise/UDP control plane.
+  chain_link:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.1.0/24
+  # Home LAN behind the terminal: gateway has NO route here, AND no
+  # external traffic can enter this network. `internal: true` is what
+  # actually enforces that — by default podman bridges different
+  # networks together via the host's IP-forwarding tables, so two
+  # containers on "different" networks can still reach each other
+  # unless one of the networks is explicitly internal.
+  home_lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.2.0/24
+
+volumes: {}
+
+services:
+  init-quickstart:
+    <<: *yggdrasil-image
+    container_name: e2e-quickstart-init
+    entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/bootstrap-quickstart.sh"]
+    environment:
+      # The bootstrap script reads these to write `[dial].endpoint` /
+      # `[accept].listen` / rule targets without hard-coding addresses.
+      # GATEWAY_CHAIN_ENDPOINT is a hostname so the terminal's chain
+      # client exercises the OS-resolver path on dial.
+      # APP_TCP_IP is a literal IP so the tcp-echo rule's target
+      # exercises the static-resolver code path; APP_UDP_HOST is a
+      # hostname so udp-echo exercises the DNS-resolver path.
+      GATEWAY_CHAIN_ENDPOINT: "gateway:51820"
+      PRIMARY_SNI: "app.test.local"
+      ALT_SNI: "alt.test.local"
+      APP_NGINX_HOST: "app-nginx"
+      APP_NGINX_ALT_HOST: "app-nginx-alt"
+      APP_TCP_IP: "172.31.2.40"
+      APP_UDP_HOST: "app-udp"
+    volumes:
+      # Two distinct mount points so bootstrap can write each daemon's
+      # config without colliding. Each daemon mounts the matching
+      # bind-mount source at the canonical /etc/yggdrasil path.
+      # Bind mounts (not named volumes) so the host runtime tree is the
+      # single source of truth and `tests/e2e/run-quickstart.sh` can
+      # `rm -rf` it between runs — guaranteeing no stale config bleeds in.
+      - ../tests/e2e/runtime/quickstart/gateway/etc:/etc/yggdrasil-gateway
+      - ../tests/e2e/runtime/quickstart/terminal/etc:/etc/yggdrasil-terminal
+    restart: "no"
+    networks:
+      - client_wan
+
+  gateway:
+    <<: *yggdrasil-image
+    container_name: e2e-quickstart-gateway
+    command:
+      - yggdrasil
+      - run
+      - --config
+      - /etc/yggdrasil/config.toml
+    environment:
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
+    volumes:
+      - ../tests/e2e/runtime/quickstart/gateway/etc:/etc/yggdrasil
+      - ../tests/e2e/runtime/quickstart/gateway/run:/run/yggdrasil
+      - ../tests/e2e/runtime/quickstart/gateway/state:/var/lib/yggdrasil
+    networks:
+      client_wan:
+        ipv4_address: 172.31.0.20
+      chain_link:
+        ipv4_address: 172.31.1.10
+    expose:
+      - "7100/tcp"
+      - "7101/udp"
+      - "8443/tcp"
+      - "8443/udp"
+      - "51820/udp"
+
+  terminal:
+    <<: *yggdrasil-image
+    container_name: e2e-quickstart-terminal
+    depends_on:
+      gateway:
+        condition: service_started
+    command:
+      - yggdrasil
+      - run
+      - --config
+      - /etc/yggdrasil/config.toml
+    environment:
+      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG_FORMAT: pretty
+    volumes:
+      - ../tests/e2e/runtime/quickstart/terminal/etc:/etc/yggdrasil
+      - ../tests/e2e/runtime/quickstart/terminal/run:/run/yggdrasil
+      - ../tests/e2e/runtime/quickstart/terminal/state:/var/lib/yggdrasil
+    networks:
+      chain_link:
+        ipv4_address: 172.31.1.20
+      home_lan:
+        ipv4_address: 172.31.2.10
+
+  app-nginx:
+    image: docker.io/library/nginx:alpine
+    container_name: e2e-quickstart-app-nginx
+    # Override the default page so the body is observably "the primary
+    # backend" — confirms the SNI dispatch landed here and not at
+    # app-nginx-alt.
+    command:
+      - sh
+      - -c
+      - |
+        echo 'primary backend (app-nginx)' > /usr/share/nginx/html/index.html
+        exec nginx -g 'daemon off;'
+    networks:
+      home_lan:
+        ipv4_address: 172.31.2.20
+    expose:
+      - "80/tcp"
+
+  app-nginx-alt:
+    image: docker.io/library/nginx:alpine
+    container_name: e2e-quickstart-app-nginx-alt
+    command:
+      - sh
+      - -c
+      - |
+        echo 'alternate backend (app-nginx-alt)' > /usr/share/nginx/html/index.html
+        exec nginx -g 'daemon off;'
+    networks:
+      home_lan:
+        ipv4_address: 172.31.2.30
+    expose:
+      - "80/tcp"
+
+  app-tcp:
+    <<: *yggdrasil-image
+    container_name: e2e-quickstart-app-tcp
+    # The Dockerfile.e2e default ENTRYPOINT is `tini --`, so this runs
+    # echo-server.py under tini for clean SIGTERM handling.
+    command:
+      - python3
+      - /usr/local/bin/echo-server.py
+      - --mode
+      - tcp
+      - --tcp-port
+      - "7100"
+    networks:
+      home_lan:
+        ipv4_address: 172.31.2.40
+    expose:
+      - "7100/tcp"
+
+  app-udp:
+    <<: *yggdrasil-image
+    container_name: e2e-quickstart-app-udp
+    command:
+      - python3
+      - /usr/local/bin/echo-server.py
+      - --mode
+      - udp
+      - --udp-port
+      - "7101"
+    networks:
+      home_lan:
+        ipv4_address: 172.31.2.50
+    expose:
+      - "7101/udp"
+
+  client:
+    image: docker.io/library/python:3.12-slim
+    container_name: e2e-quickstart-client
+    depends_on:
+      gateway:
+        condition: service_started
+      terminal:
+        condition: service_started
+    working_dir: /tests
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ../tests/e2e:/tests:ro
+      # Read-only view of the terminal's cert directory so the HTTPS
+      # probes can pin the served cert via ctx.load_verify_locations(),
+      # mirroring what a homelab operator would do
+      # (`update-ca-certificates` / `curl --cacert`). Re-mints during
+      # the cert-reload phases overwrite server.pem in place, so each
+      # probe loads whatever cert the terminal is currently serving.
+      - ../tests/e2e/runtime/quickstart/client-trust:/etc/ssl/yggdrasil-test:ro
+    # Resolve both SNI hostnames to the gateway's client_wan IP so the
+    # only routing signal is SNI — the L7 router on the terminal picks
+    # the backend, the network can't.
+    extra_hosts:
+      - "app.test.local:172.31.0.20"
+      - "alt.test.local:172.31.0.20"
+      - "bogus.test.local:172.31.0.20"
+    networks:
+      client_wan:
+        ipv4_address: 172.31.0.10

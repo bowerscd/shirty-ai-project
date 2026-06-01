@@ -1,6 +1,7 @@
 # Multi-stage build that produces a single small runtime image containing
-# yggdrasil and yggdrasilctl. compose.e2e.yml picks the right binary per
-# service via `command:` overrides.
+# yggdrasil and yggdrasilctl. compose.e2e.quickstart.yml and
+# compose.e2e.chain.yml pick the right binary per service via
+# `command:` overrides.
 #
 # Plain Dockerfile (OCI) syntax — no BuildKit-only directives — so the build
 # runs cleanly under `podman build` (and `docker build` if you ever need it).
@@ -43,12 +44,15 @@ RUN set -eux; \
     done; \
     # `yggdrasil` crate is bin+lib, give it a stub lib too.
     echo "pub fn _stub() {}" > crates/yggdrasil/src/lib.rs; \
-    # Stubs for [[bench]] entries — names match crates/*/Cargo.toml.
+    # Stubs for [[bench]] entries — names must match crates/*/Cargo.toml.
+    # Keep this list in sync; cargo refuses to parse the manifest if a
+    # declared bench has no source file.
     mkdir -p crates/ratatoskr/benches crates/yggdrasil/benches; \
     echo "fn main() {}" > crates/ratatoskr/benches/noise.rs; \
     echo "fn main() {}" > crates/ratatoskr/benches/rule_parse.rs; \
     echo "fn main() {}" > crates/yggdrasil/benches/flow_table.rs; \
-    echo "fn main() {}" > crates/yggdrasil/benches/h3_forward.rs
+    echo "fn main() {}" > crates/yggdrasil/benches/h3_forward.rs; \
+    echo "fn main() {}" > crates/yggdrasil/benches/udp_fast_path.rs
 
 RUN cargo build --release --workspace \
         --bin yggdrasil --bin yggdrasilctl
@@ -80,19 +84,15 @@ RUN apt-get update \
 COPY --from=builder /out/yggdrasil    /usr/local/bin/yggdrasil
 COPY --from=builder /out/yggdrasilctl /usr/local/bin/yggdrasilctl
 
-# Helper scripts for the compose e2e topology.
-COPY docker/bootstrap.sh                       /usr/local/bin/bootstrap.sh
-COPY docker/home-entrypoint.sh                 /usr/local/bin/home-entrypoint.sh
-COPY docker/echo-server.py                     /usr/local/bin/echo-server.py
-# Chain (3-level) e2e helpers — used by compose.e2e.chain.yml. Shipped
-# inside the same image so a single `docker build` covers both stacks.
-COPY docker/bootstrap-chain.sh                 /usr/local/bin/bootstrap-chain.sh
-COPY docker/chain-loopback-echo-entrypoint.sh  /usr/local/bin/chain-loopback-echo-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/bootstrap.sh \
-               /usr/local/bin/home-entrypoint.sh \
-               /usr/local/bin/echo-server.py \
+# Helper scripts for the compose e2e topologies. Both quickstart
+# (2-node) and chain (3-node) ship in the same image; compose picks the
+# right entrypoint per service via `command:` overrides.
+COPY docker/bootstrap-quickstart.sh /usr/local/bin/bootstrap-quickstart.sh
+COPY docker/bootstrap-chain.sh      /usr/local/bin/bootstrap-chain.sh
+COPY docker/echo-server.py          /usr/local/bin/echo-server.py
+RUN chmod 0755 /usr/local/bin/bootstrap-quickstart.sh \
                /usr/local/bin/bootstrap-chain.sh \
-               /usr/local/bin/chain-loopback-echo-entrypoint.sh
+               /usr/local/bin/echo-server.py
 
 # Create runtime directories. The compose file mounts volumes over the
 # *contents* of these so each container has its own isolated state.

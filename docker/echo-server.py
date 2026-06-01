@@ -61,10 +61,21 @@ def main() -> int:
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--tcp-port", type=int, default=int(os.environ.get("ECHO_TCP_PORT", "7100")))
     p.add_argument("--udp-port", type=int, default=int(os.environ.get("ECHO_UDP_PORT", "7101")))
+    p.add_argument(
+        "--mode",
+        choices=("both", "tcp", "udp"),
+        default=os.environ.get("ECHO_MODE", "both"),
+        help="which echo to run; defaults to both for backward compatibility",
+    )
     args = p.parse_args()
 
-    threading.Thread(target=serve_tcp, args=(args.bind, args.tcp_port), daemon=True).start()
-    serve_udp(args.bind, args.udp_port)
+    if args.mode == "tcp":
+        serve_tcp(args.bind, args.tcp_port)
+    elif args.mode == "udp":
+        serve_udp(args.bind, args.udp_port)
+    else:
+        threading.Thread(target=serve_tcp, args=(args.bind, args.tcp_port), daemon=True).start()
+        serve_udp(args.bind, args.udp_port)
     return 0
 
 

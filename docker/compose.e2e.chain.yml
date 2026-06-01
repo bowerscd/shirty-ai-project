@@ -1,62 +1,22 @@
-# End-to-end network-stack test for the 3-level chain control plane.
+# End-to-end test for the 3-node chain quickstart deployment.
 #
-# Topology:
+# Topology — faithful homelab segmentation with a mid-chain relay,
+# four networks each limited to who should reach whom:
 #
-#   ┌────────────────┐
-#   │  client-chain  │ 172.30.1.40
-#   │   (tester)     │
-#   └────────┬───────┘
-#            │ wan-chain (172.30.1.0/24)
-#            │
-#   ┌────────┼────────────────────────────────────────────────────┐
-#   │        ▼                                                    │
-#   │  ┌──────────────┐    chain ctrl     ┌──────────────┐        │
-#   │  │   home-chain │ ────heartbeat──►  │    midbox    │        │
-#   │  │   172.30.1.30│  predicate push   │   172.30.1.20│        │
-#   │  │   terminal   │                   │ relay+forward│        │
-#   │  │  upstream=mb │                   │ upstream=vps │        │
-#   │  │  rules dir:  │                   │ downstream=hm│        │
-#   │  │  home-tcp-   │                   │  listener    │        │
-#   │  │  echo :7200  │                   │  :51820      │        │
-#   │  │  +loopback   │                   │              │        │
-#   │  │  echo:7100   │                   │              │        │
-#   │  └──────────────┘                   └──────┬───────┘        │
-#   │                                            │ chain ctrl     │
-#   │                                            │ heartbeat      │
-#   │                                            │                │
-#   │                                            │                │
-#   │                                            ▼                │
-#   │                                     ┌──────────────┐        │
-#   │                                     │  vps-chain   │        │
-#   │                                     │  172.30.1.10 │        │
-#   │                                     │  relay       │        │
-#   │                                     │  downstream= │        │
-#   │                                     │   midbox     │        │
-#   │                                     │  listener    │        │
-#   │                                     │   :51820     │        │
-#   │                                     │  (residual   │        │
-#   │                                     │  loopback    │        │
-#   │                                     │  echo:7100)  │        │
-#   │                                     └──────────────┘        │
-#   └─────────────────────────────────────────────────────────────┘
+#   ┌────────┐  client_wan  ┌─────────┐  inet_link  ┌───────┐  chain_link  ┌──────────┐  home_lan  ┌─────────────────┐
+#   │ client │ ────────────►│ gateway │ ◄──────────►│ relay │ ◄──────────►│ terminal │ ◄─────────►│ app servers     │
+#   └────────┘              └─────────┘             └───────┘              └──────────┘            └─────────────────┘
+#   172.31.10.10            172.31.10.20            172.31.11.20           172.31.12.20           172.31.13.{20-50}
+#                           172.31.11.10            172.31.12.10           172.31.13.10
 #
-# What the smoke driver exercises:
+# Same scenario suite as compose.e2e.quickstart.yml; the only
+# difference is the extra hop. Proves predicate forwarding, `chain
+# diff`, `chain canary`, and SNI dispatch across one additional hop
+# without re-testing any node-local behaviour redundantly.
 #
-#   * Predicate flow: home publishes the home-tcp-echo predicate over the
-#     chain control plane to midbox. midbox derives a matching listener
-#     on midbox:7200 that proxies to home:7200, which proxies to
-#     127.0.0.1:7100 on home (the loopback echo). vps stays unaware —
-#     v1 relays do not re-project predicates upward.
-#
-#   * `yggdrasilctl chain diff`: the smoke driver runs the diff from
-#     home and asserts exit 0 (predicates published from home match what
-#     midbox accepted; vps is end-of-chain and has nothing to compare).
-#
-# Note: the chain wire no longer carries tunnel frames, so vps-chain's
-# loopback echo on :7100 is unused by the current smoke driver. It is
-# kept only because vps-chain shares chain-loopback-echo-entrypoint.sh
-# with home-chain, where the loopback echo is still the predicate-flow
-# target.
+# Address-space note: this stack uses 172.31.10.0/24 .. 172.31.13.0/24
+# so it can run concurrently with compose.e2e.quickstart.yml (which
+# uses 172.31.0.0/24 .. 172.31.2.0/24) on the same host during CI.
 
 x-yggdrasil-image: &yggdrasil-image
   build:
@@ -64,66 +24,102 @@ x-yggdrasil-image: &yggdrasil-image
     dockerfile: docker/Dockerfile.e2e
 
 networks:
-  wan-chain:
+  # Public-internet stand-in: client reaches gateway, nothing else.
+  client_wan:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.1.0/24
+        - subnet: 172.31.10.0/24
+  # Gateway <-> relay leg.
+  inet_link:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.11.0/24
+  # Relay <-> terminal leg.
+  chain_link:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.12.0/24
+  # Home LAN behind the terminal: gateway and relay have NO route
+  # here. `internal: true` is what actually enforces that — by default
+  # podman bridges different networks together via the host's
+  # IP-forwarding tables, so two containers on "different" networks can
+  # still reach each other unless one of the networks is explicitly
+  # internal.
+  home_lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.13.0/24
 
-volumes:
-  vps_chain_etc:
-  vps_chain_run:
-  vps_chain_state:
-  midbox_etc:
-  midbox_run:
-  midbox_state:
-  home_chain_etc:
-  home_chain_run:
-  home_chain_state:
+volumes: {}
 
 services:
   init-chain:
     <<: *yggdrasil-image
     container_name: e2e-chain-init
     entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/bootstrap-chain.sh"]
+    environment:
+      # GATEWAY_INET_ENDPOINT and RELAY_CHAIN_ENDPOINT are hostnames so
+      # both the relay -> gateway dial and the terminal -> relay dial
+      # exercise the OS-resolver path. APP_TCP_IP is a literal IP so
+      # the tcp-echo rule's target exercises the static-resolver code
+      # path; APP_UDP_HOST is a hostname so udp-echo exercises the
+      # DNS-resolver path.
+      GATEWAY_INET_ENDPOINT: "gateway:51820"
+      RELAY_CHAIN_ENDPOINT: "relay:51820"
+      PRIMARY_SNI: "app.test.local"
+      ALT_SNI: "alt.test.local"
+      APP_NGINX_HOST: "app-nginx"
+      APP_NGINX_ALT_HOST: "app-nginx-alt"
+      APP_TCP_IP: "172.31.13.40"
+      APP_UDP_HOST: "app-udp"
     volumes:
-      - vps_chain_etc:/etc/yggdrasil-vps
-      - midbox_etc:/etc/yggdrasil-midbox
-      - home_chain_etc:/etc/yggdrasil-home
+      # Bind mounts (not named volumes) so the host runtime tree is the
+      # single source of truth and `tests/e2e/run-chain.sh` can
+      # `rm -rf` it between runs.
+      - ../tests/e2e/runtime/chain/gateway/etc:/etc/yggdrasil-gateway
+      - ../tests/e2e/runtime/chain/relay/etc:/etc/yggdrasil-relay
+      - ../tests/e2e/runtime/chain/terminal/etc:/etc/yggdrasil-terminal
     restart: "no"
     networks:
-      - wan-chain
+      - client_wan
 
-  vps-chain:
+  gateway:
     <<: *yggdrasil-image
-    container_name: e2e-chain-vps
-    # `init-chain` must run to completion BEFORE the daemons start. We
-    # rely on tests/e2e/run-chain.sh orchestrating that explicitly with
-    # `run --rm init-chain` because podman-compose 1.5 doesn't honour
-    # `depends_on.condition: service_completed_successfully`.
+    container_name: e2e-chain-gateway
     command:
-      - /usr/local/bin/chain-loopback-echo-entrypoint.sh
+      - yggdrasil
+      - run
+      - --config
+      - /etc/yggdrasil/config.toml
     environment:
       YGGDRASIL_LOG: info
       YGGDRASIL_LOG_FORMAT: pretty
-      # vps-chain runs a residual loopback echo on :7100; the chain
-      # wire no longer carries tunnel frames, so it is currently unused.
-      ECHO_TCP_PORT: "7100"
     volumes:
-      - vps_chain_etc:/etc/yggdrasil
-      - vps_chain_run:/run/yggdrasil
-      - vps_chain_state:/var/lib/yggdrasil
+      - ../tests/e2e/runtime/chain/gateway/etc:/etc/yggdrasil
+      - ../tests/e2e/runtime/chain/gateway/run:/run/yggdrasil
+      - ../tests/e2e/runtime/chain/gateway/state:/var/lib/yggdrasil
     networks:
-      wan-chain:
-        ipv4_address: 172.30.1.10
+      client_wan:
+        ipv4_address: 172.31.10.20
+      inet_link:
+        ipv4_address: 172.31.11.10
     expose:
+      - "7100/tcp"
+      - "7101/udp"
+      - "8443/tcp"
+      - "8443/udp"
       - "51820/udp"
 
-  midbox:
+  relay:
     <<: *yggdrasil-image
-    container_name: e2e-chain-midbox
+    container_name: e2e-chain-relay
     depends_on:
-      vps-chain:
+      gateway:
         condition: service_started
     command:
       - yggdrasil
@@ -134,54 +130,122 @@ services:
       YGGDRASIL_LOG: info
       YGGDRASIL_LOG_FORMAT: pretty
     volumes:
-      - midbox_etc:/etc/yggdrasil
-      - midbox_run:/run/yggdrasil
-      - midbox_state:/var/lib/yggdrasil
+      - ../tests/e2e/runtime/chain/relay/etc:/etc/yggdrasil
+      - ../tests/e2e/runtime/chain/relay/run:/run/yggdrasil
+      - ../tests/e2e/runtime/chain/relay/state:/var/lib/yggdrasil
     networks:
-      wan-chain:
-        ipv4_address: 172.30.1.20
+      inet_link:
+        ipv4_address: 172.31.11.20
+      chain_link:
+        ipv4_address: 172.31.12.10
     expose:
-      - "7200/tcp"
       - "51820/udp"
 
-  home-chain:
+  terminal:
     <<: *yggdrasil-image
-    container_name: e2e-chain-home
+    container_name: e2e-chain-terminal
     depends_on:
-      midbox:
+      relay:
         condition: service_started
     command:
-      - /usr/local/bin/chain-loopback-echo-entrypoint.sh
+      - yggdrasil
+      - run
+      - --config
+      - /etc/yggdrasil/config.toml
     environment:
       YGGDRASIL_LOG: info
       YGGDRASIL_LOG_FORMAT: pretty
-      # home's loopback echo is the local backend for the terminal-mode
-      # rule (listen=:7200, target=127.0.0.1:7100).
-      ECHO_TCP_PORT: "7100"
     volumes:
-      - home_chain_etc:/etc/yggdrasil
-      - home_chain_run:/run/yggdrasil
-      - home_chain_state:/var/lib/yggdrasil
+      - ../tests/e2e/runtime/chain/terminal/etc:/etc/yggdrasil
+      - ../tests/e2e/runtime/chain/terminal/run:/run/yggdrasil
+      - ../tests/e2e/runtime/chain/terminal/state:/var/lib/yggdrasil
     networks:
-      wan-chain:
-        ipv4_address: 172.30.1.30
-    expose:
-      - "7200/tcp"
+      chain_link:
+        ipv4_address: 172.31.12.20
+      home_lan:
+        ipv4_address: 172.31.13.10
 
-  client-chain:
-    image: python:3.12-slim
+  app-nginx:
+    image: docker.io/library/nginx:alpine
+    container_name: e2e-chain-app-nginx
+    command:
+      - sh
+      - -c
+      - |
+        echo 'primary backend (app-nginx)' > /usr/share/nginx/html/index.html
+        exec nginx -g 'daemon off;'
+    networks:
+      home_lan:
+        ipv4_address: 172.31.13.20
+    expose:
+      - "80/tcp"
+
+  app-nginx-alt:
+    image: docker.io/library/nginx:alpine
+    container_name: e2e-chain-app-nginx-alt
+    command:
+      - sh
+      - -c
+      - |
+        echo 'alternate backend (app-nginx-alt)' > /usr/share/nginx/html/index.html
+        exec nginx -g 'daemon off;'
+    networks:
+      home_lan:
+        ipv4_address: 172.31.13.30
+    expose:
+      - "80/tcp"
+
+  app-tcp:
+    <<: *yggdrasil-image
+    container_name: e2e-chain-app-tcp
+    command:
+      - python3
+      - /usr/local/bin/echo-server.py
+      - --mode
+      - tcp
+      - --tcp-port
+      - "7100"
+    networks:
+      home_lan:
+        ipv4_address: 172.31.13.40
+    expose:
+      - "7100/tcp"
+
+  app-udp:
+    <<: *yggdrasil-image
+    container_name: e2e-chain-app-udp
+    command:
+      - python3
+      - /usr/local/bin/echo-server.py
+      - --mode
+      - udp
+      - --udp-port
+      - "7101"
+    networks:
+      home_lan:
+        ipv4_address: 172.31.13.50
+    expose:
+      - "7101/udp"
+
+  client:
+    image: docker.io/library/python:3.12-slim
     container_name: e2e-chain-client
     depends_on:
-      vps-chain:
+      gateway:
         condition: service_started
-      midbox:
+      relay:
         condition: service_started
-      home-chain:
+      terminal:
         condition: service_started
     working_dir: /tests
     entrypoint: ["sleep", "infinity"]
     volumes:
       - ../tests/e2e:/tests:ro
+      - ../tests/e2e/runtime/chain/client-trust:/etc/ssl/yggdrasil-test:ro
+    extra_hosts:
+      - "app.test.local:172.31.10.20"
+      - "alt.test.local:172.31.10.20"
+      - "bogus.test.local:172.31.10.20"
     networks:
-      wan-chain:
-        ipv4_address: 172.30.1.40
+      client_wan:
+        ipv4_address: 172.31.10.10

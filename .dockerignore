@@ -13,7 +13,8 @@ bench/target-profile/
 # Container builds never need these and they grow without bound.
 bench/results/
 
-# E2E test artifacts — created by tests/e2e/run*.sh.
+# E2E test artifacts — created by tests/e2e/run-*.sh.
+tests/e2e/runtime/
 tests/e2e/output/
 /tmp/yggbench.*
 

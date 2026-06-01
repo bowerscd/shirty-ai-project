@@ -19,6 +19,12 @@ identity.key
 # Benchmark output trees (per-sha results dirs from bench/run-all.sh)
 /bench/results/
 
+# e2e harness runtime trees — bind-mount targets that hold per-run
+# generated identities, configs, certs, and per-daemon state. The
+# runner scripts `rm -rf` and re-create these on every run so stale
+# config never bleeds across runs. See tests/e2e/run-*.sh.
+/tests/e2e/runtime/
+
 # Isolated CARGO_TARGET_DIR used by bench/profile.sh for `--features
 # profile` builds. Keeps pprof + its transitive dep graph out of the
 # main /target/ — see .github/copilot-instructions.md for rationale.

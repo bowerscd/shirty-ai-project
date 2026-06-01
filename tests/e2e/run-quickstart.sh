@@ -1,25 +1,40 @@
 #!/usr/bin/env bash
-# tests/e2e/run-chain.sh — end-to-end smoke for the 3-node chain
-# quickstart deployment (terminal -> relay -> gateway).
+# tests/e2e/run-quickstart.sh — end-to-end smoke for the canonical
+# 2-node quickstart deployment.
 #
-# Topology (per docker/compose.e2e.chain.yml):
+# Topology (per docker/compose.e2e.quickstart.yml):
 #
-#   client ─client_wan─► gateway ─inet_link─► relay ─chain_link─► terminal ─home_lan─► {nginx, nginx-alt, tcp-echo, udp-echo}
+#   client ──client_wan──► gateway ──chain_link──► terminal ──home_lan──► {nginx, nginx-alt, tcp-echo, udp-echo}
 #
-# Same scenario suite as run-quickstart.sh, with the extra hop:
-#   - Predicate propagation must traverse two hops (terminal -> relay -> gateway).
-#   - `chain diff` from terminal must report 3 hops, no drift.
-#   - `chain canary` must report 3 chain hops armed.
+# What the driver exercises, in order:
+#
+#   1. Build + init (one-shot key/cert/config setup).
+#   2. Enrollment + heartbeat: gateway sees the terminal.
+#   3. Predicate propagation: TCP, UDP, and HTTPS predicates land at gateway.
+#   4. `chain diff` from terminal: 2 hops, no drift.
+#   5. `chain canary` for each rule (tcp / udp / https-as-tcp): status=ok, 2 hops.
+#   6. TCP echo client -> gateway:7100 -> chain -> app-tcp:7100, byte-for-byte.
+#   7. UDP echo client -> gateway:7101 -> chain -> app-udp:7101, byte-for-byte.
+#   8. HTTPS GET SNI=app.test.local: terminal terminates TLS, routes to app-nginx,
+#      asserts the leaf-cert fingerprint matches what init minted.
+#   9. HTTPS GET SNI=alt.test.local: routes to app-nginx-alt (distinct body).
+#  10. HTTPS GET SNI=bogus.test.local: asserts 404 (no [[route]] matches).
+#  11. Cert hot-reload: re-mint the cert in-place, fingerprint must change, body still 200.
+#  12. Malformed-cert rollback: write garbage PEM, old cert keeps serving.
+#  13. Recovery: restoring a valid cert reloads cleanly.
+#  14. Negative isolation: client cannot reach any home_lan app directly
+#      (would-pass-on-regression check that the gateway bypassed the chain).
+#  15. Teardown.
 #
 # Usage:
-#   ./tests/e2e/run-chain.sh                # build + run + verify + teardown
-#   KEEP_STACK=1 ./tests/e2e/run-chain.sh   # leave stack up for poking
+#   ./tests/e2e/run-quickstart.sh                # build + run + verify + teardown
+#   KEEP_STACK=1 ./tests/e2e/run-quickstart.sh   # leave stack up for poking
 set -euo pipefail
 
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-COMPOSE_FILE="$REPO_ROOT/docker/compose.e2e.chain.yml"
-RUNTIME_DIR="$REPO_ROOT/tests/e2e/runtime/chain"
-COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p yggdrasil-e2e-chain)
+COMPOSE_FILE="$REPO_ROOT/docker/compose.e2e.quickstart.yml"
+RUNTIME_DIR="$REPO_ROOT/tests/e2e/runtime/quickstart"
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p yggdrasil-e2e-quickstart)
 
 if command -v podman-compose >/dev/null 2>&1; then
     DC=(podman-compose)
@@ -43,28 +58,34 @@ trap teardown EXIT
 
 cd "$REPO_ROOT"
 
-echo "==> preparing fresh runtime tree at tests/e2e/runtime/chain"
+echo "==> preparing fresh runtime tree at tests/e2e/runtime/quickstart"
 rm -rf "$RUNTIME_DIR"
-mkdir -p "$RUNTIME_DIR"/{gateway,relay,terminal}/{etc,run,state}
-# Separate dir for the client's trust store; see run-quickstart.sh
-# for why this is split from the terminal's live cert dir.
+mkdir -p "$RUNTIME_DIR"/{gateway,terminal}/{etc,run,state}
+# Separate dir for the client's trust store. The runner copies the
+# valid cert here after init and after each successful remint. The
+# malformed-cert phase intentionally does NOT touch this dir, so the
+# client keeps trusting the cert the server is still serving in
+# memory after rustls rejects the bad on-disk PEM.
 mkdir -p "$RUNTIME_DIR/client-trust"
 
 echo "==> building images"
 "${DC[@]}" "${COMPOSE_ARGS[@]}" build
 
-echo "==> running bootstrap (init-chain)"
-if ! "${DC[@]}" "${COMPOSE_ARGS[@]}" run --rm init-chain; then
-    echo "FAIL: init-chain exited non-zero" >&2
+echo "==> running bootstrap (init-quickstart)"
+if ! "${DC[@]}" "${COMPOSE_ARGS[@]}" run --rm init-quickstart; then
+    echo "FAIL: init-quickstart exited non-zero" >&2
     exit 1
 fi
 
+# Snapshot the bootstrap-minted cert into the client's trust dir so
+# every HTTPS probe verifies against a known-good PEM the test
+# controls. Refreshed after each successful remint below.
 cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
 
 echo "==> bringing app + daemons up"
 "${DC[@]}" "${COMPOSE_ARGS[@]}" up -d \
     app-nginx app-nginx-alt app-tcp app-udp \
-    gateway relay terminal client
+    gateway terminal client
 
 # -------- helpers -----------------------------------------------------------
 
@@ -102,32 +123,23 @@ wait_for() {
 fail() {
     echo "FAIL: $*"
     "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --no-color --tail 120 gateway  || true
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --no-color --tail 120 relay    || true
     "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --no-color --tail 120 terminal || true
     exit 1
 }
 
-# -------- enrollment gating (both hops) ------------------------------------
+# -------- enrollment gating -------------------------------------------------
 
-echo "==> waiting for terminal to enrol at relay"
-terminal_enrolled_at_relay() {
-    local out; out=$(ctl_json_on relay status 2>/dev/null || true)
-    echo "$out" | grep -q '"downstream_enrolled": true' && \
-        echo "$out" | grep -q '"downstream_ip": "172.31.12.20"'
-}
-WAIT_TIMEOUT=60 wait_for "terminal enrolled at relay" terminal_enrolled_at_relay
-
-echo "==> waiting for relay to enrol at gateway"
-relay_enrolled_at_gateway() {
+echo "==> waiting for terminal to enrol at gateway"
+terminal_enrolled() {
     local out; out=$(ctl_json_on gateway status 2>/dev/null || true)
     echo "$out" | grep -q '"downstream_enrolled": true' && \
-        echo "$out" | grep -q '"downstream_ip": "172.31.11.20"'
+        echo "$out" | grep -q '"downstream_ip": "172.31.1.20"'
 }
-WAIT_TIMEOUT=60 wait_for "relay enrolled at gateway" relay_enrolled_at_gateway
+WAIT_TIMEOUT=60 wait_for "terminal enrolled + heartbeat from 172.31.1.20" terminal_enrolled
 
-# -------- predicate propagation (terminal -> relay -> gateway) -------------
+# -------- predicate propagation ---------------------------------------------
 
-echo "==> waiting for tcp-echo + udp-echo + https-app predicates at gateway"
+echo "==> waiting for tcp-echo, udp-echo, https-app predicates at gateway"
 predicates_landed() {
     local body; body=$(ctl_json_on gateway derived-rules 2>/dev/null || true)
     echo "$body" | grep -q '"name": "tcp-echo"' && \
@@ -136,9 +148,9 @@ predicates_landed() {
 }
 WAIT_TIMEOUT=30 wait_for "all three predicates derived at gateway" predicates_landed
 
-# -------- chain diff (3 hops, no drift) ------------------------------------
+# -------- chain diff (2 hops, no drift) -------------------------------------
 
-echo "==> [chain-diff] yggdrasilctl chain diff from terminal (3 hops)"
+echo "==> [chain-diff] yggdrasilctl chain diff from terminal (2 hops)"
 diff_json=$(dc_exec terminal yggdrasilctl \
     --json chain --socket /run/yggdrasil/control.sock \
     diff || true)
@@ -146,16 +158,16 @@ echo "$diff_json" | python3 -c '
 import json, sys
 report = json.load(sys.stdin)
 hops = report["hops"]
-assert len(hops) == 3, f"expected 3 hops, got {len(hops)}: {hops}"
+assert len(hops) == 2, f"expected 2 hops, got {len(hops)}: {hops}"
 for i, hop in enumerate(hops):
     names = [p["name"] for p in hop["view"]["predicates"]]
     for required in ("tcp-echo", "udp-echo"):
         assert required in names, f"hop {i} missing {required}: {names}"
 assert report["drift_detected"] is False, f"unexpected drift: {report}"
-print(f"[chain-diff] 3 hops in sync; all see tcp-echo + udp-echo")
-' || fail "chain diff --json output did not match 3-hop expectations"
+print(f"[chain-diff] 2 hops in sync; both see tcp-echo + udp-echo")
+' || fail "chain diff --json output did not match 2-hop expectations"
 
-# -------- chain canary (each rule, 3 hops armed) ---------------------------
+# -------- chain canary (each rule) ------------------------------------------
 
 run_canary() {
     local port="$1" proto="$2" expected_rule="$3"
@@ -171,8 +183,8 @@ r = reports[0]
 assert r['status'] == 'ok', f'status not ok: {r}'
 assert r['rule_name'] == '${expected_rule}', f'rule_name mismatch: {r}'
 chain = r['chain']
-assert len(chain) == 3, f'expected 3 chain hops, got {len(chain)}: {chain}'
-print(f'[canary] ${expected_rule}/${proto}: 3 hops armed, status=ok')
+assert len(chain) == 2, f'expected 2 chain hops, got {len(chain)}: {chain}'
+print(f'[canary] ${expected_rule}/${proto}: 2 hops armed, status=ok')
 " || fail "chain canary for ${expected_rule}/${proto} did not match expectations"
 }
 
@@ -183,9 +195,10 @@ run_canary 7101 udp udp-echo
 # Note: `chain canary` for HTTPS routes uses a different invocation
 # (auto-probes TCP + UDP on [server].https_listen, no --port/--proto
 # flags) per docs/operations.md. The HTTPS surface is exercised
-# directly by the three HTTPS GET phases below.
+# directly by the three HTTPS GET phases below, which prove the same
+# end-to-end property.
 
-# -------- TCP echo end-to-end ----------------------------------------------
+# -------- TCP echo end-to-end -----------------------------------------------
 
 echo "==> [tcp-echo] client -> gateway:7100 -> chain -> app-tcp:7100"
 run_tcp_echo() {
@@ -193,8 +206,8 @@ run_tcp_echo() {
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)
-s.connect(("172.31.10.20", 7100))
-payload = b"chain-tcp-" + b"a" * 200
+s.connect(("172.31.0.20", 7100))
+payload = b"quickstart-tcp-" + b"a" * 200
 s.sendall(payload)
 got = b""
 while len(got) < len(payload):
@@ -206,9 +219,9 @@ s.close()
 sys.exit(0 if got == payload else 1)
 PY
 }
-WAIT_TIMEOUT=15 wait_for "TCP echo round-trips through the 3-hop chain" run_tcp_echo
+WAIT_TIMEOUT=15 wait_for "TCP echo round-trips through the chain" run_tcp_echo
 
-# -------- UDP echo end-to-end ----------------------------------------------
+# -------- UDP echo end-to-end -----------------------------------------------
 
 echo "==> [udp-echo] client -> gateway:7101 -> chain -> app-udp:7101"
 run_udp_echo() {
@@ -216,24 +229,32 @@ run_udp_echo() {
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(5)
-payload = b"chain-udp-" + b"b" * 200
-s.sendto(payload, ("172.31.10.20", 7101))
+payload = b"quickstart-udp-" + b"b" * 200
+s.sendto(payload, ("172.31.0.20", 7101))
 got, _ = s.recvfrom(65536)
 s.close()
 sys.exit(0 if got == payload else 1)
 PY
 }
-WAIT_TIMEOUT=15 wait_for "UDP echo round-trips through the 3-hop chain" run_udp_echo
+WAIT_TIMEOUT=15 wait_for "UDP echo round-trips through the chain" run_udp_echo
 
-# -------- HTTPS GETs (SNI dispatch) ----------------------------------------
+# -------- HTTPS GETs (SNI dispatch) -----------------------------------------
 
+# Returns JSON with status, body (truncated), and the SHA-256 fingerprint of
+# the served leaf cert. The probe trusts the self-signed PEM the init
+# container minted (bind-mounted at /etc/ssl/yggdrasil-test/server.pem),
+# so `verify_mode = CERT_REQUIRED` and `check_hostname = True` both fire
+# on every probe — a regression where yggdrasil served the wrong cert
+# (right port, wrong SAN) would fail here instead of silently passing.
 https_probe() {
     local sni="$1"
     dc_exec client python3 - "$sni" <<'PY'
 import hashlib, http.client, json, socket, ssl, sys
 sni = sys.argv[1]
-addr = ("172.31.10.20", 8443)
+addr = ("172.31.0.20", 8443)
 ctx = ssl.create_default_context(cafile="/etc/ssl/yggdrasil-test/server.pem")
+# Defaults: check_hostname = True, verify_mode = CERT_REQUIRED. Don't
+# weaken either; that's the whole point of the trust posture.
 sock = socket.create_connection(addr, timeout=5)
 ssock = ctx.wrap_socket(sock, server_hostname=sni)
 leaf_der = ssock.getpeercert(binary_form=True)
@@ -273,17 +294,25 @@ fp2=$(echo "$probe_alt"     | python3 -c "import json,sys; print(json.load(sys.s
 echo "    [ok] alt SNI dispatched to app-nginx-alt (same cert)"
 
 echo "==> [https-unknown] SNI=bogus.test.local rejected at TLS handshake"
+# yggdrasil's cert resolver returns nothing for an unknown SNI, so the
+# rustls handshake fails with an access-denied alert rather than
+# completing into an HTTP 404. This is the cert-resolver rung-3
+# behaviour documented in `docs/configuration.md`: a hostname with no
+# matching `[[route]]` is not bound to the `:443` SNI table.
 unknown_sni_rejected() {
     dc_exec client python3 - <<'PY'
 import socket, ssl, sys
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
-sock = socket.create_connection(("172.31.10.20", 8443), timeout=5)
+sock = socket.create_connection(("172.31.0.20", 8443), timeout=5)
 try:
     ctx.wrap_socket(sock, server_hostname="bogus.test.local")
-    sys.exit(1)
-except ssl.SSLError:
+    sys.exit(1)  # handshake should NOT succeed for an unknown SNI
+except ssl.SSLError as e:
+    # Any TLS alert from the server is a pass; access_denied is what
+    # yggdrasil's rustls sends today, but accepting any SSLError makes
+    # the assertion robust to alert-code changes.
     sys.exit(0)
 finally:
     sock.close()
@@ -292,11 +321,13 @@ PY
 unknown_sni_rejected || fail "unknown SNI: TLS handshake should have been rejected, but the connection succeeded"
 echo "    [ok] unknown SNI rejected at TLS handshake (no [[route]] matched, cert resolver returned nothing)"
 
-# -------- Cert hot-reload (in-place re-mint) -------------------------------
+# -------- Cert hot-reload (in-place re-mint) --------------------------------
 
 CERT_HOST_DIR="$RUNTIME_DIR/terminal/etc/certs"
 
 remint_cert() {
+    # Generates a fresh cert+key with the same SANs. A new RSA key →
+    # different leaf fingerprint, which is the observable hot-reload signal.
     openssl req -x509 -newkey rsa:2048 -nodes \
         -keyout "$CERT_HOST_DIR/server.key" \
         -out    "$CERT_HOST_DIR/server.pem" \
@@ -309,12 +340,17 @@ remint_cert() {
 }
 
 echo "==> [cert-reload] re-minting cert on host (terminal watcher should pick it up)"
-sleep 0.3
+sleep 0.3  # ensure mtime delta vs init's write
 remint_cert
-# Update trust to the new cert BEFORE polling, so probes during the
-# polling window verify successfully once the watcher catches up.
+
+# Update the client's trust copy to the new cert BEFORE polling, so
+# probes during the polling window can verify successfully once the
+# server's watcher catches up. (Brief race window where server still
+# serves the old cert + client trusts the new cert is fine — those
+# probes raise CertificateVerifyError and the loop just retries.)
 cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
 
+# Poll for fp change up to ~3s (250ms debounce + load latency).
 deadline=$(( $(date +%s) + 4 ))
 fp3="$fp1"
 while (( $(date +%s) < deadline )); do
@@ -336,7 +372,7 @@ status_after=$(echo "$probe_after" | python3 -c "import json,sys; print(json.loa
 
 echo "==> [malformed-cert] writing garbage PEM over working cert"
 echo "this is not a PEM file" > "$CERT_HOST_DIR/server.pem"
-sleep 1.5
+sleep 1.5  # give the watcher debounce + reject latency time to fire
 
 probe_bad=$(https_probe app.test.local) || fail "HTTPS broke after malformed write (should have kept old cert)"
 status_bad=$(echo "$probe_bad" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
@@ -350,6 +386,8 @@ echo "    [ok] old cert still serving after malformed PEM rejected"
 echo "==> [cert-recovery] writing valid cert; expect another reload"
 sleep 0.3
 remint_cert
+# Refresh trust to the recovered cert before polling; the malformed
+# phase intentionally left the old trust in place.
 cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
 deadline=$(( $(date +%s) + 4 ))
 fp4="$fp3"
@@ -365,6 +403,11 @@ done
 echo "    [ok] recovery reload succeeded; new leaf fp ${fp4:0:16}…"
 
 # -------- Negative isolation check -----------------------------------------
+#
+# The client lives on client_wan; the app containers live on home_lan.
+# Compose's network isolation means the client must not have a route to
+# any home_lan IP. If a connect attempt succeeds, the test topology
+# itself is broken and every other assertion above is suspect.
 
 echo "==> [isolation] client cannot reach home_lan app IPs directly"
 isolation_probe() {
@@ -378,27 +421,29 @@ s.settimeout(2)
 try:
     if proto == "tcp":
         s.connect((ip, port))
-        sys.exit(1)
+        sys.exit(1)  # connect succeeded = isolation broken
     else:
+        # UDP is connectionless; "isolation" for UDP means no response.
+        # Send a probe and see if we get anything back.
         s.sendto(b"isolation-probe", (ip, port))
         try:
             s.recvfrom(4096)
-            sys.exit(1)
+            sys.exit(1)  # got a reply = isolation broken
         except (socket.timeout, OSError):
             sys.exit(0)
 except (socket.timeout, ConnectionRefusedError, OSError):
-    sys.exit(0)
+    sys.exit(0)  # unreachable = good
 finally:
     s.close()
 PY
 }
-isolation_probe 172.31.13.20 80   tcp || fail "isolation: client could reach app-nginx directly"
-isolation_probe 172.31.13.30 80   tcp || fail "isolation: client could reach app-nginx-alt directly"
-isolation_probe 172.31.13.40 7100 tcp || fail "isolation: client could reach app-tcp directly"
-isolation_probe 172.31.13.50 7101 udp || fail "isolation: client could reach app-udp directly"
+isolation_probe 172.31.2.20 80   tcp || fail "isolation: client could reach app-nginx directly"
+isolation_probe 172.31.2.30 80   tcp || fail "isolation: client could reach app-nginx-alt directly"
+isolation_probe 172.31.2.40 7100 tcp || fail "isolation: client could reach app-tcp directly"
+isolation_probe 172.31.2.50 7101 udp || fail "isolation: client could reach app-udp directly"
 echo "    [ok] all four home_lan app endpoints unreachable from client"
 
-# -------- done -------------------------------------------------------------
+# -------- done --------------------------------------------------------------
 
 echo
-echo "ALL CHAIN E2E TESTS PASSED"
+echo "ALL QUICKSTART E2E TESTS PASSED"

@@ -1,52 +1,65 @@
 #!/usr/bin/env bash
-# bootstrap-chain.sh — one-shot key-and-config setup for the 3-level chain
-# compose e2e stack (terminal -> midbox -> vps).
+# bootstrap-chain.sh — one-shot key + cert + config setup for the
+# 3-node chain compose stack (terminal -> relay -> gateway).
 #
-# Runs in the `init-chain` service. Mounts the state volumes for vps_chain
-# (the chain root relay), midbox (mid-chain forwarder), and home_chain
-# (the publishing terminal); provisions three identities, writes configs,
-# and runs the offline request/grant handshake via `yggdrasilctl identity`
-# twice (home<->midbox, midbox<->vps).
+# Runs in the `init-chain` service. Mounts each daemon's etc volume at
+# /etc/yggdrasil-<role> (init's view); the daemons mount the same
+# volume at /etc/yggdrasil (their view).
+#
+# What this script does:
+#   1. Generates 3 identities (gateway, relay, terminal).
+#   2. Drives two request/grant ceremonies in sequence:
+#        - terminal exports request -> relay add-accept -> terminal add-dial
+#        - relay     exports request -> gateway add-accept -> relay add-dial
+#   3. Mints a self-signed cert with two SANs covering both HTTPS
+#      hostnames the test uses.
+#   4. Writes the terminal's `conf.d/*.toml` rule + route files using
+#      the post-fadac5d schema. Relay holds no rule files.
 #
 # Idempotent: re-running after a partial failure is a no-op.
 set -euo pipefail
 
+# ---- env from compose ------------------------------------------------------
+
+: "${GATEWAY_INET_ENDPOINT:?missing}"
+: "${RELAY_CHAIN_ENDPOINT:?missing}"
+: "${PRIMARY_SNI:?missing}"        ; : "${ALT_SNI:?missing}"
+: "${APP_NGINX_HOST:?missing}"     ; : "${APP_NGINX_ALT_HOST:?missing}"
+: "${APP_TCP_IP:?missing}"         ; : "${APP_UDP_HOST:?missing}"
+
 # ---- paths (init container's view) -----------------------------------------
-#
-# Each daemon container mounts its volume at the canonical /etc/yggdrasil.
-# This init container mounts each one at /etc/yggdrasil-<role> so config +
-# rules can be written without collision. Config file path fields refer to
-# the *consumer* container's view (/etc/yggdrasil/*); bash variables use
-# init's view (/etc/yggdrasil-<role>/*).
 
-VPS_CFG=/etc/yggdrasil-vps/config.toml
-VPS_KEY=/etc/yggdrasil-vps/identity.key
+GW_CFG=/etc/yggdrasil-gateway/config.toml
+GW_KEY=/etc/yggdrasil-gateway/identity.key
 
-MIDBOX_CFG=/etc/yggdrasil-midbox/config.toml
-MIDBOX_KEY=/etc/yggdrasil-midbox/identity.key
+RL_CFG=/etc/yggdrasil-relay/config.toml
+RL_KEY=/etc/yggdrasil-relay/identity.key
 
-HOME_CFG=/etc/yggdrasil-home/config.toml
-HOME_KEY=/etc/yggdrasil-home/identity.key
+TM_CFG=/etc/yggdrasil-terminal/config.toml
+TM_KEY=/etc/yggdrasil-terminal/identity.key
+TM_CERT=/etc/yggdrasil-terminal/certs/server.pem
+TM_PKEY=/etc/yggdrasil-terminal/certs/server.key
 
-HOME_REQUEST=/tmp/home-request.txt
-HOME_GRANT=/tmp/home-grant.txt
-MIDBOX_REQUEST=/tmp/midbox-request.txt
-MIDBOX_GRANT=/tmp/midbox-grant.txt
+TM_REQUEST=/tmp/terminal-request.txt
+TM_GRANT=/tmp/terminal-grant.txt
+RL_REQUEST=/tmp/relay-request.txt
+RL_GRANT=/tmp/relay-grant.txt
 
-if [[ -f "$VPS_KEY"     && -f "$VPS_CFG"    \
-   && -f "$MIDBOX_KEY"  && -f "$MIDBOX_CFG" \
-   && -f "$HOME_KEY"    && -f "$HOME_CFG" ]]; then
+if [[ -f "$GW_KEY" && -f "$GW_CFG" \
+   && -f "$RL_KEY" && -f "$RL_CFG" \
+   && -f "$TM_KEY" && -f "$TM_CFG" \
+   && -f "$TM_CERT" && -f "$TM_PKEY" ]]; then
     echo "[init-chain] already bootstrapped; skipping"
     exit 0
 fi
 
-# ---- vps (chain root relay) ------------------------------------------------
+# ---- gateway (accept-only) -------------------------------------------------
 
-echo "[init-chain] preparing vps-chain dirs"
-mkdir -p /etc/yggdrasil-vps/rules /etc/yggdrasil-vps/certs
+echo "[init-chain] preparing gateway dirs"
+mkdir -p /etc/yggdrasil-gateway/rules /etc/yggdrasil-gateway/certs
 
-echo "[init-chain] writing vps-chain seed config"
-cat >"$VPS_CFG" <<EOF
+echo "[init-chain] writing gateway seed config"
+cat >"$GW_CFG" <<EOF
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
@@ -60,17 +73,19 @@ socket = "/run/yggdrasil/control.sock"
 listen = "0.0.0.0:51820"
 EOF
 
-echo "[init-chain] generating vps-chain identity"
-yggdrasilctl --config "$VPS_CFG" identity rotate \
-    --identity-file "$VPS_KEY" --force >/dev/null
+echo "[init-chain] generating gateway identity"
+yggdrasilctl --config "$GW_CFG" identity rotate \
+    --identity-file "$GW_KEY" --force >/dev/null
 
-# ---- midbox (mid-chain relay + forwarder) ----------------------------------
+# ---- relay (mid-chain: dial + accept) --------------------------------------
 
-echo "[init-chain] preparing midbox dirs"
-mkdir -p /etc/yggdrasil-midbox/rules /etc/yggdrasil-midbox/certs
+echo "[init-chain] preparing relay dirs"
+mkdir -p /etc/yggdrasil-relay/rules /etc/yggdrasil-relay/certs
 
-echo "[init-chain] writing midbox seed config"
-cat >"$MIDBOX_CFG" <<EOF
+echo "[init-chain] writing relay seed config"
+# Relay's [accept] listen is the address terminals dial; its [dial]
+# is filled in by add-dial after the gateway mints its grant.
+cat >"$RL_CFG" <<EOF
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
@@ -84,88 +99,123 @@ socket = "/run/yggdrasil/control.sock"
 listen = "0.0.0.0:51820"
 EOF
 
-echo "[init-chain] generating midbox identity"
-yggdrasilctl --config "$MIDBOX_CFG" identity rotate \
-    --identity-file "$MIDBOX_KEY" --force >/dev/null
+echo "[init-chain] generating relay identity"
+yggdrasilctl --config "$RL_CFG" identity rotate \
+    --identity-file "$RL_KEY" --force >/dev/null
 
-# ---- home-chain (publishing terminal) --------------------------------------
+# ---- terminal (dial-only) --------------------------------------------------
 
-echo "[init-chain] preparing home-chain dirs"
-mkdir -p /etc/yggdrasil-home/rules /etc/yggdrasil-home/certs
+echo "[init-chain] preparing terminal dirs"
+mkdir -p /etc/yggdrasil-terminal/rules /etc/yggdrasil-terminal/certs
 
-echo "[init-chain] writing home-chain seed config"
-cat >"$HOME_CFG" <<EOF
+echo "[init-chain] writing terminal seed config"
+cat >"$TM_CFG" <<EOF
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
+default_cert  = "/etc/yggdrasil/certs/server.pem"
+default_key   = "/etc/yggdrasil/certs/server.key"
+https_listen  = "0.0.0.0:8443"
 
 [control]
 socket = "/run/yggdrasil/control.sock"
 EOF
 
-echo "[init-chain] generating home-chain identity"
-yggdrasilctl --config "$HOME_CFG" identity rotate \
-    --identity-file "$HOME_KEY" --force >/dev/null
+echo "[init-chain] generating terminal identity"
+yggdrasilctl --config "$TM_CFG" identity rotate \
+    --identity-file "$TM_KEY" --force >/dev/null
 
-# home-chain publishes a single TCP predicate. midbox derives a matching
-# listener AND forwards the verbatim predicate set upstream to vps, so
-# vps applies the same predicate against home's origin pubkey.
-# The terminal-mode rule needs a `target` because terminal-mode rules
-# can't use peer-relative target_port. We point it at home's own
-# loopback echo (started by the chain entrypoint).
-echo "[init-chain] writing home-chain predicate-publishing rule"
-cat >/etc/yggdrasil-home/rules/home-tcp-echo.toml <<'EOF'
+# ---- handshake 1: terminal <-> relay --------------------------------------
+
+echo "[init-chain] terminal exports request"
+yggdrasilctl --config "$TM_CFG" identity export-request \
+    --identity-file "$TM_KEY" \
+    --out "$TM_REQUEST" \
+    --note "chain e2e terminal" >/dev/null
+
+echo "[init-chain] relay add-accept (writes relay's [accept].pubkey)"
+yggdrasilctl --config "$RL_CFG" identity add-accept \
+    --identity-file "$RL_KEY" \
+    --from "$TM_REQUEST" \
+    --my-endpoint "${RELAY_CHAIN_ENDPOINT}" \
+    --out "$TM_GRANT" \
+    --note "chain e2e relay->terminal" >/dev/null
+
+echo "[init-chain] terminal add-dial (writes terminal's [dial])"
+yggdrasilctl --config "$TM_CFG" identity add-dial \
+    --identity-file "$TM_KEY" \
+    --from "$TM_GRANT" >/dev/null
+
+# ---- handshake 2: relay <-> gateway ---------------------------------------
+
+echo "[init-chain] relay exports request"
+yggdrasilctl --config "$RL_CFG" identity export-request \
+    --identity-file "$RL_KEY" \
+    --out "$RL_REQUEST" \
+    --note "chain e2e relay" >/dev/null
+
+echo "[init-chain] gateway add-accept (writes gateway's [accept].pubkey)"
+yggdrasilctl --config "$GW_CFG" identity add-accept \
+    --identity-file "$GW_KEY" \
+    --from "$RL_REQUEST" \
+    --my-endpoint "${GATEWAY_INET_ENDPOINT}" \
+    --out "$RL_GRANT" \
+    --note "chain e2e gateway->relay" >/dev/null
+
+echo "[init-chain] relay add-dial (writes relay's [dial])"
+yggdrasilctl --config "$RL_CFG" identity add-dial \
+    --identity-file "$RL_KEY" \
+    --from "$RL_GRANT" >/dev/null
+
+rm -f "$TM_REQUEST" "$TM_GRANT" "$RL_REQUEST" "$RL_GRANT"
+
+# ---- self-signed cert with multi-SAN ---------------------------------------
+
+echo "[init-chain] minting self-signed cert covering both SNIs"
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$TM_PKEY" \
+    -out    "$TM_CERT" \
+    -days   1 \
+    -subj   "/CN=${PRIMARY_SNI}" \
+    -addext "subjectAltName=DNS:${PRIMARY_SNI},DNS:${ALT_SNI}" \
+    >/dev/null 2>&1
+chmod 0644 "$TM_CERT"
+chmod 0600 "$TM_PKEY"
+
+# ---- terminal rules + routes -----------------------------------------------
+
+echo "[init-chain] writing terminal rules: tcp-echo, udp-echo"
+# tcp-echo's target is a LITERAL IP — exercises the static-resolver
+# code path. udp-echo's target is a hostname so the same harness
+# exercises the DNS-resolver path as well.
+cat >/etc/yggdrasil-terminal/rules/tcp-echo.toml <<EOF
 [[rule]]
-name     = "home-tcp-echo"
-listen   = "0.0.0.0:7200"
+name     = "tcp-echo"
+listen   = "0.0.0.0:7100"
 protocol = "tcp"
-target   = "127.0.0.1:7100"
+target   = "${APP_TCP_IP}:7100"
 EOF
 
-# ---- handshake 1: home-chain <-> midbox -----------------------------------
+cat >/etc/yggdrasil-terminal/rules/udp-echo.toml <<EOF
+[[rule]]
+name         = "udp-echo"
+listen       = "0.0.0.0:7101"
+protocol     = "udp"
+target       = "${APP_UDP_HOST}:7101"
+idle_timeout = "30s"
+EOF
 
-echo "[init-chain] home-chain exports request"
-yggdrasilctl --config "$HOME_CFG" identity export-request \
-    --identity-file "$HOME_KEY" \
-    --out "$HOME_REQUEST" \
-    --note "chain e2e home" >/dev/null
+echo "[init-chain] writing terminal https routes: primary + alt SNI"
+cat >/etc/yggdrasil-terminal/rules/https-routes.toml <<EOF
+[[route]]
+hostname = "${PRIMARY_SNI}"
+target   = "http://${APP_NGINX_HOST}:80"
 
-echo "[init-chain] midbox add-accept from home-chain (writes midbox's [accept])"
-yggdrasilctl --config "$MIDBOX_CFG" identity add-accept \
-    --identity-file "$MIDBOX_KEY" \
-    --from "$HOME_REQUEST" \
-    --my-endpoint midbox:51820 \
-    --out "$HOME_GRANT" \
-    --note "chain e2e midbox->home" >/dev/null
-
-echo "[init-chain] home-chain add-dial from midbox grant"
-yggdrasilctl --config "$HOME_CFG" identity add-dial \
-    --identity-file "$HOME_KEY" \
-    --from "$HOME_GRANT" >/dev/null
-
-# ---- handshake 2: midbox <-> vps-chain -------------------------------------
-
-echo "[init-chain] midbox exports request"
-yggdrasilctl --config "$MIDBOX_CFG" identity export-request \
-    --identity-file "$MIDBOX_KEY" \
-    --out "$MIDBOX_REQUEST" \
-    --note "chain e2e midbox" >/dev/null
-
-echo "[init-chain] vps-chain add-accept from midbox (writes vps's [accept])"
-yggdrasilctl --config "$VPS_CFG" identity add-accept \
-    --identity-file "$VPS_KEY" \
-    --from "$MIDBOX_REQUEST" \
-    --my-endpoint vps-chain:51820 \
-    --out "$MIDBOX_GRANT" \
-    --note "chain e2e vps->midbox" >/dev/null
-
-echo "[init-chain] midbox add-dial from vps-chain grant"
-yggdrasilctl --config "$MIDBOX_CFG" identity add-dial \
-    --identity-file "$MIDBOX_KEY" \
-    --from "$MIDBOX_GRANT" >/dev/null
-
-rm -f "$HOME_REQUEST" "$HOME_GRANT" "$MIDBOX_REQUEST" "$MIDBOX_GRANT"
+[[route]]
+hostname = "${ALT_SNI}"
+target   = "http://${APP_NGINX_ALT_HOST}:80"
+EOF
 
 echo "[init-chain] done"

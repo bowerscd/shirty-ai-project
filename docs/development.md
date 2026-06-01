@@ -47,11 +47,11 @@ cargo build --workspace                # warms the dep cache; ~3-5 min cold
 cargo test  --workspace --all-targets  # ~2-3 min; should be all-green
 
 # Optional: end-to-end smoke under podman-compose.
-tests/e2e/run.sh                       # 2-node (relay + terminal)
+tests/e2e/run-quickstart.sh           # 2-node (gateway + terminal + apps)
 ```
 
-If `cargo test` is green and `tests/e2e/run.sh` exits 0, you have a working
-dev environment. From here, the [`docs/quickstart.md`](quickstart.md)
+If `cargo test` is green and `tests/e2e/run-quickstart.sh` exits 0, you have
+a working dev environment. From here, the [`docs/quickstart.md`](quickstart.md)
 walkthrough deploys a real two-host topology against the binary you just
 built.
 
@@ -64,8 +64,9 @@ built.
    Don't skip this; everything below assumes you've *seen the thing work*.
 3. [`docs/architecture.md`](architecture.md) — why the design looks the way
    it does (chain plane, predicate projection, half-close).
-4. Run [`tests/e2e/run.sh`](../tests/e2e/run.sh) and read it; it's the
-   smallest exhaustive demonstration of "what good looks like."
+4. Run [`tests/e2e/run-quickstart.sh`](../tests/e2e/run-quickstart.sh) and
+   read it; it's the smallest exhaustive demonstration of "what good looks
+   like."
 5. [`crates/yggdrasil/src/main.rs`](../crates/yggdrasil/src/main.rs) →
    [`lib.rs`](../crates/yggdrasil/src/lib.rs). The binary entry point is
    thin; the subsystems are pub-exposed from the library so tests and
@@ -112,8 +113,10 @@ up the binary under socket I/O. If you're adding a subsystem, expose it from
   nginx / haproxy / traefik. Separate from Criterion micro-benches under
   `crates/*/benches/`. See [`bench/README.md`](../bench/README.md).
 - [`tests/e2e/`](../tests/e2e/) — podman-compose smoke tests:
-  `run.sh` (2-node), `run-chain.sh` (3-node), `run-l7.sh` (HTTPS),
-  `run-acme.sh` (ACME issuance against pebble).
+  `run-quickstart.sh` (2-node) and `run-chain.sh` (3-node). Each
+  exercises TCP / UDP / HTTPS (with SNI host-based routing + cert
+  hot-reload), chain introspection, and a negative isolation check
+  proving traffic only flows through the chain.
 - [`contrib/`](../contrib/) — systemd unit, sysusers.d, tmpfiles.d, example
   config. Sourced by `CMakeLists.txt`; you generally don't touch these
   during feature work.
