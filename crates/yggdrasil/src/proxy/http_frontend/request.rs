@@ -25,7 +25,6 @@ use crate::proxy::forward::{
 };
 
 use super::backend::BackendClient;
-use super::route::RouteTable;
 
 pub(crate) struct ConnContext {
     /// Owning [`Rule`] for this connection. Only consulted by the
@@ -36,7 +35,13 @@ pub(crate) struct ConnContext {
     pub(crate) rule: Option<Arc<ratatoskr::rule::Rule>>,
     pub(crate) rule_name: String,
     pub(crate) client_addr: SocketAddr,
-    pub(crate) routes: Arc<RouteTable>,
+    /// Shared route table. Held under a `RwLock` so the supervisor can
+    /// hot-swap the entries on route addition / removal / edit without
+    /// disturbing in-flight TLS connections or HTTP/2 streams. Read
+    /// once per request via a brief read-guard; the matched route's
+    /// data is cloned out and the guard is dropped before any
+    /// `.await`.
+    pub(crate) routes: Arc<parking_lot::RwLock<super::route::RouteTable>>,
     pub(crate) client: BackendClient,
     /// `true` when this connection was accepted on a TLS-terminated
     /// listener (the HTTPS frontend, also HTTP/3). `false` when accepted
@@ -95,17 +100,24 @@ pub(crate) async fn serve_request(
     };
 
     // -------------------------------------------------------------------
-    // Route lookup.
+    // Route lookup. Clone the matched route's data out under a brief
+    // read-guard so the supervisor's hot-swap path (which takes a
+    // write-guard) is never blocked behind an in-flight request, and
+    // so the (parking_lot, !Send) guard never crosses an `.await`.
     // -------------------------------------------------------------------
-    let (route_label, route) = match ctx.routes.lookup(&host) {
-        Some(r) => {
+    let route_data: Option<(String, Url, Option<ratatoskr::rule::HstsConfig>, std::collections::BTreeMap<String, String>)> = {
+        let routes = ctx.routes.read();
+        routes.lookup(&host).map(|r| {
             let label = host
                 .rsplit_once(':')
                 .map(|(h, _)| h)
                 .unwrap_or(&host)
                 .to_ascii_lowercase();
-            (label, r)
-        }
+            (label, r.target.clone(), r.hsts, r.headers.clone())
+        })
+    };
+    let (route_label, upstream_url, hsts_header, static_headers) = match route_data {
+        Some(t) => t,
         None => {
             debug!(
                 rule = %ctx.rule_name,
@@ -126,10 +138,6 @@ pub(crate) async fn serve_request(
     // CONNECT, which the backend may handle as it sees fit.
     // -------------------------------------------------------------------
     let is_websocket = req.version() == Version::HTTP_11 && is_websocket_upgrade(req.headers());
-
-    let upstream_url = route.target.clone();
-    let hsts_header = route.hsts;
-    let static_headers = route.headers.clone();
 
     // -------------------------------------------------------------------
     // Forward.

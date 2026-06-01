@@ -130,6 +130,13 @@ pub struct HttpFrontend {
     /// loop. See [`crate::proxy::tcp::TcpProxy::conn_tracker`] for
     /// the symmetric rationale on graceful drain.
     conn_tracker: TaskTracker,
+    /// Shared route table. Each request's serve handler reads through
+    /// this lock to look up the route for its Host/`:authority`. The
+    /// supervisor calls [`HttpFrontend::update_routes`] to swap the
+    /// underlying table on hot reload, so a route addition / removal /
+    /// edit does not require tearing down the entire frontend (and
+    /// thus does not interrupt in-flight requests on other routes).
+    route_table: Arc<parking_lot::RwLock<route::RouteTable>>,
 }
 
 impl std::fmt::Debug for HttpFrontend {
@@ -199,7 +206,11 @@ impl HttpFrontend {
             proxy_protocol: None,
         });
 
-        let route_table = Arc::new(route::RouteTable::build(&cert_d_routes, &name));
+        let route_table =
+            Arc::new(parking_lot::RwLock::new(route::RouteTable::build(
+                &cert_d_routes,
+                &name,
+            )));
 
         let server_config = build_rustls_server_config(cert_store, &[b"h2", b"http/1.1"]);
         let acceptor = TlsAcceptor::from(server_config);
@@ -240,7 +251,7 @@ impl HttpFrontend {
             name = %name,
             listen = %local_addr,
             alpn = "h2,http/1.1",
-            routes = route_table.len(),
+            routes = route_table.read().len(),
             "HTTPS endpoint listening"
         );
 
@@ -251,6 +262,7 @@ impl HttpFrontend {
             conn_cancel,
             handle,
             conn_tracker,
+            route_table,
         })
     }
     pub fn rule_name(&self) -> &str {
@@ -259,6 +271,44 @@ impl HttpFrontend {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Hot-swap the route set served by this frontend's `:443` SNI
+    /// path. Per-route adds, removes, and edits land here without
+    /// disturbing the accept loop or any in-flight TLS connection /
+    /// HTTP request on the unaffected routes.
+    ///
+    /// Cert-less routes (no entry in `cert_store` for their hostname)
+    /// are filtered out, matching the spawn-time behaviour: cert-less
+    /// routes live on the companion `:80` plaintext path, not on
+    /// `:443`.
+    ///
+    /// The supervisor is responsible for populating `cert_store` with
+    /// any new routes' certs *before* calling this method.
+    pub fn update_routes(
+        &self,
+        routes: &[ratatoskr::rule::HttpRoute],
+        cert_store: &Arc<CertStore>,
+    ) {
+        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = routes
+            .iter()
+            .filter(|r| cert_store.contains(&r.hostname))
+            .cloned()
+            .collect();
+        let new_table = route::RouteTable::build(&cert_d_routes, &self.rule_name);
+        let route_count = new_table.len();
+        *self.route_table.write() = new_table;
+        tracing::info!(
+            rule = %self.rule_name,
+            routes = route_count,
+            "HTTPS route table hot-swapped"
+        );
+    }
+
+    /// Snapshot of the currently-served route count. For status
+    /// surfaces.
+    pub fn route_count(&self) -> usize {
+        self.route_table.read().len()
     }
 
     pub fn cancel(&self) {

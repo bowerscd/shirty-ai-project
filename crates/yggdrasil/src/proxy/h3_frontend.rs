@@ -68,6 +68,10 @@ pub struct H3Frontend {
     /// [`crate::proxy::http_frontend::HttpFrontend`] for the
     /// symmetric shape on the TCP TLS path.
     conn_tracker: TaskTracker,
+    /// Shared route table. Mirrors the HTTPS frontend's
+    /// `HttpFrontend::route_table` so per-route hot reload updates
+    /// both transports in lock-step.
+    route_table: Arc<parking_lot::RwLock<RouteTable>>,
 }
 
 impl H3Frontend {
@@ -115,7 +119,10 @@ impl H3Frontend {
             );
         }
 
-        let route_table = Arc::new(RouteTable::build(&cert_d_routes, &name));
+        let route_table = Arc::new(parking_lot::RwLock::new(RouteTable::build(
+            &cert_d_routes,
+            &name,
+        )));
 
         let rustls_arc = build_rustls_server_config(cert_store, &[b"h3"]);
         let rustls_inner: rustls::ServerConfig = (*rustls_arc).clone();
@@ -207,7 +214,7 @@ impl H3Frontend {
             name = %name,
             listen = %local_addr,
             alpn = "h3",
-            routes = route_table.len(),
+            routes = route_table.read().len(),
             migration = true,
             zero_rtt = false,
             "HTTP/3 endpoint listening"
@@ -220,6 +227,7 @@ impl H3Frontend {
             cancel,
             handle,
             conn_tracker,
+            route_table,
         })
     }
 
@@ -233,6 +241,30 @@ impl H3Frontend {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Hot-swap the route set served by this endpoint's HTTP/3 path.
+    /// Mirrors [`HttpFrontend::update_routes`]; the supervisor calls
+    /// both in lock-step so the h2/h1 and h3 paths agree on the
+    /// current route set for any given request.
+    pub fn update_routes(
+        &self,
+        routes: &[ratatoskr::rule::HttpRoute],
+        cert_store: &Arc<CertStore>,
+    ) {
+        let cert_d_routes: Vec<ratatoskr::rule::HttpRoute> = routes
+            .iter()
+            .filter(|r| cert_store.contains(&r.hostname))
+            .cloned()
+            .collect();
+        let new_table = RouteTable::build(&cert_d_routes, &self.name);
+        let route_count = new_table.len();
+        *self.route_table.write() = new_table;
+        tracing::info!(
+            name = %self.name,
+            routes = route_count,
+            "HTTP/3 route table hot-swapped"
+        );
     }
 
     /// Cancel the accept loop and wait for it to exit. With
@@ -271,7 +303,7 @@ impl H3Frontend {
 async fn run_accept_loop(
     rule: Rule,
     endpoint: Endpoint,
-    routes: Arc<RouteTable>,
+    routes: Arc<parking_lot::RwLock<RouteTable>>,
     client: BackendClient,
     interpose_map: InterposeMap,
     request_body_limit: usize,
@@ -348,7 +380,7 @@ async fn run_accept_loop(
 async fn serve_connection(
     rule: Rule,
     peer_addr: SocketAddr,
-    routes: Arc<RouteTable>,
+    routes: Arc<parking_lot::RwLock<RouteTable>>,
     client: BackendClient,
     quic_conn: quinn::Connection,
     request_body_limit: usize,
@@ -393,7 +425,7 @@ async fn serve_connection(
 async fn handle_stream<C>(
     rule: Rule,
     peer_addr: SocketAddr,
-    routes: Arc<RouteTable>,
+    routes: Arc<parking_lot::RwLock<RouteTable>>,
     client: BackendClient,
     resolver: h3::server::RequestResolver<C, Bytes>,
     request_body_limit: usize,
@@ -426,13 +458,23 @@ where
         .await;
     };
 
-    let Some(route) = routes.lookup(&host) else {
-        debug!(rule = %rule.name, host = %host, "no route for host; replying 404");
-        return send_short_response(stream, StatusCode::NOT_FOUND, b"no route\n").await;
+    // Route lookup. Clone the matched route's data out under a brief
+    // read-guard so the supervisor's hot-swap path is never blocked
+    // behind an in-flight request, and so the (parking_lot, !Send)
+    // guard never crosses an `.await`.
+    let route_data: Option<(url::Url, Option<ratatoskr::rule::HstsConfig>, std::collections::BTreeMap<String, String>)> = {
+        let routes = routes.read();
+        routes
+            .lookup(&host)
+            .map(|r| (r.target.clone(), r.hsts, r.headers.clone()))
     };
-    let upstream_url = route.target.clone();
-    let hsts_cfg = route.hsts;
-    let static_headers = route.headers.clone();
+    let (upstream_url, hsts_cfg, static_headers) = match route_data {
+        Some(t) => t,
+        None => {
+            debug!(rule = %rule.name, host = %host, "no route for host; replying 404");
+            return send_short_response(stream, StatusCode::NOT_FOUND, b"no route\n").await;
+        }
+    };
 
     // WebSocket-over-h3 (RFC 9220 extended CONNECT) is not supported.
     // h3 0.0.8 does not surface the `:protocol` pseudo-header through

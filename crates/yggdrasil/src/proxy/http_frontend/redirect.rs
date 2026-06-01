@@ -386,7 +386,10 @@ async fn dispatch(
                 hsts: None,
                 headers: std::collections::BTreeMap::new(),
             }];
-            let route_table = Arc::new(RouteTable::build(&single_route, &rule_name));
+            let route_table = Arc::new(parking_lot::RwLock::new(RouteTable::build(
+                &single_route,
+                &rule_name,
+            )));
             let ctx = Arc::new(ConnContext {
                 rule: None,
                 rule_name: rule_name.clone(),
