@@ -1634,6 +1634,8 @@ mod tests {
             if proxy.active_flows() == expected {
                 return;
             }
+            // Bounded poll on the per-shard flow count; the proxy
+            // publishes no notify channel for active_flows.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(proxy.active_flows(), expected);
@@ -1817,6 +1819,7 @@ mod tests {
             if proxy.active_flows() == 32 {
                 break;
             }
+            // Bounded poll while clients fan out across shards.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(proxy.active_flows(), 32);
@@ -1874,6 +1877,7 @@ mod tests {
             if proxy.active_flows() > 0 {
                 break;
             }
+            // Bounded poll waiting for the proxy to create a flow.
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_recv_timeout(&client, Duration::from_millis(250)).await;
@@ -1904,7 +1908,11 @@ mod tests {
         let _ = send_recv(&client, proxy.local_addr(), b"x").await;
         assert_eq!(proxy.active_flows(), 1);
 
-        // Wait long enough for the flow to age out and the reaper to fire.
+        // Real-time wait: this test verifies that the reaper actually
+        // fires after the idle_timeout (200 ms) elapses. The reaper
+        // runs on a wall-clock interval and there's no event we can
+        // subscribe to that says "reaper just swept." 700 ms is
+        // idle_timeout + reaper interval + slack.
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert_eq!(
             proxy.active_flows(),
@@ -1949,6 +1957,7 @@ mod tests {
             "expected every shard to receive at least one flow: {initial_shard_sizes:?}"
         );
 
+        // Same real-time pattern as reaper_evicts_idle_flow above.
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert!(
             proxy.shards.iter().all(|shard| shard.is_empty()),
@@ -1992,6 +2001,9 @@ mod tests {
 
         let entry = flow_for(&proxy, client.local_addr().unwrap());
         let before_return = entry.last_seen_ms.load(Ordering::Relaxed);
+        // 20 ms spacing so the assertion below can observe a strict
+        // post-return advance in last_seen_ms (the ms-resolution clock
+        // would otherwise tie pre- and post-return readings).
         tokio::time::sleep(Duration::from_millis(20)).await;
         release_tx.send(()).unwrap();
 
@@ -2007,6 +2019,8 @@ mod tests {
                 proxy.stop().await;
                 return;
             }
+            // Bounded poll on an atomic; the upstream-to-client task
+            // updates this without notify-channel coordination.
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("return traffic did not advance last_seen_ms");
@@ -2036,7 +2050,9 @@ mod tests {
         // Simulate an IP change via the same PeerState.
         let _ = peer.record_heartbeat("198.51.100.1:1".parse().unwrap());
 
-        // The watcher task should drain the table promptly.
+        // Bounded poll on the drain; the IP-change watcher task fires
+        // on the peer-state watch but has no separate "drain complete"
+        // notification we can await on directly.
         for _ in 0..50 {
             if proxy.active_flows() == 0 {
                 break;
@@ -2072,11 +2088,17 @@ mod tests {
             c.send_to(b"x", proxy.local_addr()).await.unwrap();
             clients.push(c);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_active_flows(&proxy, 16).await;
         assert!(proxy.active_flows() >= 1, "flows should be established");
 
         let _ = peer.record_heartbeat("198.51.100.1:1".parse().unwrap());
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Bounded poll for drain (same shape as the single-shard variant).
+        for _ in 0..50 {
+            if proxy.active_flows() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         assert_eq!(proxy.active_flows(), 0, "all shards should be drained");
         proxy.stop().await;
@@ -2107,13 +2129,24 @@ mod tests {
             .local_addr()
             .unwrap();
 
+        // Subscribe to the peer-state watch BEFORE firing the burst.
+        // record_heartbeat uses send_if_modified, so the watch only
+        // fires when the IP actually changes. After the burst, the
+        // watch must NOT have changed — that's the deterministic
+        // negative assertion that proves the drain task could not
+        // have been triggered.
+        let mut watch_rx = peer.watch();
+        let _ = watch_rx.borrow_and_update();
+
         // 200 same-IP heartbeats with rotating source ports.
         for port in 2000..2200u16 {
             let _ = peer.record_heartbeat(format!("127.0.0.1:{port}").parse().unwrap());
         }
 
-        // Give the (non-)drain task a chance to NOT run.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !watch_rx.has_changed().unwrap_or(true),
+            "same-IP heartbeats must not fire the peer-state watch"
+        );
 
         assert_eq!(
             proxy.active_flows(),

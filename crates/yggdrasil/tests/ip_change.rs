@@ -185,19 +185,29 @@ async fn ip_change_drains_inflight_udp_flow() {
     );
     let _ = watch_rx.borrow_and_update();
 
-    // Give the proxy a moment to react to the watch (drain flows, ready for
-    // new upstream sockets pointed at 127.0.0.2).
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Send a new datagram through the proxy. It should be forwarded to the
-    // 127.0.0.2 echo (new upstream), with a *different* upstream port than
-    // before because the flow table was rebuilt.
-    client_sock.send(b"after-change").await.unwrap();
-    let n = tokio::time::timeout(Duration::from_secs(2), client_sock.recv(&mut reply))
-        .await
-        .expect("post-change echo timeout")
-        .unwrap();
-    assert_eq!(&reply[..n], b"after-change");
+    // Deterministic wait for the drain: the proxy's IP-change watcher
+    // task races with this send. If the drain hasn't run yet, the
+    // first datagram still routes through the old flow's upstream
+    // socket (echo_a, 127.0.0.1) and seen_b stays empty. Instead of
+    // an arbitrary sleep before the send, retry the send until we
+    // observe the new upstream landing at echo_b — that's evidence
+    // both that the drain ran AND that the new flow targets 127.0.0.2.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut reply = [0u8; 2048];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("echo @ 127.0.0.2 never received the post-change datagram (drain raced?)");
+        }
+        client_sock.send(b"after-change").await.unwrap();
+        // Best-effort recv with short timeout; an old-flow route still
+        // produces a reply via echo_a, so observing a reply is not by
+        // itself evidence the drain happened.
+        let _ = tokio::time::timeout(Duration::from_millis(100), client_sock.recv(&mut reply))
+            .await;
+        if !seen_b.lock().await.is_empty() {
+            break;
+        }
+    }
 
     let upstream_post = {
         let v = seen_b.lock().await;

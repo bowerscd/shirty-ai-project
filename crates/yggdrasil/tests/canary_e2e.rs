@@ -153,15 +153,16 @@ async fn tcp_canary_ok_against_unreachable_backend() {
     let ruleset = ratatoskr::rule::RuleSet::from_rules(vec![rule.clone()]).unwrap();
     supervisor.handle().apply_ruleset(ruleset).await.unwrap();
     // Wait briefly for the supervisor to bind the listener.
-    let mut tries = 0;
-    while supervisor.snapshot_receiver().borrow().is_empty() && tries < 50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        tries += 1;
+    {
+        let mut rx = supervisor.snapshot_receiver();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.borrow().is_empty() {
+                rx.changed().await.expect("supervisor snapshot watch closed");
+            }
+        })
+        .await
+        .expect("supervisor never bound the test rule");
     }
-    assert!(
-        !supervisor.snapshot_receiver().borrow().is_empty(),
-        "supervisor never bound the test rule"
-    );
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("control.sock");
@@ -226,12 +227,16 @@ async fn udp_canary_ok_against_unreachable_backend() {
     let rule = terminal_udp_rule("udp-canary", listen_port, "127.0.0.1:1");
     let ruleset = ratatoskr::rule::RuleSet::from_rules(vec![rule.clone()]).unwrap();
     supervisor.handle().apply_ruleset(ruleset).await.unwrap();
-    let mut tries = 0;
-    while supervisor.snapshot_receiver().borrow().is_empty() && tries < 50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        tries += 1;
+    {
+        let mut rx = supervisor.snapshot_receiver();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.borrow().is_empty() {
+                rx.changed().await.expect("supervisor snapshot watch closed");
+            }
+        })
+        .await
+        .expect("supervisor never bound the UDP test rule");
     }
-    assert!(!supervisor.snapshot_receiver().borrow().is_empty());
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("control.sock");
@@ -305,12 +310,16 @@ async fn canary_no_such_rule_reports_close_matches() {
     ];
     let ruleset = ratatoskr::rule::RuleSet::from_rules(rules).unwrap();
     supervisor.handle().apply_ruleset(ruleset).await.unwrap();
-    let mut tries = 0;
-    while supervisor.snapshot_receiver().borrow().len() < 3 && tries < 50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        tries += 1;
+    {
+        let mut rx = supervisor.snapshot_receiver();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.borrow().len() < 3 {
+                rx.changed().await.expect("supervisor snapshot watch closed");
+            }
+        })
+        .await
+        .expect("supervisor never bound all three test rules");
     }
-    assert_eq!(supervisor.snapshot_receiver().borrow().len(), 3);
 
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("control.sock");

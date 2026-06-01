@@ -241,6 +241,10 @@ mod tests {
         let table = CanaryArmTable::new();
         let tok = token(0xAB);
         table.arm(listen(2222), Protocol::Tcp, tok, Duration::from_millis(1));
+        // Real-time TTL test: the table consults Instant::now() to
+        // decide expiry; making this deterministic would require
+        // injecting a Clock trait through CanaryArmTable. 10x slack
+        // over the 1 ms TTL.
         std::thread::sleep(Duration::from_millis(10));
         assert!(!table.is_armed(listen(2222), Protocol::Tcp));
         assert!(!table.match_token(listen(2222), Protocol::Tcp, &tok));
@@ -269,7 +273,8 @@ mod tests {
         table.arm(listen(2222), Protocol::Tcp, tok, Duration::from_secs(5));
         assert_eq!(table.active_count(), 1);
         // After the original short TTL would have expired, the
-        // refreshed entry still matches.
+        // refreshed entry still matches. Real-time TTL test (see
+        // expired_arm_is_no_longer_armed for why no Clock trait).
         std::thread::sleep(Duration::from_millis(100));
         assert!(table.match_token(listen(2222), Protocol::Tcp, &tok));
     }
@@ -305,6 +310,7 @@ mod tests {
             token(0x22),
             Duration::from_secs(5),
         );
+        // Real-time TTL test; 10x slack on the 1 ms TTL of the first arm.
         std::thread::sleep(Duration::from_millis(10));
         table.purge_expired();
         assert!(!table.is_armed(listen(2222), Protocol::Tcp));
@@ -322,6 +328,7 @@ mod tests {
             token(0x11),
             Duration::from_millis(1),
         );
+        // Real-time TTL test; 10x slack on the 1 ms TTL.
         std::thread::sleep(Duration::from_millis(10));
         // Now install a fresh arm with a different token; the
         // existing stale entry must be cleaned up by the insert

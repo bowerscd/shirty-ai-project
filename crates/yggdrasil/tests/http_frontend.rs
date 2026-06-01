@@ -487,9 +487,13 @@ impl TwoRouteFixture {
 
     async fn stop(self) {
         self.shutdown.cancel();
-        // give the supervisor a moment to drain — strictly-correct teardown
-        // would also `supervisor.stop().await` but the Drop on tmpdir is
-        // sufficient for the assertions we've already made.
+        // The supervisor's stop() would await its main_handle and
+        // properly drain; we skip that here because the assertions
+        // above have already completed and tmpdir's Drop is sufficient
+        // for the file-handle teardown. 50 ms is a slack window to let
+        // any spawned background tasks finish their current poll before
+        // we drop the runtime. Not a flake risk — the test has already
+        // asserted everything by this point.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -1070,11 +1074,11 @@ async fn missing_host_header_is_rejected() {
 #[tokio::test]
 async fn port_80_redirects_known_host_to_https() {
     let fx = TwoRouteFixture::spawn().await;
-    // Give the redirect listener a brief moment to fully wire up.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut tcp = TcpStream::connect(format!("127.0.0.1:{}", fx.redirect_port))
-        .await
-        .expect("connect to redirect listener");
+    // Wait deterministically for the redirect listener to be up. The
+    // supervisor's snapshot only tracks the HTTPS frontend; the per-IP
+    // :80 companion is spawned alongside but not surfaced. Poll
+    // connect() — ConnectionRefused = not bound yet, Ok = ready.
+    let mut tcp = await_connect(fx.redirect_port).await;
     let req = format!(
         "GET /foo?bar=baz HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
         host = fx.api_host,
@@ -1101,10 +1105,7 @@ async fn port_80_redirects_known_host_to_https() {
 #[tokio::test]
 async fn port_80_unknown_host_returns_404() {
     let fx = TwoRouteFixture::spawn().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut tcp = TcpStream::connect(format!("127.0.0.1:{}", fx.redirect_port))
-        .await
-        .expect("connect to redirect listener");
+    let mut tcp = await_connect(fx.redirect_port).await;
     tcp.write_all(b"GET / HTTP/1.1\r\nHost: nowhere.example\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
@@ -1201,18 +1202,24 @@ async fn disk_backed_cert_reloads_on_change() {
     // watcher in `certs.rs` will observe the file-write event in the
     // cert directory, debounce, and trigger `CertStore::reload_host`
     // for the affected hostname — no rule-file bump required.
+    //
+    // Pause before the rewrite so the new file's mtime is reliably
+    // greater than the original's; notify-debouncer-mini's coarse mtime
+    // resolution would otherwise coalesce both writes into one event.
     std::thread::sleep(std::time::Duration::from_millis(100));
     issue_self_signed_pem(&cert_path, &key_path, &host);
-    // Wait up to 2s for the reload to land.
+    // Poll the leaf fingerprint until it changes. The cert watcher's
+    // debounce window dictates the lower bound; 2 s is generous.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut second_leaf_fp = first_leaf_fp;
     while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let now = leaf_fingerprint(frontend_addr, &host).await;
         if now != first_leaf_fp {
             second_leaf_fp = now;
             break;
         }
+        // 50 ms backoff between TLS handshakes; deadline gates the loop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_ne!(
         second_leaf_fp, first_leaf_fp,
@@ -1273,8 +1280,11 @@ async fn malformed_cert_reload_keeps_old_cert_serving() {
     // because the file is now malformed. The store keeps the previously
     // loaded entry in service.
     std::fs::write(&cert_path, b"this is not pem").unwrap();
-    // Give the watcher's debounce window + a healthy margin to attempt
-    // the reload and reject it.
+    // The cert watcher's debounce window (50 ms in this test) + a
+    // generous reload-attempt budget. There's no observable post-reload
+    // signal because the reload is REJECTED (no state change to detect);
+    // this is one of the irreducible "wait for system to do nothing
+    // observable" patterns.
     tokio::time::sleep(Duration::from_millis(800)).await;
     // Old cert should still be in service.
     let still_fp = leaf_fingerprint(frontend_addr, &host).await;
@@ -1498,6 +1508,23 @@ impl CertLessFixture {
         // shutdown signal cascades through.
         let _ = self.cert_d;
         let _ = self.cert_less;
+    }
+}
+
+/// Wait for `redirect_port` to accept a TCP connection. Replaces the
+/// "give the redirect listener a brief moment" sleep pattern with a
+/// deterministic poll: `connect()` returns ConnectionRefused until the
+/// per-IP companion listener has bound, then succeeds.
+async fn await_connect(port: u16) -> TcpStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            Ok(s) => return s,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::task::yield_now().await;
+            }
+            Err(e) => panic!("redirect listener on :{port} never came up: {e}"),
+        }
     }
 }
 
@@ -1752,8 +1779,13 @@ target = "{}"
         http1_request(&mut tls, Some(&host_a_for_task), &[], "/").await
     });
 
-    // Give the request a moment to reach the slow backend so it's
-    // genuinely in-flight when we swap the frontend.
+    // The in-flight request needs to actually reach the slow backend
+    // before we trigger the route swap, otherwise we'd be testing the
+    // wrong race (request in transit vs request awaiting backend).
+    // SlowBackend doesn't expose an observable "received request"
+    // signal; the 200 ms here is the irreducible client→frontend→
+    // backend latency budget on loopback (typically <5 ms). The
+    // outer 8 s timeout still bounds the worst case.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Apply the route addition via the supervisor handle.

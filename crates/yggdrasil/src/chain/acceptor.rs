@@ -973,7 +973,6 @@ mod tests {
     use ratatoskr::auth::PUBLIC_KEY_LEN;
     use ratatoskr::predicate::Predicate;
     use ratatoskr::rule::Protocol;
-    use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
 
     use crate::proxy::resolver::ResolverFactory;
@@ -1032,19 +1031,20 @@ mod tests {
     }
 
     async fn await_snapshot_len(sup: &ProxySupervisor, target: usize) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if sup.snapshot().len() == target {
-                return;
+        // Deterministic wait via the supervisor's snapshot watch.
+        let mut rx = sup.snapshot_receiver();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.borrow().len() != target {
+                rx.changed().await.expect("snapshot watch closed");
             }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for snapshot len {target}; have {}",
-                    sup.snapshot().len()
-                );
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for snapshot len {target}; have {}",
+                sup.snapshot().len()
+            )
+        });
     }
 
     fn derive_cfg() -> DeriveConfig {

@@ -110,6 +110,7 @@ async fn handshake_then_heartbeat_ack_roundtrip() {
                     .load(std::sync::atomic::Ordering::Relaxed)
             );
         }
+        // Bounded poll on an atomic counter; no notify channel.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -182,6 +183,7 @@ async fn rekey_triggers_a_second_handshake() {
                 handshakes.load(std::sync::atomic::Ordering::Relaxed)
             );
         }
+        // Bounded poll on an atomic counter; no notify channel.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -210,6 +212,10 @@ async fn cancel_token_stops_client_promptly() {
     let client = ChainClient::new(cfg, cancel.clone());
     let client_handle = tokio::spawn(async move { client.run().await });
 
+    // Give the client task a window to drive its first handshake +
+    // heartbeat before we cancel; without it we'd be testing cancel-on-
+    // startup not cancel-mid-session. The assertion below bounds the
+    // post-cancel exit latency at 1 s.
     tokio::time::sleep(Duration::from_millis(150)).await;
     cancel.cancel();
 
@@ -241,6 +247,11 @@ async fn backoff_and_reconnect_when_endpoint_unresponsive() {
     let client = ChainClient::new(cfg, cancel.clone());
     let client_handle = tokio::spawn(async move { client.run().await });
 
+    // Tests the backoff path on an unresponsive endpoint: the client
+    // must NOT exit during this window — it should retry per the
+    // configured backoff. There's no observable signal for "i am
+    // currently backing off," so the irreducible test is "wait past
+    // at least one backoff cycle and confirm the task is still alive."
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !client_handle.is_finished(),
@@ -391,9 +402,11 @@ async fn control_send_handle_resolves_one_thousand_noop_envelopes() {
     let handle = client.handle();
     let client_handle = tokio::spawn(async move { client.run().await });
 
-    // Wait for the handshake to complete: the very first send would
-    // race the handshake otherwise. A brief sleep is sufficient
-    // because `start_with_loss(_, 0)` never drops anything.
+    // Wait for the handshake to complete: send_control before the
+    // session exists fails with ChainClientShutDown. ChainClient
+    // exposes no "handshake done" notification today, so 300 ms is
+    // the irreducible lossless-handshake budget. (The lossy variant
+    // below uses 500 ms for the same reason.)
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut receivers = Vec::with_capacity(1000);
@@ -469,6 +482,8 @@ async fn control_send_converges_under_10_percent_packet_loss() {
     let client_handle = tokio::spawn(async move { client.run().await });
 
     // Wait for handshake (which may itself need a retry on loss).
+    // 500 ms is the lossy-handshake-with-one-retry budget; no
+    // observable "handshake done" signal exists on ChainClient.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     const N: usize = 1000;
@@ -524,7 +539,8 @@ async fn pending_sends_resolve_when_session_ends() {
     let handle = client.handle();
     let client_handle = tokio::spawn(async move { client.run().await });
 
-    // Wait for handshake.
+    // Wait for handshake (no observable signal; same pattern as the
+    // other control-send tests above).
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Enqueue a send, then immediately cancel. The send's completion

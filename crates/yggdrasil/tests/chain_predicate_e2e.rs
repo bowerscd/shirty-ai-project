@@ -160,6 +160,10 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
                 snap.len()
             );
         }
+        // Bounded poll: the supervisor publishes through a watch::Sender
+        // we could subscribe to, but the predicate-derived snapshot lands
+        // a few μs after the ack we already observed; 20 ms / 50 attempts
+        // is generous enough that the test never flakes in practice.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

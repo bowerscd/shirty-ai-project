@@ -411,7 +411,9 @@ async fn h3_chain_proxy_v2_propagates_real_client_ip_to_xff() {
     // here we want the PROXY datagram to land before quinn's client-
     // side handshake fires its Initial, otherwise quinn would see an
     // Initial first and stamp X-Forwarded-For from the kernel peer
-    // before the interpose ever sees the PROXY datagram.
+    // before the interpose ever sees the PROXY datagram. The interpose
+    // exposes no observable "just processed" signal; this 50 ms is
+    // the irreducible "race the kernel" budget for this test.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Hand the now-quiesced socket to a client-side quinn endpoint.

@@ -95,6 +95,9 @@ async fn send_recv_observed(
 }
 
 async fn wait_for_active_flows(proxy: &UdpProxy, expected: usize) {
+    // Bounded poll on the per-shard flow count. The proxy publishes no
+    // notify-channel for active_flows; 20 ms / 100 attempts ≈ 2 s
+    // safety budget.
     for _ in 0..100 {
         if proxy.active_flows() == expected {
             return;
@@ -187,10 +190,23 @@ async fn multi_worker_heartbeat_invariance() {
         "expected SO_REUSEPORT fan-out to place flows on every shard: {shard_counts_before:?}"
     );
 
+    // Subscribe to the peer-state watch BEFORE firing the heartbeat
+    // burst. PeerState::record_heartbeat uses send_if_modified, so the
+    // watch only fires when the IP actually changes. After the burst,
+    // has_changed() must return false to prove the heartbeats classified
+    // as SameIp and therefore couldn't have triggered the proxy's drain
+    // task. That's the deterministic signal — no time-based wait needed.
+    let mut watch_rx = peer.watch();
+    let _ = watch_rx.borrow_and_update();
+
     for port in 2000..2000 + HEARTBEATS {
         let _ = peer.record_heartbeat(format!("127.0.0.1:{port}").parse().unwrap());
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        !watch_rx.has_changed().unwrap_or(true),
+        "same-IP heartbeats must not fire the watch (would have triggered drain)"
+    );
 
     let flows_after = proxy.active_flows();
     assert_eq!(
@@ -246,6 +262,8 @@ async fn multi_worker_ip_change_drains_all_shards() {
     assert!(proxy.active_flows() >= 1);
 
     let _ = peer.record_heartbeat("198.51.100.1:1".parse().unwrap());
+    // Bounded poll on active_flows; the proxy's drain task fires
+    // asynchronously on the peer-state watch.
     for _ in 0..50 {
         if proxy.active_flows() == 0 {
             break;

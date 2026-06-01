@@ -760,14 +760,18 @@ mod tests {
         assert_eq!(snaps[0].name, "ext-alpha");
 
         // The current_set watch should also reflect the applied set.
+        // Use changed() rather than poll-sleep — the supervisor sends
+        // through current_set_tx after every apply, so the very next
+        // changed() resolves once the apply we just did has been
+        // committed.
         let mut rx = handle.current_set_rx();
-        // Spin briefly: the watch send happens after the snapshot send.
-        for _ in 0..50 {
-            if rx.borrow_and_update().rules().len() == 1 {
-                break;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.borrow_and_update().rules().len() != 1 {
+                rx.changed().await.expect("current_set watch closed");
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("current_set never reflected the external apply");
         assert_eq!(rx.borrow().rules().len(), 1);
         assert_eq!(rx.borrow().rules()[0].name, "ext-alpha");
 
@@ -1048,7 +1052,9 @@ mod tests {
         handle.apply_ruleset(set_b).await.unwrap();
 
         // Wait for the cert store to reflect the swap. The frontend
-        // respawn + cert plumbing is observable through CertStore::contains.
+        // respawn + cert plumbing is observable through CertStore::contains,
+        // but the cert store publishes no notify channel; this bounded
+        // poll is the available signal.
         let store_swap_seen = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if store.contains(host_b) && !store.contains(host_a) {
@@ -1114,8 +1120,9 @@ mod tests {
         await_no_https(&sup).await;
 
         // The supervisor GCs the per-IP redirect listener after both
-        // `hosts` and `plaintext_routes` go empty. Poll until the port
-        // is free, bounded so flakes are visible.
+        // `hosts` and `plaintext_routes` go empty. Poll TCP bind until
+        // the port is free; no notify channel exists for listener
+        // teardown so this bounded poll is the available signal.
         let gc_seen = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if tokio::net::TcpListener::bind(format!("127.0.0.1:{redirect_port}"))

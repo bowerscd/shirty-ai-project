@@ -487,6 +487,7 @@ mod tests {
             if tokio::time::Instant::now() >= deadline {
                 panic!("publisher did not emit a control op within 5s");
             }
+            // 10 ms poll backoff; see fn-level doc for the rationale.
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }

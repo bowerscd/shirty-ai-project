@@ -26,6 +26,28 @@ use common::nat_gateway::{MockNatGateway, MockResponse};
 
 const SETTLE: Duration = Duration::from_millis(150);
 
+/// Poll until the mock gateway has received at least `target`
+/// requests, bounded by `timeout`. Deterministic replacement for
+/// `sleep(SETTLE)` in tests where the next assertion looks at the
+/// gateway's recorded request log.
+async fn wait_for_requests(gateway: &MockNatGateway, target: usize, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let n = gateway.requests().len();
+        if n >= target {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for ≥ {target} gateway requests; have {n}"
+            );
+        }
+        // 5 ms backoff between request-count polls; deadline gates the loop.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+
 fn loopback_rule(name: &str, port: u16) -> Rule {
     Rule {
         name: name.into(),
@@ -115,13 +137,9 @@ async fn mapper_pcp_maps_initial_rule_on_apply() {
 
     // Apply a single TCP rule.
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
 
     let reqs = gateway.requests();
-    assert!(
-        !reqs.is_empty(),
-        "mapper should have sent at least one MAP request"
-    );
     let pcp = reqs[0].pcp().expect("first request should be PCP");
     assert_eq!(pcp.protocol, MapProtocol::Tcp);
     assert_eq!(pcp.internal_port, 22);
@@ -156,10 +174,9 @@ async fn mapper_natpmp_explicit_mode_uses_natpmp_only() {
     .await;
 
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
 
     let reqs = gateway.requests();
-    assert!(!reqs.is_empty());
     assert!(
         reqs.iter().all(|r| r.natpmp().is_some()),
         "every request must be NAT-PMP in natpmp mode, got {reqs:?}"
@@ -198,7 +215,9 @@ async fn mapper_auto_falls_back_to_natpmp_on_unsupp_version() {
     .await;
 
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
+    // Expect ≥ 2: the initial PCP attempt + the NAT-PMP retry that
+    // actually succeeds.
+    wait_for_requests(&gateway, 2, Duration::from_secs(2)).await;
 
     let snap = mapper.handle().snapshot();
     assert_eq!(
@@ -230,14 +249,13 @@ async fn mapper_unmaps_on_rule_removal() {
     .await;
 
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
-    assert!(!gateway.requests().is_empty());
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
     let create_count = gateway.requests().len();
 
     // Apply an empty rule set; the mapper should send a
     // lifetime=0 release request for the previously-mapped port.
     tx.send(RuleSet::default()).unwrap();
-    sleep(SETTLE).await;
+    wait_for_requests(&gateway, create_count + 1, Duration::from_secs(2)).await;
 
     let after = gateway.requests();
     assert!(
@@ -283,17 +301,17 @@ async fn mapper_unmaps_all_on_shutdown() {
         loopback_rule("web", 8080),
     ]))
     .unwrap();
-    sleep(SETTLE).await;
+    // Two MAP requests (one per rule).
+    wait_for_requests(&gateway, 2, Duration::from_secs(2)).await;
     let create_count = gateway.requests().len();
 
     shutdown.cancel();
     mapper.shutdown().await;
-    // Let the gateway task drain the release datagrams from the
-    // kernel buffer. `mapper.shutdown()` returns as soon as the
-    // task's tokio::spawn handle resolves, but the datagrams it
-    // sent on its way out still need a scheduling tick on the
-    // gateway side.
-    sleep(SETTLE).await;
+    // Wait for the lifetime=0 release datagrams the mapper sent on
+    // its way out — one per active mapping (2). `mapper.shutdown()`
+    // returned when its tokio::spawn handle resolved, but the
+    // datagrams still need to be observed by the gateway task.
+    wait_for_requests(&gateway, create_count + 2, Duration::from_secs(2)).await;
 
     let after = gateway.requests();
     let releases: Vec<&pcp::PcpMapRequest> = after
@@ -327,7 +345,7 @@ async fn mapper_includes_accept_listen_target() {
     )
     .await;
 
-    sleep(SETTLE).await;
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
     let reqs = gateway.requests();
     let udp_51820 = reqs
         .iter()
@@ -366,7 +384,12 @@ async fn mapper_loopback_listener_is_filtered_and_never_mapped() {
     )
     .await;
 
-    // Loopback bind — must not produce a MAP request.
+    // Loopback bind — must not produce a MAP request. This is a
+    // negative assertion: there's no observable "the mapper finished
+    // processing the rule-set update without producing a request"
+    // signal, so SETTLE is the irreducible budget for the mapper's
+    // reconcile loop. If it ever does emit, the assertion below
+    // catches it.
     let mut rule = loopback_rule("local-only", 9000);
     rule.listen = "127.0.0.1:9000".parse().unwrap();
     tx.send(rule_set(vec![rule])).unwrap();
@@ -391,7 +414,8 @@ async fn mapper_off_makes_no_requests_even_after_apply() {
     let shutdown = CancellationToken::new();
     let (tx, _rx) = watch::channel(RuleSet::default());
     // We explicitly DO NOT spawn the mapper. Off-mode must hold no
-    // resources and emit no traffic.
+    // resources and emit no traffic. Negative assertion — same
+    // irreducible-SETTLE caveat as loopback_listener_is_filtered.
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
     sleep(SETTLE).await;
 
@@ -428,7 +452,7 @@ async fn status_snapshot_reflects_mapper_progress() {
     ));
 
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
 
     let snap1 = handle.snapshot();
     assert_eq!(snap1.state, NatState::Active);
@@ -464,9 +488,20 @@ async fn mapper_permanent_error_drops_target_and_surfaces_error() {
     .await;
 
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
-
-    let snap = mapper.handle().snapshot();
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
+    // Then poll the snapshot for the surfaced error (it's set after
+    // the request response is processed; one short await is enough).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let snap = loop {
+        let snap = mapper.handle().snapshot();
+        if snap.last_error.is_some() {
+            break snap;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("mapper never surfaced last_error");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     assert_eq!(snap.active_mappings.len(), 0);
     assert!(snap.last_error.is_some());
     assert!(snap.last_error.unwrap().contains("NotAuthorized"));
@@ -493,12 +528,13 @@ async fn natpmp_release_has_lifetime_zero() {
     .await;
 
     tx.send(rule_set(vec![loopback_rule("ssh", 22)])).unwrap();
-    sleep(SETTLE).await;
+    wait_for_requests(&gateway, 1, Duration::from_secs(2)).await;
     let after_create = gateway.requests().len();
 
     shutdown.cancel();
     mapper.shutdown().await;
-    sleep(SETTLE).await;
+    // Wait for the release datagram to land after shutdown returns.
+    wait_for_requests(&gateway, after_create + 1, Duration::from_secs(2)).await;
 
     let all = gateway.requests();
     let release = all

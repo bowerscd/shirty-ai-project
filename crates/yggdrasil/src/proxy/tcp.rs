@@ -1269,8 +1269,9 @@ mod tests {
         // copy_bidirectional waiting for bytes that never come.
         let client = TcpStream::connect(listen).await.unwrap();
         // Give the accept loop a moment to actually spawn the per-conn
-        // task — otherwise stop() races and the tracker may be empty
-        // when we drain.
+        // task; without it stop() races and the tracker may be empty
+        // when we drain. The proxy doesn't expose its TaskTracker
+        // count, so this is the irreducible "wait for accept" budget.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let drain_budget = Duration::from_millis(250);

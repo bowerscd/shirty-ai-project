@@ -55,10 +55,10 @@ async fn reload_emits_reloading_then_ready_when_notify_socket_set() {
     .await
     .expect("spawn supervisor");
 
-    // The initial empty-load completes with no notify (the supervisor
-    // suppresses the cycle when both old and new sets are empty). Give
-    // the watcher a moment to confirm that.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // `ProxySupervisor::spawn` runs the initial rule load synchronously
+    // inside `RuleWatcher::spawn`, so by the time it returns the watcher
+    // is live and the initial cycle has either suppressed its notify (both
+    // sides empty) or emitted one. No race window to wait out.
 
     // Pick a free port for the new rule's listen address.
     let listen_port = {
@@ -117,6 +117,10 @@ target_port = 9001
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Bounded poll on a non-blocking UnixDatagram with
+                    // no async-notify integration; 20 ms keeps the
+                    // spawn_blocking task off the CPU between recv
+                    // attempts.
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => panic!("recv on notify socket failed: {e}"),

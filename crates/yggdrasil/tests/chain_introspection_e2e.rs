@@ -160,6 +160,8 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
         if Instant::now() >= deadline {
             panic!("supervisor never picked up the derived rule");
         }
+        // Bounded poll over the introspection snapshot (no notify channel
+        // to await on here); deadline guards against indefinite hang.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

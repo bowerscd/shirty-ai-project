@@ -109,6 +109,8 @@ async fn dropping_a_new_rule_file_adds_a_listener_live() {
                  snapshot = {new_snap:?}"
             );
         }
+        // Bounded poll on the supervisor snapshot (the rule-watcher
+        // debounce gates this; the deadline above is the safety net).
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // Sanity: rule-a survived unchanged.
