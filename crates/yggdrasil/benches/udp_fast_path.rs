@@ -81,7 +81,7 @@ fn build_proxy(runtime: &Runtime) -> (UdpProxy, SocketAddr) {
         let rule: Rule = rule_file.rule.into_iter().next().unwrap();
         assert_eq!(rule.protocol, Protocol::Udp);
 
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let resolver = UpstreamResolver::Dynamic {
             peer_state: peer,

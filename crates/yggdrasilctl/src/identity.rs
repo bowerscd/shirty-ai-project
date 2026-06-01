@@ -30,7 +30,6 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use ratatoskr::auth::StaticKeyPair;
 use ratatoskr::enrollment::{GrantFile, RequestFile};
-use ratatoskr::pubkey::PubKey;
 
 /// Fallback identity-file path when neither `--identity-file` nor the
 /// config's `[server].identity_file` is available.
@@ -147,7 +146,7 @@ fn show(args: ShowArgs, config_path: &Path, json: bool) -> Result<()> {
     }
     let kp = StaticKeyPair::load_from_file(&identity_file)
         .with_context(|| format!("load {}", identity_file.display()))?;
-    let pubkey = PubKey::X25519(*kp.public_key()).to_string();
+    let pubkey = kp.public_key().to_string();
     let fingerprint = kp.fingerprint();
     let path_str = identity_file.display().to_string();
     print_kv(
@@ -257,7 +256,7 @@ fn rotate(args: RotateArgs, config_path: &Path, json: bool) -> Result<()> {
     let kp = StaticKeyPair::generate().context("generate keypair")?;
     kp.save_to_file(&identity_file)
         .with_context(|| format!("write {}", identity_file.display()))?;
-    let pubkey = PubKey::X25519(*kp.public_key()).to_string();
+    let pubkey = kp.public_key().to_string();
     let fingerprint = kp.fingerprint();
     let path_str = identity_file.display().to_string();
     print_kv(
@@ -342,7 +341,7 @@ fn export_request(args: ExportRequestArgs, config_path: &Path, json: bool) -> Re
     }
     let kp = StaticKeyPair::load_from_file(&identity_file)
         .with_context(|| format!("load {}", identity_file.display()))?;
-    let pubkey = PubKey::X25519(*kp.public_key());
+    let pubkey = kp.public_key();
     let req = RequestFile::new(pubkey, now_unix_secs(), args.note.clone());
     let toml_str = req.to_toml().context("serialise request file")?;
 
@@ -397,7 +396,7 @@ fn add_dial(args: AddDialArgs, config_path: &Path, json: bool) -> Result<()> {
     }
     let kp = StaticKeyPair::load_from_file(&identity_file)
         .with_context(|| format!("load {}", identity_file.display()))?;
-    let local_pubkey = PubKey::X25519(*kp.public_key());
+    let local_pubkey = kp.public_key();
 
     let grant = GrantFile::read(&args.from)
         .with_context(|| format!("read grant {}", args.from.display()))?;
@@ -465,7 +464,7 @@ fn add_accept(args: AddAcceptArgs, config_path: &Path, json: bool) -> Result<()>
     }
     let kp = StaticKeyPair::load_from_file(&identity_file)
         .with_context(|| format!("load {}", identity_file.display()))?;
-    let accept_pubkey = PubKey::X25519(*kp.public_key());
+    let accept_pubkey = kp.public_key();
 
     // Validate endpoint shape: must contain a ':' (host:port). We don't
     // resolve DNS or check reachability here — that's the daemon's job at

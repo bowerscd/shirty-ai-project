@@ -9,11 +9,11 @@ matters.
 
 | Primitive               | Construction                                       | Purpose                                           |
 | ----------------------- | -------------------------------------------------- | ------------------------------------------------- |
-| Long-term keypair       | X25519, 32 bytes each side                          | Node identity. Pinned at every chain hop.         |
-| Handshake               | Noise_IK_25519_ChaChaPoly_BLAKE2s (`snow` crate)    | Authenticated key agreement per session.          |
-| Symmetric AEAD          | ChaCha20-Poly1305 (16-byte tag)                     | Payload confidentiality + integrity.              |
+| Long-term keypair       | X25519, 32 bytes each side (modelled as the X25519 variant of `ratatoskr::auth::StaticKeyPair`, a `#[non_exhaustive]` tagged enum) | Node identity. Pinned at every chain hop.         |
+| Handshake               | `Noise_IK_25519_ChaChaPoly_BLAKE2s` (`snow` crate), selected via the `X25519ChaChaPolyBlake2s` variant of `ratatoskr::auth::NoiseSuite` | Authenticated key agreement per session. The Noise *pattern* (IK) is fixed; the cipher suite is `#[non_exhaustive]` so new suites can be added without breaking parsing. |
+| Symmetric AEAD          | ChaCha20-Poly1305 (16-byte tag) — part of the suite above | Payload confidentiality + integrity.              |
 | Strict-monotonic replay | 8-byte counter, rejected on `<= last_accepted`      | Replay prevention.                                |
-| Fingerprint             | BLAKE2s-128 over pubkey, 32 hex chars               | Human-checkable identifier for request/grant.      |
+| Fingerprint             | Tagged `<algo>:<hex hash>` via `PubKey::fingerprint()`. For X25519: BLAKE2s-128, rendered as `x25519:` + 32 hex chars (39 chars total). The hash family is fixed per variant so new variants may pick differently without colliding. | Human-checkable identifier for request/grant.      |
 
 The Noise pattern is **IK**: the initiator already knows the responder's
 static public key. This is the right primitive for a chain where every
@@ -61,7 +61,7 @@ out-of-band:
 * **request.txt** — emitted by the downstream node via `yggdrasilctl
   identity export-request`. Contents:
     * `dial_pubkey` (tagged `x25519:<hex>`)
-    * `downstream_fingerprint` (32-hex BLAKE2s-128)
+    * `downstream_fingerprint` (tagged `x25519:<32-hex BLAKE2s-128>`)
     * optional operator `note`
   Encoded as base64-url-no-pad with a magic prefix; not a secret.
 * **grant.txt** — emitted by the upstream via `yggdrasilctl identity

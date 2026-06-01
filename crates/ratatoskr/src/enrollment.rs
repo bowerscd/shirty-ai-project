@@ -275,10 +275,10 @@ impl GrantFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::PUBLIC_KEY_LEN;
+    use crate::auth::X25519_PUBLIC_LEN;
 
     fn pk(byte: u8) -> PubKey {
-        PubKey::X25519([byte; PUBLIC_KEY_LEN])
+        PubKey::X25519([byte; X25519_PUBLIC_LEN])
     }
 
     #[test]

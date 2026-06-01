@@ -241,10 +241,10 @@ pub const PREDICATE_SET_MAX_WIRE_BYTES: usize = 8 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::PUBLIC_KEY_LEN;
+    use crate::auth::X25519_PUBLIC_LEN;
 
     fn sample_origin() -> PubKey {
-        PubKey::x25519([0x42u8; PUBLIC_KEY_LEN])
+        PubKey::x25519([0x42u8; X25519_PUBLIC_LEN])
     }
 
     fn sample_predicate(name: &str, port: u16, protocol: Protocol) -> Predicate {

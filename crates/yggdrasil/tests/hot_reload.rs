@@ -25,9 +25,9 @@ use crate::common::{
 async fn dropping_a_new_rule_file_adds_a_listener_live() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
     let shutdown = CancellationToken::new();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
 
     let hb = HeartbeatHarness::spawn(server_keys, peer_state.clone(), shutdown.clone()).await;
 

@@ -30,7 +30,11 @@ async fn make_supervisor_with_enrolled(
     enrolled: bool,
 ) -> (ProxySupervisor, Arc<PeerState>, CancellationToken) {
     std::fs::create_dir_all(dir).unwrap();
-    let key = if enrolled { [7u8; 32] } else { [0u8; 32] };
+    let key = if enrolled {
+        Some(ratatoskr::pubkey::PubKey::x25519([7u8; 32]))
+    } else {
+        None
+    };
     let peer_state = PeerState::new(key);
     let shutdown = CancellationToken::new();
     let supervisor = ProxySupervisor::spawn(
@@ -197,7 +201,9 @@ async fn downstream_show_returns_pubkey_when_enrolled() {
             // tagged form: "x25519:" + 64 hex chars = 71 chars
             assert_eq!(p.pubkey.len(), 71);
             assert!(p.pubkey.starts_with("x25519:"));
-            assert_eq!(p.fingerprint.len(), 32);
+            // tagged fingerprint form: "x25519:" + 32 hex chars = 39 chars
+            assert!(p.fingerprint.starts_with("x25519:"));
+            assert_eq!(p.fingerprint.len(), 39);
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -307,8 +313,12 @@ async fn peer_pending_lists_staged_candidates() {
     let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
     let socket = tmp.path().join("control.sock");
     let (pending, cfg) = aux_state(tmp.path());
-    pending.record_candidate([0xAAu8; 32]).unwrap();
-    pending.record_candidate([0xBBu8; 32]).unwrap();
+    pending
+        .record_candidate(ratatoskr::pubkey::PubKey::x25519([0xAAu8; 32]))
+        .unwrap();
+    pending
+        .record_candidate(ratatoskr::pubkey::PubKey::x25519([0xBBu8; 32]))
+        .unwrap();
     let server = bind_relay_control(
         socket.clone(),
         peer_state.clone(),
@@ -339,9 +349,9 @@ async fn downstream_approve_writes_config_and_swaps_live_key() {
     let socket = tmp.path().join("control.sock");
     let (pending, cfg) = aux_state(tmp.path());
 
-    let candidate = [0x42u8; 32];
+    let candidate = ratatoskr::pubkey::PubKey::x25519([0x42u8; 32]);
     pending.record_candidate(candidate).unwrap();
-    let fp = ratatoskr::auth::public_key_fingerprint(&candidate);
+    let fp = candidate.fingerprint();
 
     assert!(!peer_state.is_peer_enrolled());
 
@@ -368,10 +378,10 @@ async fn downstream_approve_writes_config_and_swaps_live_key() {
     }
     // Live key was swapped in.
     assert!(peer_state.is_peer_enrolled());
-    assert_eq!(peer_state.peer_static_key(), candidate);
+    assert_eq!(peer_state.peer_static_key(), Some(candidate));
     // Config file was rewritten with the approved key in tagged form.
     let rewritten = std::fs::read_to_string(&cfg).unwrap();
-    let tagged = format!("x25519:{}", hex::encode(candidate));
+    let tagged = candidate.to_string();
     assert!(
         rewritten.contains(&tagged),
         "config not rewritten with tagged pubkey: {rewritten}"

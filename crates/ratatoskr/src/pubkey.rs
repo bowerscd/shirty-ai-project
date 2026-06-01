@@ -7,13 +7,18 @@
 //!
 //! The enum is `#[non_exhaustive]` so adding variants in a future version is
 //! a non-breaking change for downstream crates that match on it.
+//!
+//! Fingerprints are also tagged (`<algo>:<hex hash>`). The hash family used
+//! for a given variant is fixed at the variant level: X25519 uses
+//! BLAKE2s-128. Future variants may pick a different hash family without
+//! colliding because the algorithm tag prefix disambiguates the renderings.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::auth::{public_key_fingerprint, PUBLIC_KEY_LEN};
+use crate::auth::X25519_PUBLIC_LEN;
 use crate::error::Error;
 
 /// Public key, tagged by algorithm. Wire serialisation uses a 1-byte
@@ -22,7 +27,7 @@ use crate::error::Error;
 #[non_exhaustive]
 pub enum PubKey {
     /// X25519 — the only algorithm in v1.
-    X25519([u8; PUBLIC_KEY_LEN]),
+    X25519([u8; X25519_PUBLIC_LEN]),
 }
 
 impl PubKey {
@@ -38,7 +43,7 @@ impl PubKey {
     /// assert_eq!(pk.raw_bytes().len(), 32);
     /// assert_eq!(pk.as_x25519(), Some(&[0x42; 32]));
     /// ```
-    pub fn x25519(bytes: [u8; PUBLIC_KEY_LEN]) -> Self {
+    pub fn x25519(bytes: [u8; X25519_PUBLIC_LEN]) -> Self {
         Self::X25519(bytes)
     }
 
@@ -58,30 +63,45 @@ impl PubKey {
 
     /// Return the X25519 bytes if this is an X25519 key. Returns `None` for
     /// any future variants.
-    pub fn as_x25519(&self) -> Option<&[u8; PUBLIC_KEY_LEN]> {
+    pub fn as_x25519(&self) -> Option<&[u8; X25519_PUBLIC_LEN]> {
         match self {
             Self::X25519(b) => Some(b),
         }
     }
 
-    /// Short BLAKE2s-128 fingerprint, hex-encoded. Suitable for voice/log
-    /// display. Includes the algorithm tag prefix so fingerprints across
-    /// algorithms cannot collide.
+    /// Short fingerprint, hex-encoded, suitable for voice/log display.
+    /// Tagged with the algorithm prefix (`<algo>:<hex>`) so fingerprints
+    /// across algorithms cannot collide and so the hash family used for
+    /// each algorithm can vary without ambiguity.
+    ///
+    /// X25519 uses BLAKE2s-128 (16-byte hash, 32 hex chars).
     ///
     /// # Examples
     ///
     /// ```
     /// use ratatoskr::pubkey::PubKey;
     /// let fp = PubKey::x25519([0u8; 32]).fingerprint();
-    /// // tagged form is "<algo>:<32 hex chars>"
+    /// // tagged form is "<algo>:<32 hex chars>" for X25519
     /// assert!(fp.starts_with("x25519:"));
     /// assert_eq!(fp.len(), "x25519:".len() + 32);
     /// ```
     pub fn fingerprint(&self) -> String {
         match self {
-            Self::X25519(b) => format!("x25519:{}", public_key_fingerprint(b)),
+            Self::X25519(b) => format!("x25519:{}", x25519_fingerprint_hex(b)),
         }
     }
+}
+
+/// BLAKE2s-128 of an X25519 public key, rendered as 32 hex characters.
+/// The hash-family choice is part of the X25519 variant's fingerprint
+/// contract; new variants may pick a different hash family.
+pub(crate) fn x25519_fingerprint_hex(public: &[u8; X25519_PUBLIC_LEN]) -> String {
+    use blake2::digest::{consts::U16, Digest};
+    type Blake2s128 = blake2::Blake2s<U16>;
+    let mut hasher = Blake2s128::new();
+    hasher.update(public);
+    let out = hasher.finalize();
+    hex::encode(out)
 }
 
 impl fmt::Display for PubKey {
@@ -126,10 +146,10 @@ impl FromStr for PubKey {
             "x25519" => {
                 let bytes = hex::decode(hex_str)
                     .map_err(|e| Error::InvalidPubKey(format!("x25519 pubkey hex decode: {e}")))?;
-                let arr: [u8; PUBLIC_KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
+                let arr: [u8; X25519_PUBLIC_LEN] = bytes.as_slice().try_into().map_err(|_| {
                     Error::InvalidPubKey(format!(
                         "x25519 pubkey must decode to {} bytes, got {}",
-                        PUBLIC_KEY_LEN,
+                        X25519_PUBLIC_LEN,
                         bytes.len()
                     ))
                 })?;
@@ -153,7 +173,7 @@ impl Serialize for PubKey {
             // emits a stable 1-byte tag.
             #[derive(Serialize)]
             enum Binary<'a> {
-                X25519(&'a [u8; PUBLIC_KEY_LEN]),
+                X25519(&'a [u8; X25519_PUBLIC_LEN]),
             }
             match self {
                 Self::X25519(b) => Binary::X25519(b).serialize(serializer),
@@ -170,7 +190,7 @@ impl<'de> Deserialize<'de> for PubKey {
         } else {
             #[derive(Deserialize)]
             enum Binary {
-                X25519([u8; PUBLIC_KEY_LEN]),
+                X25519([u8; X25519_PUBLIC_LEN]),
             }
             match Binary::deserialize(deserializer)? {
                 Binary::X25519(b) => Ok(Self::X25519(b)),
@@ -185,7 +205,7 @@ mod tests {
 
     #[test]
     fn x25519_round_trip_text() {
-        let key = PubKey::X25519([0x11; PUBLIC_KEY_LEN]);
+        let key = PubKey::X25519([0x11; X25519_PUBLIC_LEN]);
         let s = key.to_string();
         assert!(s.starts_with("x25519:"));
         let parsed: PubKey = s.parse().unwrap();
@@ -194,7 +214,7 @@ mod tests {
 
     #[test]
     fn rejects_untagged_hex() {
-        let raw = hex::encode([0x22; PUBLIC_KEY_LEN]);
+        let raw = hex::encode([0x22; X25519_PUBLIC_LEN]);
         let err = raw.parse::<PubKey>().unwrap_err();
         assert!(matches!(err, Error::InvalidPubKey(s) if s.contains("<algorithm>:<hex>")));
     }
@@ -215,14 +235,14 @@ mod tests {
 
     #[test]
     fn trims_whitespace_on_parse() {
-        let key = PubKey::X25519([0x55; PUBLIC_KEY_LEN]);
+        let key = PubKey::X25519([0x55; X25519_PUBLIC_LEN]);
         let s = format!("\n  {key}  \n");
         assert_eq!(s.parse::<PubKey>().unwrap(), key);
     }
 
     #[test]
     fn fingerprint_includes_algorithm_prefix() {
-        let key = PubKey::X25519([0x66; PUBLIC_KEY_LEN]);
+        let key = PubKey::X25519([0x66; X25519_PUBLIC_LEN]);
         let fp = key.fingerprint();
         assert!(fp.starts_with("x25519:"));
         assert_eq!(fp.len(), "x25519:".len() + 32); // 16-byte hash = 32 hex chars
@@ -230,7 +250,7 @@ mod tests {
 
     #[test]
     fn postcard_round_trip() {
-        let key = PubKey::X25519([0x77; PUBLIC_KEY_LEN]);
+        let key = PubKey::X25519([0x77; X25519_PUBLIC_LEN]);
         let bytes = postcard::to_stdvec(&key).unwrap();
         // 1-byte discriminator + 32 bytes raw = 33 bytes total.
         assert_eq!(bytes.len(), 33);
@@ -241,7 +261,7 @@ mod tests {
 
     #[test]
     fn json_round_trip() {
-        let key = PubKey::X25519([0x88; PUBLIC_KEY_LEN]);
+        let key = PubKey::X25519([0x88; X25519_PUBLIC_LEN]);
         let json = serde_json::to_string(&key).unwrap();
         assert!(json.contains("x25519:"));
         let decoded: PubKey = serde_json::from_str(&json).unwrap();
@@ -250,9 +270,9 @@ mod tests {
 
     #[test]
     fn raw_bytes_round_trip() {
-        let key = PubKey::X25519([0x99; PUBLIC_KEY_LEN]);
-        assert_eq!(key.raw_bytes(), &[0x99; PUBLIC_KEY_LEN]);
-        assert_eq!(key.as_x25519().unwrap(), &[0x99; PUBLIC_KEY_LEN]);
+        let key = PubKey::X25519([0x99; X25519_PUBLIC_LEN]);
+        assert_eq!(key.raw_bytes(), &[0x99; X25519_PUBLIC_LEN]);
+        assert_eq!(key.as_x25519().unwrap(), &[0x99; X25519_PUBLIC_LEN]);
         assert_eq!(key.algorithm(), "x25519");
     }
 }

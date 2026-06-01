@@ -142,7 +142,7 @@ accepted.
 
 | Positional        | Notes                                                                                |
 | ----------------- | ------------------------------------------------------------------------------------ |
-| `<fingerprint>`   | Full BLAKE2s-128 fingerprint (32 hex chars) shown by `accept pending`, or any unique 8+-hex-char prefix. The daemon disambiguates against the staged queue; ambiguous prefixes return `error_codes::AMBIGUOUS_FINGERPRINT` listing every match. |
+| `<fingerprint>`   | Tagged fingerprint (e.g. `x25519:<32 hex chars>` for X25519) shown by `accept pending`, or any unique 8+-hex-char prefix of the hash tail (the algorithm prefix is optional). The daemon disambiguates against the staged queue; ambiguous prefixes return `error_codes::AMBIGUOUS_FINGERPRINT` listing every match. |
 
 ### `local acme list`
 

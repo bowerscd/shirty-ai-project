@@ -22,7 +22,7 @@ fn established_pair() -> (Session, Session) {
     let server = StaticKeyPair::generate().unwrap();
     let client = StaticKeyPair::generate().unwrap();
     let sid = SessionId::random();
-    let (init, hs1) = Initiator::start(&client, server.public_key(), sid).unwrap();
+    let (init, hs1) = Initiator::start(&client, &server.public_key(), sid).unwrap();
     let view = wire::parse(&hs1).unwrap();
     let half = Responder::process_handshake_1(&server, &view).unwrap();
     let (server_session, hs2) = half.complete().unwrap();
@@ -34,7 +34,7 @@ fn established_pair() -> (Session, Session) {
 fn bench_handshake(c: &mut Criterion) {
     let server = StaticKeyPair::generate().unwrap();
     let client = StaticKeyPair::generate().unwrap();
-    let server_pub = *server.public_key();
+    let server_pub = server.public_key();
 
     let mut group = c.benchmark_group("handshake");
     group.throughput(Throughput::Elements(1));

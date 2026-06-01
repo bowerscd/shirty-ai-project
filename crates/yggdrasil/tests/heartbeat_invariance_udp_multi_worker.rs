@@ -152,7 +152,7 @@ fn shard_flow_counts(rule_name: &str) -> Vec<usize> {
 async fn multi_worker_heartbeat_invariance() {
     let _ = metrics_handle();
     let upstream = observed_echo_server().await;
-    let peer = PeerState::new([0u8; 32]);
+    let peer = PeerState::new(None);
     let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
 
     let proxy = UdpProxy::spawn_with(
@@ -237,7 +237,7 @@ async fn multi_worker_heartbeat_invariance() {
 async fn multi_worker_ip_change_drains_all_shards() {
     let _ = metrics_handle();
     let upstream = observed_echo_server().await;
-    let peer = PeerState::new([0u8; 32]);
+    let peer = PeerState::new(None);
     let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
 
     let proxy = UdpProxy::spawn_with(

@@ -47,7 +47,7 @@ if you want to deviate.
 | `/usr/local/bin/yggdrasil`        | root:root 0755  | Daemon binary.                                                   |
 | `/usr/local/bin/yggdrasilctl`     | root:root 0755  | Admin CLI binary.                                                |
 | `/etc/yggdrasil/config.toml`      | root:root 0644  | Daemon config ([configuration.md](configuration.md)).            |
-| `/etc/yggdrasil/identity.key`     | root:root 0600  | Long-term X25519 identity (64 bytes). Never copy off the host.    |
+| `/etc/yggdrasil/identity.key`     | root:root 0600  | Long-term identity in tagged on-disk format (`b"YGGID"` magic + version + algorithm + key payload; X25519 today). Never copy off the host.  |
 | `/etc/yggdrasil/conf.d/*.toml`    | root:root 0644  | Rule files. Hot-reloaded. Terminal nodes only — relays derive rules from the chain. |
 | `/etc/yggdrasil/certs/`           | root:root 0755  | HTTPS-only. Per-hostname certs the convention rung looks under. |
 | `/var/lib/yggdrasil/`             | root:root 0755  | Per-host state (TOFU candidates, runtime markers).               |

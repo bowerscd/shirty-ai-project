@@ -366,14 +366,14 @@ fn derived_https_rule_name(p: &Predicate, derived_protocol: Protocol) -> String 
 mod tests {
     use super::*;
     use crate::chain::predicate_extractor;
-    use ratatoskr::auth::PUBLIC_KEY_LEN;
+    use ratatoskr::auth::X25519_PUBLIC_LEN;
     use ratatoskr::pubkey::PubKey;
     use ratatoskr::rule::HttpRoute;
     use std::net::Ipv4Addr;
     use url::Url;
 
     fn origin() -> PubKey {
-        PubKey::x25519([0x33u8; PUBLIC_KEY_LEN])
+        PubKey::x25519([0x33u8; X25519_PUBLIC_LEN])
     }
 
     fn predicate(name: &str, port: u16, protocol: Protocol) -> Predicate {

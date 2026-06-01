@@ -28,7 +28,6 @@ use std::time::Duration;
 use ratatoskr::auth::StaticKeyPair;
 use ratatoskr::control_frame::{AckStatus, ControlBodyType, ControlEnvelope};
 use ratatoskr::predicate::{predicate_reject, Predicate, PredicateSet};
-use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::Protocol;
 use ratatoskr::wire;
 use tokio::net::UdpSocket;
@@ -68,7 +67,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
     // 1. Crypto identities + downstream enrollment.
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
 
     let pending_dir = tempfile::tempdir().unwrap();
     let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
@@ -115,11 +114,11 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
 
     // 5. Driver-side handshake.
     let (mut session, sock) =
-        drive_handshake(server_keys.public_key(), &client_keys, server_addr).await;
+        drive_handshake(&server_keys.public_key(), &client_keys, server_addr).await;
 
     // 6. Pick a free port for the (derived) listener and send the push.
     let listen_port = pick_free_tcp_port().await;
-    let origin = PubKey::x25519(*client_keys.public_key());
+    let origin = client_keys.public_key();
     let set = PredicateSet {
         predicates: vec![Predicate {
             name: "alpha".into(),
@@ -219,7 +218,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     // dispatch path returns `AckStatus::Unknown` end-to-end.
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
     let pending_dir = tempfile::tempdir().unwrap();
     let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
 
@@ -256,7 +255,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     let server_addr = hb.local_addr().unwrap();
     let hb_join = tokio::spawn(hb.run());
     let (mut session, sock) =
-        drive_handshake(server_keys.public_key(), &client_keys, server_addr).await;
+        drive_handshake(&server_keys.public_key(), &client_keys, server_addr).await;
 
     // Body type 0x7F is unassigned in the registry.
     let envelope = ControlEnvelope {

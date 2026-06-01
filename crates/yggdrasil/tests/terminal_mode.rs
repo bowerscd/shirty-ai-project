@@ -52,9 +52,9 @@ use crate::common::{
 async fn chained_tcp_relay_to_terminal_to_echo_round_trips() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
     let shutdown = CancellationToken::new();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
 
     // Heartbeat server so the relay's `peer_state.current_ip()` is populated.
     let hb = HeartbeatHarness::spawn(server_keys, peer_state.clone(), shutdown.clone()).await;
@@ -152,9 +152,9 @@ async fn chained_tcp_relay_to_terminal_to_echo_round_trips() {
 async fn chained_udp_relay_to_terminal_to_echo_round_trips() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
     let shutdown = CancellationToken::new();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
 
     let hb = HeartbeatHarness::spawn(server_keys, peer_state.clone(), shutdown.clone()).await;
 
@@ -241,9 +241,9 @@ async fn proxy_protocol_v2_passes_through_terminal_unchanged() {
 
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
     let shutdown = CancellationToken::new();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
 
     let hb = HeartbeatHarness::spawn(server_keys, peer_state.clone(), shutdown.clone()).await;
 

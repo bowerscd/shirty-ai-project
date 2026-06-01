@@ -57,7 +57,8 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use ratatoskr::auth::{StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::auth::StaticKeyPair;
+use ratatoskr::pubkey::PubKey;
 
 use crate::chain::query_router::QueryRouter;
 
@@ -68,8 +69,8 @@ use self::run_loop::SessionExit;
 pub struct ChainClientConfig {
     /// `host:port` (or `[ipv6]:port`) of the upstream node.
     pub endpoint: String,
-    /// X25519 pubkey of the upstream — what Noise_IK pins.
-    pub upstream_pubkey: [u8; PUBLIC_KEY_LEN],
+    /// Tagged pubkey of the upstream — what Noise_IK pins.
+    pub upstream_pubkey: PubKey,
     /// This node's static identity.
     pub local_keys: StaticKeyPair,
     pub heartbeat_interval: Duration,
@@ -92,7 +93,7 @@ impl std::fmt::Debug for ChainClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChainClientConfig")
             .field("endpoint", &self.endpoint)
-            .field("upstream_pubkey", &hex::encode(self.upstream_pubkey))
+            .field("upstream_pubkey", &self.upstream_pubkey.to_string())
             .field("local_keys", &"<redacted>")
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("rekey_interval", &self.rekey_interval)

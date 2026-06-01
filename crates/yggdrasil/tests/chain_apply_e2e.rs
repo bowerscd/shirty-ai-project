@@ -160,7 +160,7 @@ async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
     std::fs::create_dir_all(&rules_dir).unwrap();
 
     let peer_keys = ratatoskr::auth::StaticKeyPair::generate().unwrap();
-    let peer_state = yggdrasil::heartbeat::PeerState::new(*peer_keys.public_key());
+    let peer_state = yggdrasil::heartbeat::PeerState::new(Some(peer_keys.public_key()));
 
     let supervisor = spawn_supervisor(
         rules_dir,

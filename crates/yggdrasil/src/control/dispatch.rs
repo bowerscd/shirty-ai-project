@@ -7,12 +7,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatoskr::auth::public_key_fingerprint;
 use ratatoskr::control::{
     error_codes, DownstreamResponse, HealthResponse, MetricsResponse, NatMappingEntry, NatStatus,
     PendingResponse, Request, Response, RuleInfo, RulesResponse, StatusResponse,
 };
-use ratatoskr::pubkey::PubKey;
 
 use super::handlers::{approve_downstream, terminal_mode_unsupported};
 use super::ControlState;
@@ -116,18 +114,11 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                 Some(ps) => ps,
                 None => return terminal_mode_unsupported("downstream show"),
             };
+            let (pubkey, fingerprint) = match peer_state.peer_static_key() {
+                Some(pk) => (pk.to_string(), pk.fingerprint()),
+                None => (String::new(), String::new()),
+            };
             let enrolled = peer_state.is_peer_enrolled();
-            let raw = peer_state.peer_static_key();
-            let pubkey = if enrolled {
-                PubKey::X25519(raw).to_string()
-            } else {
-                String::new()
-            };
-            let fingerprint = if enrolled {
-                public_key_fingerprint(&raw)
-            } else {
-                String::new()
-            };
             Response::Downstream(DownstreamResponse {
                 enrolled,
                 pubkey,

@@ -61,7 +61,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     // 1. Crypto identities + downstream enrollment.
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
 
     let pending_dir = tempfile::tempdir().unwrap();
     let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
@@ -88,9 +88,9 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let local_pubkey = PubKey::x25519(*server_keys.public_key());
+    let local_pubkey = server_keys.public_key();
     let upstream_pubkey = PubKey::x25519([0xAA; 32]);
-    let downstream_pubkey = PubKey::x25519(*client_keys.public_key());
+    let downstream_pubkey = client_keys.public_key();
     let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path())
         .expect("load acceptor");
 
@@ -122,7 +122,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
 
     // 6. Driver-side handshake + predicate push.
     let (mut session, sock) =
-        drive_handshake(server_keys.public_key(), &client_keys, server_addr).await;
+        drive_handshake(&server_keys.public_key(), &client_keys, server_addr).await;
 
     let listen_port = pick_free_tcp_port().await;
     let origin = downstream_pubkey;

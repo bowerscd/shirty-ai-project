@@ -1656,7 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn echoes_datagram_through_proxy() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn(
             udp_rule("echo", upstream.port(), 60),
@@ -1676,7 +1676,7 @@ mod tests {
     #[tokio::test]
     async fn each_client_gets_its_own_flow() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn(
             udp_rule("multi", upstream.port(), 60),
@@ -1700,7 +1700,7 @@ mod tests {
     #[tokio::test]
     async fn multi_worker_echoes_all_clients() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn_with(
             udp_rule("multi-worker", upstream.port(), 60),
@@ -1739,7 +1739,7 @@ mod tests {
     async fn worker_count_smoke_echoes_distinct_clients() {
         for workers in [1usize, 2, 4, 8] {
             let upstream = echo_server().await;
-            let peer = PeerState::new([0u8; 32]);
+            let peer = PeerState::new(None);
             let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
             let proxy = UdpProxy::spawn_with(
                 udp_rule(&format!("worker-smoke-{workers}"), upstream.port(), 60),
@@ -1766,7 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_rejects_zero_workers() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let result = UdpProxy::spawn_with(
             udp_rule("zero-workers", upstream.port(), 60),
@@ -1791,7 +1791,7 @@ mod tests {
     #[tokio::test]
     async fn shards_are_isolated_per_worker() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn_with(
             udp_rule("shards", upstream.port(), 60),
@@ -1834,7 +1834,7 @@ mod tests {
     #[tokio::test]
     async fn drops_datagram_when_no_peer_yet() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         // No record_heartbeat → current_ip is None.
 
         let proxy = UdpProxy::spawn(
@@ -1886,7 +1886,7 @@ mod tests {
     #[tokio::test]
     async fn reaper_evicts_idle_flow() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         // 200ms idle_timeout. reaper interval ≈ max(50ms, 100ms) = 100ms.
         let rule = {
@@ -1920,7 +1920,7 @@ mod tests {
     #[tokio::test]
     async fn reaper_evicts_idle_flows_across_all_shards() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let rule = {
             let mut r = udp_rule("idle-shards", upstream.port(), 1);
@@ -1976,7 +1976,7 @@ mod tests {
             let _ = upstream_sock.send_to(&buf[..n], from).await;
         });
 
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn(
             udp_rule("return-touch", upstream.port(), 60),
@@ -2023,7 +2023,7 @@ mod tests {
     #[tokio::test]
     async fn ip_change_drains_flow_table() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn(
             udp_rule("drain", upstream.port(), 60),
@@ -2065,7 +2065,7 @@ mod tests {
     #[tokio::test]
     async fn ip_change_drains_all_shards() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn_with(
             udp_rule("drain-all", upstream.port(), 60),
@@ -2105,7 +2105,7 @@ mod tests {
         // with rotating ports (mirroring residential NAT port rotation) and
         // assert the flow table is unaffected.
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1000".parse().unwrap());
         let proxy = UdpProxy::spawn(
             udp_rule("invariance", upstream.port(), 60),
@@ -2167,7 +2167,7 @@ mod tests {
     #[tokio::test]
     async fn soft_cap_rejects_new_flows_when_full() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         // cap = 2.
         let proxy = UdpProxy::spawn_with_cap(
@@ -2197,7 +2197,7 @@ mod tests {
     #[tokio::test]
     async fn multi_worker_soft_cap_rejects_new_flows_when_full() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn_with(
             udp_rule("cap-multi-worker", upstream.port(), 60),
@@ -2237,7 +2237,7 @@ mod tests {
     #[tokio::test]
     async fn stop_aborts_per_flow_tasks() {
         let upstream = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
         let proxy = UdpProxy::spawn(
             udp_rule("stop", upstream.port(), 60),
@@ -2457,7 +2457,7 @@ mod tests {
     #[tokio::test]
     async fn emits_proxy_v2_first_datagram_on_new_flow() {
         let (upstream_addr, mut upstream_rx) = capture_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
 
         let proxy = UdpProxy::spawn(
@@ -2502,7 +2502,7 @@ mod tests {
         // emit a PROXY header — the application payload must arrive at
         // the upstream byte-for-byte as the client sent it.
         let (upstream_addr, mut upstream_rx) = capture_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
 
         let proxy = UdpProxy::spawn(
@@ -2542,7 +2542,7 @@ mod tests {
     #[tokio::test]
     async fn bridges_inbound_proxy_v2_to_outbound_first_datagram() {
         let (upstream_addr, mut upstream_rx) = capture_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
 
         let proxy = UdpProxy::spawn_with_arm_table(
@@ -2611,7 +2611,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_consume_inbound_proxy_when_flag_off_udp() {
         let (upstream_addr, mut upstream_rx) = capture_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:1".parse().unwrap());
 
         let proxy = UdpProxy::spawn_with_arm_table(

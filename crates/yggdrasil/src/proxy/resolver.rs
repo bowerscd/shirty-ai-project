@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn dynamic_resolver_returns_target_when_peer_known() {
-        let peer = PeerState::new([1u8; 32]);
+        let peer = PeerState::new(Some(ratatoskr::pubkey::PubKey::x25519([1u8; 32])));
         let _ = peer.record_heartbeat("203.0.113.1:9999".parse().unwrap());
         let r = UpstreamResolver::Dynamic {
             peer_state: peer,
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn dynamic_resolver_returns_none_when_peer_unknown() {
-        let peer = PeerState::new([1u8; 32]);
+        let peer = PeerState::new(Some(ratatoskr::pubkey::PubKey::x25519([1u8; 32])));
         let r = UpstreamResolver::Dynamic {
             peer_state: peer,
             port: 8080,
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn factory_relay_mode_builds_dynamic_for_relay_rule() {
-        let peer = PeerState::new([1u8; 32]);
+        let peer = PeerState::new(Some(ratatoskr::pubkey::PubKey::x25519([1u8; 32])));
         let f = ResolverFactory::new_relay(peer);
         let r = f.build(&relay_rule(22)).unwrap();
         assert!(matches!(r, UpstreamResolver::Dynamic { port: 22, .. }));
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn factory_relay_mode_rejects_terminal_rule() {
-        let peer = PeerState::new([1u8; 32]);
+        let peer = PeerState::new(Some(ratatoskr::pubkey::PubKey::x25519([1u8; 32])));
         let f = ResolverFactory::new_relay(peer);
         let err = f.build(&terminal_rule("192.168.1.10:22")).err().unwrap();
         assert!(matches!(
@@ -417,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_watch_handle_fires_on_ip_update() {
-        let peer = PeerState::new([1u8; 32]);
+        let peer = PeerState::new(Some(ratatoskr::pubkey::PubKey::x25519([1u8; 32])));
         let r = UpstreamResolver::Dynamic {
             peer_state: peer.clone(),
             port: 1234,
@@ -491,7 +491,7 @@ mod tests {
     /// upstreams are a terminal-mode-only feature.
     #[test]
     fn factory_relay_mode_rejects_dns_rule() {
-        let peer = PeerState::new([1u8; 32]);
+        let peer = PeerState::new(Some(ratatoskr::pubkey::PubKey::x25519([1u8; 32])));
         let f = ResolverFactory::new_relay(peer);
         let err = f.build(&dns_rule("example.com", 80)).err().unwrap();
         assert!(

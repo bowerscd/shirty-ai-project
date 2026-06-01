@@ -970,7 +970,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
-    use ratatoskr::auth::PUBLIC_KEY_LEN;
+    use ratatoskr::auth::X25519_PUBLIC_LEN;
     use ratatoskr::predicate::Predicate;
     use ratatoskr::rule::Protocol;
     use tokio_util::sync::CancellationToken;
@@ -979,7 +979,7 @@ mod tests {
     use crate::proxy::supervisor::{CertConfig, ProxySupervisor};
 
     fn origin_a() -> PubKey {
-        PubKey::x25519([0xAAu8; PUBLIC_KEY_LEN])
+        PubKey::x25519([0xAAu8; X25519_PUBLIC_LEN])
     }
 
     fn predicate_set(origin: PubKey, version: u64, ports: &[u16]) -> PredicateSet {
@@ -1012,7 +1012,7 @@ mod tests {
         cancel: CancellationToken,
     ) -> (ProxySupervisor, SupervisorHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let peer = crate::heartbeat::PeerState::new([0u8; 32]);
+        let peer = crate::heartbeat::PeerState::new(None);
         let factory = ResolverFactory::new_relay(peer);
         let sup = ProxySupervisor::spawn(
             dir.path().to_path_buf(),

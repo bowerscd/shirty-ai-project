@@ -160,15 +160,27 @@ discovery-protocol ethos.
 
 ## Crypto: Noise_IK
 
-The chain control channel uses **Noise_IK_25519_ChaChaPoly_BLAKE2s** via
-the `snow` crate. Same suite as WireGuard. Why this and not TLS:
+The chain control channel uses **Noise_IK** with the
+`Noise_IK_25519_ChaChaPoly_BLAKE2s` cipher suite by default, via the
+`snow` crate. Same suite as WireGuard. Why this and not TLS:
 
-* No certificates or PKI. Both ends pin a single 32-byte X25519 public key
-  in their config. Same trust model as SSH `authorized_keys`.
+* No certificates or PKI. Both ends pin a single tagged public key
+  (`x25519:<hex>`) in their config. Same trust model as SSH
+  `authorized_keys`.
 * Noise_IK gives mutual authentication in one round-trip (two messages):
   the responder learns the initiator's static key in message 1.
 * The transcript fits in a single UDP datagram on either side, so we don't
   need a fragmentation/reassembly story for the handshake.
+
+The Noise *pattern* (IK) is fixed — it encodes the project's
+identity-hiding and forward-secrecy choices and is not part of the
+agility surface. The cipher *suite* (key algorithm + AEAD + hash) is
+modelled by `ratatoskr::auth::NoiseSuite`, a `#[non_exhaustive]` enum so
+new suites can be added without breaking downstream code that matches
+on its variants. `StaticKeyPair::noise_suite()` returns the suite
+implied by the local identity's algorithm; both ends agree on the
+suite implicitly by agreeing on the key algorithm out-of-band during
+enrollment.
 
 After the handshake completes both sides hold a `snow::TransportState`
 which we wrap as `Session` in [`crates/ratatoskr/src/auth.rs`](../crates/ratatoskr/src/auth.rs).
@@ -203,19 +215,43 @@ handles loss above the crypto layer.
 
 ## Identity & enrollment
 
-Each node has one X25519 keypair, stored on disk as a 64-byte file (32
-secret + 32 public) with mode 0600. Default path
-`/etc/yggdrasil/identity.key`, overridable via `[server].identity_file`.
-Auto-generated on first daemon start if missing. The pubkey is publishable;
-the secret is wrapped in `zeroize::Zeroizing` so it's wiped on drop.
+Each node has one long-term keypair (X25519 in v1, modelled as a
+`#[non_exhaustive]` `StaticKeyPair` enum so a future algorithm slots in
+without breaking the type), stored on disk in a tagged identity-file
+format with mode 0600. Default path `/etc/yggdrasil/identity.key`,
+overridable via `[server].identity_file`. Auto-generated on first
+daemon start if missing. The pubkey is publishable; the secret is
+wrapped in `zeroize::Zeroizing` so it's wiped on drop.
+
+The on-disk layout is:
+
+```text
+offset  bytes  field
+0       5      magic = b"YGGID"
+5       1      file format version (currently 0x01)
+6       1      algorithm discriminator (matches PubKey's postcard tag)
+7       N      algorithm-specific payload
+```
+
+For X25519 the payload is 32 bytes of secret followed by 32 bytes of
+public, for a total file size of 71 bytes. A bare 64-byte untagged
+blob (the legacy pre-tagged layout) is unambiguously rejected by the
+parser so a future key type with the same key length cannot be
+silently mis-parsed as X25519.
 
 Tagged pubkey form `x25519:<hex>` is used everywhere on the operator surface
 and on the wire's TOML/JSON projections. Bare hex is rejected. The
 `postcard`-encoded wire form uses an enum-with-discriminator so future
 algorithms (`ed25519:…`, `pq:…`) can be added without breaking parsing.
 
-`fingerprint = BLAKE2s-128(pubkey)` rendered as 32 hex chars (no `x25519:`
-tag). Used for downstream TOFU approval and out-of-band confirmation.
+`fingerprint = <algo>:<hex hash>` is the tagged form returned by
+`PubKey::fingerprint()`. X25519 uses BLAKE2s-128 (rendered as 32 hex
+chars after the `x25519:` prefix, for 39 chars total). The hash family
+used for a given variant is fixed at the variant level so future
+variants may pick a different hash family without colliding. Used for
+downstream TOFU approval and out-of-band confirmation; operators
+typing fingerprints into `yggdrasilctl peer approve` may paste either
+the full tagged form or just the hex tail.
 
 ### Request / grant handshake
 

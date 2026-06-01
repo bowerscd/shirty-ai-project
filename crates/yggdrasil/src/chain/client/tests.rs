@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use ratatoskr::auth::{Responder, Session, StaticKeyPair, PUBLIC_KEY_LEN};
+use ratatoskr::auth::{Responder, Session, StaticKeyPair};
 use ratatoskr::control_frame::{AckStatus, ControlAck};
+use ratatoskr::pubkey::PubKey;
 use ratatoskr::wire::{self, PacketType};
 
 use crate::chain::reliability::InboundDisposition;
@@ -78,7 +79,7 @@ impl TestServer {
 async fn handshake_then_heartbeat_ack_roundtrip() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
 
     let server = TestServer::start(server_keys).await;
     let endpoint = server.addr.to_string();
@@ -123,7 +124,7 @@ async fn handshake_then_heartbeat_ack_roundtrip() {
 async fn rekey_triggers_a_second_handshake() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
 
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
@@ -196,7 +197,7 @@ async fn rekey_triggers_a_second_handshake() {
 async fn cancel_token_stops_client_promptly() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
     let server = TestServer::start(server_keys).await;
 
     let cancel = CancellationToken::new();
@@ -237,7 +238,7 @@ async fn backoff_and_reconnect_when_endpoint_unresponsive() {
     let cancel = CancellationToken::new();
     let cfg = ChainClientConfig {
         endpoint: "127.0.0.1:1".to_string(),
-        upstream_pubkey: [0u8; PUBLIC_KEY_LEN],
+        upstream_pubkey: PubKey::x25519([0u8; 32]),
         local_keys: client_keys,
         heartbeat_interval: Duration::from_millis(50),
         rekey_interval: Duration::from_secs(60),
@@ -385,7 +386,7 @@ async fn control_send_handle_resolves_one_thousand_noop_envelopes() {
     use ratatoskr::control_frame::ControlBodyType;
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
     let server = ControlTestServer::start_with_loss(server_keys, 0, 0).await;
 
     let cancel = CancellationToken::new();
@@ -461,7 +462,7 @@ async fn control_send_converges_under_10_percent_packet_loss() {
     use ratatoskr::control_frame::ControlBodyType;
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
     // 10% loss in each direction, deterministic drop pattern.
     let server = ControlTestServer::start_with_loss(server_keys, 10, 1).await;
 
@@ -522,7 +523,7 @@ async fn pending_sends_resolve_when_session_ends() {
     use ratatoskr::control_frame::ControlBodyType;
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
     let server = ControlTestServer::start_with_loss(server_keys, 0, 0).await;
 
     let cancel = CancellationToken::new();

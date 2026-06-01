@@ -92,9 +92,10 @@ pub enum AcceptAction {
 
 #[derive(Debug, Args)]
 pub struct ApproveArgs {
-    /// Full BLAKE2s-128 fingerprint (32 hex chars) of the accept-side
-    /// peer to approve, or any unique prefix of at least 8 hex chars. The
-    /// daemon disambiguates against the staged queue; ambiguous
-    /// prefixes return an error listing every match.
+    /// Tagged fingerprint (e.g. `x25519:<32 hex chars>` for X25519) of
+    /// the accept-side peer to approve, or any unique prefix of at
+    /// least 8 hex chars of the hash tail (the algorithm prefix is
+    /// optional). The daemon disambiguates against the staged queue;
+    /// ambiguous prefixes return an error listing every match.
     pub fingerprint: String,
 }

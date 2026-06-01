@@ -1307,7 +1307,7 @@ mod tests {
         assert_eq!(up.rekey_interval, Duration::from_secs(3600));
         assert_eq!(
             up.pubkey,
-            PubKey::X25519([0x11; ratatoskr::auth::PUBLIC_KEY_LEN])
+            PubKey::X25519([0x11; ratatoskr::auth::X25519_PUBLIC_LEN])
         );
     }
 
@@ -1395,7 +1395,7 @@ mod tests {
         let acc = cfg.accept.expect("accept parsed");
         assert_eq!(
             acc.pubkey,
-            PubKey::X25519([0x33; ratatoskr::auth::PUBLIC_KEY_LEN])
+            PubKey::X25519([0x33; ratatoskr::auth::X25519_PUBLIC_LEN])
         );
         assert_eq!(acc.listen, "0.0.0.0:51820".parse::<SocketAddr>().unwrap());
         assert_eq!(acc.rekey_interval, Duration::from_secs(3600));

@@ -136,7 +136,7 @@ fn project_routes(_routes: &[HttpRoute], meta: HttpsPredicateMeta) -> Predicate 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatoskr::auth::PUBLIC_KEY_LEN;
+    use ratatoskr::auth::X25519_PUBLIC_LEN;
     use ratatoskr::pubkey::PubKey;
     use ratatoskr::rule::{HttpRoute, Rule};
     use std::net::SocketAddr;
@@ -148,7 +148,7 @@ mod tests {
     }
 
     fn origin() -> PubKey {
-        PubKey::x25519([0x11u8; PUBLIC_KEY_LEN])
+        PubKey::x25519([0x11u8; X25519_PUBLIC_LEN])
     }
 
     fn tcp_rule(name: &str, port: u16, target_port: u16) -> Rule {

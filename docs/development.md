@@ -142,12 +142,15 @@ docs cover the multi-thread vs current-thread distinction.
 
 ### `snow` — Noise_IK handshake
 
-Implements the chain handshake suite
-`Noise_IK_25519_ChaChaPoly_BLAKE2s` — same as WireGuard. yggdrasil uses
-it for mutual static-key authentication between adjacent chain hops; no
-PKI, no SNI, no in-band key discovery. Each hop knows the next hop's
-long-term public key out of band via the request/grant ceremony.
-Integration lives in
+Implements the chain handshake. v1 defaults to
+`Noise_IK_25519_ChaChaPoly_BLAKE2s` (same suite as WireGuard) selected
+via `ratatoskr::auth::NoiseSuite::X25519ChaChaPolyBlake2s`. The Noise
+*pattern* (IK) is fixed; the cipher suite is modelled as a
+`#[non_exhaustive]` enum so new suites can be added without breaking
+downstream code. yggdrasil uses Noise for mutual static-key
+authentication between adjacent chain hops; no PKI, no SNI, no in-band
+key discovery. Each hop knows the next hop's long-term public key out
+of band via the request/grant ceremony. Integration lives in
 [`crates/ratatoskr/src/auth.rs`](../crates/ratatoskr/src/auth.rs).
 
 [Noise spec §5–7](https://noiseprotocol.org/noise.html#handshake-patterns)

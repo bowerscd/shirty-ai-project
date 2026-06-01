@@ -868,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn proxies_bytes_bidirectionally() {
         let (upstream, _us) = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
 
         let proxy = TcpProxy::spawn(
@@ -892,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn drops_connection_when_no_peer_yet() {
         let (upstream, _us) = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         // Note: no record_heartbeat call → current_ip is None.
 
         let proxy = TcpProxy::spawn(
@@ -958,7 +958,7 @@ mod tests {
             let _ = tx.send(buf);
         });
 
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         let proxy = TcpProxy::spawn(
             rule("v1head", target_addr.port(), Some(ProxyProto::V1)),
@@ -1002,7 +1002,7 @@ mod tests {
             let _ = tx.send(buf);
         });
 
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         let proxy = TcpProxy::spawn_with_arm_table(
             rule("midhop", target_addr.port(), Some(ProxyProto::V2)),
@@ -1054,7 +1054,7 @@ mod tests {
             let _ = tx.send(buf);
         });
 
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         let proxy = TcpProxy::spawn(
             rule("gateway-mode", target_addr.port(), Some(ProxyProto::V2)),
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     async fn closes_when_upstream_unreachable() {
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         // Port 1 is reserved and won't have anything listening on a normal box.
         let proxy = TcpProxy::spawn(rule("noupstream", 1, None), dynamic_resolver(peer, 1), 1)
@@ -1128,7 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn stop_cancels_in_flight_connection() {
         let (upstream, _us) = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
         let proxy = TcpProxy::spawn(
             rule("cancel", upstream.port(), None),
@@ -1178,7 +1178,7 @@ mod tests {
         //   2. echo round-trips still succeed after fan-out;
         //   3. stop() awaits all worker tasks.
         let (upstream, _us) = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
 
         let proxy = TcpProxy::spawn(
@@ -1212,7 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn graceful_drain_lets_inflight_connection_finish() {
         let (upstream, _us) = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
 
         let proxy = TcpProxy::spawn(
@@ -1252,7 +1252,7 @@ mod tests {
     #[tokio::test]
     async fn graceful_drain_returns_when_timeout_expires() {
         let (upstream, _us) = echo_server().await;
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let _ = peer.record_heartbeat("127.0.0.1:9999".parse().unwrap());
 
         let proxy = TcpProxy::spawn(

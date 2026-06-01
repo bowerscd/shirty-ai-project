@@ -21,5 +21,5 @@
 mod peer_state;
 mod server;
 
-pub use peer_state::{HeartbeatEffect, PeerState, UNENROLLED_PEER_KEY};
+pub use peer_state::{HeartbeatEffect, PeerState};
 pub use server::{HeartbeatServer, OutboundHandle};

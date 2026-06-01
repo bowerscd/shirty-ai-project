@@ -11,12 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::watch;
 
-use ratatoskr::auth::{public_key_fingerprint, PUBLIC_KEY_LEN};
-
-/// Sentinel value meaning "no peer enrolled yet". X25519 rejects the all-zeros
-/// point as a public key (low-order), so this is unambiguously distinct from
-/// any real peer key.
-pub const UNENROLLED_PEER_KEY: [u8; PUBLIC_KEY_LEN] = [0u8; PUBLIC_KEY_LEN];
+use ratatoskr::pubkey::PubKey;
 
 /// What happened when the heartbeat server accepted an authenticated
 /// heartbeat. Used by [`HeartbeatServer`](super::HeartbeatServer) to decide
@@ -41,15 +36,21 @@ impl HeartbeatEffect {
 }
 
 /// Single, process-wide peer state. Constructed at startup with the
-/// configured peer pubkey; shared by `Arc` clone across the heartbeat server,
-/// proxy supervisors, control socket, and metrics exporter.
+/// configured peer pubkey (or `None` when no peer is enrolled yet); shared
+/// by `Arc` clone across the heartbeat server, proxy supervisors, control
+/// socket, and metrics exporter.
 ///
 /// The peer's static public key is held behind a `RwLock` so it can be
 /// live-replaced by the TOFU approval flow without restarting the daemon.
 /// Reads are taken on every `Handshake1`; writes happen only via
 /// `yggdrasilctl peer approve`.
+///
+/// Crypto-agility: the configured key is stored as a tagged [`PubKey`] so a
+/// future identity algorithm slots in without changing the storage shape.
+/// "No peer enrolled" is represented by `None`, removing the all-zeros
+/// X25519 sentinel that the older raw-bytes shape required.
 pub struct PeerState {
-    peer_static_key: RwLock<[u8; PUBLIC_KEY_LEN]>,
+    peer_static_key: RwLock<Option<PubKey>>,
     current_ip_tx: watch::Sender<Option<IpAddr>>,
     /// Last accepted-heartbeat timestamp in milliseconds since `UNIX_EPOCH`.
     /// `0` means "no heartbeat ever received in this process lifetime".
@@ -57,11 +58,11 @@ pub struct PeerState {
 }
 
 impl PeerState {
-    /// Construct from the enrolled peer's static public key. Pass
-    /// [`UNENROLLED_PEER_KEY`] when no peer has been enrolled yet — in that
-    /// case the heartbeat server stages incoming handshakes to the pending
-    /// store instead of rejecting them.
-    pub fn new(peer_static_key: [u8; PUBLIC_KEY_LEN]) -> Arc<Self> {
+    /// Construct from the enrolled peer's static public key. Pass `None`
+    /// when no peer has been enrolled yet — in that case the heartbeat
+    /// server stages incoming handshakes to the pending store instead of
+    /// rejecting them.
+    pub fn new(peer_static_key: Option<PubKey>) -> Arc<Self> {
         let (tx, _rx) = watch::channel::<Option<IpAddr>>(None);
         Arc::new(Self {
             peer_static_key: RwLock::new(peer_static_key),
@@ -70,17 +71,16 @@ impl PeerState {
         })
     }
 
-    /// Whether a real peer is currently enrolled (key is not the all-zeros
-    /// sentinel).
+    /// Whether a real peer is currently enrolled.
     pub fn is_peer_enrolled(&self) -> bool {
-        *self.peer_static_key.read().unwrap() != UNENROLLED_PEER_KEY
+        self.peer_static_key.read().unwrap().is_some()
     }
 
     /// Replace the configured peer public key. Called by the TOFU approve
     /// flow after writing the new key to disk. Subsequent `Handshake1`s
     /// from the just-approved peer will be accepted immediately.
-    pub fn set_peer_static_key(&self, new_key: [u8; PUBLIC_KEY_LEN]) {
-        *self.peer_static_key.write().unwrap() = new_key;
+    pub fn set_peer_static_key(&self, new_key: PubKey) {
+        *self.peer_static_key.write().unwrap() = Some(new_key);
     }
 
     /// Subscribe to peer-IP changes. The initial `borrow()` yields whatever
@@ -103,14 +103,22 @@ impl PeerState {
         }
     }
 
-    /// Snapshot the currently-configured peer public key. Returns the
-    /// all-zeros [`UNENROLLED_PEER_KEY`] sentinel if no peer is enrolled.
-    pub fn peer_static_key(&self) -> [u8; PUBLIC_KEY_LEN] {
+    /// Snapshot the currently-configured peer public key. Returns `None`
+    /// when no peer is enrolled.
+    pub fn peer_static_key(&self) -> Option<PubKey> {
         *self.peer_static_key.read().unwrap()
     }
 
+    /// Tagged fingerprint of the currently-configured peer, or the empty
+    /// string when no peer is enrolled. The empty-string case is harmless in
+    /// log output and matches the prior call-site expectations (which were
+    /// never invoked for an unenrolled peer).
     pub fn fingerprint(&self) -> String {
-        public_key_fingerprint(&self.peer_static_key.read().unwrap())
+        self.peer_static_key
+            .read()
+            .unwrap()
+            .map(|k| k.fingerprint())
+            .unwrap_or_default()
     }
 
     /// Record an authenticated heartbeat from `peer_addr`. Returns the
@@ -175,25 +183,28 @@ mod tests {
 
     #[test]
     fn starts_empty() {
-        let p = PeerState::new([7u8; 32]);
+        let key = PubKey::x25519([7u8; 32]);
+        let p = PeerState::new(Some(key));
         assert_eq!(p.current_ip(), None);
         assert_eq!(p.last_heartbeat_ms(), None);
-        assert_eq!(p.peer_static_key(), [7u8; 32]);
+        assert_eq!(p.peer_static_key(), Some(key));
         assert!(p.is_peer_enrolled());
     }
 
     #[test]
-    fn unenrolled_sentinel_is_recognised() {
-        let p = PeerState::new(UNENROLLED_PEER_KEY);
+    fn unenrolled_is_recognised() {
+        let p = PeerState::new(None);
         assert!(!p.is_peer_enrolled());
-        p.set_peer_static_key([9u8; 32]);
+        assert_eq!(p.peer_static_key(), None);
+        let new_key = PubKey::x25519([9u8; 32]);
+        p.set_peer_static_key(new_key);
         assert!(p.is_peer_enrolled());
-        assert_eq!(p.peer_static_key(), [9u8; 32]);
+        assert_eq!(p.peer_static_key(), Some(new_key));
     }
 
     #[test]
     fn first_heartbeat_is_classified_as_first() {
-        let p = PeerState::new([0u8; 32]);
+        let p = PeerState::new(None);
         let eff = p.record_heartbeat(addr("203.0.113.7:1234"));
         assert!(
             matches!(eff, HeartbeatEffect::FirstHeartbeat(ip) if ip.to_string() == "203.0.113.7")
@@ -205,7 +216,7 @@ mod tests {
 
     #[test]
     fn repeat_same_ip_does_not_fire_watch() {
-        let p = PeerState::new([0u8; 32]);
+        let p = PeerState::new(None);
         let mut rx = p.watch();
         // Initial subscribe: current value is None.
         assert_eq!(*rx.borrow_and_update(), None);
@@ -229,7 +240,7 @@ mod tests {
 
     #[test]
     fn changed_ip_fires_watch_with_old_and_new() {
-        let p = PeerState::new([0u8; 32]);
+        let p = PeerState::new(None);
         let mut rx = p.watch();
         let _ = rx.borrow_and_update();
 
@@ -250,7 +261,7 @@ mod tests {
 
     #[test]
     fn last_heartbeat_ms_monotonic() {
-        let p = PeerState::new([0u8; 32]);
+        let p = PeerState::new(None);
         let _ = p.record_heartbeat(addr("198.51.100.1:1111"));
         let first = p.last_heartbeat_ms().unwrap();
         // No sleep — but a second call should produce ms >= first (system clock).
@@ -260,12 +271,20 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_stable() {
-        let key = [0xABu8; 32];
-        let p = PeerState::new(key);
+    fn fingerprint_is_stable_and_tagged() {
+        let key = PubKey::x25519([0xABu8; 32]);
+        let p = PeerState::new(Some(key));
         let f1 = p.fingerprint();
         let f2 = p.fingerprint();
         assert_eq!(f1, f2);
-        assert_eq!(f1.len(), 32);
+        // Tagged form: "x25519:" + 32 hex chars.
+        assert!(f1.starts_with("x25519:"));
+        assert_eq!(f1.len(), "x25519:".len() + 32);
+    }
+
+    #[test]
+    fn unenrolled_fingerprint_is_empty_string() {
+        let p = PeerState::new(None);
+        assert_eq!(p.fingerprint(), "");
     }
 }

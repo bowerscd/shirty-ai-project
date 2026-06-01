@@ -208,8 +208,11 @@ impl HeartbeatServer {
             }
         };
 
-        // Authenticate: the peer's offered static key must match the configured one.
-        if *half.remote_public() != self.peer_state.peer_static_key() {
+        // Authenticate: the peer's offered static key must match the
+        // configured one. Both sides are compared as tagged `PubKey`s so a
+        // future algorithm slots in without changing this comparison.
+        let offered_pubkey = *half.remote_public();
+        if Some(offered_pubkey) != self.peer_state.peer_static_key() {
             if self.peer_state.is_peer_enrolled() {
                 tracing::warn!(
                     src = %src,
@@ -220,8 +223,7 @@ impl HeartbeatServer {
             } else {
                 // TOFU staging: record the candidate so the operator can
                 // approve it via `yggdrasilctl peer approve <fingerprint>`.
-                let offered = *half.remote_public();
-                match self.pending_store.record_candidate(offered) {
+                match self.pending_store.record_candidate(offered_pubkey) {
                     Ok(()) => tracing::info!(
                         src = %src,
                         offered = %half.remote_fingerprint(),
@@ -529,6 +531,7 @@ fn current_unix_millis() -> u64 {
 mod tests {
     use super::*;
     use ratatoskr::auth::{Initiator, StaticKeyPair};
+    use ratatoskr::pubkey::PubKey;
     use ratatoskr::wire::SessionId;
     use std::time::Duration;
 
@@ -545,7 +548,7 @@ mod tests {
     ) {
         let server_keys = StaticKeyPair::generate().unwrap();
         let client_keys = StaticKeyPair::generate().unwrap();
-        let peer_state = PeerState::new(*client_keys.public_key());
+        let peer_state = PeerState::new(Some(client_keys.public_key()));
         let pending_dir = tempfile::tempdir().unwrap();
         let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
         // Leak the tempdir so it lives as long as the test (avoids relying
@@ -567,14 +570,15 @@ mod tests {
         (server_keys, client_keys, peer_state, addr, cancel, handle)
     }
 
-    // StaticKeyPair has no public Clone (secret is zeroizing) — provide a
-    // shallow test-only constructor that recovers the same key from raw bytes.
+    // StaticKeyPair's derived Clone is fine; this helper exists so the
+    // call site reads as "clone for test setup" rather than re-loading
+    // bytes from disk.
     trait CloneForTest {
         fn clone_for_test(&self) -> Self;
     }
     impl CloneForTest for StaticKeyPair {
         fn clone_for_test(&self) -> Self {
-            StaticKeyPair::from_raw(*self.secret_bytes(), *self.public_key())
+            self.clone()
         }
     }
 
@@ -582,7 +586,7 @@ mod tests {
     /// established Session plus the client UDP socket bound to a local port
     /// (so the test can keep sending heartbeats on the same source).
     async fn handshake_with_server(
-        server_pub: &[u8; 32],
+        server_pub: &PubKey,
         client: &StaticKeyPair,
         server_addr: SocketAddr,
     ) -> (Session, UdpSocket) {
@@ -606,7 +610,7 @@ mod tests {
         let (server_keys, client_keys, peer_state, server_addr, cancel, handle) =
             spawn_server().await;
         let (mut session, sock) =
-            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
+            handshake_with_server(&server_keys.public_key(), &client_keys, server_addr).await;
 
         // Send a heartbeat and expect an ACK.
         let (counter, hb) = session.encode_heartbeat(1234, 0).unwrap();
@@ -646,7 +650,7 @@ mod tests {
         assert_eq!(*rx.borrow_and_update(), None);
 
         let (mut session, sock) =
-            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
+            handshake_with_server(&server_keys.public_key(), &client_keys, server_addr).await;
 
         // 25 heartbeats from the same client socket. We expect the watch
         // channel to fire exactly once (the initial None→Some(127.0.0.1)).
@@ -684,7 +688,7 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sock.connect(server_addr).await.unwrap();
         let sid = SessionId::random();
-        let (_init, hs1) = Initiator::start(&intruder, server_keys.public_key(), sid).unwrap();
+        let (_init, hs1) = Initiator::start(&intruder, &server_keys.public_key(), sid).unwrap();
         sock.send(&hs1).await.unwrap();
 
         // The server must NOT send Handshake2.
@@ -705,7 +709,7 @@ mod tests {
         let (server_keys, client_keys, peer_state, server_addr, cancel, handle) =
             spawn_server().await;
         let (mut session, sock) =
-            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
+            handshake_with_server(&server_keys.public_key(), &client_keys, server_addr).await;
 
         // Send heartbeat 0, get ACK, then replay the exact same packet.
         let (_, hb0) = session.encode_heartbeat(100, 0).unwrap();
@@ -741,7 +745,7 @@ mod tests {
 
         // First session.
         let (mut s1, sock1) =
-            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
+            handshake_with_server(&server_keys.public_key(), &client_keys, server_addr).await;
         let (_, hb) = s1.encode_heartbeat(1, 0).unwrap();
         sock1.send(&hb).await.unwrap();
         let mut buf = [0u8; 2048];
@@ -753,7 +757,7 @@ mod tests {
         // Second handshake on a fresh client socket. The server should
         // accept and replace; the *new* session can send heartbeats.
         let (mut s2, sock2) =
-            handshake_with_server(server_keys.public_key(), &client_keys, server_addr).await;
+            handshake_with_server(&server_keys.public_key(), &client_keys, server_addr).await;
         let (counter, hb) = s2.encode_heartbeat(1, 0).unwrap();
         sock2.send(&hb).await.unwrap();
         let n = tokio::time::timeout(Duration::from_secs(2), sock2.recv(&mut buf))

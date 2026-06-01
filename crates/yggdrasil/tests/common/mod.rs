@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::{Initiator, Session, StaticKeyPair};
+use ratatoskr::pubkey::PubKey;
 use ratatoskr::wire::{self, SessionId};
 
 use yggdrasil::heartbeat::{HeartbeatServer, PeerState};
@@ -138,7 +139,7 @@ pub async fn reserve_tcp_port() -> ReservedTcpPort {
 /// `HeartbeatServer`. Returns the resulting transport session and the
 /// connected UDP socket bound for further heartbeats.
 pub async fn drive_handshake(
-    server_pub: &[u8; 32],
+    server_pub: &PubKey,
     client: &StaticKeyPair,
     server_addr: SocketAddr,
 ) -> (Session, UdpSocket) {

@@ -88,8 +88,9 @@ pub enum Request {
     /// [`error_codes::AMBIGUOUS_FINGERPRINT`] with the colliding
     /// fingerprints in the message.
     DownstreamApprove {
-        /// Full BLAKE2s-128 fingerprint (32 hex chars) or any unique
-        /// prefix of at least 8 hex chars.
+        /// Tagged fingerprint (e.g. `x25519:<32 hex chars>` for X25519)
+        /// or any unique prefix of at least 8 hex chars of the hash
+        /// tail (the algorithm prefix is optional).
         fingerprint: String,
     },
     /// List TLS certificates currently loaded into the cert store, one
@@ -465,8 +466,13 @@ pub struct PendingResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingCandidate {
+    /// Tagged fingerprint (`<algo>:<hex>`). Recomputed by the daemon from
+    /// the candidate's `pubkey` on each `peer pending` snapshot, so it is
+    /// always consistent with whatever fingerprint scheme the pubkey's
+    /// algorithm currently uses.
     pub fingerprint: String,
-    pub public_key_hex: String,
+    /// Candidate's tagged public key.
+    pub pubkey: crate::pubkey::PubKey,
     /// Unix epoch milliseconds when the candidate was first seen.
     pub first_seen_unix_ms: u64,
     /// Number of failed handshake attempts observed from this candidate.

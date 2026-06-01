@@ -40,7 +40,7 @@ use ratatoskr::auth::StaticKeyPair;
 
 use crate::chain::{ChainAcceptor, ChainClient, ChainClientConfig, ChainClientHandle};
 use crate::control::ControlServer;
-use crate::heartbeat::{HeartbeatServer, PeerState, UNENROLLED_PEER_KEY};
+use crate::heartbeat::{HeartbeatServer, PeerState};
 use crate::pending_peers::PendingPeerStore;
 use crate::proxy::resolver::ResolverFactory;
 use crate::proxy::supervisor::{CertConfig, ProxySupervisor};
@@ -122,13 +122,7 @@ pub async fn run_relay(
     //    No `[accept]` means the daemon has no inbound chain peer at
     //    all; we still keep a TOFU staging hook here for the future
     //    `yggdrasilctl identity add-accept` flow.
-    let downstream_pubkey = match config.accept.as_ref() {
-        Some(acc) => *acc
-            .pubkey
-            .as_x25519()
-            .expect("PubKey::X25519 only variant in v1"),
-        None => UNENROLLED_PEER_KEY,
-    };
+    let downstream_pubkey = config.accept.as_ref().map(|acc| acc.pubkey);
     let peer_state = PeerState::new(downstream_pubkey);
     if peer_state.is_peer_enrolled() {
         tracing::info!(
@@ -198,7 +192,7 @@ pub async fn run_relay(
     //     `Request::DerivedRules`) and into the chain acceptor
     //     (`record_apply` writer on a relay).
     let introspection_state = crate::chain::IntrospectionState::new(
-        ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
+        local_keys.public_key(),
         config.dial.as_ref().map(|d| d.pubkey),
         config.accept.as_ref().map(|a| a.pubkey),
         supervisor.handle(),
@@ -540,7 +534,7 @@ pub async fn run_terminal(
     //     always `None` here (terminals don't accept downstream
     //     connections).
     let introspection_state = crate::chain::IntrospectionState::new(
-        ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key()),
+        local_keys.public_key(),
         config.dial.as_ref().map(|d| d.pubkey),
         None,
         supervisor.handle(),
@@ -593,7 +587,7 @@ pub async fn run_terminal(
     //     can update the `Request::DerivedRules` snapshot on each
     //     successful upstream ack.
     let predicate_publisher_join = chain_client_handle.as_ref().map(|handle| {
-        let origin = ratatoskr::pubkey::PubKey::x25519(*local_keys.public_key());
+        let origin = local_keys.public_key();
         let supervisor_handle = supervisor.handle();
         let https_meta = chain::predicate_extractor::HttpsPredicateMeta {
             listen_port: config.server.https_listen.port(),
@@ -715,10 +709,7 @@ fn build_chain_client(
     shutdown: CancellationToken,
 ) -> Option<BuiltChainClient> {
     let up = config.dial.as_ref()?;
-    let upstream_pubkey = *up
-        .pubkey
-        .as_x25519()
-        .expect("PubKey::X25519 only variant in v1");
+    let upstream_pubkey = up.pubkey;
     let cfg = ChainClientConfig {
         endpoint: up.endpoint.clone(),
         upstream_pubkey,
@@ -728,7 +719,7 @@ fn build_chain_client(
         body_handler: None,
         local_bind: config.server.default_bind,
     };
-    let upstream_fp = ratatoskr::auth::public_key_fingerprint(&upstream_pubkey);
+    let upstream_fp = upstream_pubkey.fingerprint();
     tracing::info!(
         upstream_endpoint = %up.endpoint,
         upstream_fingerprint = %upstream_fp,

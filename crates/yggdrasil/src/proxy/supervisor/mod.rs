@@ -360,7 +360,7 @@ mod tests {
     /// `PeerState` (rules never have to dial upstream during these tests —
     /// only the supervisor wiring is exercised).
     fn relay_factory() -> (ResolverFactory, std::sync::Arc<PeerState>) {
-        let peer = PeerState::new([0u8; 32]);
+        let peer = PeerState::new(None);
         let factory = ResolverFactory::new_relay(peer.clone());
         (factory, peer)
     }

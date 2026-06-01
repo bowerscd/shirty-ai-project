@@ -162,7 +162,7 @@ Approve a staged candidate by its fingerprint or any unique 8+-hex-char prefix
 
 ###### **Arguments:**
 
-* `<FINGERPRINT>` — Full BLAKE2s-128 fingerprint (32 hex chars) of the accept-side peer to approve, or any unique prefix of at least 8 hex chars. The daemon disambiguates against the staged queue; ambiguous prefixes return an error listing every match
+* `<FINGERPRINT>` — Tagged fingerprint (e.g. `x25519:<32 hex chars>` for X25519) of the accept-side peer to approve, or any unique prefix of at least 8 hex chars of the hash tail (the algorithm prefix is optional). The daemon disambiguates against the staged queue; ambiguous prefixes return an error listing every match
 
 
 

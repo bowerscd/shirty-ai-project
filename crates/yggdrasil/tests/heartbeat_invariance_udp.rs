@@ -37,10 +37,10 @@ async fn full_stack_heartbeat_storm_does_not_disturb_udp_data_plane() {
     // 1. Set up identities and the heartbeat server.
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
-    let peer_state = PeerState::new(*client_keys.public_key());
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
     let shutdown = CancellationToken::new();
 
-    let server_pub = *server_keys.public_key();
+    let server_pub = server_keys.public_key();
     let hb = HeartbeatHarness::spawn(server_keys, peer_state.clone(), shutdown.clone()).await;
 
     // 2. Backing echo socket — stands in for whatever runs on the residential box.

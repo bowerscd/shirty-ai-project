@@ -8,7 +8,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use ratatoskr::control::{error_codes, Response};
-use ratatoskr::pubkey::PubKey;
 
 use super::super::ControlState;
 use super::terminal_mode_unsupported;
@@ -55,7 +54,7 @@ pub(in crate::control) fn approve_downstream(state: &ControlState, fingerprint: 
             };
         }
     };
-    let tagged = PubKey::X25519(key).to_string();
+    let tagged = key.to_string();
     if let Err(e) = update_downstream_pubkey(&state.config_path, &tagged) {
         return Response::Error {
             code: error_codes::CONFIG_WRITE_FAILED.into(),

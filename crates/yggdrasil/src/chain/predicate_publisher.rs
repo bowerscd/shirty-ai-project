@@ -429,7 +429,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use ratatoskr::auth::PUBLIC_KEY_LEN;
+    use ratatoskr::auth::X25519_PUBLIC_LEN;
     use ratatoskr::predicate::PredicateSet;
     use ratatoskr::rule::{Protocol, Rule, RuleSet};
     use tokio::sync::Mutex;
@@ -449,7 +449,7 @@ mod tests {
     }
 
     fn origin() -> PubKey {
-        PubKey::x25519([0x42u8; PUBLIC_KEY_LEN])
+        PubKey::x25519([0x42u8; X25519_PUBLIC_LEN])
     }
 
     /// Build a `(ChainClientHandle, sink)` pair for tests. The sink

@@ -40,7 +40,7 @@ async fn reload_emits_reloading_then_ready_when_notify_socket_set() {
         std::env::set_var("NOTIFY_SOCKET", &notify_path);
     }
 
-    let peer_state = PeerState::new([0u8; 32]);
+    let peer_state = PeerState::new(None);
     let shutdown = CancellationToken::new();
     let supervisor = ProxySupervisor::spawn(
         rules_dir.clone(),
