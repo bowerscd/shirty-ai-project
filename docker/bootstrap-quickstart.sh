@@ -59,6 +59,13 @@ rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
+# Bind all derived rules dual-stack (v4 + v6) so the IPv6 e2e
+# phase has a v6 ingress at the gateway. Realistic homelab posture
+# for an operator who wants v6 client-facing while keeping
+# internal LAN forwarding on v4. With kernel
+# `/proc/sys/net/ipv6/bindv6only = 0` (default on most distros),
+# Linux accepts both v4 and v6 connections on a `[::]:port` socket.
+default_bind = "::"
 # Honour SIGTERM by draining in-flight TCP / HTTPS for up to 5s
 # before cancelling. Exercised by the graceful-drain e2e phase.
 graceful_drain_timeout = "5s"

@@ -25,11 +25,16 @@ x-yggdrasil-image: &yggdrasil-image
 
 networks:
   # Public-internet stand-in: client reaches gateway, nothing else.
+  # Dual-stack so the IPv6 hot-reload phase can exercise the
+  # "added rule spawns a fresh listener on a new address family"
+  # path with a real v6 socket on the wire.
   client_wan:
     driver: bridge
+    enable_ipv6: true
     ipam:
       config:
         - subnet: 172.31.10.0/24
+        - subnet: fd00:31:a::/64
   # Gateway <-> relay leg.
   inet_link:
     driver: bridge
@@ -106,6 +111,7 @@ services:
     networks:
       client_wan:
         ipv4_address: 172.31.10.20
+        ipv6_address: fd00:31:a::20
       inet_link:
         ipv4_address: 172.31.11.10
     expose:
@@ -249,3 +255,4 @@ services:
     networks:
       client_wan:
         ipv4_address: 172.31.10.10
+        ipv6_address: fd00:31:a::10

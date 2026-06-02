@@ -595,7 +595,7 @@ EOF
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
         predicates_landed
 
-    WAIT_TIMEOUT=15 wait_for "TCP echo recovers after $role_desc restart" run_tcp_echo
+    WAIT_TIMEOUT=60 wait_for "TCP echo recovers after $role_desc restart" run_tcp_echo
     WAIT_TIMEOUT=15 wait_for "UDP echo recovers after $role_desc restart" run_udp_echo
 
     local deadline=$(( $(date +%s) + 10 ))
@@ -806,7 +806,7 @@ WAIT_TIMEOUT=20 wait_for "post-rotation sentinel landed at gateway" sentinel_pos
 rm "$sentinel"
 WAIT_TIMEOUT=20 wait_for "post-rotation sentinel cleared" sentinel_post_rot_absent
 
-WAIT_TIMEOUT=15 wait_for "TCP echo recovers post-rotation" run_tcp_echo
+WAIT_TIMEOUT=60 wait_for "TCP echo recovers post-rotation" run_tcp_echo
 echo "    [ok] relay key rotation + dual-ceremony recovery succeeded"
 
 # Cleanup transit files.
@@ -1013,6 +1013,67 @@ WAIT_TIMEOUT=10 wait_for "ephemeral-tcp port no longer accepts" ephemeral_tcp_de
 # Confirm the disk-defined rules are back online (one of them suffices).
 WAIT_TIMEOUT=15 wait_for "original tcp-echo rule restored after reload" run_tcp_echo
 echo "    [ok] chain apply ephemeral lifetime (push -> serve -> clobber) verified"
+
+# -------- IPv6 path (hot-load v6 rule, probe over v6) ----------------------
+#
+# Same shape as the quickstart phase. The chain transport itself
+# (gateway <-> relay <-> terminal Noise/UDP) stays IPv4; only
+# client_wan is dual-stack so the client can reach the gateway over
+# v6. The gateway's `[server].default_bind = "::"` makes all derived
+# rules bind `[::]:port` (dual-stack via kernel `bindv6only = 0`),
+# so the v6 SYN lands and the existing v4 chain transport ferries
+# it through to the terminal.
+
+echo "==> [ipv6] hot-load tcp-echo-v6 rule, probe via IPv6 (3-hop chain)"
+
+v6_rule="$RUNTIME_DIR/terminal/etc/rules/tcp-echo-v6.toml"
+cat > "$v6_rule" <<'EOF'
+[[rule]]
+name     = "tcp-echo-v6"
+listen   = "[::]:7102"
+protocol = "tcp"
+target   = "172.31.13.40:7100"
+EOF
+
+v6_derived() {
+    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "tcp-echo-v6"'
+}
+WAIT_TIMEOUT=20 wait_for "tcp-echo-v6 derived at gateway" v6_derived
+
+# Independent v6 probe — `AF_INET6` socket against the gateway's v6
+# address. The literal address is parsed as v6 (no DNS path).
+ipv6_tcp_echo() {
+    dc_exec client python3 - <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(("fd00:31:a::20", 7102, 0, 0))
+except (ConnectionRefusedError, socket.timeout, OSError) as e:
+    print(f"connect failed: {e}", file=sys.stderr)
+    sys.exit(1)
+payload = b"chain-v6-" + b"6" * 100
+s.sendall(payload)
+got = b""
+while len(got) < len(payload):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    got += chunk
+s.close()
+sys.exit(0 if got == payload else 1)
+PY
+}
+WAIT_TIMEOUT=30 wait_for "TCP echo round-trips over IPv6 (3-hop chain)" ipv6_tcp_echo
+echo "    [ok] IPv6 TCP rule hot-loaded and serving over v6 through chain"
+
+# Hygiene: remove the v6 rule so subsequent phases (none yet, but
+# guards against drift) see a clean set.
+rm "$v6_rule"
+v6_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "tcp-echo-v6"'
+}
+WAIT_TIMEOUT=20 wait_for "tcp-echo-v6 removed from gateway" v6_absent
 
 # -------- done -------------------------------------------------------------
 

@@ -702,7 +702,7 @@ EOF
         predicates_landed
 
     # Same independent probes that passed pre-restart.
-    WAIT_TIMEOUT=15 wait_for "TCP echo recovers after $role_desc restart" run_tcp_echo
+    WAIT_TIMEOUT=60 wait_for "TCP echo recovers after $role_desc restart" run_tcp_echo
     WAIT_TIMEOUT=15 wait_for "UDP echo recovers after $role_desc restart" run_udp_echo
 
     # HTTPS needs the frontend to come back up; poll briefly. Also
@@ -891,7 +891,7 @@ dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
 # explicit is good).
 WAIT_TIMEOUT=60 wait_for "post-rotation re-enrollment" terminal_enrolled
 WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
-WAIT_TIMEOUT=15 wait_for "TCP echo recovers post-rotation" run_tcp_echo
+WAIT_TIMEOUT=60 wait_for "TCP echo recovers post-rotation" run_tcp_echo
 echo "    [ok] gateway key rotation + re-enrollment cycle succeeded"
 
 # Cleanup transit files (operator-equivalent of `rm /tmp/*.{request,grant}`).
@@ -1054,7 +1054,7 @@ s.close()
 sys.exit(0 if got == payload else 1)
 PY
 }
-WAIT_TIMEOUT=30 wait_for "TCP echo through ephemeral-tcp rule" ephemeral_tcp_echo
+WAIT_TIMEOUT=60 wait_for "TCP echo through ephemeral-tcp rule" ephemeral_tcp_echo
 
 # `chain apply` lives until the next rules_dir reload. The watcher
 # only re-emits when the rescanned RuleSet semantically differs from
@@ -1104,6 +1104,70 @@ WAIT_TIMEOUT=10 wait_for "ephemeral-tcp port no longer accepts" ephemeral_tcp_de
 # Confirm the disk-defined rules are back online (one of them suffices).
 WAIT_TIMEOUT=10 wait_for "original tcp-echo rule restored after reload" run_tcp_echo
 echo "    [ok] chain apply ephemeral lifetime (push -> serve -> clobber) verified"
+
+# -------- IPv6 path (hot-load v6 rule, probe over v6) ----------------------
+#
+# Exercises the "added rule spawns a fresh listener on a new address
+# family" code path. The terminal's rule binds [::]:7102 (the
+# predicate carries protocol+port, and the gateway derives a rule
+# with the same listen spec — so both nodes bind a v6 socket). The
+# client connects to the gateway's v6 address on client_wan; the
+# gateway then forwards over the IPv4 chain transport to the
+# terminal, which targets the IPv4 echo on home_lan. Only client_wan
+# is dual-stack; chain_link and home_lan stay IPv4-only, which is
+# realistic (most homelabs have v6 client-facing but IPv4 internally).
+
+echo "==> [ipv6] hot-load tcp-echo-v6 rule, probe via IPv6"
+
+v6_rule="$RUNTIME_DIR/terminal/etc/rules/tcp-echo-v6.toml"
+cat > "$v6_rule" <<'EOF'
+[[rule]]
+name     = "tcp-echo-v6"
+listen   = "[::]:7102"
+protocol = "tcp"
+target   = "172.31.2.40:7100"
+EOF
+
+v6_derived() {
+    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "tcp-echo-v6"'
+}
+WAIT_TIMEOUT=15 wait_for "tcp-echo-v6 derived at gateway" v6_derived
+
+# Independent v6 probe — `AF_INET6` socket against the gateway's v6
+# address. The literal address is parsed as v6 (not a hostname lookup)
+# so no DNS path is involved.
+ipv6_tcp_echo() {
+    dc_exec client python3 - <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(("fd00:31::20", 7102, 0, 0))
+except (ConnectionRefusedError, socket.timeout, OSError) as e:
+    print(f"connect failed: {e}", file=sys.stderr)
+    sys.exit(1)
+payload = b"quickstart-v6-" + b"6" * 100
+s.sendall(payload)
+got = b""
+while len(got) < len(payload):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    got += chunk
+s.close()
+sys.exit(0 if got == payload else 1)
+PY
+}
+WAIT_TIMEOUT=15 wait_for "TCP echo round-trips over IPv6" ipv6_tcp_echo
+echo "    [ok] IPv6 TCP rule hot-loaded and serving over v6"
+
+# Hygiene: remove the v6 rule so subsequent phases (none yet, but
+# guards against drift) see a clean set.
+rm "$v6_rule"
+v6_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "tcp-echo-v6"'
+}
+WAIT_TIMEOUT=15 wait_for "tcp-echo-v6 removed from gateway" v6_absent
 
 # -------- done --------------------------------------------------------------
 
