@@ -208,10 +208,16 @@ idle_timeout = "30s"
 EOF
 
 echo "[init-chain] writing terminal https routes: primary + alt SNI"
+# Same shape as bootstrap-quickstart.sh — primary exercises HSTS +
+# [route.headers] injection; alt stays bare for body-comparison.
 cat >/etc/yggdrasil-terminal/rules/https-routes.toml <<EOF
 [[route]]
 hostname = "${PRIMARY_SNI}"
 target   = "http://${APP_NGINX_HOST}:80"
+hsts     = true
+[route.headers]
+"X-Robots-Tag" = "noindex, nofollow"
+"X-Custom-E2E" = "primary-backend"
 
 [[route]]
 hostname = "${ALT_SNI}"

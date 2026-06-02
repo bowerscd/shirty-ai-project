@@ -293,6 +293,52 @@ fp2=$(echo "$probe_alt"     | python3 -c "import json,sys; print(json.load(sys.s
 [[ "$fp2" == "$fp1" ]] || fail "alt SNI: leaf cert fingerprint differs from primary; same cert should cover both SANs"
 echo "    [ok] alt SNI dispatched to app-nginx-alt (same cert)"
 
+# -------- HSTS + custom response headers on primary route ------------------
+#
+# The primary [[route]] in the bootstrap declares `hsts = true` and a
+# [route.headers] table. Probe the headers directly to assert they
+# fired. Alt route is bare; spot-check that it does NOT carry the
+# custom headers (proves the table is route-scoped, not global).
+
+echo "==> [https-headers] HSTS + [route.headers] stamped on primary route only"
+headers_for_sni() {
+    local sni="$1"
+    dc_exec client python3 - "$sni" <<'PY'
+import http.client, json, ssl, sys
+sni = sys.argv[1]
+ctx = ssl.create_default_context(cafile="/etc/ssl/yggdrasil-test/server.pem")
+conn = http.client.HTTPSConnection(sni, 8443, context=ctx, timeout=5)
+conn.request("GET", "/")
+resp = conn.getresponse()
+hdrs = {k.lower(): v for k, v in resp.getheaders()}
+print(json.dumps(hdrs))
+conn.close()
+PY
+}
+hdrs_primary=$(headers_for_sni app.test.local) \
+    || fail "header probe to primary SNI failed"
+hdrs_alt=$(headers_for_sni alt.test.local) \
+    || fail "header probe to alt SNI failed"
+echo "$hdrs_primary" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+assert "strict-transport-security" in h, f"HSTS missing on primary: {h}"
+assert h.get("x-robots-tag") == "noindex, nofollow", \
+    f"X-Robots-Tag wrong on primary: {h}"
+assert h.get("x-custom-e2e") == "primary-backend", \
+    f"X-Custom-E2E wrong on primary: {h}"
+' || fail "primary route missing HSTS or custom headers"
+echo "$hdrs_alt" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+# Bare route — must NOT carry the primary route'\''s custom headers.
+assert "x-custom-e2e" not in h, \
+    f"X-Custom-E2E leaked from primary route into alt: {h}"
+assert "x-robots-tag" not in h, \
+    f"X-Robots-Tag leaked from primary route into alt: {h}"
+' || fail "alt route is leaking primary route's headers"
+echo "    [ok] HSTS + custom headers present on primary, absent on alt"
+
 echo "==> [https-unknown] SNI=bogus.test.local rejected at TLS handshake"
 # yggdrasil's cert resolver returns nothing for an unknown SNI, so the
 # rustls handshake fails with an access-denied alert rather than
@@ -402,6 +448,86 @@ done
 [[ "$fp4" != "$fp3" ]] || fail "cert did not reload after recovery"
 echo "    [ok] recovery reload succeeded; new leaf fp ${fp4:0:16}…"
 
+# -------- L4 rule hot-add/remove (inotify-driven) --------------------------
+#
+# Drop a new tcp-echo-hot.toml directly into the host-side bind mount.
+# The terminal's inotify watcher (250 ms debounce per
+# docs/configuration.md hot-reload semantics) picks it up; the
+# predicate publisher emits a new version; the gateway's chain
+# client acks and derives a matching listener. Independent client
+# probe to the new port verifies the whole flow. Then `rm` the file
+# and verify the listener stops accepting.
+
+echo "==> [hot-reload] dropping tcp-echo-hot.toml; expect gateway to derive + serve"
+cat > "$RUNTIME_DIR/terminal/etc/rules/tcp-echo-hot.toml" <<EOF
+[[rule]]
+name     = "tcp-echo-hot"
+listen   = "0.0.0.0:7110"
+protocol = "tcp"
+target   = "172.31.2.40:7100"
+EOF
+
+hot_rule_present() {
+    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "tcp-echo-hot"'
+}
+hot_rule_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "tcp-echo-hot"'
+}
+WAIT_TIMEOUT=10 wait_for "tcp-echo-hot derived at gateway" \
+    hot_rule_present
+
+run_tcp_echo_hot() {
+    dc_exec client python3 - <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(("172.31.0.20", 7110))
+payload = b"hot-reload-tcp-" + b"h" * 200
+s.sendall(payload)
+got = b""
+while len(got) < len(payload):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    got += chunk
+s.close()
+sys.exit(0 if got == payload else 1)
+PY
+}
+WAIT_TIMEOUT=10 wait_for "TCP echo through hot-added rule" run_tcp_echo_hot
+
+echo "==> [hot-reload] removing tcp-echo-hot.toml; expect gateway to drop it"
+rm "$RUNTIME_DIR/terminal/etc/rules/tcp-echo-hot.toml"
+WAIT_TIMEOUT=10 wait_for "tcp-echo-hot removed from gateway" \
+    hot_rule_absent
+# Re-probe must now fail — the listener stopped, kernel returns ECONNREFUSED
+# (or in the wait-and-retry case, the test would time out).
+if run_tcp_echo_hot 2>/dev/null; then
+    fail "removed rule is still accepting traffic"
+fi
+echo "    [ok] hot-removed rule no longer serving"
+
+# -------- Init re-run idempotency ------------------------------------------
+#
+# init-quickstart is idempotent at the bash level (skips when all
+# expected files exist). Verify the compose-level re-run also works:
+# nothing is broken by re-running init mid-test, and the existing
+# live traffic continues unaffected.
+
+echo "==> [init-idempotent] re-running init-quickstart container mid-test"
+init_out=$("${DC[@]}" "${COMPOSE_ARGS[@]}" run --rm init-quickstart 2>&1) \
+    || fail "init-quickstart re-run exited non-zero: $init_out"
+echo "$init_out" | grep -q "already bootstrapped; skipping" \
+    || fail "init re-run did not detect existing bootstrap: $init_out"
+
+# Live probes must still succeed.
+run_tcp_echo || fail "TCP echo broke after init re-run"
+probe_after_init=$(https_probe app.test.local) \
+    || fail "HTTPS probe failed after init re-run"
+[[ $(echo "$probe_after_init" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])") == "200" ]] \
+    || fail "HTTPS not 200 after init re-run"
+echo "    [ok] init re-run was a no-op and live traffic kept flowing"
+
 # -------- Negative isolation check -----------------------------------------
 #
 # The client lives on client_wan; the app containers live on home_lan.
@@ -410,9 +536,9 @@ echo "    [ok] recovery reload succeeded; new leaf fp ${fp4:0:16}…"
 # itself is broken and every other assertion above is suspect.
 
 echo "==> [isolation] client cannot reach home_lan app IPs directly"
-isolation_probe() {
-    local target_ip="$1" target_port="$2" proto="$3"
-    dc_exec client python3 - "$target_ip" "$target_port" "$proto" <<'PY'
+isolation_probe_from() {
+    local from_container="$1" target_ip="$2" target_port="$3" proto="$4"
+    dc_exec "$from_container" python3 - "$target_ip" "$target_port" "$proto" <<'PY'
 import socket, sys
 ip, port, proto = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 fam = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
@@ -424,7 +550,6 @@ try:
         sys.exit(1)  # connect succeeded = isolation broken
     else:
         # UDP is connectionless; "isolation" for UDP means no response.
-        # Send a probe and see if we get anything back.
         s.sendto(b"isolation-probe", (ip, port))
         try:
             s.recvfrom(4096)
@@ -437,11 +562,28 @@ finally:
     s.close()
 PY
 }
-isolation_probe 172.31.2.20 80   tcp || fail "isolation: client could reach app-nginx directly"
-isolation_probe 172.31.2.30 80   tcp || fail "isolation: client could reach app-nginx-alt directly"
-isolation_probe 172.31.2.40 7100 tcp || fail "isolation: client could reach app-tcp directly"
-isolation_probe 172.31.2.50 7101 udp || fail "isolation: client could reach app-udp directly"
+isolation_probe_from client 172.31.2.20 80   tcp || fail "isolation: client could reach app-nginx directly"
+isolation_probe_from client 172.31.2.30 80   tcp || fail "isolation: client could reach app-nginx-alt directly"
+isolation_probe_from client 172.31.2.40 7100 tcp || fail "isolation: client could reach app-tcp directly"
+isolation_probe_from client 172.31.2.50 7101 udp || fail "isolation: client could reach app-udp directly"
 echo "    [ok] all four home_lan app endpoints unreachable from client"
+
+# -------- Two-way isolation: gateway also can't bypass the chain -----------
+#
+# The strong version of the property: the gateway, which sits between
+# the client and the chain, must ALSO have no route to home_lan. If
+# the gateway accidentally got connectivity to the app containers
+# (network misconfig, host IP-forwarding leak, etc.), a future
+# regression could let it dial them directly and skip the chain
+# entirely — and the client-side isolation check above would still
+# pass.
+
+echo "==> [isolation] gateway cannot reach home_lan app IPs directly"
+isolation_probe_from gateway 172.31.2.20 80   tcp || fail "isolation: gateway could reach app-nginx directly"
+isolation_probe_from gateway 172.31.2.30 80   tcp || fail "isolation: gateway could reach app-nginx-alt directly"
+isolation_probe_from gateway 172.31.2.40 7100 tcp || fail "isolation: gateway could reach app-tcp directly"
+isolation_probe_from gateway 172.31.2.50 7101 udp || fail "isolation: gateway could reach app-udp directly"
+echo "    [ok] all four home_lan app endpoints unreachable from gateway"
 
 # -------- done --------------------------------------------------------------
 

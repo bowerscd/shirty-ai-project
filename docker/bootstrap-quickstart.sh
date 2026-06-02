@@ -166,10 +166,18 @@ idle_timeout = "30s"
 EOF
 
 echo "[init-quickstart] writing terminal https routes: primary + alt SNI"
+# Primary route exercises HSTS + the [route.headers] static-injection
+# surface (mirrors nginx's `add_header NAME VALUE always` posture per
+# docs/configuration.md). Alt route stays bare so the comparison
+# between the two response shapes is meaningful.
 cat >/etc/yggdrasil-terminal/rules/https-routes.toml <<EOF
 [[route]]
 hostname = "${PRIMARY_SNI}"
 target   = "http://${APP_NGINX_HOST}:80"
+hsts     = true
+[route.headers]
+"X-Robots-Tag" = "noindex, nofollow"
+"X-Custom-E2E" = "primary-backend"
 
 [[route]]
 hostname = "${ALT_SNI}"
