@@ -113,6 +113,18 @@ but the code agrees with the doc, **the audit is the thing that was
 wrong** — flag it and re-scope rather than executing the audit's
 recommendation against the doc.
 
+The same logic applies when **debugging a failing test or probe**.
+The standard reactions to a "flaky" test (bump the timeout, add a
+sleep, retry, mark `#[ignore]`) are also the standard way to
+silently bury a real correctness bug that the test happened to
+expose. When a test fails in a way that contradicts your model of
+how the code "should" work, **read the code path the test exercises
+before concluding the test is wrong**. The order is: (1) locate the
+code path the failing test hits; (2) decide whether the test is
+correct in expecting the behaviour it asserted; (3) only then
+conclude variance and apply a timeout bump or retry. Skipping
+straight to (3) is the failure mode this rule prevents.
+
 Updating docs to match the code is **always in scope** and is **the
 highest-priority work** when discrepancies are found. A code change
 that renames a field, removes a mode, changes a default, or deletes
@@ -136,6 +148,71 @@ removed surfaces, they are bugs that go through the normal
 code-change flow, not silent doc-update fixups. Surface them as
 findings; do not silently re-scope a doc-update task into a
 code-fix task.
+
+## Surfacing bugs discovered as byproducts
+
+While working on an authorised task — refactor, test phase, doc fix,
+anything — you'll sometimes discover a real bug in unrelated code.
+The discipline for handling out-of-scope discoveries:
+
+1. **Don't silently fix.** Fixing an out-of-scope bug expands the
+   blast radius of the current PR and bypasses the human owner's
+   per-bug authorisation. Surface it instead.
+2. **Don't silently work around.** If your current task can't land
+   cleanly without a workaround, the workaround must be
+   discoverable. A silent workaround drops the bug on the floor.
+3. **Record the bug in a session-scoped tracking surface** (SQL
+   `findings` table, plan-file appendix, whatever the host platform
+   provides) so the human can find it after the session even if
+   chat history is compacted. Minimum fields: id, one-line title,
+   description with file:line, severity, what surfaced it. Don't
+   rely on chat-history alone — chat is lost across compaction.
+4. **Cite the recorded bug from the workaround.** Code or test
+   comments name the finding id and rationale ("see finding `X`:
+   <one-line summary>; remove this when X is fixed"). Commit
+   messages name the finding too.
+5. **When a planned change can't land at all** because of the bug,
+   skip the change *explicitly*. Drop a comment at the skip-site
+   ("intentionally omitted — see finding `X`") and a callout in the
+   commit body explaining what would have happened and why it
+   can't. Don't silently delete the planned change with no trace.
+
+The pattern this prevents: workarounds that look like first-class
+code, findings lost to compaction, future readers (human or agent)
+re-deriving the bug from scratch.
+
+## Host-environment hygiene
+
+The host running the agent is not a sandbox. It is the operator's
+working machine, often shared with other projects. Do not install
+software at host scope unless absolutely necessary, and when you do,
+**record it for remediation**.
+
+- **Default to in-project installs.** Before reaching for `pip
+  install`, `apt install`, `npm install -g`, `cargo install` to
+  default paths, `gem install`, etc., check whether the same install
+  can happen inside this repo's existing containers
+  (`Dockerfile.*`, `docker/compose.*`), a project venv, `target/`,
+  or `node_modules/`. Almost always it can — and the in-project
+  install is hermetic by construction.
+- **Recognise the disguised host install.** `pip install --user X`
+  pollutes `~/.local/lib/python*/site-packages/`. `cargo install X`
+  without `--root` lands in `~/.cargo/bin/`. `npm install -g X`
+  writes to the user's npm prefix. `pip install
+  --break-system-packages` is the unflagged install with safety off.
+  All count as host installs.
+- **If a host install is genuinely necessary** — typical case:
+  one-off API probing before committing to an in-image install —
+  record it in a session-scoped tracking surface in a table or
+  section named `host_pollution` with at minimum `what` (package +
+  transitive deps), `where_at` (filesystem path), `how` (exact
+  command), and `remediation` (exact reverse command). The human
+  reviews the record at end-of-session and removes what they want
+  to remove.
+- **Don't assume the human will notice** the install during PR
+  review. Most host installs are invisible there — they don't show
+  up in the diff. The persistent record is the only surface that
+  surfaces them.
 
 ## Terminology: "upstream" / "downstream" — two conventions, avoid in new code
 
