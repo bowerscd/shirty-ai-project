@@ -372,7 +372,52 @@ probe_after=$(https_probe app.test.local)
 status_after=$(echo "$probe_after" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 [[ "$status_after" == "200" ]] || fail "HTTPS broke after cert reload (got $status_after)"
 
+# -------- Concurrent flow survival across cert reload ----------------------
+#
+# Same shape as run-quickstart.sh; here the in-flight TLS sessions
+# traverse the full 3-hop chain. See the comment block there.
+
+echo "==> [concurrent-cert-reload] 6 long-lived HTTPS keep-alive sessions across reload"
+dc_exec client bash -c 'rm -f /tmp/hsess-*.done /tmp/hsess-*.log'
+
+SESSIONS=6
+for i in $(seq 1 "$SESSIONS"); do
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -dT client \
+        bash -c "python3 /tests/concurrent_https_session.py \
+            --sni app.test.local --id $i --requests 12 --interval 0.4 \
+            > /tmp/hsess-$i.log 2>&1"
+done
+
+sleep 1
+remint_cert
+cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
+
+deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < deadline )); do
+    done_count=$(dc_exec client bash -c 'ls /tmp/hsess-*.done 2>/dev/null | wc -l' | tr -d '[:space:]')
+    [[ "$done_count" == "$SESSIONS" ]] && break
+    sleep 0.5
+done
+done_count=$(dc_exec client bash -c 'ls /tmp/hsess-*.done 2>/dev/null | wc -l' | tr -d '[:space:]')
+[[ "$done_count" == "$SESSIONS" ]] || fail "only $done_count/$SESSIONS sessions completed within timeout"
+
+failed_sessions=0
+for i in $(seq 1 "$SESSIONS"); do
+    last=$(dc_exec client bash -c "tail -1 /tmp/hsess-$i.log" | tr -d '[:space:]')
+    if [[ "$last" != OK* ]]; then
+        echo "    session $i did not complete cleanly: $(dc_exec client cat /tmp/hsess-$i.log | tail -3)"
+        failed_sessions=$(( failed_sessions + 1 ))
+    fi
+done
+(( failed_sessions == 0 )) || fail "$failed_sessions/$SESSIONS HTTPS sessions broke across cert reload"
+echo "    [ok] all $SESSIONS HTTPS keep-alive sessions completed across reload"
+
 # -------- Malformed-cert rollback ------------------------------------------
+
+# Capture the current fingerprint right before writing garbage —
+# the concurrent-reload phase above advanced it past the original
+# `fp3` captured during the simple cert-reload phase.
+fp_pre_malformed=$(https_probe app.test.local | python3 -c "import json,sys; print(json.load(sys.stdin)['fp'])")
 
 echo "==> [malformed-cert] writing garbage PEM over working cert"
 echo "this is not a PEM file" > "$CERT_HOST_DIR/server.pem"
@@ -382,7 +427,7 @@ probe_bad=$(https_probe app.test.local) || fail "HTTPS broke after malformed wri
 status_bad=$(echo "$probe_bad" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 fp_bad=$(echo "$probe_bad"     | python3 -c "import json,sys; print(json.load(sys.stdin)['fp'])")
 [[ "$status_bad" == "200" ]] || fail "expected 200 with old cert, got $status_bad"
-[[ "$fp_bad" == "$fp3" ]] || fail "expected old fp ${fp3:0:16}… still serving, got ${fp_bad:0:16}…"
+[[ "$fp_bad" == "$fp_pre_malformed" ]] || fail "expected pre-malformed fp ${fp_pre_malformed:0:16}… still serving, got ${fp_bad:0:16}…"
 echo "    [ok] old cert still serving after malformed PEM rejected"
 
 # -------- Recovery: restore valid cert -------------------------------------
@@ -391,17 +436,18 @@ echo "==> [cert-recovery] writing valid cert; expect another reload"
 sleep 0.3
 remint_cert
 cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
+fp_pre_recovery="$fp_pre_malformed"
 deadline=$(( $(date +%s) + 4 ))
-fp4="$fp3"
+fp4="$fp_pre_recovery"
 while (( $(date +%s) < deadline )); do
     sleep 0.25
     cur=$(https_probe app.test.local | python3 -c "import json,sys; print(json.load(sys.stdin)['fp'])" 2>/dev/null || true)
-    if [[ -n "$cur" && "$cur" != "$fp3" ]]; then
+    if [[ -n "$cur" && "$cur" != "$fp_pre_recovery" ]]; then
         fp4="$cur"
         break
     fi
 done
-[[ "$fp4" != "$fp3" ]] || fail "cert did not reload after recovery"
+[[ "$fp4" != "$fp_pre_recovery" ]] || fail "cert did not reload after recovery"
 echo "    [ok] recovery reload succeeded; new leaf fp ${fp4:0:16}…"
 
 # -------- L4 rule hot-add/remove (inotify-driven, through the relay) --------

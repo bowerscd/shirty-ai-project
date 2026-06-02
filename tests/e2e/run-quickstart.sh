@@ -414,7 +414,76 @@ probe_after=$(https_probe app.test.local)
 status_after=$(echo "$probe_after" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 [[ "$status_after" == "200" ]] || fail "HTTPS broke after cert reload (got $status_after)"
 
+# -------- Concurrent flow survival across cert reload ----------------------
+#
+# `CertStore::reload_host` (per docs/configuration.md:520-524) is
+# documented as per-hostname, in-memory cert swap that should NOT
+# disturb existing TLS sessions. Spawn N HTTPS keep-alive sessions
+# in background; trigger a cert remint mid-stream; assert all N
+# complete cleanly. This is the inverse-property test of route
+# hot-add (which DOES kill in-flight HTTPS per the same docs).
+#
+# Independent observer: the Python script in each background
+# session runs the full request loop in-process; its OK/ERR
+# summary line is what we check after, externally.
+
+echo "==> [concurrent-cert-reload] 6 long-lived HTTPS keep-alive sessions across reload"
+# Clean any previous done markers from earlier in this run.
+dc_exec client bash -c 'rm -f /tmp/hsess-*.done /tmp/hsess-*.log'
+
+# Spawn 6 background sessions, each doing 12 requests with 0.4s
+# spacing → ~5s wall time per session. Cert reload fires ~1s in,
+# so most requests on each session straddle the swap.
+SESSIONS=6
+for i in $(seq 1 "$SESSIONS"); do
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -dT client \
+        bash -c "python3 /tests/concurrent_https_session.py \
+            --sni app.test.local --id $i --requests 12 --interval 0.4 \
+            > /tmp/hsess-$i.log 2>&1"
+done
+
+# Let sessions warm up + complete their TLS handshake against the
+# CURRENT cert before the reload fires.
+sleep 1
+
+# Trigger the cert reload mid-stream. Same remint mechanism as the
+# existing cert-reload phase above; here the reload is incidental
+# to the test (we don't poll for fingerprint change — the existing
+# phase already proved that works). The point is that the in-flight
+# sessions don't die.
+remint_cert
+cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
+
+# Wait for all sessions to drop their done markers (~5s + slack).
+deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < deadline )); do
+    done_count=$(dc_exec client bash -c 'ls /tmp/hsess-*.done 2>/dev/null | wc -l' | tr -d '[:space:]')
+    [[ "$done_count" == "$SESSIONS" ]] && break
+    sleep 0.5
+done
+done_count=$(dc_exec client bash -c 'ls /tmp/hsess-*.done 2>/dev/null | wc -l' | tr -d '[:space:]')
+[[ "$done_count" == "$SESSIONS" ]] || fail "only $done_count/$SESSIONS sessions completed within timeout"
+
+# Each session writes its final line ending in either "OK <n>" or
+# "ERR ...". Independent: we inspect the captured stdout, not any
+# yggdrasil signal.
+failed_sessions=0
+for i in $(seq 1 "$SESSIONS"); do
+    last=$(dc_exec client bash -c "tail -1 /tmp/hsess-$i.log" | tr -d '[:space:]')
+    if [[ "$last" != OK* ]]; then
+        echo "    session $i did not complete cleanly: $(dc_exec client cat /tmp/hsess-$i.log | tail -3)"
+        failed_sessions=$(( failed_sessions + 1 ))
+    fi
+done
+(( failed_sessions == 0 )) || fail "$failed_sessions/$SESSIONS HTTPS sessions broke across cert reload"
+echo "    [ok] all $SESSIONS HTTPS keep-alive sessions completed across reload"
+
 # -------- Malformed-cert rollback ------------------------------------------
+
+# Capture the current fingerprint immediately before writing garbage —
+# previous phases (including concurrent-cert-reload above) may have
+# advanced it from the value fp3 captured during the initial reload.
+fp_pre_malformed=$(https_probe app.test.local | python3 -c "import json,sys; print(json.load(sys.stdin)['fp'])")
 
 echo "==> [malformed-cert] writing garbage PEM over working cert"
 echo "this is not a PEM file" > "$CERT_HOST_DIR/server.pem"
@@ -424,7 +493,7 @@ probe_bad=$(https_probe app.test.local) || fail "HTTPS broke after malformed wri
 status_bad=$(echo "$probe_bad" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 fp_bad=$(echo "$probe_bad"     | python3 -c "import json,sys; print(json.load(sys.stdin)['fp'])")
 [[ "$status_bad" == "200" ]] || fail "expected 200 with old cert, got $status_bad"
-[[ "$fp_bad" == "$fp3" ]] || fail "expected old fp ${fp3:0:16}… still serving, got ${fp_bad:0:16}…"
+[[ "$fp_bad" == "$fp_pre_malformed" ]] || fail "expected pre-malformed fp ${fp_pre_malformed:0:16}… still serving, got ${fp_bad:0:16}…"
 echo "    [ok] old cert still serving after malformed PEM rejected"
 
 # -------- Recovery: restore valid cert -------------------------------------
@@ -435,17 +504,18 @@ remint_cert
 # Refresh trust to the recovered cert before polling; the malformed
 # phase intentionally left the old trust in place.
 cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
+fp_pre_recovery="$fp_pre_malformed"
 deadline=$(( $(date +%s) + 4 ))
-fp4="$fp3"
+fp4="$fp_pre_recovery"
 while (( $(date +%s) < deadline )); do
     sleep 0.25
     cur=$(https_probe app.test.local | python3 -c "import json,sys; print(json.load(sys.stdin)['fp'])" 2>/dev/null || true)
-    if [[ -n "$cur" && "$cur" != "$fp3" ]]; then
+    if [[ -n "$cur" && "$cur" != "$fp_pre_recovery" ]]; then
         fp4="$cur"
         break
     fi
 done
-[[ "$fp4" != "$fp3" ]] || fail "cert did not reload after recovery"
+[[ "$fp4" != "$fp_pre_recovery" ]] || fail "cert did not reload after recovery"
 echo "    [ok] recovery reload succeeded; new leaf fp ${fp4:0:16}…"
 
 # -------- L4 rule hot-add/remove (inotify-driven) --------------------------
