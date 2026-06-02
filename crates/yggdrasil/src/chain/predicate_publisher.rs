@@ -117,6 +117,18 @@ async fn run(
     };
     let mut last_sent_predicates: Option<Vec<Predicate>> = None;
 
+    // Session-epoch watch: bumps each time the chain client completes
+    // a fresh handshake (upstream restart, network blip rekey, etc.).
+    // We mark the initial value as "seen" so the first arm fires only
+    // on subsequent handshakes; the initial handshake itself is
+    // covered by the normal rules_rx flow on startup. If the sender
+    // ever drops (typically: the chain client task has exited), the
+    // arm flips to inactive and the publisher falls back to rules_rx
+    // only.
+    let mut session_epoch_rx = chain_handle.session_epoch_rx();
+    session_epoch_rx.borrow_and_update();
+    let mut epoch_source_alive = true;
+
     tracing::info!(
         origin = %origin,
         version,
@@ -130,6 +142,60 @@ async fn run(
                 tracing::info!("predicate publisher shutdown");
                 return;
             }
+            res = session_epoch_rx.changed(), if epoch_source_alive => {
+                if res.is_err() {
+                    // Chain client's session_epoch sender dropped (its
+                    // task exited or the handle was constructed
+                    // without a live chain client, e.g. unit tests).
+                    // Not fatal: continue serving rules_rx; the
+                    // resync-on-new-session guarantee just becomes a
+                    // no-op for the rest of the publisher's lifetime.
+                    tracing::debug!(
+                        "chain client session-epoch source closed; \
+                         publisher continues on rules_rx alone"
+                    );
+                    epoch_source_alive = false;
+                    continue;
+                }
+                let epoch = *session_epoch_rx.borrow_and_update();
+                // If we've never successfully pushed in this process,
+                // there's no stale upstream state to refresh — the
+                // first rules_rx emission will handle the initial
+                // push naturally. Skip the resync. Otherwise, clear
+                // the dedup snapshot and push the current set so a
+                // restarted upstream (which lost its in-memory
+                // predicate state) rebuilds its view from scratch.
+                if last_sent_predicates.is_none() {
+                    tracing::debug!(
+                        epoch,
+                        "chain session bumped; no prior push to resync"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    epoch,
+                    "chain session re-established; resyncing predicate set to upstream"
+                );
+                metrics::counter!(
+                    "yggdrasil_chain_predicate_push_total",
+                    "outcome" => "session_resync"
+                )
+                .increment(1);
+                last_sent_predicates = None;
+                let set = rules_rx.borrow().clone();
+                publish_and_persist(
+                    &set,
+                    origin,
+                    &mut version,
+                    &mut last_sent_predicates,
+                    https_meta,
+                    &chain_handle,
+                    introspection.as_deref(),
+                    &cancel,
+                    &version_path,
+                )
+                .await;
+            }
             res = rules_rx.changed() => {
                 if res.is_err() {
                     tracing::info!(
@@ -138,41 +204,74 @@ async fn run(
                     return;
                 }
                 let set = rules_rx.borrow_and_update().clone();
-                let next_version = version.saturating_add(1);
-                if let Some(applied) = publish_one(
+                publish_and_persist(
                     &set,
                     origin,
-                    next_version,
+                    &mut version,
+                    &mut last_sent_predicates,
                     https_meta,
-                    last_sent_predicates.as_deref(),
                     &chain_handle,
                     introspection.as_deref(),
                     &cancel,
-                ).await {
-                    version = applied.version;
-                    last_sent_predicates = Some(applied.predicates);
-                    if let Err(e) = persist_version(&version_path, version) {
-                        // Persist failure does not roll the in-memory
-                        // version back: the upstream has already accepted
-                        // and a future restart that loses this write
-                        // will only ever request a *lower* version, which
-                        // the upstream will reject with VERSION_STALE.
-                        // That is the safe failure mode.
-                        tracing::error!(
-                            error = %e,
-                            path = %version_path.display(),
-                            version,
-                            "failed to persist predicate version"
-                        );
-                        metrics::counter!(
-                            "yggdrasil_chain_predicate_push_total",
-                            "outcome" => "persist_error"
-                        )
-                        .increment(1);
-                    }
-                }
+                    &version_path,
+                )
+                .await;
             }
         }
+    }
+}
+
+/// Push one rule set's projection upstream, and on a successful ack
+/// update the in-memory version + dedup snapshot and persist the new
+/// version counter. Factored out so the main loop's normal-flow arm
+/// (`rules_rx.changed()`) and the session-resync arm
+/// (`session_epoch_rx.changed()`) share one implementation.
+#[allow(clippy::too_many_arguments)]
+async fn publish_and_persist(
+    set: &RuleSet,
+    origin: PubKey,
+    version: &mut u64,
+    last_sent_predicates: &mut Option<Vec<Predicate>>,
+    https_meta: HttpsPredicateMeta,
+    chain_handle: &ChainClientHandle,
+    introspection: Option<&IntrospectionState>,
+    cancel: &CancellationToken,
+    version_path: &Path,
+) {
+    let next_version = version.saturating_add(1);
+    let Some(applied) = publish_one(
+        set,
+        origin,
+        next_version,
+        https_meta,
+        last_sent_predicates.as_deref(),
+        chain_handle,
+        introspection,
+        cancel,
+    )
+    .await
+    else {
+        return;
+    };
+    *version = applied.version;
+    *last_sent_predicates = Some(applied.predicates);
+    if let Err(e) = persist_version(version_path, *version) {
+        // Persist failure does not roll the in-memory version back:
+        // the upstream has already accepted and a future restart that
+        // loses this write will only ever request a *lower* version,
+        // which the upstream will reject with VERSION_STALE. That is
+        // the safe failure mode.
+        tracing::error!(
+            error = %e,
+            path = %version_path.display(),
+            version = *version,
+            "failed to persist predicate version"
+        );
+        metrics::counter!(
+            "yggdrasil_chain_predicate_push_total",
+            "outcome" => "persist_error"
+        )
+        .increment(1);
     }
 }
 
@@ -698,6 +797,163 @@ mod tests {
             "expected v2 after restart with persisted v1"
         );
         op.completion.send(Ok(())).unwrap();
+
+        cancel.cancel();
+        let _ = publisher.await;
+    }
+
+    /// `gateway-udp-claim-conflict` companion finding: a restarted
+    /// upstream loses its in-memory predicate state, but the
+    /// publisher's dedup snapshot would otherwise prevent a re-push.
+    /// Bumping `session_epoch_tx` simulates the chain client completing
+    /// a fresh handshake against a restarted upstream; the publisher
+    /// must clear its dedup snapshot and re-emit the current set so
+    /// upstream rebuilds its view.
+    #[tokio::test]
+    async fn resyncs_after_chain_session_re_establishment() {
+        let cancel = CancellationToken::new();
+        // fake_handle_with_epoch returns both the handle and the live
+        // epoch sender so we can drive the resync arm.
+        let (tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<ControlOp>();
+        let sink: Arc<Mutex<Vec<ControlOp>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_task = Arc::clone(&sink);
+        tokio::spawn(async move {
+            while let Some(op) = control_rx.recv().await {
+                sink_task.lock().await.push(op);
+            }
+        });
+        let (handle, epoch_tx) = ChainClientHandle::__test_new_with_epoch(tx);
+
+        let (rules_tx, rules_rx) = watch::channel(RuleSet::default());
+        let state_dir = tempfile::tempdir().unwrap();
+        let publisher = spawn(
+            rules_rx,
+            handle,
+            origin(),
+            state_dir.path().to_path_buf(),
+            HttpsPredicateMeta::default(),
+            None,
+            cancel.clone(),
+        );
+
+        // Initial push of a real rule, acked OK so the publisher
+        // remembers it (last_sent_predicates = Some(...)).
+        let set = RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap();
+        rules_tx.send(set.clone()).unwrap();
+        let op1 = next_op(&sink).await;
+        let decoded1: PredicateSet = postcard::from_bytes(&op1.body).unwrap();
+        assert_eq!(decoded1.predicates.len(), 1);
+        assert_eq!(decoded1.version, 1);
+        op1.completion.send(Ok(())).unwrap();
+
+        // Simulate a fresh handshake against a restarted upstream:
+        // bump the session epoch. The publisher must observe the bump
+        // and re-push the current set as version 2, ignoring its
+        // dedup snapshot of version 1.
+        epoch_tx.send_modify(|e| {
+            *e = e.saturating_add(1);
+        });
+
+        let op2 = next_op(&sink).await;
+        let decoded2: PredicateSet = postcard::from_bytes(&op2.body).unwrap();
+        assert_eq!(
+            decoded2.predicates.len(),
+            1,
+            "resync push must contain the current rule set, not an empty/stale one"
+        );
+        assert_eq!(decoded2.predicates[0].name, "alpha");
+        assert_eq!(
+            decoded2.version, 2,
+            "resync push must bump the monotone version (was 1, now 2)"
+        );
+        op2.completion.send(Ok(())).unwrap();
+
+        // Verify subsequent epoch bumps continue to resync: bump
+        // again, expect a third push. Use a marker-set so dedup
+        // wouldn't accidentally produce the same result.
+        let set2 =
+            RuleSet::from_rules(vec![tcp_rule("alpha", 8080), tcp_rule("beta", 9090)]).unwrap();
+        rules_tx.send(set2).unwrap();
+        let op_set2 = next_op(&sink).await;
+        let decoded_set2: PredicateSet = postcard::from_bytes(&op_set2.body).unwrap();
+        assert_eq!(decoded_set2.version, 3);
+        assert_eq!(decoded_set2.predicates.len(), 2);
+        op_set2.completion.send(Ok(())).unwrap();
+
+        epoch_tx.send_modify(|e| {
+            *e = e.saturating_add(1);
+        });
+        let op4 = next_op(&sink).await;
+        let decoded4: PredicateSet = postcard::from_bytes(&op4.body).unwrap();
+        assert_eq!(decoded4.version, 4);
+        assert_eq!(decoded4.predicates.len(), 2);
+        op4.completion.send(Ok(())).unwrap();
+
+        cancel.cancel();
+        let _ = publisher.await;
+    }
+
+    /// First-handshake case: when the publisher has never pushed yet
+    /// (`last_sent_predicates == None`), an epoch bump should NOT
+    /// synthesise an empty push. The first rules_rx emission still
+    /// drives the actual first push.
+    #[tokio::test]
+    async fn first_session_epoch_bump_does_not_force_empty_push() {
+        let cancel = CancellationToken::new();
+        let (tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<ControlOp>();
+        let sink: Arc<Mutex<Vec<ControlOp>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_task = Arc::clone(&sink);
+        tokio::spawn(async move {
+            while let Some(op) = control_rx.recv().await {
+                sink_task.lock().await.push(op);
+            }
+        });
+        let (handle, epoch_tx) = ChainClientHandle::__test_new_with_epoch(tx);
+
+        let (rules_tx, rules_rx) = watch::channel(RuleSet::default());
+        let state_dir = tempfile::tempdir().unwrap();
+        let publisher = spawn(
+            rules_rx,
+            handle,
+            origin(),
+            state_dir.path().to_path_buf(),
+            HttpsPredicateMeta::default(),
+            None,
+            cancel.clone(),
+        );
+
+        // Bump the epoch BEFORE any rules_rx emission. The publisher
+        // has never pushed, so there's no upstream state to resync.
+        // The resync arm should observe `last_sent_predicates =
+        // None` and skip silently. Then the first real rules_rx
+        // emission should trigger the actual first push.
+        epoch_tx.send_modify(|e| {
+            *e = e.saturating_add(1);
+        });
+        // Small async yield so the publisher gets a chance to observe
+        // the epoch change before we drive rules_rx — without this,
+        // both events may be observed in the same select iteration
+        // and the test wouldn't actually exercise "epoch first,
+        // then rules". Borrowed pattern from notify-debouncer-mini
+        // tests.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let set = RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap();
+        rules_tx.send(set).unwrap();
+
+        let op1 = next_op(&sink).await;
+        let decoded1: PredicateSet = postcard::from_bytes(&op1.body).unwrap();
+        // Marker assertion: the FIRST op must contain the real set,
+        // not an empty resync push that would have arrived first if
+        // the epoch arm had erroneously synthesised one.
+        assert_eq!(
+            decoded1.predicates.len(),
+            1,
+            "first push must be the real set, not an empty epoch-triggered resync"
+        );
+        assert_eq!(decoded1.version, 1);
+        op1.completion.send(Ok(())).unwrap();
 
         cancel.cancel();
         let _ = publisher.await;

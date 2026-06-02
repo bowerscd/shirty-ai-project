@@ -47,6 +47,15 @@ impl ChainClient {
         );
 
         let session = self.handshake(&socket).await?;
+        // Bump the session epoch so external watchers (predicate
+        // publisher in particular) know a new session has been
+        // established and that upstream's in-memory per-session state
+        // — like the publisher-side dedup snapshot — should be
+        // resynced. `send_modify` is used so the counter advances even
+        // if no receivers are currently parked on `.changed()`.
+        self.session_epoch_tx.send_modify(|epoch| {
+            *epoch = epoch.saturating_add(1);
+        });
         self.heartbeat_loop(socket, session).await
     }
 

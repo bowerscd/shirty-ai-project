@@ -549,23 +549,15 @@ echo "    [ok] init re-run was a no-op and live traffic kept flowing"
 #     re-handshake on both sides.
 #
 #   - Gateway and relay restarts both wipe in-memory predicate state
-#     of the node that holds the "applied" snapshot the terminal's
-#     publisher believes is current. The terminal's publisher dedupes
-#     against its own `last_sent` snapshot, so it won't auto-re-push.
-#     Same sentinel-rule workaround as run-quickstart.sh applies.
-#     See the comment block there + the FINDING note about a deeper
-#     fix in the publisher.
+#     of the node that holds the "applied" snapshot. The terminal's
+#     publisher subscribes to the chain client's session-epoch watch
+#     and auto-resyncs on every fresh handshake, so no sentinel-rule
+#     workaround is needed after restart any more (was needed prior
+#     to the publisher-session-epoch fix).
 
 restart_and_reprobe() {
     local service="$1" role_desc="$2"
     echo "==> [restart-$role_desc] restart $service, expect chain recovers"
-
-    sentinel_present() {
-        ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-restart-sentinel"'
-    }
-    sentinel_absent() {
-        ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-restart-sentinel"'
-    }
 
     "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
@@ -573,24 +565,6 @@ restart_and_reprobe() {
     # hops re-handshake; wait for both gating predicates.
     WAIT_TIMEOUT=60 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
     WAIT_TIMEOUT=60 wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
-
-    # Sentinel workaround for gateway and relay restarts; see the
-    # block comment above. Terminal restart re-loads from disk on
-    # its startup path, so no workaround needed there.
-    if [[ "$role_desc" == "gateway" || "$role_desc" == "relay" ]]; then
-        local sentinel="$RUNTIME_DIR/terminal/etc/rules/post-restart-sentinel.toml"
-        cat > "$sentinel" <<EOF
-[[rule]]
-name     = "post-restart-sentinel"
-listen   = "0.0.0.0:7199"
-protocol = "tcp"
-target   = "172.31.13.40:7100"
-EOF
-        WAIT_TIMEOUT=20 wait_for "sentinel landed at gateway (forces full set re-push through chain)" \
-            sentinel_present
-        rm "$sentinel"
-        WAIT_TIMEOUT=20 wait_for "sentinel cleared from gateway" sentinel_absent
-    fi
 
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
         predicates_landed
@@ -787,24 +761,9 @@ sleep 3
 
 WAIT_TIMEOUT=60 wait_for "post-rotation terminal->relay re-enrollment" terminal_enrolled_at_relay
 WAIT_TIMEOUT=60 wait_for "post-rotation relay->gateway re-enrollment" relay_enrolled_at_gateway
-# Publisher dedup workaround (see restart phase comment block).
-sentinel="$RUNTIME_DIR/terminal/etc/rules/post-rotation-sentinel.toml"
-cat > "$sentinel" <<EOF
-[[rule]]
-name     = "post-rotation-sentinel"
-listen   = "0.0.0.0:7198"
-protocol = "tcp"
-target   = "172.31.13.40:7100"
-EOF
-sentinel_post_rot_present() {
-    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-rotation-sentinel"'
-}
-sentinel_post_rot_absent() {
-    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-rotation-sentinel"'
-}
-WAIT_TIMEOUT=20 wait_for "post-rotation sentinel landed at gateway" sentinel_post_rot_present
-rm "$sentinel"
-WAIT_TIMEOUT=20 wait_for "post-rotation sentinel cleared" sentinel_post_rot_absent
+# Publisher's session-epoch watch auto-resyncs on the fresh handshake,
+# no sentinel workaround needed.
+WAIT_TIMEOUT=20 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
 
 WAIT_TIMEOUT=60 wait_for "TCP echo recovers post-rotation" run_tcp_echo
 echo "    [ok] relay key rotation + dual-ceremony recovery succeeded"
@@ -882,29 +841,10 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
     relay_enrolled_at_gateway
 
-# Publisher dedup workaround (same shape as restart/rotation phases):
-# the terminal's predicate publisher dedupes against in-memory
-# `last_sent`. After gateway restart, the upstream chain rehandshakes
-# but the publisher sees "same set, skip push" and the gateway stays
-# empty. Drop a real-delta rule file to force the publisher to push
-# the full set again, then clean it up.
-sentinel_drain="$RUNTIME_DIR/terminal/etc/rules/post-drain-sentinel.toml"
-cat > "$sentinel_drain" <<EOF
-[[rule]]
-name     = "post-drain-sentinel"
-listen   = "0.0.0.0:7197"
-protocol = "tcp"
-target   = "172.31.13.40:7100"
-EOF
-sentinel_drain_present() {
-    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-drain-sentinel"'
-}
-sentinel_drain_absent() {
-    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-drain-sentinel"'
-}
-WAIT_TIMEOUT=20 wait_for "post-drain sentinel landed at gateway" sentinel_drain_present
-rm "$sentinel_drain"
-WAIT_TIMEOUT=20 wait_for "post-drain sentinel cleared" sentinel_drain_absent
+# Publisher's session-epoch watch auto-resyncs on the fresh handshake,
+# no sentinel workaround needed.
+WAIT_TIMEOUT=20 wait_for "predicates re-derived at gateway post-drain" \
+    predicates_landed
 echo "    [ok] gateway re-enrolled after graceful-drain SIGTERM"
 
 # -------- chain apply --file (ephemeral rule push) -------------------------

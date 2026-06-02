@@ -637,13 +637,6 @@ restart_and_reprobe() {
     local service="$1" role_desc="$2"
     echo "==> [restart-$role_desc] restart $service, expect chain recovers"
 
-    sentinel_present() {
-        ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-restart-sentinel"'
-    }
-    sentinel_absent() {
-        ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-restart-sentinel"'
-    }
-
     # Restart and let the daemon come back up. Default --time is 10s.
     "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
@@ -653,49 +646,11 @@ restart_and_reprobe() {
     # restart-specific signal fires.
     WAIT_TIMEOUT=60 wait_for "chain re-enrolled after $role_desc restart" terminal_enrolled
 
-    # Gateway restart wipes its in-memory predicate state, but the
-    # terminal's predicate publisher dedupes against its own
-    # in-memory `last_sent` (see
-    # crates/yggdrasil/src/chain/predicate_publisher.rs:210-220).
-    # So after the chain session re-establishes, the publisher
-    # thinks "same set already acked, skip" and the gateway stays
-    # empty. `chain diff` from the terminal will show drift.
-    #
-    # The only way to force a re-push is to introduce a real delta
-    # in the predicate content (NOT just an mtime touch — same
-    # bytes → same dedup skip). Workaround: drop a sentinel rule
-    # file with a unique name, wait for it to land at the gateway
-    # (which proves the WHOLE set was re-pushed including the
-    # originals — the publisher only sends the complete set, not
-    # diffs), then remove the sentinel.
-    #
-    # Terminal restarts don't need this workaround because the
-    # terminal re-reads its rules from disk on startup and its
-    # publisher initialises fresh, so the first push on the new
-    # chain session is a real push.
-    #
-    # FINDING surfaced by this test (tracked separately): an
-    # upstream restart leaves the chain in a "session re-established
-    # but no predicates" state from the gateway's perspective. The
-    # publisher's dedup is correct for happy-path steady state but
-    # has no signal for "upstream wiped state from under me." A
-    # publisher reset on session re-establishment, or a "what version
-    # do you currently hold?" NACK from the gateway on first
-    # heartbeat, would fix this without operator intervention.
-    if [[ "$role_desc" == "gateway" ]]; then
-        local sentinel="$RUNTIME_DIR/terminal/etc/rules/post-restart-sentinel.toml"
-        cat > "$sentinel" <<EOF
-[[rule]]
-name     = "post-restart-sentinel"
-listen   = "0.0.0.0:7199"
-protocol = "tcp"
-target   = "172.31.2.40:7100"
-EOF
-        WAIT_TIMEOUT=15 wait_for "sentinel landed at gateway (forces full set re-push)" \
-            sentinel_present
-        rm "$sentinel"
-        WAIT_TIMEOUT=15 wait_for "sentinel cleared from gateway" sentinel_absent
-    fi
+    # The terminal's predicate publisher now subscribes to the chain
+    # client's session-epoch watch and automatically resyncs on each
+    # fresh handshake, so an upstream restart no longer leaves the
+    # gateway in a "session re-established but no predicates" state.
+    # No sentinel-rule workaround needed.
 
     # Wait for predicates to land at the gateway.
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
@@ -971,24 +926,10 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 # Restart gateway for the negative-isolation phase that follows.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
 WAIT_TIMEOUT=90 wait_for "gateway re-enrolled after graceful-drain restart" terminal_enrolled
-# Publisher dedup workaround.
-sentinel_drain="$RUNTIME_DIR/terminal/etc/rules/post-drain-sentinel.toml"
-cat > "$sentinel_drain" <<EOF
-[[rule]]
-name     = "post-drain-sentinel"
-listen   = "0.0.0.0:7197"
-protocol = "tcp"
-target   = "172.31.2.40:7100"
-EOF
-sentinel_drain_present() {
-    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-drain-sentinel"'
-}
-sentinel_drain_absent() {
-    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-drain-sentinel"'
-}
-WAIT_TIMEOUT=15 wait_for "post-drain sentinel landed" sentinel_drain_present
-rm "$sentinel_drain"
-WAIT_TIMEOUT=15 wait_for "post-drain sentinel cleared" sentinel_drain_absent
+# The publisher's session-epoch watch auto-resyncs after the gateway
+# comes back, so no post-restart sentinel is needed here.
+WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway post-drain" \
+    predicates_landed
 echo "    [ok] gateway re-enrolled after graceful-drain SIGTERM"
 
 # -------- chain apply --file (ephemeral rule push) -------------------------

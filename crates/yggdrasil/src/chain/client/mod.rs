@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
@@ -111,6 +111,13 @@ pub struct ChainClient {
     pub(super) control_tx: mpsc::UnboundedSender<ControlOp>,
     pub(super) control_rx: mpsc::UnboundedReceiver<ControlOp>,
     pub(super) router: Arc<QueryRouter>,
+    /// Monotone counter bumped after each successful handshake. Consumers
+    /// (notably the predicate publisher) watch this to detect that
+    /// upstream may have lost in-memory state on a restart and re-sync
+    /// accordingly. Initial value `0` means "no session yet established";
+    /// the first handshake bumps to `1`. See
+    /// [`ChainClientHandle::session_epoch_rx`] for the consumer side.
+    pub(super) session_epoch_tx: watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for ChainClient {
@@ -125,12 +132,14 @@ impl std::fmt::Debug for ChainClient {
 impl ChainClient {
     pub fn new(config: ChainClientConfig, cancel: CancellationToken) -> Self {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (session_epoch_tx, _session_epoch_rx) = watch::channel(0u64);
         Self {
             config,
             cancel,
             control_tx,
             control_rx,
             router: QueryRouter::new(),
+            session_epoch_tx,
         }
     }
 
@@ -141,6 +150,7 @@ impl ChainClient {
         ChainClientHandle {
             tx: self.control_tx.clone(),
             router: Arc::clone(&self.router),
+            session_epoch_rx: self.session_epoch_tx.subscribe(),
         }
     }
 

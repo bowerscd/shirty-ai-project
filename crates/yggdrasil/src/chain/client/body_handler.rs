@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use ratatoskr::canary::{CanaryArm as CanaryArmFrame, CanaryReply};
 use ratatoskr::chain_query::{ChainHopQuery, ChainHopReply};
@@ -47,6 +47,15 @@ pub struct ChainClientHandle {
     /// body-handler closure resolves [`ChainHopReply`] envelopes
     /// through this same router.
     pub(super) router: Arc<QueryRouter>,
+    /// Subscriber-side of the chain client's session-epoch watch.
+    /// The counter is bumped after each successful handshake (initial
+    /// value `0` = no session yet, first handshake bumps to `1`).
+    /// Consumers that hold session-spanning in-memory state — notably
+    /// the predicate publisher's dedup snapshot — watch this to detect
+    /// upstream restart and resync, since upstream loses its in-memory
+    /// predicate state on restart but the publisher's `last_sent`
+    /// snapshot would otherwise keep deduping against stale state.
+    pub(super) session_epoch_rx: watch::Receiver<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -82,10 +91,32 @@ impl ChainClientHandle {
     #[cfg(test)]
     #[doc(hidden)]
     pub(crate) fn __test_new(tx: mpsc::UnboundedSender<ControlOp>) -> Self {
+        let (_, session_epoch_rx) = watch::channel(0u64);
         Self {
             tx,
             router: QueryRouter::new(),
+            session_epoch_rx,
         }
+    }
+
+    /// Test-only constructor that also returns a live `session_epoch`
+    /// sender so tests can drive the publisher's resync-on-new-session
+    /// arm without standing up a real chain client. Not part of the
+    /// public API.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn __test_new_with_epoch(
+        tx: mpsc::UnboundedSender<ControlOp>,
+    ) -> (Self, watch::Sender<u64>) {
+        let (epoch_tx, session_epoch_rx) = watch::channel(0u64);
+        (
+            Self {
+                tx,
+                router: QueryRouter::new(),
+                session_epoch_rx,
+            },
+            epoch_tx,
+        )
     }
 
     /// Shared per-session query router. The body handler installed on
@@ -94,6 +125,17 @@ impl ChainClientHandle {
     /// [`QueryRouter::install_into_body_handler`]).
     pub fn query_router(&self) -> Arc<QueryRouter> {
         Arc::clone(&self.router)
+    }
+
+    /// Subscribe to the chain client's session-epoch watch. The counter
+    /// starts at `0` and bumps after each successful handshake.
+    /// Returns a cloned receiver so the caller can `.changed().await`
+    /// to learn when a new session has been established (e.g. after
+    /// upstream restart or a network blip that re-handshakes). The
+    /// predicate publisher is the canonical consumer; see
+    /// [`crate::chain::predicate_publisher`] for the resync pattern.
+    pub fn session_epoch_rx(&self) -> watch::Receiver<u64> {
+        self.session_epoch_rx.clone()
     }
 
     /// Issue a [`ChainHopQuery`] upstream and await the matching

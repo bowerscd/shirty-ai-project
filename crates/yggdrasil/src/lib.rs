@@ -256,6 +256,16 @@ pub async fn run_relay(
         acc.set_arm_table(Arc::clone(&canary_arm_table))
             .map_err(|_| anyhow::anyhow!("arm_table set twice on acceptor"))?;
     }
+    // 6.5. On a mid-chain relay (acceptor + upstream both present),
+    //      spawn the upstream-session-resync task. When the relay's
+    //      chain client re-handshakes against upstream (e.g. after a
+    //      gateway restart), this task re-forwards every origin's
+    //      latest predicate body so the gateway's in-memory predicate
+    //      state rebuilds without operator intervention. No-op
+    //      otherwise.
+    let upstream_resync_join = chain_acceptor
+        .as_ref()
+        .and_then(|acc| acc.spawn_upstream_resync(shutdown.clone()));
 
     // 6a. Heartbeat (chain) listener — only when [accept] is set.
     //    A pure-proxy relay (no downstream/listener, only an upstream) is
@@ -381,6 +391,9 @@ pub async fn run_relay(
     }
     let _ = sighup_join.await;
     if let Some(handle) = hb_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = upstream_resync_join {
         let _ = handle.await;
     }
     if let Some(handle) = chain_client_join {

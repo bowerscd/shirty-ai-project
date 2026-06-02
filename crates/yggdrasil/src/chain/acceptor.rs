@@ -34,7 +34,7 @@
 //! [`RuleSet`]: ratatoskr::rule::RuleSet
 //! [`predicate_reject::VERSION_STALE`]: ratatoskr::predicate::predicate_reject::VERSION_STALE
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -81,6 +81,21 @@ struct OriginRecord {
 #[derive(Debug, Default)]
 struct InMemoryState {
     versions: HashMap<PubKey, u64>,
+    /// Origins for which the persisted `last_accepted` version was
+    /// loaded from disk on startup but has not yet been re-applied
+    /// this runtime. The supervisor's in-memory state is empty on
+    /// daemon restart, so a peer (relay or terminal) re-forwarding
+    /// the SAME version it pushed before our restart must be allowed
+    /// to land it once, re-populating the supervisor. After that
+    /// first re-apply per origin, strict monotone resumes.
+    ///
+    /// Without this, an upstream daemon restart in a multi-hop chain
+    /// is unrecoverable without operator intervention: the relay's
+    /// `last_forwarded` body still carries the pre-restart version,
+    /// and a same-version push would be rejected `VERSION_STALE`
+    /// while the supervisor stays empty. See finding
+    /// `publisher-dedup-after-upstream-restart` for the full path.
+    pending_reapply: HashSet<PubKey>,
 }
 
 impl InMemoryState {
@@ -89,7 +104,17 @@ impl InMemoryState {
         for r in &p.origins {
             versions.insert(r.pubkey, r.version);
         }
-        Self { versions }
+        // Every origin that already had a persisted version on disk
+        // needs the chance to re-apply it once after the daemon
+        // starts (the supervisor's in-memory state has been wiped by
+        // the restart and the same version may arrive again from a
+        // peer's last_forwarded body — see finding
+        // `publisher-dedup-after-upstream-restart`).
+        let pending_reapply: HashSet<PubKey> = versions.keys().copied().collect();
+        Self {
+            versions,
+            pending_reapply,
+        }
     }
 
     fn to_persisted(&self) -> PersistedState {
@@ -157,6 +182,14 @@ pub struct ChainAcceptor {
     /// arm-installation step is a no-op, so probe traffic at this
     /// hop's listeners would forward to the configured backend.
     arm_table: OnceLock<Arc<CanaryArmTable>>,
+    /// Per-origin snapshot of the last `PredicateSetUpdate` body bytes
+    /// this relay forwarded upstream. Held verbatim (postcard-encoded)
+    /// so the upstream-session-resync task can re-forward without
+    /// recoding from the in-memory derived RuleSet (which loses the
+    /// origin-pubkey ↔ version coupling). Empty on relays without an
+    /// upstream; populated as the relay observes each origin for the
+    /// first time. Keyed by `PredicateSet.origin`.
+    last_forwarded: Mutex<HashMap<PubKey, Vec<u8>>>,
 }
 
 impl ChainAcceptor {
@@ -191,6 +224,7 @@ impl ChainAcceptor {
             outbound: OnceLock::new(),
             upstream: OnceLock::new(),
             arm_table: OnceLock::new(),
+            last_forwarded: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -255,6 +289,107 @@ impl ChainAcceptor {
         ix: Arc<IntrospectionState>,
     ) -> std::result::Result<(), Arc<IntrospectionState>> {
         self.introspection.set(ix)
+    }
+
+    /// Spawn the upstream-session-resync task. Each time the upstream
+    /// chain client completes a fresh handshake, this task walks
+    /// `last_forwarded` and re-pushes each origin's most recent
+    /// predicate body to the upstream. This is the relay-side counter-
+    /// part to the terminal publisher's session-epoch resync:
+    /// terminal restarts trigger the publisher to re-push; gateway /
+    /// upstream-relay restarts trigger this task on every
+    /// downstream relay so the gateway's predicate state rebuilds
+    /// without operator intervention.
+    ///
+    /// No-op when `upstream` is unset (gateway / top-of-chain relay
+    /// with no `[dial]`). Returns immediately in that case.
+    ///
+    /// `cancel` causes the task to return on the next select round.
+    /// Caller is responsible for awaiting the join handle during
+    /// shutdown.
+    pub fn spawn_upstream_resync(
+        self: &Arc<Self>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let upstream = self.upstream.get()?.clone();
+        let acceptor = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            let mut epoch_rx = upstream.session_epoch_rx();
+            // Mark the initial value as seen so the first .changed()
+            // fires only on the next handshake, not the very first.
+            epoch_rx.borrow_and_update();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        tracing::debug!(
+                            "upstream-resync task: cancel received, exiting"
+                        );
+                        return;
+                    }
+                    res = epoch_rx.changed() => {
+                        if res.is_err() {
+                            tracing::debug!(
+                                "upstream-resync task: epoch source closed, exiting"
+                            );
+                            return;
+                        }
+                        let epoch = *epoch_rx.borrow_and_update();
+                        let bodies: Vec<(PubKey, Vec<u8>)> = {
+                            let g = acceptor.last_forwarded.lock().await;
+                            g.iter().map(|(k, v)| (*k, v.clone())).collect()
+                        };
+                        if bodies.is_empty() {
+                            tracing::debug!(
+                                epoch,
+                                "upstream session re-established; no stored \
+                                 predicate bodies to resync (relay has not \
+                                 forwarded any predicates yet)"
+                            );
+                            continue;
+                        }
+                        tracing::info!(
+                            epoch,
+                            origins = bodies.len(),
+                            "upstream session re-established; \
+                             re-forwarding stored predicate bodies"
+                        );
+                        for (origin, body) in bodies {
+                            match upstream.send_control(
+                                ControlBodyType::PredicateSetUpdate.as_byte(),
+                                body,
+                            ) {
+                                Ok(_completion) => {
+                                    metrics::counter!(
+                                        "yggdrasil_chain_predicate_forward_total",
+                                        "outcome" => "resync_enqueued",
+                                    )
+                                    .increment(1);
+                                    tracing::debug!(
+                                        %origin,
+                                        epoch,
+                                        "stored predicate body re-forwarded upstream after session resync"
+                                    );
+                                }
+                                Err(_) => {
+                                    metrics::counter!(
+                                        "yggdrasil_chain_predicate_forward_total",
+                                        "outcome" => "resync_client_down",
+                                    )
+                                    .increment(1);
+                                    tracing::warn!(
+                                        %origin,
+                                        epoch,
+                                        "upstream chain client down during resync; \
+                                         resync push dropped"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
     }
 
     /// Decode + dispatch one [`ControlEnvelope`] body and return the
@@ -352,11 +487,26 @@ impl ChainAcceptor {
             }
         };
 
-        // Version invariant: strictly monotone per origin.
+        // Version invariant: monotone per origin, with one exception.
+        //
+        // Steady state: strictly increasing. Equal-version pushes are
+        // rejected as `VERSION_STALE` — they signal a publisher bug.
+        //
+        // Exception: on daemon restart, the persisted per-origin
+        // version is loaded into `state.versions` but the supervisor's
+        // in-memory rule state is empty. A peer (relay or terminal)
+        // whose `last_forwarded` body still carries the pre-restart
+        // version may legitimately re-push the same version once
+        // post-restart to repopulate the supervisor; we allow this
+        // re-apply by tracking `pending_reapply` and clearing the
+        // origin's flag after the first acceptance per runtime. This
+        // closes the multi-hop upstream-restart recovery gap; see
+        // finding `publisher-dedup-after-upstream-restart`.
         {
             let state = self.state.lock().await;
             if let Some(&last) = state.versions.get(&set.origin) {
-                if set.version <= last {
+                let reapply_ok = set.version == last && state.pending_reapply.contains(&set.origin);
+                if set.version < last || (set.version == last && !reapply_ok) {
                     tracing::warn!(
                         origin = %set.origin,
                         offered = set.version,
@@ -420,6 +570,10 @@ impl ChainAcceptor {
         {
             let mut state = self.state.lock().await;
             state.versions.insert(set.origin, set.version);
+            // First successful apply per origin per runtime clears
+            // the re-apply flag; subsequent equal-version pushes will
+            // be rejected as stale (steady-state strict-monotone).
+            state.pending_reapply.remove(&set.origin);
             if let Err(e) = write_atomic(&self.state_path, &state.to_persisted()) {
                 tracing::error!(
                     error = %e,
@@ -469,6 +623,18 @@ impl ChainAcceptor {
         // logged but do not fail the downstream ack — the downstream
         // has already done its job by getting the predicate to us.
         if let Some(upstream) = self.upstream.get() {
+            // Capture the body before the move into send_control so
+            // the upstream-resync task can re-forward it after a
+            // session re-establishment. We store the latest body
+            // per-origin: an upstream that just restarted lost its
+            // in-memory predicate state, so on the next handshake we
+            // need to re-push whatever each downstream-origin most
+            // recently sent us. Older body for the same origin is
+            // discarded — only the latest matters for resync.
+            self.last_forwarded
+                .lock()
+                .await
+                .insert(set.origin, body.to_vec());
             match upstream
                 .send_control(ControlBodyType::PredicateSetUpdate.as_byte(), body.to_vec())
             {
@@ -1184,6 +1350,76 @@ mod tests {
 
         let acc2 = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
         assert_eq!(acc2.last_accepted_version(&origin_a()).await, Some(7));
+
+        cancel.cancel();
+        sup.stop().await;
+    }
+
+    /// Restart-recovery semantic: when a fresh acceptor loads a
+    /// persisted version, the first push from that origin AT THE
+    /// PERSISTED VERSION must be accepted (to re-populate the
+    /// supervisor that was wiped by the restart). Subsequent pushes
+    /// at the same version revert to strict-monotone reject. This
+    /// is the gateway-side of the upstream-restart resync path; the
+    /// relay's `last_forwarded` body still carries the pre-restart
+    /// version, and the gateway must let it land once.
+    #[tokio::test]
+    async fn allows_one_reapply_at_persisted_version_after_restart() {
+        let cancel = CancellationToken::new();
+        let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // Run 1: push v3, simulating pre-restart steady state.
+        let p = free_port();
+        let acc1 = ChainAcceptor::load(handle.clone(), derive_cfg(), state_dir.path()).unwrap();
+        let v3 = encode(&predicate_set(origin_a(), 3, &[p]));
+        assert_eq!(
+            acc1.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v3)
+                .await,
+            AckStatus::Ok
+        );
+        drop(acc1);
+
+        // Run 2: simulating the restart. Persisted version = 3. The
+        // relay's `last_forwarded` body still has version 3; we re-
+        // push it verbatim. The acceptor must allow exactly one re-
+        // apply at the persisted version per origin, then revert to
+        // strict monotone.
+        let acc2 = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
+        let v3_again = encode(&predicate_set(origin_a(), 3, &[p]));
+        assert_eq!(
+            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v3_again)
+                .await,
+            AckStatus::Ok,
+            "first re-apply at persisted version after restart must be allowed"
+        );
+
+        // A SECOND push at v3 must be rejected — the re-apply window
+        // is one shot per origin per runtime.
+        let v3_third = encode(&predicate_set(origin_a(), 3, &[p]));
+        assert_eq!(
+            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v3_third)
+                .await,
+            AckStatus::Reject(predicate_reject::VERSION_STALE),
+            "second push at persisted version must revert to strict-monotone reject"
+        );
+
+        // A strictly-older push must still be rejected — replay
+        // protection survives the re-apply window.
+        let v2 = encode(&predicate_set(origin_a(), 2, &[p]));
+        assert_eq!(
+            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v2)
+                .await,
+            AckStatus::Reject(predicate_reject::VERSION_STALE)
+        );
+
+        // A strictly-newer push must be accepted as normal.
+        let v4 = encode(&predicate_set(origin_a(), 4, &[p]));
+        assert_eq!(
+            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v4)
+                .await,
+            AckStatus::Ok
+        );
 
         cancel.cancel();
         sup.stop().await;
