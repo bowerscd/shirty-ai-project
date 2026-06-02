@@ -89,8 +89,25 @@ echo "==> bringing app + daemons up"
 
 # -------- helpers -----------------------------------------------------------
 
+# `container_name:` prefix from compose.e2e.quickstart.yml. Used by the
+# detached-exec helper below to bypass podman-compose 1.5's broken
+# `exec -d` (it blocks until the inner command finishes, defeating
+# the whole point of detach — verified directly: a 5s sleep makes the
+# `exec -dT` call take 5s, not return immediately).
+CTR_PREFIX="e2e-quickstart"
+
 dc_exec() {
     "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -T "$@"
+}
+
+# Detached exec, used when the inner command MUST run in the background
+# (e.g. a slow client we want to be in-flight while the runner script
+# performs a SIGTERM). Goes around podman-compose by calling
+# `podman exec -d` directly against the well-known container name.
+# Returns immediately (does not wait for the inner command).
+dc_exec_detached() {
+    local svc="$1"; shift
+    podman exec -d "${CTR_PREFIX}-${svc}" "$@" >/dev/null
 }
 
 ctl_on() {
@@ -436,7 +453,7 @@ dc_exec client bash -c 'rm -f /tmp/hsess-*.done /tmp/hsess-*.log'
 # so most requests on each session straddle the swap.
 SESSIONS=6
 for i in $(seq 1 "$SESSIONS"); do
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" exec -dT client \
+    dc_exec_detached client \
         bash -c "python3 /tests/concurrent_https_session.py \
             --sni app.test.local --id $i --requests 12 --interval 0.4 \
             > /tmp/hsess-$i.log 2>&1"
@@ -881,6 +898,98 @@ echo "    [ok] gateway key rotation + re-enrollment cycle succeeded"
 rm -f "$local_req" "$local_grant" \
       "$RUNTIME_DIR/gateway/etc/rotation-request.txt" \
       "$RUNTIME_DIR/terminal/etc/rotation-grant.txt"
+
+# -------- graceful_drain_timeout ------------------------------------------
+#
+# [server].graceful_drain_timeout = "5s" was set in the gateway's
+# seed config. Per docs/configuration.md:42, on SIGTERM the daemon
+# stops accepting new TCP connections immediately but waits up to
+# the configured duration for in-flight conversations to finish
+# naturally before cancelling them.
+#
+# We test by:
+#   1. Spawning a slow-drip TCP client (1 byte/sec for 7 bytes ≈ 7s
+#      wall) that connects through gateway:7100 → chain → app-tcp.
+#   2. After ~1s (one byte sent), SIGTERM the gateway with
+#      `podman stop --time 10`.
+#   3. Wait for both: the client to finish, and the gateway process
+#      to exit.
+#   4. Assert the client got all 7 bytes echoed back (drain worked).
+#   5. Assert the gateway exit took ~5s (drain window respected,
+#      not killed abruptly nor stuck indefinitely).
+#
+# Independent observer: the slow-drip client writes OK/ERR to a log
+# file the runner inspects, and we time `podman stop` ourselves.
+
+echo "==> [graceful-drain] slow-drip TCP through chain across gateway SIGTERM"
+dc_exec client bash -c 'rm -f /tmp/slow-tcp.done /tmp/slow-tcp.log'
+
+# Spawn the slow-drip client in background. Use the detached helper
+# (NOT `dc_exec ... &`) — see CTR_PREFIX comment.
+dc_exec_detached client \
+    bash -c "python3 /tests/slow_tcp_echo.py \
+        --host 172.31.0.20 --port 7100 \
+        --bytes 7 --interval 1.0 \
+        > /tmp/slow-tcp.log 2>&1"
+
+# Let the connection establish + the slow-drip get well into its
+# send loop (we want several bytes mid-flight when SIGTERM fires).
+# 3 seconds gets us to ~byte 3 of 7.
+sleep 3
+
+# SIGTERM gateway. --time 10 gives 5s drain + 5s slack before SIGKILL.
+t0=$(date +%s)
+"${DC[@]}" "${COMPOSE_ARGS[@]}" stop -t 10 gateway >/dev/null
+t1=$(date +%s)
+drain_elapsed=$(( t1 - t0 ))
+
+echo "    gateway exit took ${drain_elapsed}s (configured drain = 5s)"
+# Drain should be roughly 4s (drain starts 3s into a 7s slow-drip;
+# ~4s of work remains). Accept [3s, 8s]. Too short means the drain
+# didn't honor in-flight; too long means SIGKILL fallback fired.
+(( drain_elapsed >= 3 && drain_elapsed <= 8 )) \
+    || fail "drain elapsed ${drain_elapsed}s outside [3,8] window"
+
+# Wait for the slow client to drop its done marker.
+dc_done=$(( $(date +%s) + 15 ))
+while (( $(date +%s) < dc_done )); do
+    if dc_exec client bash -c '[ -f /tmp/slow-tcp.done ]' 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+
+# The client either completed naturally (all 7 bytes round-tripped
+# within the drain window) or its connection was cancelled (drain
+# timed out before all bytes were exchanged). Both are observable
+# outcomes; we want it to have COMPLETED, which proves the drain
+# preserved the in-flight conversation.
+last=$(dc_exec client bash -c 'tail -1 /tmp/slow-tcp.log' | tr -d '[:space:]')
+[[ "$last" == "OK7" ]] || fail "slow-drip client did not complete cleanly: $(dc_exec client cat /tmp/slow-tcp.log | tail -5)"
+echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
+
+# Restart gateway for the negative-isolation phase that follows.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
+WAIT_TIMEOUT=60 wait_for "gateway re-enrolled after graceful-drain restart" terminal_enrolled
+# Publisher dedup workaround.
+sentinel_drain="$RUNTIME_DIR/terminal/etc/rules/post-drain-sentinel.toml"
+cat > "$sentinel_drain" <<EOF
+[[rule]]
+name     = "post-drain-sentinel"
+listen   = "0.0.0.0:7197"
+protocol = "tcp"
+target   = "172.31.2.40:7100"
+EOF
+sentinel_drain_present() {
+    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-drain-sentinel"'
+}
+sentinel_drain_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-drain-sentinel"'
+}
+WAIT_TIMEOUT=15 wait_for "post-drain sentinel landed" sentinel_drain_present
+rm "$sentinel_drain"
+WAIT_TIMEOUT=15 wait_for "post-drain sentinel cleared" sentinel_drain_absent
+echo "    [ok] gateway re-enrolled after graceful-drain SIGTERM"
 
 # -------- done --------------------------------------------------------------
 

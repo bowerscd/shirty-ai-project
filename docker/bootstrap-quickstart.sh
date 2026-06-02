@@ -59,6 +59,9 @@ rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
 state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
+# Honour SIGTERM by draining in-flight TCP / HTTPS for up to 5s
+# before cancelling. Exercised by the graceful-drain e2e phase.
+graceful_drain_timeout = "5s"
 
 [control]
 socket = "/run/yggdrasil/control.sock"
