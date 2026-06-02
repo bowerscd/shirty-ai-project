@@ -128,6 +128,11 @@ identity_file = "/etc/yggdrasil/identity.key"
 default_cert  = "/etc/yggdrasil/certs/server.pem"
 default_key   = "/etc/yggdrasil/certs/server.key"
 https_listen  = "0.0.0.0:8443"
+# Cap inbound HTTP/3 request bodies at 1 KiB. Exercised by the
+# h3-body-limit e2e phase: an h3 POST over the limit must come back
+# 413, while the same POST over h1 (which streams uncapped per
+# docs/configuration.md:45) must come back 200.
+https_request_body_limit = 1024
 
 [control]
 socket = "/run/yggdrasil/control.sock"

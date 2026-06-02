@@ -76,10 +76,19 @@ FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         openssl \
         python3 \
+        python3-pip \
         tini \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ # aioquic is needed by the HTTP/3 e2e probe (tests/e2e/h3_probe.py),
+ # which is invoked from inside the terminal container via loopback
+ # to work around the gateway's UDP/8443 claim conflict (finding
+ # `gateway-udp-claim-conflict`). --break-system-packages because the
+ # base image is Debian 12 with PEP 668 marker; we're an e2e image,
+ # not a system Python install, so the constraint doesn't apply.
+ && pip3 install --no-cache-dir --break-system-packages aioquic
 
 COPY --from=builder /out/yggdrasil    /usr/local/bin/yggdrasil
 COPY --from=builder /out/yggdrasilctl /usr/local/bin/yggdrasilctl

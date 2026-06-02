@@ -155,6 +155,11 @@ services:
       - ../tests/e2e/runtime/quickstart/terminal/etc:/etc/yggdrasil
       - ../tests/e2e/runtime/quickstart/terminal/run:/run/yggdrasil
       - ../tests/e2e/runtime/quickstart/terminal/state:/var/lib/yggdrasil
+      # Read-only bind-mount of the e2e helper scripts. Used by the
+      # h3 / cert-less phases that probe the terminal's own listeners
+      # via loopback (see runner script for the why — gateway can't
+      # bind UDP/8443, finding `gateway-udp-claim-conflict`).
+      - ../tests/e2e:/tests:ro
     networks:
       chain_link:
         ipv4_address: 172.31.1.20
