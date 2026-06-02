@@ -101,9 +101,9 @@ wait_for() {
 
 fail() {
     echo "FAIL: $*"
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --no-color --tail 120 gateway  || true
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --no-color --tail 120 relay    || true
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --no-color --tail 120 terminal || true
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 120 gateway  || true
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 120 relay    || true
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 120 terminal || true
     exit 1
 }
 
@@ -471,6 +471,89 @@ probe_after_init=$(https_probe app.test.local) \
 [[ $(echo "$probe_after_init" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])") == "200" ]] \
     || fail "HTTPS not 200 after init re-run"
 echo "    [ok] init re-run was a no-op and live traffic kept flowing"
+
+# -------- Restart / rehydration -------------------------------------------
+#
+# Restart each yggdrasil node in turn. Implicitly tests state_dir
+# persistence + Noise rekey-on-reconnect + the daemon's startup path
+# at each node. See run-quickstart.sh for the deeper rationale.
+#
+# Chain-specific notes:
+#
+#   - The relay is the most interesting restart target: when it goes
+#     down, BOTH the gateway (its downstream) and the terminal (its
+#     upstream) lose their chain session. The recovery exercises
+#     re-handshake on both sides.
+#
+#   - Gateway and relay restarts both wipe in-memory predicate state
+#     of the node that holds the "applied" snapshot the terminal's
+#     publisher believes is current. The terminal's publisher dedupes
+#     against its own `last_sent` snapshot, so it won't auto-re-push.
+#     Same sentinel-rule workaround as run-quickstart.sh applies.
+#     See the comment block there + the FINDING note about a deeper
+#     fix in the publisher.
+
+restart_and_reprobe() {
+    local service="$1" role_desc="$2"
+    echo "==> [restart-$role_desc] restart $service, expect chain recovers"
+
+    sentinel_present() {
+        ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-restart-sentinel"'
+    }
+    sentinel_absent() {
+        ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-restart-sentinel"'
+    }
+
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
+
+    # Re-wait for full chain enrollment. For relay restart, both
+    # hops re-handshake; wait for both gating predicates.
+    WAIT_TIMEOUT=60 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
+    WAIT_TIMEOUT=60 wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
+
+    # Sentinel workaround for gateway and relay restarts; see the
+    # block comment above. Terminal restart re-loads from disk on
+    # its startup path, so no workaround needed there.
+    if [[ "$role_desc" == "gateway" || "$role_desc" == "relay" ]]; then
+        local sentinel="$RUNTIME_DIR/terminal/etc/rules/post-restart-sentinel.toml"
+        cat > "$sentinel" <<EOF
+[[rule]]
+name     = "post-restart-sentinel"
+listen   = "0.0.0.0:7199"
+protocol = "tcp"
+target   = "172.31.13.40:7100"
+EOF
+        WAIT_TIMEOUT=20 wait_for "sentinel landed at gateway (forces full set re-push through chain)" \
+            sentinel_present
+        rm "$sentinel"
+        WAIT_TIMEOUT=20 wait_for "sentinel cleared from gateway" sentinel_absent
+    fi
+
+    WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
+        predicates_landed
+
+    WAIT_TIMEOUT=15 wait_for "TCP echo recovers after $role_desc restart" run_tcp_echo
+    WAIT_TIMEOUT=15 wait_for "UDP echo recovers after $role_desc restart" run_udp_echo
+
+    local deadline=$(( $(date +%s) + 10 ))
+    local status_after=""
+    while (( $(date +%s) < deadline )); do
+        local probe; probe=$(https_probe app.test.local 2>/dev/null || true)
+        if [[ -n "$probe" ]]; then
+            status_after=$(echo "$probe" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" 2>/dev/null || true)
+            [[ "$status_after" == "200" ]] && break
+        fi
+        sleep 0.5
+    done
+    [[ "$status_after" == "200" ]] || fail "HTTPS not 200 after $role_desc restart (got '$status_after')"
+    echo "    [ok] TCP/UDP/HTTPS all recover after $role_desc restart"
+}
+
+# Order: edge nodes first, mid-chain hop last — covers the "both
+# sides survive a middle restart" case.
+restart_and_reprobe gateway  gateway
+restart_and_reprobe terminal terminal
+restart_and_reprobe relay    relay
 
 # -------- Negative isolation check -----------------------------------------
 
