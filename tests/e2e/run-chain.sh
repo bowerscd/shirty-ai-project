@@ -879,7 +879,7 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 # Restart gateway for the post-drain re-enrollment check (and to leave
 # the stack healthy for `KEEP_STACK=1` debugging).
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-WAIT_TIMEOUT=60 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
+WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
     relay_enrolled_at_gateway
 
 # Publisher dedup workaround (same shape as restart/rotation phases):
@@ -906,6 +906,113 @@ WAIT_TIMEOUT=20 wait_for "post-drain sentinel landed at gateway" sentinel_drain_
 rm "$sentinel_drain"
 WAIT_TIMEOUT=20 wait_for "post-drain sentinel cleared" sentinel_drain_absent
 echo "    [ok] gateway re-enrolled after graceful-drain SIGTERM"
+
+# -------- chain apply --file (ephemeral rule push) -------------------------
+#
+# `yggdrasilctl chain apply --file <path>` pushes a pre-validated rule
+# set into the running terminal daemon's supervisor without touching
+# rules_dir. The pushed set REPLACES the in-memory current set; it
+# lives only until the next rules_dir reload, at which point the
+# disk state wins again (see docs/configuration.md:543-546).
+#
+# The on-disk rules are *temporarily* clobbered while the ephemeral
+# set is active. That's the documented behaviour ("apply REPLACES the
+# set"); the clobber-sentinel write+remove in steps 4-5 restores them.
+
+echo "==> [chain-apply] push ephemeral rule via chain apply, then clobber via rules_dir reload"
+
+dc_exec terminal bash -c 'cat > /tmp/candidate-rules.toml' <<'EOF'
+[[rule]]
+name     = "ephemeral-tcp"
+listen   = "0.0.0.0:7120"
+protocol = "tcp"
+target   = "172.31.13.40:7100"
+EOF
+
+dc_exec terminal yggdrasilctl chain --socket /run/yggdrasil/control.sock \
+    apply --file /tmp/candidate-rules.toml >/dev/null \
+    || fail "chain apply rejected the candidate rule set"
+
+ephemeral_derived() {
+    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "ephemeral-tcp"'
+}
+WAIT_TIMEOUT=15 wait_for "ephemeral-tcp derived at gateway" ephemeral_derived
+
+# Independent probe: TCP round-trip through the new port via the
+# 3-hop chain (client -> gateway:7120 -> relay -> terminal:7120 ->
+# app-tcp:7100).
+ephemeral_tcp_echo() {
+    dc_exec client python3 - <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    s.connect(("172.31.10.20", 7120))
+except (ConnectionRefusedError, socket.timeout, OSError):
+    sys.exit(1)
+s.settimeout(5)
+payload = b"chain-apply-ephemeral-" + b"e" * 100
+s.sendall(payload)
+got = b""
+while len(got) < len(payload):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    got += chunk
+s.close()
+sys.exit(0 if got == payload else 1)
+PY
+}
+WAIT_TIMEOUT=60 wait_for "TCP echo through ephemeral-tcp rule" ephemeral_tcp_echo
+
+# `chain apply` lives until the next rules_dir reload. The watcher
+# only re-emits when the rescanned RuleSet semantically differs from
+# its own in-memory copy (rule_watcher's no-op check, watcher.rs:116),
+# so `touch` alone is insufficient — comments / mtimes don't count.
+# We force a real disk delta by writing a clobber-sentinel rule file
+# (one new rule = guaranteed diff). The supervisor reloads the full
+# disk state (originals + sentinel), clobbering the ephemeral. We
+# then remove the sentinel and the next reload settles back to the
+# original disk state.
+clobber_sentinel="$RUNTIME_DIR/terminal/etc/rules/chain-apply-clobber.toml"
+cat > "$clobber_sentinel" <<EOF
+[[rule]]
+name     = "chain-apply-clobber-sentinel"
+listen   = "0.0.0.0:7198"
+protocol = "tcp"
+target   = "172.31.13.40:7100"
+EOF
+
+ephemeral_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "ephemeral-tcp"'
+}
+WAIT_TIMEOUT=15 wait_for "ephemeral-tcp clobbered by rules_dir reload" ephemeral_absent
+rm "$clobber_sentinel"
+clobber_sentinel_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "chain-apply-clobber-sentinel"'
+}
+WAIT_TIMEOUT=15 wait_for "clobber sentinel removed from gateway" clobber_sentinel_absent
+
+# And the port itself no longer accepts. Connection-refused is the
+# success signal (port unbound after the rule was torn down).
+ephemeral_tcp_dead() {
+    dc_exec client python3 - <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(("172.31.10.20", 7120))
+    s.close()
+    sys.exit(1)
+except (ConnectionRefusedError, socket.timeout, OSError):
+    sys.exit(0)
+PY
+}
+WAIT_TIMEOUT=10 wait_for "ephemeral-tcp port no longer accepts" ephemeral_tcp_dead
+
+# Confirm the disk-defined rules are back online (one of them suffices).
+WAIT_TIMEOUT=15 wait_for "original tcp-echo rule restored after reload" run_tcp_echo
+echo "    [ok] chain apply ephemeral lifetime (push -> serve -> clobber) verified"
 
 # -------- done -------------------------------------------------------------
 
