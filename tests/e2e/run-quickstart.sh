@@ -765,6 +765,123 @@ isolation_probe_from gateway 172.31.2.40 7100 tcp || fail "isolation: gateway co
 isolation_probe_from gateway 172.31.2.50 7101 udp || fail "isolation: gateway could reach app-udp directly"
 echo "    [ok] all four home_lan app endpoints unreachable from gateway"
 
+# -------- Key rotation -----------------------------------------------------
+#
+# Rotate the gateway's identity, redo the request/grant ceremony from
+# inside the running containers (the same flow an operator would
+# follow per docs/operations.md → Key rotation), restart both nodes,
+# and verify the chain recovers.
+#
+# The rotation is the canonical "I think my key is compromised"
+# operator action. Exercises:
+#
+#   - `yggdrasilctl identity rotate --force
+#       --yes-i-understand-this-breaks-existing-chains` (the literal
+#     flag name documented in operations.md)
+#   - `identity export-request` from the downstream
+#   - `identity add-accept` from the new upstream (re-binds
+#     [accept].pubkey to the terminal's existing pubkey, but mints
+#     a fresh grant signed by the NEW upstream identity)
+#   - `identity add-dial` on the downstream (rewrites [dial].pubkey
+#     to the new upstream key)
+#   - Independent probes verify the chain is back online afterwards
+#
+# Files shuttle through the host's bind-mounted runtime tree rather
+# than `podman cp`, because every container's /etc/yggdrasil is
+# already a bind mount the host can write to directly.
+
+echo "==> [key-rotation] rotate gateway identity, redo ceremony, expect recovery"
+
+# Baseline (already passing). The rotation is destructive — if we
+# fail mid-rotation, the chain stays broken until the next test run
+# wipes the runtime tree.
+run_tcp_echo || fail "baseline TCP broken before rotation"
+
+# Snapshot the gateway's pre-rotation pubkey so we can verify the
+# rotation actually changed it.
+gw_pubkey_before=$(dc_exec gateway yggdrasilctl identity show 2>/dev/null \
+    | grep '^pubkey:' | awk '{print $2}')
+[[ -n "$gw_pubkey_before" ]] || fail "could not read gateway's pre-rotation pubkey"
+
+# Rotate. The daemon process is still running; the new identity is
+# written to disk but won't take effect until restart.
+dc_exec gateway yggdrasilctl identity rotate \
+    --identity-file /etc/yggdrasil/identity.key \
+    --force \
+    --yes-i-understand-this-breaks-existing-chains >/dev/null \
+    || fail "identity rotate failed"
+
+gw_pubkey_after=$(dc_exec gateway yggdrasilctl identity show 2>/dev/null \
+    | grep '^pubkey:' | awk '{print $2}')
+[[ -n "$gw_pubkey_after" ]] || fail "could not read gateway's post-rotation pubkey"
+[[ "$gw_pubkey_after" != "$gw_pubkey_before" ]] || fail "rotation did not change the pubkey"
+echo "    [ok] gateway identity rotated (${gw_pubkey_before:0:24}… -> ${gw_pubkey_after:0:24}…)"
+
+# Restart gateway so the new identity is loaded. Chain will be DOWN
+# because the terminal's [dial].pubkey still pins the OLD key.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" restart gateway >/dev/null
+sleep 5
+
+# Confirm the chain is genuinely down (handshakes against the new
+# gateway should fail; TCP echo should not work). We don't fail the
+# test if it happens to still work — that'd be a different kind of
+# bug — but log the state for debugging.
+if run_tcp_echo 2>/dev/null; then
+    echo "    [note] chain still functional immediately after rotation+restart"
+    echo "    [note] (probably the heartbeat hasn't expired yet)"
+fi
+
+# Redo the request/grant ceremony from inside the running containers.
+# Files shuttle through the host's bind-mounted runtime tree.
+local_req="$RUNTIME_DIR/terminal/etc/rotation-request.txt"
+local_grant="$RUNTIME_DIR/gateway/etc/rotation-grant.txt"
+
+dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity export-request \
+    --identity-file /etc/yggdrasil/identity.key \
+    --out /etc/yggdrasil/rotation-request.txt \
+    --note "post-rotation re-enroll" >/dev/null \
+    || fail "terminal failed to export request after rotation"
+
+# Move request file into the gateway's view via the host filesystem.
+cp "$local_req" "$RUNTIME_DIR/gateway/etc/rotation-request.txt"
+
+dc_exec gateway yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity add-accept \
+    --identity-file /etc/yggdrasil/identity.key \
+    --from /etc/yggdrasil/rotation-request.txt \
+    --my-endpoint "${GATEWAY_CHAIN_ENDPOINT:-gateway:51820}" \
+    --out /etc/yggdrasil/rotation-grant.txt \
+    --note "post-rotation gateway->terminal" >/dev/null \
+    || fail "gateway add-accept failed after rotation"
+
+# Move grant back to the terminal's view.
+cp "$local_grant" "$RUNTIME_DIR/terminal/etc/rotation-grant.txt"
+
+dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity add-dial \
+    --identity-file /etc/yggdrasil/identity.key \
+    --from /etc/yggdrasil/rotation-grant.txt >/dev/null \
+    || fail "terminal add-dial failed after rotation"
+
+# [dial] is read at startup; restart the terminal so the new pubkey
+# takes effect. Gateway is already restarted above.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" restart terminal >/dev/null
+
+# Re-wait for enrollment + the sentinel-rule re-push workaround for
+# the publisher-dedup behaviour (the terminal's publisher comes back
+# fresh after its own restart so this is technically redundant, but
+# explicit is good).
+WAIT_TIMEOUT=60 wait_for "post-rotation re-enrollment" terminal_enrolled
+WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
+WAIT_TIMEOUT=15 wait_for "TCP echo recovers post-rotation" run_tcp_echo
+echo "    [ok] gateway key rotation + re-enrollment cycle succeeded"
+
+# Cleanup transit files (operator-equivalent of `rm /tmp/*.{request,grant}`).
+rm -f "$local_req" "$local_grant" \
+      "$RUNTIME_DIR/gateway/etc/rotation-request.txt" \
+      "$RUNTIME_DIR/terminal/etc/rotation-grant.txt"
+
 # -------- done --------------------------------------------------------------
 
 echo

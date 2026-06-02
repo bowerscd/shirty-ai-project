@@ -656,6 +656,149 @@ isolation_probe_from relay 172.31.13.40 7100 tcp || fail "isolation: relay could
 isolation_probe_from relay 172.31.13.50 7101 udp || fail "isolation: relay could reach app-udp directly"
 echo "    [ok] all four home_lan app endpoints unreachable from relay"
 
+# -------- Key rotation (mid-chain relay) -----------------------------------
+#
+# Rotate the RELAY's identity (the most interesting target in a
+# 3-node chain — it's the only node whose key change affects both
+# the upstream-side and downstream-side enrollments). The full
+# operator workflow per docs/operations.md is:
+#
+#   1. Relay rotates its own identity.
+#   2. Re-enrol relay->gateway (relay exports request, gateway
+#      add-accept, relay add-dial). Updates the gateway's
+#      [accept].pubkey and the relay's [dial].pubkey.
+#   3. Re-enrol terminal->relay (terminal exports request, relay
+#      add-accept). Updates the relay's [accept].pubkey. The
+#      terminal's [dial].pubkey already pins the relay's NEW key
+#      because the relay rotated, so the terminal also needs to
+#      add-dial against a fresh grant from the new-identity relay.
+#   4. Restart all three nodes so the new identities + [dial]/[accept]
+#      pubkeys take effect.
+#
+# Files shuttle through host bind mounts.
+
+echo "==> [key-rotation] rotate relay identity, redo both ceremonies, expect recovery"
+run_tcp_echo || fail "baseline TCP broken before rotation"
+
+relay_pubkey_before=$(dc_exec relay yggdrasilctl identity show 2>/dev/null \
+    | grep '^pubkey:' | awk '{print $2}')
+[[ -n "$relay_pubkey_before" ]] || fail "could not read relay's pre-rotation pubkey"
+
+dc_exec relay yggdrasilctl identity rotate \
+    --identity-file /etc/yggdrasil/identity.key \
+    --force \
+    --yes-i-understand-this-breaks-existing-chains >/dev/null \
+    || fail "relay identity rotate failed"
+
+relay_pubkey_after=$(dc_exec relay yggdrasilctl identity show 2>/dev/null \
+    | grep '^pubkey:' | awk '{print $2}')
+[[ "$relay_pubkey_after" != "$relay_pubkey_before" ]] || fail "relay rotation did not change pubkey"
+echo "    [ok] relay identity rotated (${relay_pubkey_before:0:24}… -> ${relay_pubkey_after:0:24}…)"
+
+# Restart relay; both chain links are now broken.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" restart relay >/dev/null
+sleep 5
+
+# --- Ceremony 1: relay -> gateway (re-bind gateway's [accept].pubkey)
+local_req1="$RUNTIME_DIR/relay/etc/rotation-request.txt"
+local_grant1="$RUNTIME_DIR/gateway/etc/rotation-grant-to-relay.txt"
+
+dc_exec relay yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity export-request \
+    --identity-file /etc/yggdrasil/identity.key \
+    --out /etc/yggdrasil/rotation-request.txt \
+    --note "post-rotation relay->gateway" >/dev/null \
+    || fail "relay failed to export request after rotation"
+
+cp "$local_req1" "$RUNTIME_DIR/gateway/etc/rotation-request-from-relay.txt"
+
+dc_exec gateway yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity add-accept \
+    --identity-file /etc/yggdrasil/identity.key \
+    --from /etc/yggdrasil/rotation-request-from-relay.txt \
+    --my-endpoint "${GATEWAY_INET_ENDPOINT:-gateway:51820}" \
+    --out /etc/yggdrasil/rotation-grant-to-relay.txt \
+    --note "post-rotation gateway->relay" >/dev/null \
+    || fail "gateway add-accept failed after relay rotation"
+
+cp "$local_grant1" "$RUNTIME_DIR/relay/etc/rotation-grant-from-gateway.txt"
+
+dc_exec relay yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity add-dial \
+    --identity-file /etc/yggdrasil/identity.key \
+    --from /etc/yggdrasil/rotation-grant-from-gateway.txt >/dev/null \
+    || fail "relay add-dial failed after rotation"
+
+# --- Ceremony 2: terminal -> relay (re-bind relay's [accept].pubkey
+#     AND terminal's [dial].pubkey, which now needs to pin the
+#     relay's NEW key)
+local_req2="$RUNTIME_DIR/terminal/etc/rotation-request.txt"
+local_grant2="$RUNTIME_DIR/relay/etc/rotation-grant-to-terminal.txt"
+
+dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity export-request \
+    --identity-file /etc/yggdrasil/identity.key \
+    --out /etc/yggdrasil/rotation-request.txt \
+    --note "post-rotation terminal->relay" >/dev/null \
+    || fail "terminal failed to export request after relay rotation"
+
+cp "$local_req2" "$RUNTIME_DIR/relay/etc/rotation-request-from-terminal.txt"
+
+dc_exec relay yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity add-accept \
+    --identity-file /etc/yggdrasil/identity.key \
+    --from /etc/yggdrasil/rotation-request-from-terminal.txt \
+    --my-endpoint "${RELAY_CHAIN_ENDPOINT:-relay:51820}" \
+    --out /etc/yggdrasil/rotation-grant-to-terminal.txt \
+    --note "post-rotation relay->terminal" >/dev/null \
+    || fail "relay add-accept failed after rotation"
+
+cp "$local_grant2" "$RUNTIME_DIR/terminal/etc/rotation-grant-from-relay.txt"
+
+dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
+    identity add-dial \
+    --identity-file /etc/yggdrasil/identity.key \
+    --from /etc/yggdrasil/rotation-grant-from-relay.txt >/dev/null \
+    || fail "terminal add-dial failed after relay rotation"
+
+# Restart terminal AND gateway sequentially (not in parallel) so
+# podman-compose's `restart` doesn't trip the "dependency not started"
+# race when two services are bouncing at once.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" restart gateway >/dev/null
+sleep 3
+"${DC[@]}" "${COMPOSE_ARGS[@]}" restart terminal >/dev/null
+
+WAIT_TIMEOUT=60 wait_for "post-rotation terminal->relay re-enrollment" terminal_enrolled_at_relay
+WAIT_TIMEOUT=60 wait_for "post-rotation relay->gateway re-enrollment" relay_enrolled_at_gateway
+# Publisher dedup workaround (see restart phase comment block).
+sentinel="$RUNTIME_DIR/terminal/etc/rules/post-rotation-sentinel.toml"
+cat > "$sentinel" <<EOF
+[[rule]]
+name     = "post-rotation-sentinel"
+listen   = "0.0.0.0:7198"
+protocol = "tcp"
+target   = "172.31.13.40:7100"
+EOF
+sentinel_post_rot_present() {
+    ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-rotation-sentinel"'
+}
+sentinel_post_rot_absent() {
+    ! ctl_json_on gateway derived-rules 2>/dev/null | grep -q '"name": "post-rotation-sentinel"'
+}
+WAIT_TIMEOUT=20 wait_for "post-rotation sentinel landed at gateway" sentinel_post_rot_present
+rm "$sentinel"
+WAIT_TIMEOUT=20 wait_for "post-rotation sentinel cleared" sentinel_post_rot_absent
+
+WAIT_TIMEOUT=15 wait_for "TCP echo recovers post-rotation" run_tcp_echo
+echo "    [ok] relay key rotation + dual-ceremony recovery succeeded"
+
+# Cleanup transit files.
+rm -f "$local_req1" "$local_grant1" "$local_req2" "$local_grant2" \
+      "$RUNTIME_DIR/gateway/etc/rotation-request-from-relay.txt" \
+      "$RUNTIME_DIR/relay/etc/rotation-grant-from-gateway.txt" \
+      "$RUNTIME_DIR/relay/etc/rotation-request-from-terminal.txt" \
+      "$RUNTIME_DIR/terminal/etc/rotation-grant-from-relay.txt"
+
 # -------- done -------------------------------------------------------------
 
 echo
