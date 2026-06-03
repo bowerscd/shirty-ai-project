@@ -813,12 +813,21 @@ async fn spawn_proxy_for_rule(
 ) -> Result<ActiveProxy> {
     let rule = rule.with_bind_override(default_bind);
 
-    let claimed: HashSet<SocketAddr> = collect_claimed_addrs(active);
-    if claimed.contains(&rule.listen) {
+    // Claim key is (SocketAddr, Protocol): TCP and UDP at the same
+    // addr:port are independent kernel binds (different L4 sockets,
+    // no actual conflict), so a derived HTTPS predicate that lands
+    // as both a TCP and a UDP rule on the same port (e.g. 8443/tcp
+    // for h1/h2 and 8443/udp for h3) must be allowed to coexist.
+    // Keying by SocketAddr alone caused the second arrival to be
+    // rejected even though the bind would succeed; the supervisor
+    // would silently drop the UDP rule (or vice-versa).
+    let claimed: HashSet<(SocketAddr, Protocol)> = collect_claimed_addrs(active);
+    if claimed.contains(&(rule.listen, rule.protocol)) {
         anyhow::bail!(
-            "rule {:?}: listen address {} is already claimed by another rule",
+            "rule {:?}: listen address {} ({}) is already claimed by another rule",
             rule.name,
             rule.listen,
+            rule.protocol.as_str(),
         );
     }
 
@@ -890,15 +899,24 @@ async fn spawn_proxy_for_rule(
     }
 }
 
-/// Walk every active L4 proxy and collect the SocketAddrs it claims.
-fn collect_claimed_addrs(active: &HashMap<String, ActiveProxy>) -> HashSet<SocketAddr> {
+/// Walk every active L4 proxy and collect the `(SocketAddr, Protocol)`
+/// pairs it claims. The key includes the kernel-level protocol (Tcp
+/// vs Udp) because the same `addr:port` on TCP vs UDP is a distinct
+/// kernel bind and does not actually conflict — without the protocol
+/// component, a derived HTTPS predicate's matching `*-tcp` + `*-udp`
+/// pair would mutually preempt itself.
+///
+/// L4 proxies only — the `active` map never holds HTTPS handles in
+/// practice; the node-wide HTTPS frontend lives in `https_active`
+/// separately and `spawn_proxy_for_rule` bails on `Protocol::Https`
+/// before ever calling this. So we don't reach into the historic
+/// `if let ProxyHandle::Https(_)` branch that used to be here.
+fn collect_claimed_addrs(active: &HashMap<String, ActiveProxy>) -> HashSet<(SocketAddr, Protocol)> {
     let mut out = HashSet::new();
     for ap in active.values() {
         let listen = ap.handle.local_addr();
-        out.insert(listen);
-        if let ProxyHandle::Https(_) = &ap.handle {
-            out.insert(SocketAddr::new(listen.ip(), 80));
-        }
+        let protocol = ap.handle.protocol();
+        out.insert((listen, protocol));
     }
     out
 }

@@ -351,6 +351,7 @@ impl ProxySupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use crate::heartbeat::PeerState;
@@ -455,6 +456,61 @@ mod tests {
         assert_eq!(snaps[0].name, "alpha");
         assert_eq!(snaps[1].name, "beta");
         assert_eq!(snaps[1].protocol, Protocol::Udp);
+
+        sup.stop().await;
+    }
+
+    /// Regression for `gateway-udp-claim-conflict`: a TCP rule and a
+    /// UDP rule on the *same* port are independent kernel binds and
+    /// must coexist. Pre-fix, the supervisor's claim check was keyed
+    /// by `SocketAddr` alone, so the second arrival lost — most
+    /// visibly hurting the gateway, where derived HTTPS predicates
+    /// produce matching tcp/udp rule pairs on 8443 for h1/h2 + h3.
+    #[tokio::test]
+    async fn tcp_and_udp_rules_can_share_a_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_port = free_port().await;
+        std::fs::write(
+            dir.path().join("a-tcp.toml"),
+            tcp_rule_toml("shared-tcp", shared_port, 9001),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b-udp.toml"),
+            udp_rule_toml("shared-udp", shared_port, 9002),
+        )
+        .unwrap();
+
+        let (factory, _peer) = relay_factory();
+        let shutdown = CancellationToken::new();
+        let sup = ProxySupervisor::spawn(
+            dir.path().to_path_buf(),
+            Duration::from_millis(50),
+            factory,
+            None,
+            None,
+            CertConfig::default(),
+            None,
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+
+        await_snapshot_len(&sup, 2).await;
+        let snaps = sup.snapshot();
+        assert_eq!(snaps.len(), 2, "both rules must be online");
+        let by_name: HashMap<&str, &ProxySnapshot> =
+            snaps.iter().map(|s| (s.name.as_str(), s)).collect();
+        assert_eq!(by_name.get("shared-tcp").unwrap().protocol, Protocol::Tcp);
+        assert_eq!(by_name.get("shared-udp").unwrap().protocol, Protocol::Udp);
+        assert_eq!(
+            by_name.get("shared-tcp").unwrap().listen.port(),
+            shared_port
+        );
+        assert_eq!(
+            by_name.get("shared-udp").unwrap().listen.port(),
+            shared_port
+        );
 
         sup.stop().await;
     }

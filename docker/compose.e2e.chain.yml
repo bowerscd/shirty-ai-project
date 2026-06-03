@@ -165,11 +165,6 @@ services:
       - ../tests/e2e/runtime/chain/terminal/etc:/etc/yggdrasil
       - ../tests/e2e/runtime/chain/terminal/run:/run/yggdrasil
       - ../tests/e2e/runtime/chain/terminal/state:/var/lib/yggdrasil
-      # Read-only bind-mount of the e2e helper scripts. Used by the
-      # h3 / cert-less phases that probe the terminal's own listeners
-      # via loopback (see runner script for the why — gateway can't
-      # bind UDP/8443, finding `gateway-udp-claim-conflict`).
-      - ../tests/e2e:/tests:ro
     networks:
       chain_link:
         ipv4_address: 172.31.12.20
@@ -239,7 +234,7 @@ services:
       - "7101/udp"
 
   client:
-    image: docker.io/library/python:3.12-slim
+    <<: *yggdrasil-image
     container_name: e2e-chain-client
     depends_on:
       gateway:
@@ -249,7 +244,9 @@ services:
       terminal:
         condition: service_started
     working_dir: /tests
-    entrypoint: ["sleep", "infinity"]
+    # Use the yggdrasil image so we get aioquic + curl + openssl
+    # pre-installed for the h3 / cert-reload / cert-verify probes.
+    command: ["sleep", "infinity"]
     volumes:
       - ../tests/e2e:/tests:ro
       - ../tests/e2e/runtime/chain/client-trust:/etc/ssl/yggdrasil-test:ro

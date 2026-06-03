@@ -1017,30 +1017,25 @@ WAIT_TIMEOUT=20 wait_for "tcp-echo-v6 removed from gateway" v6_absent
 
 # -------- HTTP/3 SNI dispatch trio + body limit ----------------------------
 #
-# These phases probe the terminal's own HTTPS frontend over QUIC and
-# the companion :80 listener over plain HTTP, both via the terminal's
-# loopback. They do NOT go through the gateway because the gateway
-# fails to bind UDP/8443 (finding `gateway-udp-claim-conflict`:
-# `collect_claimed_addrs` keys claims by SocketAddr only, not by
-# (SocketAddr, Protocol), so the HTTPS-derived UDP rule loses the
-# claim race against the TCP rule and silently drops). Probing the
-# terminal directly still validates:
-#   - that the h3 frontend on the terminal serves HTTP/3 traffic
-#     with the same SNI-dispatch logic as h1/h2
-#   - that `https_request_body_limit` caps inbound h3 bodies but
-#     does not cap h1 bodies (docs/configuration.md:45)
+# These phases probe the gateway's h3 frontend over QUIC end-to-end:
+# client -> gateway:8443/udp -> chain transport (gateway -> relay ->
+# terminal) -> terminal's h3 frontend -> backend.
 #
-# The cert-less route phase is intentionally omitted; see the
-# matching note in run-quickstart.sh.
+# Previously these phases probed the terminal's loopback directly
+# because the gateway's supervisor rejected the HTTPS-derived UDP
+# rule as conflicting with the TCP rule on the same port (finding
+# `gateway-udp-claim-conflict`, fixed in supervisor reconcile.rs:
+# claim key is now (SocketAddr, Protocol)). Now both 8443/tcp and
+# 8443/udp listeners coexist on the gateway and h3 traverses the
+# full 3-hop chain.
 
-echo "==> [https-h3-primary] h3 SNI=app.test.local -> app-nginx (via terminal loopback)"
-h3_probe_local() {
-    dc_exec terminal python3 /tests/h3_probe.py \
-        --sni "$1" --host 127.0.0.1 --port 8443 \
-        --ca /etc/yggdrasil/certs/server.pem \
+echo "==> [https-h3-primary] h3 SNI=app.test.local -> app-nginx (via gateway + 3-hop chain)"
+h3_probe_via_gw() {
+    dc_exec client python3 /tests/h3_probe.py \
+        --sni "$1" --host 172.31.10.20 --port 8443 \
         "${@:2}"
 }
-probe_h3_primary=$(h3_probe_local app.test.local) \
+probe_h3_primary=$(h3_probe_via_gw app.test.local) \
     || fail "h3 probe to app.test.local failed: $probe_h3_primary"
 status_h3_p=$(echo "$probe_h3_primary" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 body_h3_p=$(echo "$probe_h3_primary"   | python3 -c "import json,sys; print(json.load(sys.stdin)['body'])")
@@ -1051,7 +1046,7 @@ fp_h3_p=$(echo "$probe_h3_primary"     | python3 -c "import json,sys; print(json
 echo "    [ok] h3 primary SNI dispatched to app-nginx (leaf fp ${fp_h3_p:0:16}…)"
 
 echo "==> [https-h3-alt] h3 SNI=alt.test.local -> app-nginx-alt"
-probe_h3_alt=$(h3_probe_local alt.test.local) \
+probe_h3_alt=$(h3_probe_via_gw alt.test.local) \
     || fail "h3 probe to alt.test.local failed: $probe_h3_alt"
 status_h3_a=$(echo "$probe_h3_alt" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 body_h3_a=$(echo "$probe_h3_alt"   | python3 -c "import json,sys; print(json.load(sys.stdin)['body'])")
@@ -1064,9 +1059,8 @@ fp_h3_a=$(echo "$probe_h3_alt"     | python3 -c "import json,sys; print(json.loa
 echo "    [ok] h3 alt SNI dispatched to app-nginx-alt (same cert)"
 
 echo "==> [https-h3-unknown] h3 SNI=bogus.test.local rejected at TLS handshake"
-if dc_exec terminal python3 /tests/h3_probe.py \
-        --sni bogus.test.local --host 127.0.0.1 --port 8443 \
-        --ca /etc/yggdrasil/certs/server.pem 2>/dev/null; then
+if dc_exec client python3 /tests/h3_probe.py \
+        --sni bogus.test.local --host 172.31.10.20 --port 8443 2>/dev/null; then
     fail "h3 unknown SNI: probe unexpectedly succeeded; should have been rejected"
 fi
 echo "    [ok] h3 unknown SNI rejected at TLS handshake"
@@ -1074,9 +1068,8 @@ echo "    [ok] h3 unknown SNI rejected at TLS handshake"
 echo "==> [https-body-limit] h3 POST > limit -> 413; same POST over h1 -> 200/405"
 # Bootstrap set https_request_body_limit = 1024. Send 2048 bytes
 # (well over the limit) over h3; expect 413 Payload Too Large.
-probe_h3_big=$(dc_exec terminal python3 /tests/h3_probe.py \
-    --sni app.test.local --host 127.0.0.1 --port 8443 \
-    --ca /etc/yggdrasil/certs/server.pem \
+probe_h3_big=$(dc_exec client python3 /tests/h3_probe.py \
+    --sni app.test.local --host 172.31.10.20 --port 8443 \
     --method POST --body-bytes 2048) \
     || fail "h3 body-limit probe failed at transport: $probe_h3_big"
 status_h3_big=$(echo "$probe_h3_big" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
@@ -1087,11 +1080,11 @@ echo "    [ok] h3 2048-byte POST rejected with 413 (limit=1024)"
 # h3-only per docs. nginx returns 405 for POST on a static-file
 # location, which is the proof the request reached the backend
 # uncapped (yggdrasil didn't enforce 1024).
-probe_h1_big=$(dc_exec terminal python3 - <<'PY'
+probe_h1_big=$(dc_exec client python3 - <<'PY'
 import http.client, json, socket, ssl
-ctx = ssl.create_default_context(cafile="/etc/yggdrasil/certs/server.pem")
+ctx = ssl.create_default_context(cafile="/etc/ssl/yggdrasil-test/server.pem")
 conn = http.client.HTTPSConnection("app.test.local", 8443, context=ctx, timeout=5)
-sock = socket.create_connection(("127.0.0.1", 8443), timeout=5)
+sock = socket.create_connection(("172.31.10.20", 8443), timeout=5)
 ssock = ctx.wrap_socket(sock, server_hostname="app.test.local")
 conn.sock = ssock
 body = b"x" * 2048
