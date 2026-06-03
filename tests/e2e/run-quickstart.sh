@@ -594,6 +594,70 @@ if run_tcp_echo_hot 2>/dev/null; then
 fi
 echo "    [ok] hot-removed rule no longer serving"
 
+# -------- Route-only hot-reload --------------------------------------------
+#
+# Regression for finding `route-only-reload-noop`: rewrite the
+# https-routes.toml file to swap the primary route's target from
+# app-nginx -> app-nginx-alt WITHOUT touching any [[rule]] block. Pre-
+# fix, RuleSet::diff only looked at the L4 rules collection, so a
+# route-only change tripped the watcher's is_noop gate and was
+# silently dropped — the supervisor never reconciled HTTPS routes
+# after the modification. With the fix, the diff's `routes_changed`
+# flag flips and the supervisor's HTTPS route table is hot-swapped.
+#
+# Independent probe: SNI=app.test.local should now return alt-nginx's
+# body. Restore the file at end-of-phase so subsequent phases see the
+# original mapping.
+
+echo "==> [route-hot-reload] rewrite https-routes.toml to swap primary target without touching [[rule]]"
+routes_path="$RUNTIME_DIR/terminal/etc/rules/https-routes.toml"
+# Snapshot the original file so we can restore it cleanly.
+cp "$routes_path" "$routes_path.original"
+cat > "$routes_path" <<'EOF'
+[[route]]
+hostname = "app.test.local"
+target   = "http://app-nginx-alt:80"
+hsts     = true
+[route.headers]
+"X-Robots-Tag" = "noindex, nofollow"
+"X-Custom-E2E" = "primary-backend"
+
+[[route]]
+hostname = "alt.test.local"
+target   = "http://app-nginx-alt:80"
+EOF
+
+# Wait for the new target to take effect. We poll the probe rather
+# than introspecting because (a) the route swap is an L7 thing not
+# visible in derived-rules and (b) probes are the independent-
+# observer signal we prefer.
+route_swap_landed() {
+    local out; out=$(https_probe app.test.local 2>/dev/null) || return 1
+    echo "$out" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if d.get('body') == 'alternate backend (app-nginx-alt)' else 1)
+" 2>/dev/null
+}
+WAIT_TIMEOUT=15 wait_for "primary route's new target serves alt backend" route_swap_landed
+echo "    [ok] route-only change to https-routes.toml hot-reloaded; new target observed by probe"
+
+# Restore the original file and confirm the original mapping comes
+# back. Same is_noop semantic: this is a route-only diff that must
+# re-fire the route reconcile.
+cp "$routes_path.original" "$routes_path"
+rm "$routes_path.original"
+route_restore_landed() {
+    local out; out=$(https_probe app.test.local 2>/dev/null) || return 1
+    echo "$out" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if d.get('body') == 'primary backend (app-nginx)' else 1)
+" 2>/dev/null
+}
+WAIT_TIMEOUT=15 wait_for "primary route restored to original target" route_restore_landed
+echo "    [ok] route file restored; original mapping back online"
+
 # -------- Init re-run idempotency ------------------------------------------
 #
 # init-quickstart is idempotent at the bash level (skips when all

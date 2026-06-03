@@ -143,8 +143,12 @@ impl RuleSet {
     /// Compute a name-keyed diff against a new set. Used by the hot-reload
     /// watcher to figure out which listeners to add, remove, or restart.
     ///
-    /// Currently only diffs the L4 `rules` collection. HTTPS routes are
-    /// hot-reloaded as a single replacement set by the supervisor.
+    /// L4 rules diff by `name`-keyed comparison; HTTPS routes are
+    /// treated as a single full-set replacement (the supervisor's
+    /// HTTPS reconcile path computes its own per-route diff against
+    /// the route table when applying). The `routes_changed` flag is a
+    /// coarse "should we re-run the route reconcile?" signal — true
+    /// iff the route set is not bitwise-equal between old and new.
     pub fn diff(&self, new: &RuleSet) -> RuleDiff {
         use std::collections::HashMap;
 
@@ -169,6 +173,14 @@ impl RuleSet {
         }
         // Sort removed by name for determinism (HashMap iteration is randomised).
         diff.removed.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Route diff is a full-set equality check — cheap and matches
+        // how the supervisor consumes it (route reconcile rebuilds the
+        // table from scratch on any reload). Without this, route-only
+        // changes — adding, removing, or modifying a [[route]] without
+        // touching any [[rule]] — were swallowed by the watcher's
+        // is_noop gate, leaving the supervisor out of sync with disk.
+        diff.routes_changed = self.routes != new.routes;
         diff
     }
 
@@ -177,6 +189,7 @@ impl RuleSet {
     pub fn as_initial_diff(&self) -> RuleDiff {
         RuleDiff {
             added: self.rules.clone(),
+            routes_changed: !self.routes.is_empty(),
             ..Default::default()
         }
     }
@@ -190,7 +203,10 @@ pub struct RuleChange {
 }
 
 /// Result of [`RuleSet::diff`]: a partition of the new rule set into
-/// added / removed / changed / unchanged, keyed by rule `name`.
+/// added / removed / changed / unchanged, keyed by rule `name`, plus
+/// a coarse `routes_changed` flag for the HTTPS-route side (routes
+/// don't diff per-entry here — the supervisor's HTTPS reconcile path
+/// does that itself).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleDiff {
     pub added: Vec<Rule>,
@@ -198,12 +214,23 @@ pub struct RuleDiff {
     pub changed: Vec<RuleChange>,
     /// Rule names that exist with identical contents in both sets.
     pub unchanged: Vec<String>,
+    /// `true` iff the HTTPS `[[route]]` collection differs between the
+    /// old and new sets (added / removed / modified entries, in any
+    /// combination). Coarser than the L4 added/removed/changed split
+    /// because the supervisor's HTTPS reconcile builds its own
+    /// per-route diff against the live route table — this flag just
+    /// tells the watcher and `is_noop` gate that a route-only edit is
+    /// a real change worth propagating.
+    pub routes_changed: bool,
 }
 
 impl RuleDiff {
     /// `true` if the diff represents no actual change.
     pub fn is_noop(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.changed.is_empty()
+            && !self.routes_changed
     }
 
     /// Number of rules touched (added + removed + changed).

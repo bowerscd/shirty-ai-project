@@ -596,6 +596,101 @@ fn diff_same_set_is_noop_but_marks_unchanged() {
     let d = s.diff(&s);
     assert!(d.is_noop());
     assert_eq!(d.unchanged.len(), 2);
+    assert!(!d.routes_changed);
+}
+
+/// Regression for `route-only-reload-noop`: a change that touches
+/// only the routes collection (no L4 rule add/remove/modify) must
+/// flip `routes_changed = true` and therefore NOT be reported as a
+/// no-op. Without this, the hot-reload watcher's `is_noop` gate
+/// silently dropped pure-route edits, leaving the supervisor out of
+/// sync with disk.
+#[test]
+fn route_only_change_is_not_noop() {
+    let l4 = rule("a", 1, Protocol::Tcp, 1);
+    let route_a = super::HttpRoute {
+        hostname: "a.example.local".to_string(),
+        target: "http://10.0.0.10:80".parse().unwrap(),
+        hsts: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+    let route_b = super::HttpRoute {
+        hostname: "b.example.local".to_string(),
+        target: "http://10.0.0.20:80".parse().unwrap(),
+        hsts: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+
+    let old = RuleSet::from_files([RuleFile {
+        rule: vec![l4.clone()],
+        route: vec![route_a.clone()],
+    }])
+    .unwrap();
+    // Add a [[route]] without touching the L4 rule.
+    let new = RuleSet::from_files([RuleFile {
+        rule: vec![l4.clone()],
+        route: vec![route_a.clone(), route_b.clone()],
+    }])
+    .unwrap();
+
+    let d = old.diff(&new);
+    assert!(
+        d.routes_changed,
+        "route-only addition must flip routes_changed"
+    );
+    assert!(
+        !d.is_noop(),
+        "route-only addition must NOT be reported as a no-op"
+    );
+    assert!(d.added.is_empty(), "L4 added should be empty");
+    assert!(d.removed.is_empty(), "L4 removed should be empty");
+    assert!(d.changed.is_empty(), "L4 changed should be empty");
+    assert_eq!(d.unchanged, vec!["a".to_string()]);
+
+    // And the reverse direction: removing the route also flips
+    // routes_changed.
+    let d_rev = new.diff(&old);
+    assert!(
+        d_rev.routes_changed,
+        "route-only removal must flip routes_changed"
+    );
+    assert!(!d_rev.is_noop());
+
+    // Same route set, no change → routes_changed stays false.
+    let d_same = old.diff(&old);
+    assert!(
+        !d_same.routes_changed,
+        "identical route set must NOT flip routes_changed"
+    );
+    assert!(d_same.is_noop());
+}
+
+#[test]
+fn as_initial_diff_marks_routes_changed_when_routes_present() {
+    let l4 = rule("a", 1, Protocol::Tcp, 1);
+    let route = super::HttpRoute {
+        hostname: "x.example.local".to_string(),
+        target: "http://10.0.0.10:80".parse().unwrap(),
+        hsts: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+    let with_routes = RuleSet::from_files([RuleFile {
+        rule: vec![l4.clone()],
+        route: vec![route],
+    }])
+    .unwrap();
+    let d = with_routes.as_initial_diff();
+    assert!(
+        d.routes_changed,
+        "initial diff of a set with HTTPS routes must mark routes_changed"
+    );
+    assert!(!d.is_noop());
+
+    // No routes → initial diff stays L4-only.
+    let only_l4 = set(vec![l4]);
+    let d2 = only_l4.as_initial_diff();
+    assert!(!d2.routes_changed);
+    assert!(!d2.is_noop()); // still has L4 added
 }
 
 // ---- with_bind_override ----
