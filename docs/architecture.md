@@ -685,6 +685,42 @@ buffers, not an application-level version gate.
   the heartbeat tick, and dispatch of inbound body types to the
   combined handler stack.
 
+### Liveness detection on the chain client
+
+UDP carries no graceful disconnect signal: when an upstream restarts
+or drops off the network, the downstream's chain client only learns
+about it by *not* seeing ACKs come back. Two mechanisms govern how
+fast it figures this out:
+
+* **Fast-probe** (active path) — after
+  `FAST_PROBE_AFTER_MULTIPLIER × heartbeat_interval` of silence since
+  the last ACK (default 2 × 5s = 10s), the run loop sends one extra
+  heartbeat as a probe. The probe is wire-indistinguishable from a
+  regular heartbeat — the server acks it the same way — so receipt
+  clears the probe state and the session continues. If the probe ACK
+  is still missing after `FAST_PROBE_DEADLINE_MULTIPLIER ×
+  heartbeat_interval` (default 1 × 5s = 5s), the loop bails and the
+  outer `run()` re-handshakes after a `BACKOFF_MIN` (500ms) sleep.
+  Total detection in the steady-state silent-failure case:
+  ~3 × heartbeat_interval (~15s at default).
+* **Backstop** — `ACK_DEADLINE_MULTIPLIER × heartbeat_interval`
+  (default 6 × 5s = 30s). Only fires if the probe send itself failed
+  or the loop got pathologically starved. Same bail + re-handshake
+  shape as the fast-probe path.
+* **Operator nudge** — `yggdrasilctl chain reconnect` short-circuits
+  both deadlines: the run loop's `tokio::select!` includes the
+  client's shared `reconnect_signal: Arc<Notify>`, which when fired
+  returns `SessionExit::ReconnectRequested` immediately. The outer
+  `run()` treats that like a Rekey — reset backoff, re-handshake
+  now — useful operationally ("router fixed; retry now") and in
+  test harnesses that have just bounced the upstream.
+
+All three paths converge on the same recovery: the session's
+`session_epoch` watch is bumped after each successful handshake,
+which fires the predicate publisher's resync-on-new-session arm,
+so the receiver always sees the current predicate set on the new
+session.
+
 ### Chain queries
 
 `yggdrasilctl chain {summary,health,ping,diff}` all ride the same UDS

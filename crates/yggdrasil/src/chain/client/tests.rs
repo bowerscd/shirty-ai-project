@@ -404,6 +404,178 @@ async fn reconnect_now_during_backoff_loop_does_not_panic() {
 }
 
 #[tokio::test]
+async fn fast_probe_bails_faster_than_backstop_when_upstream_goes_silent() {
+    // After two healthy round-trips the upstream stops ACKing. The
+    // fast-probe path (fires an extra heartbeat after
+    // FAST_PROBE_AFTER_MULTIPLIER × heartbeat of silence, then bails
+    // FAST_PROBE_DEADLINE_MULTIPLIER × heartbeat later if the probe
+    // ACK doesn't arrive) should declare the session dead at
+    // roughly (FAST_PROBE_AFTER + FAST_PROBE_DEADLINE) × heartbeat,
+    // vs the backstop's ACK_DEADLINE_MULTIPLIER × heartbeat.
+    //
+    // We observe via the handshake count: a bailed session triggers
+    // the outer `run()` to sleep `BACKOFF_MIN` then re-handshake,
+    // bumping `handshakes` from 1 to 2.
+    //
+    // Heartbeat = 500ms, so the fast-probe path's deterministic
+    // schedule (factoring in tick alignment ~1 tick of jitter) is:
+    //   - last ack at ~t=0.55
+    //   - probe fires at ~t=2.0  (since_ack=1.45 > fast_probe_after=1.0)
+    //   - bail at      ~t=3.0    (probe_pending.elapsed=1.0 > fast_probe_deadline=0.5)
+    //   - re-handshake at ~t=3.5 (BACKOFF_MIN = 500ms)
+    // Backstop would bail at ~t=4.0 (since_ack > ACK_DEADLINE=3s),
+    // re-handshake at ~t=4.5.
+    // Budget: 4s from test start. Beats backstop's ~4.5s by enough
+    // to distinguish even on a moderately loaded runner; if this
+    // assertion starts failing on slow CI, widen the slack BUT
+    // verify the FAST_PROBE_* multipliers haven't regressed first.
+    let server_keys = StaticKeyPair::generate().unwrap();
+    let client_keys = StaticKeyPair::generate().unwrap();
+    let server_pub = server_keys.public_key();
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let handshakes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ack_heartbeats = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let heartbeats_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let handshakes_task = handshakes.clone();
+    let heartbeats_task = heartbeats_received.clone();
+    let ack_flag = ack_heartbeats.clone();
+    let server_task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let mut session: Option<Session> = None;
+        loop {
+            let (n, from) = match sock.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let view = match wire::parse(&buf[..n]) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match view.packet_type {
+                PacketType::Handshake1 => {
+                    handshakes_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let half = Responder::process_handshake_1(&server_keys, &view).unwrap();
+                    let (s, reply) = half.complete().unwrap();
+                    sock.send_to(&reply, from).await.unwrap();
+                    session = Some(s);
+                    // Re-arm acks on each new session so the
+                    // post-bail re-handshake doesn't tear back down
+                    // before we can observe it.
+                    ack_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    heartbeats_task.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                PacketType::Heartbeat => {
+                    let count =
+                        heartbeats_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    // Ack the first two heartbeats; black-hole the
+                    // rest (incl. the fast probe). Simulates an
+                    // upstream that's silently dropped off the
+                    // network.
+                    if count > 2 {
+                        ack_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if ack_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(s) = session.as_mut() {
+                            if let Ok(hb) = s.decode_heartbeat(&view) {
+                                let (_, ack) = s.encode_heartbeat_ack(hb.counter, 0).unwrap();
+                                sock.send_to(&ack, from).await.unwrap();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let cancel = CancellationToken::new();
+    let cfg = ChainClientConfig {
+        endpoint: addr.to_string(),
+        upstream_pubkey: server_pub,
+        local_keys: client_keys,
+        heartbeat_interval: Duration::from_millis(500),
+        rekey_interval: Duration::from_secs(600),
+        body_handler: None,
+        local_bind: None,
+    };
+    let client = ChainClient::new(cfg, cancel.clone());
+    let test_started = Instant::now();
+    let client_task = tokio::spawn(async move { client.run().await });
+
+    // Expect the second handshake within 4s of test start. See the
+    // comment block above for the timing breakdown vs the backstop.
+    let deadline = test_started + Duration::from_secs(4);
+    while handshakes.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+        if Instant::now() > deadline {
+            panic!(
+                "fast-probe did not bail in time: {} handshakes after {:?} (backstop would need ~4.5s, \
+                 so the fast-probe path may have regressed)",
+                handshakes.load(std::sync::atomic::Ordering::Relaxed),
+                test_started.elapsed(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let elapsed = test_started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "fast-probe re-handshake took {elapsed:?}; expected < 4s"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn fast_probe_does_not_fire_when_upstream_is_healthy() {
+    // No probe should fire on a healthy connection: each heartbeat
+    // gets ACK'd well within FAST_PROBE_AFTER, so `last_ack_at`
+    // refreshes and `probe_pending_since` stays None. Observe by
+    // counting heartbeats received over a window and asserting it
+    // equals N (not N + extra probes).
+    //
+    // Heartbeat = 100ms, observe for 1s = ~10 heartbeats expected.
+    // Tolerate +2 jitter for tick alignment.
+    let server_keys = StaticKeyPair::generate().unwrap();
+    let client_keys = StaticKeyPair::generate().unwrap();
+    let server_pub = server_keys.public_key();
+    let server = TestServer::start(server_keys).await;
+
+    let cancel = CancellationToken::new();
+    let cfg = ChainClientConfig {
+        endpoint: server.addr.to_string(),
+        upstream_pubkey: server_pub,
+        local_keys: client_keys,
+        heartbeat_interval: Duration::from_millis(100),
+        rekey_interval: Duration::from_secs(60),
+        body_handler: None,
+        local_bind: None,
+    };
+    let client = ChainClient::new(cfg, cancel.clone());
+    let client_task = tokio::spawn(async move { client.run().await });
+
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let count = server
+        .heartbeats_seen
+        .load(std::sync::atomic::Ordering::Relaxed);
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+    server.stop().await;
+
+    // Healthy: ~10 ± 2. The sharper assertion: count must be < 13
+    // (well under what we'd see if the probe fired every other
+    // heartbeat — that would push to ~15-20).
+    assert!(
+        (8..=12).contains(&count),
+        "expected ~10 heartbeats on healthy session, got {count}; \
+         either timing is way off or fast-probe is firing spuriously"
+    );
+}
+
+#[tokio::test]
 async fn backoff_and_reconnect_when_endpoint_unresponsive() {
     let client_keys = StaticKeyPair::generate().unwrap();
 

@@ -14,7 +14,9 @@ use ratatoskr::wire::{self, PacketType};
 
 use crate::chain::reliability::{ControlChannel, InboundDisposition};
 
-use super::backoff::ACK_DEADLINE_MULTIPLIER;
+use super::backoff::{
+    ACK_DEADLINE_MULTIPLIER, FAST_PROBE_AFTER_MULTIPLIER, FAST_PROBE_DEADLINE_MULTIPLIER,
+};
 use super::body_handler::BodyHandler;
 use super::handshake::resolve_endpoint;
 use super::ChainClient;
@@ -82,7 +84,22 @@ impl ChainClient {
         let mut acks_received: u64 = 0;
         let mut buf = [0u8; ratatoskr::wire::MAX_PACKET_LEN];
 
+        // Backstop deadline. The active path is the fast-probe
+        // machinery below; this only fires if the probe send itself
+        // failed or the loop got pathologically starved. See
+        // `super::backoff` doc comments for the multipliers.
         let ack_deadline = self.config.heartbeat_interval * ACK_DEADLINE_MULTIPLIER;
+        let fast_probe_after = self.config.heartbeat_interval * FAST_PROBE_AFTER_MULTIPLIER;
+        let fast_probe_deadline = self.config.heartbeat_interval * FAST_PROBE_DEADLINE_MULTIPLIER;
+
+        // Set when a fast probe has been fired and is waiting for an
+        // ACK. Cleared on any inbound heartbeat ACK. Used to bail
+        // ahead of `ack_deadline` once the probe ACK is also overdue,
+        // cutting steady-state detection latency from
+        // `ACK_DEADLINE_MULTIPLIER × heartbeat_interval` (default
+        // 30s) to `(FAST_PROBE_AFTER + FAST_PROBE_DEADLINE) ×
+        // heartbeat_interval` (default 15s).
+        let mut probe_pending_since: Option<Instant> = None;
 
         // Per-session control reliability state. Drop-aborts every pending
         // send with `SendError::ChannelClosed` when this function returns
@@ -95,11 +112,52 @@ impl ChainClient {
                 tracing::info!(heartbeats_sent, acks_received, "rekey deadline reached");
                 return Ok(SessionExit::Rekey);
             }
+            // Fast-probe deadline check. If a probe is in flight and
+            // its ACK is overdue, bail immediately rather than wait
+            // out the full backstop deadline.
+            if let Some(probe_at) = probe_pending_since {
+                if probe_at.elapsed() > fast_probe_deadline {
+                    bail!(
+                        "fast probe unanswered for {:?} (sent={}, acked={}); presuming session dead",
+                        probe_at.elapsed(),
+                        heartbeats_sent,
+                        acks_received
+                    );
+                }
+            }
             if let Some(last) = last_ack_at {
-                if last.elapsed() > ack_deadline {
+                let since_ack = last.elapsed();
+                // Fast-probe trigger. If we've gone fast_probe_after
+                // without an ACK and haven't already fired a probe
+                // this silence-window, send one extra heartbeat
+                // immediately. The server will ACK it like any
+                // other heartbeat (no new wire shape); receipt
+                // clears `probe_pending_since` in the inbound arm.
+                if probe_pending_since.is_none() && since_ack > fast_probe_after {
+                    let ts = current_unix_millis();
+                    match session.encode_heartbeat(ts, 0) {
+                        Ok((counter, packet)) => {
+                            if let Err(e) = socket.send(&packet).await {
+                                tracing::warn!(error = %e, "fast-probe heartbeat send failed");
+                            } else {
+                                heartbeats_sent += 1;
+                                probe_pending_since = Some(Instant::now());
+                                tracing::debug!(
+                                    counter,
+                                    since_ack_ms = since_ack.as_millis() as u64,
+                                    "fast-probe heartbeat sent (no ACK in 2× heartbeat interval)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "fast-probe heartbeat encode failed");
+                        }
+                    }
+                }
+                if since_ack > ack_deadline {
                     bail!(
                         "no ACK in {:?} (sent={}, acked={}); presuming session dead",
-                        last.elapsed(),
+                        since_ack,
                         heartbeats_sent,
                         acks_received
                     );
@@ -150,6 +208,14 @@ impl ChainClient {
                                 Ok(ack) => {
                                     acks_received += 1;
                                     last_ack_at = Some(Instant::now());
+                                    // Any ACK clears the probe deadline.
+                                    // The probe IS just a heartbeat with no
+                                    // distinguishing wire shape, so we can't
+                                    // tell whether the ACK is for the probe
+                                    // or for an earlier in-flight heartbeat
+                                    // — but either way, the server is alive
+                                    // and answering, so liveness is restored.
+                                    probe_pending_since = None;
                                     tracing::trace!(
                                         echoed_counter = ack.echoed_counter,
                                         server_ts_ms  = ack.server_ts_ms,
