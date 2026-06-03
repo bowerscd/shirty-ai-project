@@ -59,7 +59,7 @@ echo "[init-chain] preparing gateway dirs"
 mkdir -p /etc/yggdrasil-gateway/rules /etc/yggdrasil-gateway/certs
 
 echo "[init-chain] writing gateway seed config"
-cat >"$GW_CFG" <<EOF
+cat >"$GW_CFG" <<'EOF'
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
@@ -94,7 +94,7 @@ mkdir -p /etc/yggdrasil-relay/rules /etc/yggdrasil-relay/certs
 echo "[init-chain] writing relay seed config"
 # Relay's [accept] listen is the address terminals dial; its [dial]
 # is filled in by add-dial after the gateway mints its grant.
-cat >"$RL_CFG" <<EOF
+cat >"$RL_CFG" <<'EOF'
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
@@ -117,7 +117,7 @@ echo "[init-chain] preparing terminal dirs"
 mkdir -p /etc/yggdrasil-terminal/rules /etc/yggdrasil-terminal/certs
 
 echo "[init-chain] writing terminal seed config"
-cat >"$TM_CFG" <<EOF
+cat >"$TM_CFG" <<'EOF'
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"

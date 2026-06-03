@@ -53,7 +53,7 @@ echo "[init-quickstart] preparing gateway dirs"
 mkdir -p /etc/yggdrasil-gateway/rules /etc/yggdrasil-gateway/certs
 
 echo "[init-quickstart] writing gateway seed config"
-cat >"$GW_CFG" <<EOF
+cat >"$GW_CFG" <<'EOF'
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
@@ -91,7 +91,7 @@ echo "[init-quickstart] writing terminal seed config"
 # https_listen on 8443 because the daemon may not run as root in
 # downstream container images and 443 needs CAP_NET_BIND_SERVICE.
 # default_cert + default_key point at the PEMs this script mints below.
-cat >"$TM_CFG" <<EOF
+cat >"$TM_CFG" <<'EOF'
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
