@@ -154,8 +154,9 @@ impl ControlServer {
     /// gates the predicate-projection pre-check in `chain apply`.
     ///
     /// `acme` is the optional ACME manager; only terminal-mode
-    /// daemons with `[acme]` set wire one. When `None`, the
-    /// `acme list` / `acme renew` verbs return empty / not_configured.
+    /// daemons with `[acme]` set wire one. Non-terminal daemons refuse
+    /// ACME methods before dispatch; terminal daemons with `None`
+    /// return empty / not_configured.
     ///
     /// `nat` is the optional NAT-traversal mapper handle. `None`
     /// when `[server].nat_traversal = "off"` or when the mapper

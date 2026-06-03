@@ -11,12 +11,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use ratatoskr::control::{ChainSummaryResponse, Request, Response};
+use ratatoskr::control::{ChainSummaryResponse, Mode, Request, Response};
 use ratatoskr::predicate::Predicate;
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::{RuleFile, RuleSet};
@@ -97,11 +97,14 @@ pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
 
 /// Push a candidate rule set from `args.file` to the running daemon.
 ///
-/// Local parse + validation runs first so the CLI fails fast with line
-/// context on schema errors (the daemon's own error path would only see
-/// a `Vec<Rule>` and couldn't point at TOML line numbers). The daemon
-/// re-validates as defence in depth.
+/// The CLI queries daemon mode first so terminal-only applies fail before
+/// shipping a candidate rule set to an intermediary. Local parse +
+/// validation then provides line context on schema errors (the daemon's
+/// own error path would only see a `Vec<Rule>`). The daemon re-validates
+/// as defence in depth.
 async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
+    ensure_terminal_mode(socket).await?;
+
     // 1. Read and parse the candidate file. `RuleFile::from_toml`
     //    attaches the path to any TOML parse error.
     let contents = std::fs::read_to_string(&args.file)
@@ -124,7 +127,7 @@ async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
 
     // 3. Send the request and await the single response line.
     let request = Request::ChainApply { rules };
-    let response = send_chain_apply(socket, &request, Duration::from_secs(5)).await?;
+    let response = send_chain_request(socket, &request, DEFAULT_CLIENT_TIMEOUT_SECS).await?;
 
     match response {
         Response::ChainApplied(b) => {
@@ -142,33 +145,6 @@ async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
         }
         other => bail!("daemon returned unexpected response to ChainApply: {other:?}"),
     }
-}
-
-/// Connect to the UDS, write a single `Request::ChainApply` line, read
-/// exactly one response line back. Mirrors `local::send` but kept
-/// separate so the `chain` scope doesn't depend on `local` internals.
-async fn send_chain_apply(socket: &Path, request: &Request, timeout: Duration) -> Result<Response> {
-    let socket: PathBuf = socket.to_path_buf();
-    let mut stream = tokio::time::timeout(timeout, UnixStream::connect(&socket))
-        .await
-        .with_context(|| format!("connect timeout after {timeout:?}"))?
-        .with_context(|| format!("connecting to {}", socket.display()))?;
-
-    let mut buf = serde_json::to_vec(request).context("encode ChainApply request")?;
-    buf.push(b'\n');
-    tokio::time::timeout(timeout, stream.write_all(&buf))
-        .await
-        .context("write timeout")?
-        .context("writing ChainApply request")?;
-
-    let (reader, _w) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    let line = tokio::time::timeout(timeout, lines.next_line())
-        .await
-        .context("read timeout")?
-        .context("reading ChainApply response")?
-        .ok_or_else(|| anyhow!("server closed connection before responding to ChainApply"))?;
-    serde_json::from_str(&line).context("decode ChainApply response")
 }
 
 // =============================================================================
@@ -1154,6 +1130,26 @@ async fn fetch_derived_rules(socket: &Path) -> Result<DerivedRules> {
     }
 }
 
+async fn ensure_terminal_mode(socket: &Path) -> Result<()> {
+    let response =
+        send_chain_request(socket, &Request::Status, DEFAULT_CLIENT_TIMEOUT_SECS).await?;
+    let mode = match response {
+        Response::Status(status) => status.mode,
+        Response::Error { code, message } => {
+            bail!("status query failed before mode check: {code}: {message}");
+        }
+        other => bail!("expected Status response before mode check, got {other:?}"),
+    };
+    if mode != Mode::Terminal {
+        bail!(
+            "this command requires a terminal-mode daemon; target at {} is a {}",
+            socket.display(),
+            mode.as_str(),
+        );
+    }
+    Ok(())
+}
+
 const DEFAULT_CLIENT_TIMEOUT_SECS: Duration = Duration::from_secs(5);
 
 /// Generic UDS round-trip helper. Sends `req` as one JSON line, reads
@@ -1337,11 +1333,102 @@ fn hop_label_for(hop: &ratatoskr::canary::CanaryHop) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatoskr::control::ChainIdentity as ChainView;
+    use ratatoskr::control::{ChainIdentity as ChainView, StatusResponse};
     use ratatoskr::rule::Protocol;
+    use tokio::net::UnixListener;
+
+    fn status_response(mode: Mode) -> Response {
+        Response::Status(StatusResponse {
+            version: "test".into(),
+            mode,
+            downstream_ip: None,
+            last_heartbeat_age_ms: None,
+            rule_count: 0,
+            uptime_secs: 0,
+            downstream_enrolled: false,
+            default_cert_path: None,
+            default_cert_loaded_age_secs: None,
+            ephemeral_cert_count: 0,
+            nat: None,
+            lan_cidrs: Vec::new(),
+            lan_cidrs_source: "default".into(),
+            certless_route_count: 0,
+        })
+    }
+
+    async fn collect_requests_until_idle(
+        listener: UnixListener,
+        response: Response,
+    ) -> Vec<Request> {
+        let mut seen = Vec::new();
+        for accept_index in 0..2 {
+            let accepted = if accept_index == 0 {
+                tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                    .await
+                    .expect("client did not connect")
+                    .expect("accept failed")
+            } else {
+                match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => panic!("accept failed: {e}"),
+                    Err(_) => break,
+                }
+            };
+            let (stream, _) = accepted;
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            seen.push(serde_json::from_str(line.trim()).unwrap());
+            let mut buf = serde_json::to_vec(&response).unwrap();
+            buf.push(b'\n');
+            writer.write_all(&buf).await.unwrap();
+        }
+        seen
+    }
 
     fn pk(seed: u8) -> PubKey {
         PubKey::x25519([seed; 32])
+    }
+
+    #[tokio::test]
+    async fn chain_apply_refuses_gateway_before_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+        let rules_file = tmp.path().join("rules.toml");
+        std::fs::write(
+            &rules_file,
+            r#"[[rule]]
+name = "ssh"
+listen = "127.0.0.1:2222"
+protocol = "tcp"
+target = "127.0.0.1:22"
+"#,
+        )
+        .unwrap();
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(collect_requests_until_idle(
+            listener,
+            status_response(Mode::Gateway),
+        ));
+
+        let err = run(Cmd::Apply(ApplyArgs { file: rules_file }), &socket, false)
+            .await
+            .expect_err("gateway-mode daemon should be rejected client-side");
+        let message = err.to_string();
+        assert!(
+            message.contains("requires a terminal-mode daemon"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("gateway"), "unexpected error: {message}");
+        assert!(
+            message.contains(&socket.display().to_string()),
+            "unexpected error: {message}"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen, vec![Request::Status]);
     }
 
     // ---- hop_labels ----

@@ -84,17 +84,21 @@ mode the heartbeat- and downstream-related fields are suppressed.
 
 ### `local rules list`
 
-Print loaded rules with their listen sockets and resolved target
-targets.
+Terminal mode only. Print loaded terminal rules with their listen sockets
+and resolved targets. The CLI queries `local status` first and refuses
+before dispatch when the target daemon is a gateway or relay; use
+`local derived-rules` to inspect intermediary-derived rule state.
 
 ### `local rules reload`
 
-Force a re-scan of `[server].rules_dir`. The inotify watcher already
-handles most cases — use this when the filesystem stack doesn't deliver
-events (NFS, some FUSE filesystems, container bind mounts on macOS).
-Blocks until the rule supervisor has swapped in the new set and returns
-the post-swap rule count; subsequent `local rules list` / `local status`
-calls observe the new ruleset without a follow-up RTT.
+Terminal mode only. Force a re-scan of `[server].rules_dir`. The inotify
+watcher already handles most cases — use this when the filesystem stack
+doesn't deliver events (NFS, some FUSE filesystems, container bind mounts
+on macOS). The CLI queries `local status` first and refuses before
+dispatch when the target daemon is a gateway or relay. On a terminal, the
+command blocks until the rule supervisor has swapped in the new set and
+returns the post-swap rule count; subsequent `local rules list` / `local
+status` calls observe the new ruleset without a follow-up RTT.
 
 ### `local metrics`
 
@@ -146,29 +150,32 @@ accepted.
 
 ### `local acme list`
 
-After the L7 schema cleanup the renewer manages a **single wildcard
-cert** per terminal, not per-route entries. The command prints one
-row covering the apex domain from `[acme].domain` with its renewer
-state (`idle` / `pending` / `failed`), challenge (`dns01` — the
-provider derived from the `[acme.dns.<name>]` sub-table), next
-scheduled renewal (absolute Unix epoch plus a relative "in 3 d" /
-"<expired>" hint), and the last error when one is recorded.
-Returns `error_codes::ACME_NOT_CONFIGURED` if `[acme]` is absent
-from the daemon config.
+Terminal mode only. After the L7 schema cleanup the renewer manages a
+**single wildcard cert** per terminal, not per-route entries. The CLI
+queries `local status` first and refuses before dispatch when the target
+daemon is a gateway or relay. On a terminal, the command prints one row
+covering the apex domain from `[acme].domain` with its renewer state
+(`idle` / `pending` / `failed`), challenge (`dns01` — the provider
+derived from the `[acme.dns.<name>]` sub-table), next scheduled renewal
+(absolute Unix epoch plus a relative "in 3 d" / "<expired>" hint), and
+the last error when one is recorded. If `[acme]` is absent from the
+terminal config, the daemon returns an empty host list.
 
 ### `local acme renew <hostname>`
 
-Force an immediate ACME issuance, bypassing the renewer's schedule.
-`<hostname>` must be the apex domain configured in `[acme].domain`
-(there's only one cert to renew per terminal post-schema-cleanup);
-any other value returns `error_codes::ACME_UNKNOWN_HOST`. The CLI
-blocks until issuance completes (typically 5-60 s) or the daemon's
-5-minute deadline expires. On success, the freshly-issued PEM is
-written under `[acme].storage_dir` and `CertStore::reload_host`
-swaps it in atomically — clients see no connection interruption.
-Returns `error_codes::ACME_RENEW_FAILED` (with the underlying CA
-error) on issuance failure, or `error_codes::ACME_NOT_CONFIGURED`
-if `[acme]` is absent.
+Terminal mode only. Force an immediate ACME issuance, bypassing the
+renewer's schedule. The CLI queries `local status` first and refuses
+before dispatch when the target daemon is a gateway or relay. On a
+terminal, `<hostname>` must be the apex domain configured in
+`[acme].domain` (there's only one cert to renew per terminal
+post-schema-cleanup); any other value returns
+`error_codes::ACME_UNKNOWN_HOST`. The CLI blocks until issuance completes
+(typically 5-60 s) or the daemon's 5-minute deadline expires. On success,
+the freshly-issued PEM is written under `[acme].storage_dir` and
+`CertStore::reload_host` swaps it in atomically — clients see no
+connection interruption. Returns `error_codes::ACME_RENEW_FAILED` (with
+the underlying CA error) on issuance failure, or
+`error_codes::ACME_NOT_CONFIGURED` if `[acme]` is absent.
 
 ---
 
@@ -189,8 +196,10 @@ locally for early error messages with line context; the daemon
 re-validates server-side (per-rule + cross-rule uniqueness, listen /
 protocol conflicts) and rejects the apply as a unit on any conflict.
 
-Terminal mode only. Relay-mode daemons return
-`not_supported_in_relay_mode`.
+Terminal mode only. The CLI queries `local status` before reading the
+candidate file and refuses before dispatch when the target daemon is a
+gateway or relay. If a client bypasses that check, intermediary daemons
+return `method_not_available_on_mode`.
 
 | Flag       | Type | Notes                                                                                              |
 | ---------- | ---- | -------------------------------------------------------------------------------------------------- |

@@ -143,10 +143,9 @@ pub enum Request {
     /// oversize push fails synchronously here instead of silently
     /// failing later in the publisher.
     ///
-    /// **Terminal mode only.** Relays receive their rule set from
-    /// downstream predicate pushes and cannot accept a manual apply
-    /// without it being immediately overwritten on the next push;
-    /// returns [`error_codes::NOT_SUPPORTED_IN_RELAY_MODE`].
+    /// **Terminal mode only.** Intermediary daemons do not bind this
+    /// method; requests sent to a gateway or relay return
+    /// [`error_codes::METHOD_NOT_AVAILABLE_ON_MODE`].
     ChainApply {
         /// Pre-parsed rules from the operator's candidate file. Order
         /// is preserved across the wire; uniqueness + listen-conflict
@@ -774,11 +773,10 @@ pub mod error_codes {
     /// identity. Peer-related commands (`peer show`, `peer pending`,
     /// `peer approve`) are not meaningful and return this code.
     pub const NOT_SUPPORTED_IN_TERMINAL_MODE: &str = "not_supported_in_terminal_mode";
-    /// The daemon is running in `mode = "relay"`. The requested
-    /// operation is meaningful only on terminal-mode daemons; relays
-    /// have their rule sets derived from downstream predicate pushes
-    /// and would immediately overwrite anything applied manually.
-    pub const NOT_SUPPORTED_IN_RELAY_MODE: &str = "not_supported_in_relay_mode";
+    /// The request names a control method that this daemon mode does
+    /// not bind. Used for terminal-affined methods (`chain apply`,
+    /// `local rules reload`, ACME) on gateway / relay daemons.
+    pub const METHOD_NOT_AVAILABLE_ON_MODE: &str = "method_not_available_on_mode";
     /// The candidate rule set sent with [`super::Request::ChainApply`]
     /// failed validation: a duplicate name, a duplicate listen/protocol
     /// pair, or a per-rule shape error. The error `message` field
@@ -803,7 +801,7 @@ pub mod error_codes {
     /// `message` field carries the detail.
     pub const ACME_RENEW_FAILED: &str = "acme_renew_failed";
     /// The daemon has no `[acme]` section configured but the operator
-    /// asked for ACME-managed state via `local acme list/renew`.
+    /// asked to force issuance via `local acme renew`.
     pub const ACME_NOT_CONFIGURED: &str = "acme_not_configured";
     /// `chain canary --port N --proto X` was called but no rule on
     /// this node binds `(port, proto)`. The accompanying response
@@ -1134,8 +1132,8 @@ mod tests {
     fn chain_apply_error_codes_are_stable_strings() {
         // Pin the wire-stable strings so daemon + CLI never drift.
         assert_eq!(
-            error_codes::NOT_SUPPORTED_IN_RELAY_MODE,
-            "not_supported_in_relay_mode"
+            error_codes::METHOD_NOT_AVAILABLE_ON_MODE,
+            "method_not_available_on_mode"
         );
         assert_eq!(error_codes::RULES_INVALID, "rules_invalid");
         assert_eq!(

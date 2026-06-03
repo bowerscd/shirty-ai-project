@@ -9,7 +9,7 @@ pub enum Cmd {
     /// Show high-level server status (mode, downstream IP, last heartbeat,
     /// rule count, uptime).
     Status,
-    /// Inspect or manage loaded rules.
+    /// Inspect or manage terminal-loaded rules.
     Rules {
         #[command(subcommand)]
         action: RuleAction,
@@ -36,7 +36,7 @@ pub enum Cmd {
     /// args, prints the current and default directives without
     /// changing anything.
     Trace(TraceArgs),
-    /// Inspect or manage the daemon's ACME-managed certs.
+    /// Inspect or manage terminal ACME-managed certs.
     Acme {
         #[command(subcommand)]
         action: AcmeAction,
@@ -73,9 +73,9 @@ pub struct TraceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RuleAction {
-    /// List loaded rules.
+    /// List terminal-loaded rules.
     List,
-    /// Force a reload of the rules directory (in addition to inotify).
+    /// Force a reload of the terminal rules directory (in addition to inotify).
     Reload,
 }
 

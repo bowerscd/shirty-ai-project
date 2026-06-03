@@ -601,10 +601,11 @@ completeness:
   `default_key`, `cert_dir`) are read
   once at startup — `yggdrasilctl identity add-dial` / `add-accept` /
   `remove-*` mutations require a restart to take effect.
-* `yggdrasilctl local rules reload` forces a re-scan in case you suspect
-  the inotify event was missed (NFS, container bind mounts with cached
-  metadata, etc.).
+* On terminal daemons, `yggdrasilctl local rules reload` forces a re-scan
+  in case you suspect the inotify event was missed (NFS, container bind
+  mounts with cached metadata, etc.).
 * `yggdrasilctl chain apply --file rules.toml` pushes a pre-validated
   rule vector into the running terminal daemon's supervisor without
-  touching `rules_dir`. The daemon re-validates server-side and rejects
-  the apply as a unit on any cross-rule conflict.
+  touching `rules_dir`. The CLI refuses gateway / relay targets before
+  dispatch; the daemon re-validates server-side and rejects the apply as
+  a unit on any cross-rule conflict.

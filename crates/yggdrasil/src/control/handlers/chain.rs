@@ -2,7 +2,7 @@
 //!
 
 use ratatoskr::control::{
-    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse, Mode, Response,
+    error_codes, ChainAppliedResponse, ChainHop, ChainSummaryResponse, Response,
 };
 use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
 use ratatoskr::pubkey::PubKey;
@@ -18,14 +18,10 @@ use super::super::ControlState;
 /// an mpsc channel send.
 ///
 /// Flow:
-/// 1. Refuse if the daemon is running in [`Mode::Relay`] — relays
-///    receive rule sets from downstream predicate pushes and would
-///    immediately overwrite anything applied here
-///    ([`error_codes::NOT_SUPPORTED_IN_RELAY_MODE`]).
-/// 2. Validate the candidate vector by constructing a [`RuleSet`]; this
+/// 1. Validate the candidate vector by constructing a [`RuleSet`]; this
 ///    runs the same per-rule + cross-rule checks the file-watch reload
 ///    runs ([`error_codes::RULES_INVALID`]).
-/// 3. If the daemon has a chain upstream
+/// 2. If the daemon has a chain upstream
 ///    (`state.has_chain_upstream`), project the rule set through
 ///    [`predicate_extractor::extract`] and postcard-encode it. If the
 ///    encoded body would exceed
@@ -33,7 +29,7 @@ use super::super::ControlState;
 ///    ([`error_codes::PREDICATE_SET_OVERSIZE`]) — without this guard
 ///    the apply would "succeed" here but the publisher would silently
 ///    drop the push.
-/// 4. Hand the [`RuleSet`] to
+/// 3. Hand the [`RuleSet`] to
 ///    [`crate::proxy::supervisor::SupervisorHandle::apply_ruleset`].
 ///    The handle's `apply_tx` enqueues the set onto the supervisor
 ///    task; actual diff + listener mutation happens on that task. We
@@ -42,17 +38,6 @@ pub(in crate::control) async fn dispatch_chain_apply(
     rules: Vec<Rule>,
     state: &ControlState,
 ) -> Response {
-    if state.mode != Mode::Terminal {
-        return Response::Error {
-            code: error_codes::NOT_SUPPORTED_IN_RELAY_MODE.into(),
-            message: "`chain apply` is only supported on terminal-mode \
-                      daemons; relays derive their rule set from \
-                      downstream predicate pushes and would overwrite \
-                      any manual apply on the next push"
-                .to_string(),
-        };
-    }
-
     let applied_rule_count = rules.len();
     let ruleset = match RuleSet::from_rules(rules) {
         Ok(rs) => rs,

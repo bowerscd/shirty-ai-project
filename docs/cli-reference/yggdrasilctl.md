@@ -71,13 +71,13 @@ Daemon-local operations over the control socket
 ###### **Subcommands:**
 
 * `status` — Show high-level server status (mode, downstream IP, last heartbeat, rule count, uptime)
-* `rules` — Inspect or manage loaded rules
+* `rules` — Inspect or manage terminal-loaded rules
 * `accept` — Inspect or manage the enrolled accept-side peer (the inbound chain peer pinned by `[accept]` — for relay-mode this is the downstream terminal node)
 * `metrics` — Render the daemon's Prometheus metrics in text exposition format, retrieved over the control socket
 * `health` — Liveness/readiness probe served over the control socket. Exit status: 0 if ready, 1 if not yet ready, 2 on RPC error
 * `derived-rules` — Snapshot of this node's chain-applied predicates, derived rule set, and chain identity. Pretty-printed JSON to stdout
 * `trace` — Adjust the daemon's tracing-subscriber filter at runtime. Pass a directive (`debug`, `yggdrasil::heartbeat=trace,info`, etc.) or `--reset` to revert to the startup filter. With no args, prints the current and default directives without changing anything
-* `acme` — Inspect or manage the daemon's ACME-managed certs
+* `acme` — Inspect or manage terminal ACME-managed certs
 
 ###### **Options:**
 
@@ -97,20 +97,20 @@ Show high-level server status (mode, downstream IP, last heartbeat, rule count, 
 
 ## `yggdrasilctl local rules`
 
-Inspect or manage loaded rules
+Inspect or manage terminal-loaded rules
 
 **Usage:** `yggdrasilctl local rules <COMMAND>`
 
 ###### **Subcommands:**
 
-* `list` — List loaded rules
-* `reload` — Force a reload of the rules directory (in addition to inotify)
+* `list` — List terminal-loaded rules
+* `reload` — Force a reload of the terminal rules directory (in addition to inotify)
 
 
 
 ## `yggdrasilctl local rules list`
 
-List loaded rules
+List terminal-loaded rules
 
 **Usage:** `yggdrasilctl local rules list`
 
@@ -118,7 +118,7 @@ List loaded rules
 
 ## `yggdrasilctl local rules reload`
 
-Force a reload of the rules directory (in addition to inotify)
+Force a reload of the terminal rules directory (in addition to inotify)
 
 **Usage:** `yggdrasilctl local rules reload`
 
@@ -208,7 +208,7 @@ Adjust the daemon's tracing-subscriber filter at runtime. Pass a directive (`deb
 
 ## `yggdrasilctl local acme`
 
-Inspect or manage the daemon's ACME-managed certs
+Inspect or manage terminal ACME-managed certs
 
 **Usage:** `yggdrasilctl local acme <COMMAND>`
 

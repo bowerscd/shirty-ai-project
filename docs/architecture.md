@@ -581,14 +581,16 @@ On the terminal, `[server].rules_dir` is watched via
    `[[route]]` exists; the relay derives matching `(Tcp, port)` plus
    `(Udp, port)` listeners.
 
-Force a re-scan with `yggdrasilctl local rules reload` (for filesystems
-where inotify is unreliable — NFS, FUSE, some container bind mounts).
+Force a terminal re-scan with `yggdrasilctl local rules reload` (for
+filesystems where inotify is unreliable — NFS, FUSE, some container bind
+mounts).
 
-A pre-validated rule set can also be pushed directly without writing to
-disk via `yggdrasilctl chain apply --file rules.toml`. The daemon
-re-validates and feeds the result into the same supervisor pipeline. This
-is mostly useful for tests and ephemeral configurations; persistent rules
-should still live in `rules_dir`.
+A pre-validated rule set can also be pushed directly to a terminal without
+writing to disk via `yggdrasilctl chain apply --file rules.toml`. The CLI
+refuses gateway / relay targets before dispatch; the daemon re-validates
+and feeds the result into the same supervisor pipeline. This is mostly
+useful for tests and ephemeral configurations; persistent rules should
+still live in `rules_dir`.
 
 ## Chain control plane
 

@@ -13,6 +13,10 @@ use ratatoskr::control::{Mode, Request, Response};
 pub use cli_defs::yggdrasilctl::local::{AcceptAction, AcmeAction, Cmd, RuleAction};
 
 pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
+    if terminal_only_command(&cmd) {
+        ensure_terminal_mode(socket).await?;
+    }
+
     let request = build_request(&cmd);
     let response = send(socket, &request, Duration::from_secs(5)).await?;
     if json {
@@ -20,6 +24,29 @@ pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
     } else {
         print_human(&request, &response)
     }
+}
+
+fn terminal_only_command(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Rules { .. } | Cmd::Acme { .. })
+}
+
+async fn ensure_terminal_mode(socket: &Path) -> Result<()> {
+    let response = send(socket, &Request::Status, Duration::from_secs(5)).await?;
+    let mode = match response {
+        Response::Status(status) => status.mode,
+        Response::Error { code, message } => {
+            bail!("status query failed before mode check: {code}: {message}");
+        }
+        other => bail!("expected Status response before mode check, got {other:?}"),
+    };
+    if mode != Mode::Terminal {
+        bail!(
+            "this command requires a terminal-mode daemon; target at {} is a {}",
+            socket.display(),
+            mode.as_str(),
+        );
+    }
+    Ok(())
 }
 
 fn build_request(cmd: &Cmd) -> Request {
@@ -353,6 +380,126 @@ fn format_unix_secs(secs: u64) -> String {
 mod tests {
     use super::*;
     use cli_defs::yggdrasilctl::local::{AcmeRenewArgs, ApproveArgs, TraceArgs};
+    use ratatoskr::control::StatusResponse;
+    use tokio::net::UnixListener;
+
+    fn status_response(mode: Mode) -> Response {
+        Response::Status(StatusResponse {
+            version: "test".into(),
+            mode,
+            downstream_ip: None,
+            last_heartbeat_age_ms: None,
+            rule_count: 0,
+            uptime_secs: 0,
+            downstream_enrolled: false,
+            default_cert_path: None,
+            default_cert_loaded_age_secs: None,
+            ephemeral_cert_count: 0,
+            nat: None,
+            lan_cidrs: Vec::new(),
+            lan_cidrs_source: "default".into(),
+            certless_route_count: 0,
+        })
+    }
+
+    async fn collect_requests_until_idle(
+        listener: UnixListener,
+        response: Response,
+    ) -> Vec<Request> {
+        let mut seen = Vec::new();
+        for accept_index in 0..2 {
+            let accepted = if accept_index == 0 {
+                tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                    .await
+                    .expect("client did not connect")
+                    .expect("accept failed")
+            } else {
+                match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => panic!("accept failed: {e}"),
+                    Err(_) => break,
+                }
+            };
+            let (stream, _) = accepted;
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            seen.push(serde_json::from_str(line.trim()).unwrap());
+            let mut buf = serde_json::to_vec(&response).unwrap();
+            buf.push(b'\n');
+            writer.write_all(&buf).await.unwrap();
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn local_rules_refuses_gateway_before_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(collect_requests_until_idle(
+            listener,
+            status_response(Mode::Gateway),
+        ));
+
+        let err = run(
+            Cmd::Rules {
+                action: RuleAction::Reload,
+            },
+            &socket,
+            false,
+        )
+        .await
+        .expect_err("gateway-mode daemon should be rejected client-side");
+        let message = err.to_string();
+        assert!(
+            message.contains("requires a terminal-mode daemon"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("gateway"), "unexpected error: {message}");
+        assert!(
+            message.contains(&socket.display().to_string()),
+            "unexpected error: {message}"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen, vec![Request::Status]);
+    }
+
+    #[tokio::test]
+    async fn local_acme_refuses_gateway_before_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(collect_requests_until_idle(
+            listener,
+            status_response(Mode::Gateway),
+        ));
+
+        let err = run(
+            Cmd::Acme {
+                action: AcmeAction::List,
+            },
+            &socket,
+            false,
+        )
+        .await
+        .expect_err("gateway-mode daemon should be rejected client-side");
+        let message = err.to_string();
+        assert!(
+            message.contains("requires a terminal-mode daemon"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("gateway"), "unexpected error: {message}");
+        assert!(
+            message.contains(&socket.display().to_string()),
+            "unexpected error: {message}"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen, vec![Request::Status]);
+    }
 
     /// Each `Cmd` variant must map to the expected `Request` so the CLI
     /// surface stays in sync with the wire surface. A regression in

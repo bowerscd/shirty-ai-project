@@ -185,9 +185,11 @@ sudo yggdrasilctl local status
 # uptime:               62 s
 # downstream_enrolled:  true
 
-sudo yggdrasilctl local rules list
-# name  proto  listen          upstream
-# ssh   tcp    0.0.0.0:2222    dynamic:peer:22
+sudo yggdrasilctl local derived-rules
+# {
+#   "derived_rules": [ ... "ssh" ... ],
+#   "predicates": [ ... "ssh" ... ]
+# }
 
 sudo yggdrasilctl chain diff
 # hop 0 (local x25519:9d2f04a3…): predicates=1 v=1 origin=x25519:9d2f04a3…
@@ -239,7 +241,7 @@ EOF
 
 Within ~250 ms the terminal re-validates, the predicate publisher emits
 a fresh version, the relay derives the new listeners, and
-`yggdrasilctl local rules list` on the VPS shows all three rules.
+`yggdrasilctl local derived-rules` on the VPS shows all three rules.
 
 ## What to read next
 

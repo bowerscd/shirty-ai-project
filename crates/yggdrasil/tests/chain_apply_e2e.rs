@@ -5,10 +5,9 @@
 //!    assert `ChainApplied { applied_rule_count, predicate_count }`,
 //!    and verify the supervisor's `current_set_rx` watch fires with the
 //!    new ruleset.
-//! 2. **Relay-mode rejection**: a relay supervisor refuses
-//!    `ChainApply` with `NOT_SUPPORTED_IN_RELAY_MODE`. Relays derive
-//!    their rule set from downstream predicate pushes and would
-//!    immediately overwrite any manual apply.
+//! 2. **Relay-mode rejection**: a relay control server does not bind
+//!    `ChainApply` and returns `METHOD_NOT_AVAILABLE_ON_MODE` before
+//!    the apply handler runs.
 //! 3. **Invalid rules rejection**: a candidate set with duplicate names
 //!    is rejected synchronously with `RULES_INVALID` and the
 //!    supervisor's current set does not change.
@@ -149,11 +148,11 @@ async fn terminal_chain_apply_enqueues_and_reports() {
     supervisor.stop().await;
 }
 
-/// `chain apply` against a relay-mode daemon is refused with
-/// `NOT_SUPPORTED_IN_RELAY_MODE`. The supervisor's current rule set
+/// `chain apply` against a relay-mode daemon is refused at wire-up with
+/// `METHOD_NOT_AVAILABLE_ON_MODE`. The supervisor's current rule set
 /// must not change.
 #[tokio::test]
-async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
+async fn relay_chain_apply_returns_method_not_available_on_mode() {
     let shutdown = CancellationToken::new();
     let rules_tmp = tempfile::tempdir().unwrap();
     let rules_dir = rules_tmp.path().join("rules");
@@ -207,8 +206,12 @@ async fn relay_chain_apply_returns_not_supported_in_relay_mode() {
     .await;
 
     match resp {
-        Response::Error { code, .. } => {
-            assert_eq!(code, error_codes::NOT_SUPPORTED_IN_RELAY_MODE);
+        Response::Error { code, message } => {
+            assert_eq!(code, error_codes::METHOD_NOT_AVAILABLE_ON_MODE);
+            assert!(
+                message.contains("chain apply") && message.contains("relay-mode"),
+                "unexpected message: {message}"
+            );
         }
         other => panic!("expected Error response, got {other:?}"),
     }

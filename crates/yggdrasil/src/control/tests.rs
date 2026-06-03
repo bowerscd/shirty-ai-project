@@ -81,8 +81,9 @@ async fn send_request(socket_path: &Path, req: &Request) -> Response {
 /// peer-state/pending-store args in `Some(...)` so individual tests stay
 /// terse. Terminal-mode tests (which want `None` for both) bind
 /// directly.
-async fn bind_relay_control(
+async fn bind_accepting_control(
     socket: PathBuf,
+    mode: Mode,
     peer_state: Arc<PeerState>,
     supervisor: &ProxySupervisor,
     pending: Arc<PendingPeerStore>,
@@ -91,11 +92,79 @@ async fn bind_relay_control(
 ) -> ControlServer {
     ControlServer::bind(
         socket,
-        Mode::Relay,
+        mode,
         "test-node".to_string(),
         Some(peer_state),
         supervisor,
         Some(pending),
+        cfg,
+        false,
+        crate::metrics::detached_handle_for_tests(),
+        None,
+        None,
+        None,
+        None,
+        std::sync::Arc::new(crate::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(crate::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs")),
+        shutdown,
+    )
+    .await
+    .unwrap()
+}
+
+async fn bind_relay_control(
+    socket: PathBuf,
+    peer_state: Arc<PeerState>,
+    supervisor: &ProxySupervisor,
+    pending: Arc<PendingPeerStore>,
+    cfg: PathBuf,
+    shutdown: CancellationToken,
+) -> ControlServer {
+    bind_accepting_control(
+        socket,
+        Mode::Relay,
+        peer_state,
+        supervisor,
+        pending,
+        cfg,
+        shutdown,
+    )
+    .await
+}
+
+async fn bind_gateway_control(
+    socket: PathBuf,
+    peer_state: Arc<PeerState>,
+    supervisor: &ProxySupervisor,
+    pending: Arc<PendingPeerStore>,
+    cfg: PathBuf,
+    shutdown: CancellationToken,
+) -> ControlServer {
+    bind_accepting_control(
+        socket,
+        Mode::Gateway,
+        peer_state,
+        supervisor,
+        pending,
+        cfg,
+        shutdown,
+    )
+    .await
+}
+
+async fn bind_terminal_control(
+    socket: PathBuf,
+    supervisor: &ProxySupervisor,
+    cfg: PathBuf,
+    shutdown: CancellationToken,
+) -> ControlServer {
+    ControlServer::bind(
+        socket,
+        Mode::Terminal,
+        "test-node".to_string(),
+        None,
+        supervisor,
+        None,
         cfg,
         false,
         crate::metrics::detached_handle_for_tests(),
@@ -247,18 +316,10 @@ async fn downstream_show_returns_empty_when_not_enrolled() {
 async fn rules_reload_returns_current_count() {
     let tmp = tempfile::tempdir().unwrap();
     let rules = tmp.path().join("rules");
-    let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+    let (supervisor, _peer_state, shutdown) = make_supervisor(&rules).await;
     let socket = tmp.path().join("control.sock");
-    let (pending, cfg) = aux_state(tmp.path());
-    let server = bind_relay_control(
-        socket.clone(),
-        peer_state.clone(),
-        &supervisor,
-        pending,
-        cfg,
-        shutdown.clone(),
-    )
-    .await;
+    let (_pending, cfg) = aux_state(tmp.path());
+    let server = bind_terminal_control(socket.clone(), &supervisor, cfg, shutdown.clone()).await;
 
     let resp = send_request(&socket, &Request::RulesReload).await;
     match resp {
@@ -269,6 +330,58 @@ async fn rules_reload_returns_current_count() {
         }
         other => panic!("unexpected response: {other:?}"),
     }
+    shutdown.cancel();
+    server.stop().await;
+    supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn gateway_terminal_only_methods_return_not_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rules = tmp.path().join("rules");
+    let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+    let socket = tmp.path().join("control.sock");
+    let (pending, cfg) = aux_state(tmp.path());
+    let server = bind_gateway_control(
+        socket.clone(),
+        peer_state.clone(),
+        &supervisor,
+        pending,
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+
+    let cases = [
+        ("chain apply", Request::ChainApply { rules: Vec::new() }),
+        ("local rules reload", Request::RulesReload),
+        ("local acme list", Request::AcmeList),
+        (
+            "local acme renew",
+            Request::AcmeRenew {
+                hostname: "example.com".into(),
+            },
+        ),
+    ];
+
+    for (method, request) in cases {
+        let resp = send_request(&socket, &request).await;
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, error_codes::METHOD_NOT_AVAILABLE_ON_MODE);
+                assert!(
+                    message.contains(method),
+                    "expected {method:?} in message, got: {message}"
+                );
+                assert!(
+                    message.contains("gateway-mode") && message.contains("terminal-mode daemon"),
+                    "expected mode-specific message, got: {message}"
+                );
+            }
+            other => panic!("expected Error response for {method}, got {other:?}"),
+        }
+    }
+
     shutdown.cancel();
     server.stop().await;
     supervisor.stop().await;

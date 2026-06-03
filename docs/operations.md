@@ -47,7 +47,8 @@ or a dedicated sidecar). There is no in-daemon HTTP listener to attack.
 
 ```bash
 sudo yggdrasilctl local status
-sudo yggdrasilctl local rules list
+sudo yggdrasilctl local derived-rules   # gateway / relay rule state
+sudo yggdrasilctl local rules list      # terminal rule files only
 ```
 
 On the relay, `status` reports the downstream's currently-observed IP,
@@ -197,8 +198,10 @@ a deploy box), use `chain apply`:
 sudo yggdrasilctl chain apply --file /tmp/candidate-rules.toml
 ```
 
-Terminal mode only. The daemon re-validates server-side and rejects the
-apply as a unit on any conflict.
+Terminal mode only. The CLI queries the daemon mode before reading the
+candidate file and refuses gateway / relay targets before dispatch. The
+daemon re-validates server-side and rejects the apply as a unit on any
+conflict.
 
 ### Driving ACME issuance and renewal
 
@@ -291,7 +294,7 @@ Subsequent renewals run on that same schedule until daemon stop.
 The wildcard cert covers SANs `[<domain>, *.<domain>]` — one cert
 for the apex and every immediate subdomain.
 
-**Inspecting status:**
+**Inspecting status (terminal mode only):**
 
 ```bash
 sudo yggdrasilctl local acme list
@@ -311,7 +314,7 @@ States are the `HostStatus` snapshot
 The `last_error` column is populated whenever the last issuance attempt
 failed.
 
-**Forcing an out-of-band renewal:**
+**Forcing an out-of-band renewal (terminal mode only):**
 
 ```bash
 sudo yggdrasilctl local acme renew example.com

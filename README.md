@@ -184,10 +184,10 @@ with Alt-Svc advertising enabled by default (see
 [`tests/http3_frontend.rs`](crates/yggdrasil/tests/http3_frontend.rs)).
 Certs can be sourced from disk, an in-memory ephemeral self-signed CA
 (test fixtures), or ACME (RFC 8555) — issuance is DNS-01 wildcard only
-today (via Cloudflare); `yggdrasilctl local acme {list,renew}` exposes
-inspection and on-demand renewal. **The ACME pipeline is unit-tested
-only**: there is no end-to-end test that issues a real cert from any
-CA in tree.
+today (via Cloudflare); terminal-mode `yggdrasilctl local acme
+{list,renew}` exposes inspection and on-demand renewal. **The ACME
+pipeline is unit-tested only**: there is no end-to-end test that issues
+a real cert from any CA in tree.
 
 There is no FFI, no dynamic link to OpenSSL, no C build dependency.
 
