@@ -20,6 +20,10 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +33,7 @@ use ratatoskr::predicate::{Predicate, PredicateSet};
 use ratatoskr::rule::Protocol;
 use ratatoskr::wire;
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +44,150 @@ use yggdrasil::proxy::resolver::ResolverFactory;
 use yggdrasil::proxy::supervisor::{CertConfig, ProxySupervisor};
 
 use common::{drive_handshake, pick_free_tcp_port};
+
+static NEXT_SCRATCH_DIR: AtomicUsize = AtomicUsize::new(0);
+
+struct RepoScratchDir {
+    path: PathBuf,
+}
+
+impl RepoScratchDir {
+    fn new(label: &str) -> Self {
+        let id = NEXT_SCRATCH_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-state/chain_predicate_e2e")
+            .join(format!("{label}-{}-{id}", std::process::id()));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).unwrap();
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RepoScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct PredicateReceiverHarness {
+    server_pubkey: ratatoskr::pubkey::PubKey,
+    client_keys: StaticKeyPair,
+    server_addr: SocketAddr,
+    supervisor: ProxySupervisor,
+    cancel: CancellationToken,
+    hb_join: JoinHandle<anyhow::Result<()>>,
+    _rules_dir: RepoScratchDir,
+}
+
+impl PredicateReceiverHarness {
+    async fn stop(self) {
+        self.cancel.cancel();
+        self.supervisor.stop().await;
+        let _ = self.hb_join.await;
+    }
+}
+
+async fn spawn_predicate_receiver(label: &str) -> PredicateReceiverHarness {
+    let server_keys = StaticKeyPair::generate().unwrap();
+    let client_keys = StaticKeyPair::generate().unwrap();
+    let peer_state = PeerState::new(Some(client_keys.public_key()));
+    let pending_store = Arc::new(PendingPeerStore::new());
+    let rules_dir = RepoScratchDir::new(label);
+    let cancel = CancellationToken::new();
+    let supervisor = ProxySupervisor::spawn(
+        rules_dir.path().to_path_buf(),
+        Duration::from_millis(50),
+        ResolverFactory::new_relay(peer_state.clone()),
+        Some("127.0.0.1".parse().unwrap()),
+        None,
+        CertConfig::default(),
+        None,
+        cancel.clone(),
+    )
+    .await
+    .expect("spawn supervisor");
+    let derive_cfg = DeriveConfig {
+        bind_addr: "127.0.0.1".parse().unwrap(),
+        proxy_protocol: None,
+    };
+    let acceptor = ChainAcceptor::new(supervisor.handle(), derive_cfg);
+    let (hb, _outbound) = HeartbeatServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        server_keys.clone(),
+        peer_state,
+        pending_store,
+        Some(acceptor),
+        cancel.clone(),
+    )
+    .await
+    .expect("bind server");
+    let server_addr = hb.local_addr().unwrap();
+    let hb_join = tokio::spawn(hb.run());
+    PredicateReceiverHarness {
+        server_pubkey: server_keys.public_key(),
+        client_keys,
+        server_addr,
+        supervisor,
+        cancel,
+        hb_join,
+        _rules_dir: rules_dir,
+    }
+}
+
+fn predicate_set(origin: ratatoskr::pubkey::PubKey, name: &str, listen_port: u16) -> PredicateSet {
+    PredicateSet {
+        predicates: vec![Predicate {
+            name: name.into(),
+            listen_port,
+            protocol: Protocol::Tcp,
+            idle_timeout_ms: None,
+            https_http3: false,
+        }],
+        origin,
+    }
+}
+
+async fn push_predicates(
+    session: &mut ratatoskr::auth::Session,
+    sock: &UdpSocket,
+    seq: u32,
+    set: &PredicateSet,
+) -> ratatoskr::control_frame::ControlAck {
+    let envelope = ControlEnvelope {
+        seq,
+        body_type: ControlBodyType::PredicateSetUpdate.as_byte(),
+        body: postcard::to_allocvec(set).unwrap(),
+    };
+    send_control_and_await_ack(session, sock, &envelope).await
+}
+
+async fn wait_for_exact_rule_names(supervisor: &ProxySupervisor, expected: &[&str]) {
+    let expected = expected
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let names = supervisor
+            .snapshot()
+            .iter()
+            .map(|rule| rule.name.clone())
+            .collect::<BTreeSet<_>>();
+        if names == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("expected derived rules {expected:?}, got {names:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// One-shot helper that fires a single `Control` envelope and returns
 /// the (decoded) `ControlAck`.
@@ -184,6 +333,62 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
     supervisor.stop().await;
     let _ = hb_join.await;
     drop(rules_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn predicate_updates_apply_after_fresh_sessions_and_rollbacks() {
+    let receiver = spawn_predicate_receiver("realignment").await;
+    let origin = receiver.client_keys.public_key();
+    let alpha_port = pick_free_tcp_port().await;
+    let beta_port = pick_free_tcp_port().await;
+    let alpha = predicate_set(origin, "alpha", alpha_port);
+    let beta = predicate_set(origin, "beta", beta_port);
+
+    let (mut first_session, first_sock) = drive_handshake(
+        &receiver.server_pubkey,
+        &receiver.client_keys,
+        receiver.server_addr,
+    )
+    .await;
+    let ack = push_predicates(&mut first_session, &first_sock, 1, &alpha).await;
+    assert_eq!(ack.status, AckStatus::Ok);
+    wait_for_exact_rule_names(&receiver.supervisor, &["alpha"]).await;
+
+    // Scenario A: the receiver stays up while its authenticated peer
+    // reconnects and forwards the same terminal-authored set again.
+    drop(first_session);
+    drop(first_sock);
+    let (mut second_session, second_sock) = drive_handshake(
+        &receiver.server_pubkey,
+        &receiver.client_keys,
+        receiver.server_addr,
+    )
+    .await;
+    let ack = push_predicates(&mut second_session, &second_sock, 1, &alpha).await;
+    assert_eq!(ack.status, AckStatus::Ok);
+    wait_for_exact_rule_names(&receiver.supervisor, &["alpha"]).await;
+
+    // Scenario B: a fresh terminal session publishes a replacement set.
+    drop(second_session);
+    drop(second_sock);
+    let (mut third_session, third_sock) = drive_handshake(
+        &receiver.server_pubkey,
+        &receiver.client_keys,
+        receiver.server_addr,
+    )
+    .await;
+    let ack = push_predicates(&mut third_session, &third_sock, 1, &beta).await;
+    assert_eq!(ack.status, AckStatus::Ok);
+    wait_for_exact_rule_names(&receiver.supervisor, &["beta"]).await;
+
+    // Scenario C: re-publishing the earlier snapshot replaces the newer set.
+    let ack = push_predicates(&mut third_session, &third_sock, 2, &alpha).await;
+    assert_eq!(ack.status, AckStatus::Ok);
+    wait_for_exact_rule_names(&receiver.supervisor, &["alpha"]).await;
+
+    drop(third_session);
+    drop(third_sock);
+    receiver.stop().await;
 }
 
 #[tokio::test]
