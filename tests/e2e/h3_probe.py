@@ -90,14 +90,27 @@ class _H3Client(QuicConnectionProtocol):
                 self.received_body.extend(h3_event.data)
                 if h3_event.stream_ended:
                     self.done.set()
-        # Some H3 servers (including yggdrasil's at time of writing
-        # — see h3_frontend.rs:580 where `stream.finish()` is called
-        # but the FIN flush can be delayed past the response body
-        # in practice) don't promptly mark the data frame with
-        # END_STREAM, so we also complete the request once we've
-        # received the full body declared by `content-length`. The
-        # `stream_ended=True` path remains the preferred completion
-        # signal when the server does flush FIN promptly.
+        # Content-length fallback: aioquic <-> h3-rs interop quirk on
+        # the FIRST stream of an h3 connection. h3-rs's
+        # `RequestStream::finish()` sends a per-connection GREASE
+        # frame (RFC 9114 §7.2.8) between the response body and the
+        # QUIC FIN — once-per-connection, only on the first stream.
+        # aioquic's H3 layer handles GREASE silently (no event
+        # emitted), and because end_stream is attached to the LAST
+        # carried frame, the FIN ends up on the silent GREASE frame
+        # rather than the DataReceived event. Wire-level trace
+        # confirms QUIC StreamDataReceived has end_stream=True but
+        # the DataReceived loses it. Second + subsequent requests on
+        # the same connection don't trigger the bug (no more
+        # GREASE). Verified against yggdrasil's h3 frontend with
+        # h3=0.0.8 / h3-quinn=0.0.10 / aioquic=1.x; see finding
+        # `h3-fin-flush-delay` for the full trace.
+        #
+        # Workaround: complete when we've received the full body
+        # declared by `content-length`. The `stream_ended=True`
+        # path remains the preferred completion signal when the
+        # server flushes FIN visibly (e.g. via h3 clients that
+        # handle GREASE differently).
         cl = self._content_length_header()
         if cl is not None and len(self.received_body) >= cl:
             self.done.set()
