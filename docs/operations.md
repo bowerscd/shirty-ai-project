@@ -514,6 +514,32 @@ upstream:
 The chain is essentially a linked list — each hop only knows about its
 immediate upstream and immediate downstream.
 
+### Forcing the chain client to reconnect immediately
+
+When an operator has just brought the upstream back online (router
+swap, ISP outage clearing, gateway maintenance window ending), the
+local chain client takes up to ~30 s to notice on its own — UDP has no
+disconnect signal, so the client waits for six consecutive heartbeats
+to go unacked (`ACK_DEADLINE_MULTIPLIER × heartbeat_interval`) before
+deciding the session is dead and re-handshaking.
+
+`yggdrasilctl chain reconnect` short-circuits that wait:
+
+```
+$ yggdrasilctl chain reconnect
+chain reconnect signal delivered; re-handshake will follow on the chain-client task
+```
+
+The command is fire-and-forget — it returns as soon as the signal
+reaches the chain client's run loop, not once the new handshake has
+completed. Observe completion via `chain summary` or `chain diff`
+showing a non-`partial` chain again.
+
+Available on any node with a `[dial]` configured (terminals and
+mid-chain relays). Gateways have no chain client; the CLI mode-probe
+refuses there client-side, and the daemon backstops with the
+`no_chain_upstream` error code if the mode probe is somehow bypassed.
+
 ## Troubleshooting
 
 ### Profiling the hot path (dev-only)

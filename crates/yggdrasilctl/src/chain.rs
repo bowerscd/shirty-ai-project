@@ -92,6 +92,7 @@ pub async fn run(cmd: Cmd, socket: &Path, json: bool) -> Result<()> {
         Cmd::Health(args) => health(socket, &args, json).await,
         Cmd::Ping(args) => ping(socket, &args, json).await,
         Cmd::Canary(args) => canary(socket, &args, json).await,
+        Cmd::Reconnect => reconnect(socket).await,
     }
 }
 
@@ -144,6 +145,42 @@ async fn apply(socket: &Path, args: &ApplyArgs) -> Result<()> {
             bail!("daemon refused apply: code={code} message={message}");
         }
         other => bail!("daemon returned unexpected response to ChainApply: {other:?}"),
+    }
+}
+
+// =============================================================================
+// `chain reconnect`
+// =============================================================================
+
+/// Nudge the local chain client to abandon its current session and
+/// re-handshake immediately, skipping the natural ack-deadline
+/// detection wait (default ~30s).
+///
+/// CLI does a mode probe first and refuses on gateway (no chain
+/// client) with a friendly client-side error, matching the
+/// `chain apply` pattern. The daemon's own
+/// [`error_codes::NO_CHAIN_UPSTREAM`] backstops the same shape for
+/// any daemon that's mid-restart between the mode probe and the
+/// reconnect RPC.
+///
+/// [`error_codes::NO_CHAIN_UPSTREAM`]: ratatoskr::control::error_codes::NO_CHAIN_UPSTREAM
+async fn reconnect(socket: &Path) -> Result<()> {
+    ensure_has_chain_upstream(socket).await?;
+
+    let request = Request::ChainReconnect;
+    let response = send_chain_request(socket, &request, DEFAULT_CLIENT_TIMEOUT_SECS).await?;
+
+    match response {
+        Response::ChainReconnected => {
+            println!(
+                "chain reconnect signal delivered; re-handshake will follow on the chain-client task"
+            );
+            Ok(())
+        }
+        Response::Error { code, message } => {
+            bail!("daemon refused reconnect: code={code} message={message}");
+        }
+        other => bail!("daemon returned unexpected response to ChainReconnect: {other:?}"),
     }
 }
 
@@ -1127,6 +1164,30 @@ async fn ensure_terminal_mode(socket: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Variant of [`ensure_terminal_mode`] for chain-affined commands
+/// that are available on any daemon with a chain upstream (terminals
+/// AND mid-chain relays). Refuses on `Mode::Gateway` only, which is
+/// the one mode with no chain client.
+async fn ensure_has_chain_upstream(socket: &Path) -> Result<()> {
+    let response =
+        send_chain_request(socket, &Request::Status, DEFAULT_CLIENT_TIMEOUT_SECS).await?;
+    let mode = match response {
+        Response::Status(status) => status.mode,
+        Response::Error { code, message } => {
+            bail!("status query failed before mode check: {code}: {message}");
+        }
+        other => bail!("expected Status response before mode check, got {other:?}"),
+    };
+    if mode == Mode::Gateway {
+        bail!(
+            "this command requires a daemon with a chain upstream ([dial] configured); \
+             target at {} is a gateway",
+            socket.display(),
+        );
+    }
+    Ok(())
+}
+
 const DEFAULT_CLIENT_TIMEOUT_SECS: Duration = Duration::from_secs(5);
 
 /// Generic UDS round-trip helper. Sends `req` as one JSON line, reads
@@ -1406,6 +1467,126 @@ target = "127.0.0.1:22"
 
         let seen = server.await.unwrap();
         assert_eq!(seen, vec![Request::Status]);
+    }
+
+    #[tokio::test]
+    async fn chain_reconnect_refuses_gateway_before_dispatch() {
+        // Symmetric to `chain_apply_refuses_gateway_before_dispatch`:
+        // the CLI must query mode first and refuse on `Mode::Gateway`
+        // (the one mode with no chain client) before shipping the
+        // `Request::ChainReconnect`. Relays and terminals both
+        // accept it daemon-side.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(collect_requests_until_idle(
+            listener,
+            status_response(Mode::Gateway),
+        ));
+
+        let err = run(Cmd::Reconnect, &socket, false)
+            .await
+            .expect_err("gateway-mode daemon should be rejected client-side");
+        let message = err.to_string();
+        assert!(
+            message.contains("chain upstream") && message.contains("[dial]"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("gateway"), "unexpected error: {message}");
+        assert!(
+            message.contains(&socket.display().to_string()),
+            "unexpected error: {message}"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(
+            seen,
+            vec![Request::Status],
+            "ChainReconnect should not have been sent after mode probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_reconnect_succeeds_on_terminal_mode() {
+        // Symmetric "happy path" for `chain reconnect`: terminal mode
+        // passes the client-side mode probe, the runner ships the
+        // `Request::ChainReconnect`, the (mock) daemon answers
+        // `Response::ChainReconnected`, the CLI returns Ok.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            // Two accepts: one for the mode probe, one for the
+            // reconnect RPC. Each is a fresh UDS connection per the
+            // `send_chain_request` helper.
+            for accept_index in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: Request = serde_json::from_str(line.trim()).unwrap();
+                seen.push(req);
+                let response = if accept_index == 0 {
+                    status_response(Mode::Terminal)
+                } else {
+                    Response::ChainReconnected
+                };
+                let mut buf = serde_json::to_vec(&response).unwrap();
+                buf.push(b'\n');
+                writer.write_all(&buf).await.unwrap();
+            }
+            seen
+        });
+
+        run(Cmd::Reconnect, &socket, false)
+            .await
+            .expect("terminal-mode daemon should accept chain reconnect");
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen, vec![Request::Status, Request::ChainReconnect]);
+    }
+
+    #[tokio::test]
+    async fn chain_reconnect_succeeds_on_relay_mode() {
+        // Relays also accept `chain reconnect` — they hold a chain
+        // client too (their `[dial]` points at the next upstream).
+        // This asserts the CLI mode probe doesn't gate too tightly.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for accept_index in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: Request = serde_json::from_str(line.trim()).unwrap();
+                seen.push(req);
+                let response = if accept_index == 0 {
+                    status_response(Mode::Relay)
+                } else {
+                    Response::ChainReconnected
+                };
+                let mut buf = serde_json::to_vec(&response).unwrap();
+                buf.push(b'\n');
+                writer.write_all(&buf).await.unwrap();
+            }
+            seen
+        });
+
+        run(Cmd::Reconnect, &socket, false)
+            .await
+            .expect("relay-mode daemon should accept chain reconnect");
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen, vec![Request::Status, Request::ChainReconnect]);
     }
 
     // ---- hop_labels ----

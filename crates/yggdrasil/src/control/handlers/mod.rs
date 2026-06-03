@@ -12,7 +12,7 @@ pub(super) mod rules_reload;
 pub(super) use accept::approve_downstream;
 pub(super) use acme::{dispatch_acme_list, dispatch_acme_renew};
 pub(super) use canary::dispatch_chain_canary;
-pub(super) use chain::{dispatch_chain_apply, dispatch_chain_summary};
+pub(super) use chain::{dispatch_chain_apply, dispatch_chain_reconnect, dispatch_chain_summary};
 pub(super) use rules_reload::dispatch_rules_reload;
 
 use ratatoskr::control::{error_codes, Response};

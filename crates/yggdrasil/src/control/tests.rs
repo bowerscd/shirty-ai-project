@@ -177,6 +177,59 @@ async fn bind_terminal_control(
     .unwrap()
 }
 
+/// Bind a terminal-mode control server whose state carries a live
+/// `chain_client_handle`. The handle is sourced from a freshly-built
+/// `ChainClient` that is never `run()` — so it just owns the
+/// reconnect-signal `Notify` without actually dialing anywhere.
+/// Used by tests that exercise the
+/// [`ratatoskr::control::Request::ChainReconnect`] dispatch path.
+async fn bind_terminal_control_with_chain_handle(
+    socket: PathBuf,
+    supervisor: &ProxySupervisor,
+    cfg: PathBuf,
+    shutdown: CancellationToken,
+) -> ControlServer {
+    use crate::chain::client::{ChainClient, ChainClientConfig};
+    use ratatoskr::auth::StaticKeyPair;
+    use std::time::Duration;
+    let chain_cfg = ChainClientConfig {
+        endpoint: "127.0.0.1:1".to_string(),
+        upstream_pubkey: ratatoskr::pubkey::PubKey::x25519([0u8; 32]),
+        local_keys: StaticKeyPair::generate().unwrap(),
+        heartbeat_interval: Duration::from_secs(1),
+        rekey_interval: Duration::from_secs(60),
+        body_handler: None,
+        local_bind: None,
+    };
+    let chain_client = ChainClient::new(chain_cfg, CancellationToken::new());
+    let chain_client_handle = chain_client.handle();
+    // Deliberately drop the client without running it — the handle
+    // keeps the reconnect-signal Notify alive (Arc) so notify_one()
+    // is still well-defined.
+    drop(chain_client);
+
+    ControlServer::bind(
+        socket,
+        Mode::Terminal,
+        "test-node".to_string(),
+        None,
+        supervisor,
+        None,
+        cfg,
+        false,
+        crate::metrics::detached_handle_for_tests(),
+        None,
+        Some(chain_client_handle),
+        None,
+        None,
+        std::sync::Arc::new(crate::proxy::canary::CanaryArmTable::new()),
+        std::sync::Arc::new(crate::lan_cidrs::LanCidrs::resolve(None).expect("default lan_cidrs")),
+        shutdown,
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn status_reports_initial_state() {
     let tmp = tempfile::tempdir().unwrap();
@@ -377,6 +430,72 @@ async fn gateway_terminal_only_methods_return_not_available() {
             }
             other => panic!("expected Error response for {method}, got {other:?}"),
         }
+    }
+
+    shutdown.cancel();
+    server.stop().await;
+    supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn chain_reconnect_refused_when_no_chain_upstream() {
+    // A daemon bound without a `chain_client_handle` (any of:
+    // gateway-mode, root-mode relay, pure-local terminal) must
+    // refuse `Request::ChainReconnect` with the dedicated
+    // `NO_CHAIN_UPSTREAM` code, NOT the `METHOD_NOT_AVAILABLE_ON_MODE`
+    // code used for the strict terminal-only set.
+    let tmp = tempfile::tempdir().unwrap();
+    let rules = tmp.path().join("rules");
+    let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
+    let socket = tmp.path().join("control.sock");
+    let (pending, cfg) = aux_state(tmp.path());
+    let server = bind_gateway_control(
+        socket.clone(),
+        peer_state.clone(),
+        &supervisor,
+        pending,
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+
+    let resp = send_request(&socket, &Request::ChainReconnect).await;
+    match resp {
+        Response::Error { code, message } => {
+            assert_eq!(code, error_codes::NO_CHAIN_UPSTREAM);
+            assert!(
+                message.contains("chain upstream") && message.contains("[dial]"),
+                "expected chain-upstream-specific message, got: {message}"
+            );
+        }
+        other => panic!("expected NO_CHAIN_UPSTREAM error, got {other:?}"),
+    }
+    shutdown.cancel();
+    server.stop().await;
+    supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn chain_reconnect_succeeds_when_handle_is_wired() {
+    // A daemon with `Some(chain_client_handle)` accepts the request
+    // and returns `Response::ChainReconnected`. We don't observe the
+    // re-handshake here (it would require a live upstream) — that's
+    // covered in `chain::client::tests::reconnect_now_*`. The
+    // assertion here is purely "the control surface accepts the
+    // request and delivers the signal".
+    let tmp = tempfile::tempdir().unwrap();
+    let rules = tmp.path().join("rules");
+    let (supervisor, _peer_state, shutdown) = make_supervisor(&rules).await;
+    let socket = tmp.path().join("control.sock");
+    let (_pending, cfg) = aux_state(tmp.path());
+    let server =
+        bind_terminal_control_with_chain_handle(socket.clone(), &supervisor, cfg, shutdown.clone())
+            .await;
+
+    let resp = send_request(&socket, &Request::ChainReconnect).await;
+    match resp {
+        Response::ChainReconnected => {}
+        other => panic!("expected ChainReconnected, got {other:?}"),
     }
 
     shutdown.cancel();

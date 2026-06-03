@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use ratatoskr::canary::{CanaryArm as CanaryArmFrame, CanaryReply};
 use ratatoskr::chain_query::{ChainHopQuery, ChainHopReply};
@@ -56,6 +56,13 @@ pub struct ChainClientHandle {
     /// predicate state on restart but the publisher's `last_sent`
     /// snapshot would otherwise keep deduping against stale state.
     pub(super) session_epoch_rx: watch::Receiver<u64>,
+    /// Shared "reconnect now" signal owned by the chain client. Fires
+    /// when [`ChainClientHandle::reconnect_now`] is invoked, causing the
+    /// heartbeat loop to abandon its current session and re-handshake
+    /// without waiting for the ack-deadline detection (~30s by
+    /// default). The control-plane backing is
+    /// [`ratatoskr::control::Request::ChainReconnect`].
+    pub(super) reconnect_signal: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +103,7 @@ impl ChainClientHandle {
             tx,
             router: QueryRouter::new(),
             session_epoch_rx,
+            reconnect_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -114,6 +122,7 @@ impl ChainClientHandle {
                 tx,
                 router: QueryRouter::new(),
                 session_epoch_rx,
+                reconnect_signal: Arc::new(Notify::new()),
             },
             epoch_tx,
         )
@@ -136,6 +145,38 @@ impl ChainClientHandle {
     /// [`crate::chain::predicate_publisher`] for the resync pattern.
     pub fn session_epoch_rx(&self) -> watch::Receiver<u64> {
         self.session_epoch_rx.clone()
+    }
+
+    /// Operator-facing "reconnect now" nudge. Wakes the chain client's
+    /// run loop out of its current session so it re-handshakes
+    /// immediately, bypassing the ack-deadline detection wait that
+    /// otherwise kicks in only after several missed heartbeats
+    /// (default ~30s).
+    ///
+    /// The signal is delivered via a shared [`Notify`]: any call to
+    /// this method causes the heartbeat loop to return
+    /// [`SessionExit::ReconnectRequested`] on its next scheduler tick,
+    /// which the outer `run()` treats like a rekey (re-handshake, no
+    /// backoff). Multiple back-to-back nudges between two scheduler
+    /// ticks collapse into one — `Notify` is edge-triggered.
+    ///
+    /// The call is fire-and-forget: it returns as soon as the signal
+    /// is delivered to the channel, *not* once the re-handshake has
+    /// completed. Operators observe completion via `chain summary` /
+    /// `chain diff` once the new session is up.
+    ///
+    /// Note: there is no equivalent state on the gateway side. UDP
+    /// has no graceful disconnect signal, so a gateway whose terminal
+    /// just reconnected will see the new handshake naturally — its
+    /// old session-state is replaced atomically inside the
+    /// [`HeartbeatServer`](crate::heartbeat::HeartbeatServer)'s
+    /// `Acceptor` on the next valid Handshake1 from the same
+    /// origin pubkey.
+    ///
+    /// [`SessionExit::ReconnectRequested`]: super::run_loop::SessionExit::ReconnectRequested
+    /// [`HeartbeatServer`]: crate::heartbeat::HeartbeatServer
+    pub fn reconnect_now(&self) {
+        self.reconnect_signal.notify_one();
     }
 
     /// Issue a [`ChainHopQuery`] upstream and await the matching

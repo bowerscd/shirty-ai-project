@@ -224,6 +224,17 @@ pub enum Request {
         /// `None` uses [`crate::canary::CANARY_ARM_DEFAULT_DEADLINE_MS`].
         timeout_ms: Option<u32>,
     },
+    /// Nudge the local chain client to abandon its current session and
+    /// re-handshake immediately, skipping the natural ack-deadline
+    /// detection wait (default ~30s). Useful both operationally — "I
+    /// just fixed my home router; retry the chain now" — and in tests
+    /// that have just bounced the upstream and don't want to wait
+    /// for liveness detection to fire.
+    ///
+    /// **Available on any daemon with a chain upstream (`[dial]`
+    /// configured).** Gateways have no chain client and refuse this
+    /// method with [`error_codes::NO_CHAIN_UPSTREAM`].
+    ChainReconnect,
 }
 
 /// All possible server → client messages.
@@ -294,6 +305,12 @@ pub enum Response {
     /// field discriminates between the four primary outcomes; the
     /// other fields carry the structured detail rendered by the CLI.
     ChainCanary(ChainCanaryResponse),
+    /// Successful response to [`Request::ChainReconnect`]. The reconnect
+    /// signal has been delivered to the chain client; the re-handshake
+    /// happens asynchronously on the chain-client task and operators
+    /// observe completion through `chain summary` / `chain diff` once
+    /// the new session is up.
+    ChainReconnected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -808,6 +825,14 @@ pub mod error_codes {
     /// daemon returns a successful [`super::Response::ChainCanary`]
     /// with `status = [super::CanaryStatus::NoSuchRule]`.
     pub const NO_SUCH_RULE: &str = "no_such_rule";
+    /// The request names a chain-affined method
+    /// ([`super::Request::ChainReconnect`]) on a daemon that has no
+    /// chain upstream configured (`[dial]` absent — typically a
+    /// gateway). Distinct from
+    /// [`METHOD_NOT_AVAILABLE_ON_MODE`] because the gate is
+    /// `[dial]`-presence, not strict mode: relays AND terminals
+    /// accept it, gateways refuse.
+    pub const NO_CHAIN_UPSTREAM: &str = "no_chain_upstream";
 }
 
 /// Default UDS path the server binds and the CLI connects to.
@@ -835,12 +860,34 @@ mod tests {
             Request::ChainSummary {
                 timeout_ms: Some(2500),
             },
+            Request::ChainReconnect,
         ];
         for r in cases {
             let s = serde_json::to_string(&r).unwrap();
             let back: Request = serde_json::from_str(&s).unwrap();
             assert_eq!(r, back);
         }
+    }
+
+    #[test]
+    fn chain_reconnect_request_serialises_as_snake_case_kind() {
+        let s = serde_json::to_string(&Request::ChainReconnect).unwrap();
+        assert_eq!(s, r#"{"kind":"chain_reconnect"}"#);
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, Request::ChainReconnect);
+    }
+
+    #[test]
+    fn chain_reconnected_response_serialises_as_snake_case_kind() {
+        let s = serde_json::to_string(&Response::ChainReconnected).unwrap();
+        assert_eq!(s, r#"{"kind":"chain_reconnected"}"#);
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, Response::ChainReconnected);
+    }
+
+    #[test]
+    fn no_chain_upstream_error_code_is_stable() {
+        assert_eq!(error_codes::NO_CHAIN_UPSTREAM, "no_chain_upstream");
     }
 
     #[test]

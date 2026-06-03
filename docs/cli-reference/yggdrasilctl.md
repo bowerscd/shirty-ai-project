@@ -28,6 +28,7 @@ This document contains the help content for the `yggdrasilctl` command-line prog
 * [`yggdrasilctl chain health`↴](#yggdrasilctl-chain-health)
 * [`yggdrasilctl chain ping`↴](#yggdrasilctl-chain-ping)
 * [`yggdrasilctl chain canary`↴](#yggdrasilctl-chain-canary)
+* [`yggdrasilctl chain reconnect`↴](#yggdrasilctl-chain-reconnect)
 * [`yggdrasilctl identity`↴](#yggdrasilctl-identity)
 * [`yggdrasilctl identity show`↴](#yggdrasilctl-identity-show)
 * [`yggdrasilctl identity rotate`↴](#yggdrasilctl-identity-rotate)
@@ -253,6 +254,7 @@ Chain-control plane operations
 * `health` — Per-hop health (healthy / degraded / down / starting), aggregated to a chain-wide worst-of-hops verdict. Exit code reflects the worst hop: 0=healthy/starting, 1=degraded, 2=down, 3=RPC error
 * `ping` — Per-hop control-plane round-trip time. Walks the chain via the same `Request::ChainSummary` RPC and prints each hop's measured query→reply RTT (or `-` for the local hop, which has no RTT to report). Useful for isolating "slow link" vs. "unreachable hop" during a chain incident
 * `canary` — Probe a rule's L4 forwarding path end-to-end through the chain and report per-direction throughput, loss, and latency. Routes a token-prefixed probe through the rule's listener so the terminal hop short-circuits to an in-process echo — testing the chain without depending on the rule's configured backend being reachable
+* `reconnect` — Nudge the local chain client to abandon its current session and re-handshake immediately. Operationally useful for "I just fixed my home router; retry now" — without this nudge the client waits out the ack-deadline (default ~30s) before deciding the session is dead. Available on any node with a `[dial]` upstream configured (terminals AND relays); gateways have no chain client and refuse client-side
 
 ###### **Options:**
 
@@ -349,6 +351,14 @@ Exit code: 0=OK, 1=DEGRADED, 2=NO_SUCH_RULE, 3=CHAIN_DEAD, 4=RPC error.
 * `--timeout <DURATION>` — Overall budget for the chain to walk and assemble the arming reply. Matches the `--timeout` shape of the other `chain` subcommands. Caps how long we wait before giving up with `CHAIN_DEAD`; the data probe runs for a fixed daemon-side duration regardless
 
   Default value: `5s`
+
+
+
+## `yggdrasilctl chain reconnect`
+
+Nudge the local chain client to abandon its current session and re-handshake immediately. Operationally useful for "I just fixed my home router; retry now" — without this nudge the client waits out the ack-deadline (default ~30s) before deciding the session is dead. Available on any node with a `[dial]` upstream configured (terminals AND relays); gateways have no chain client and refuse client-side
+
+**Usage:** `yggdrasilctl chain reconnect`
 
 
 

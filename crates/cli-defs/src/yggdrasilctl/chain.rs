@@ -45,6 +45,14 @@ pub enum Cmd {
     /// Exit code: 0=OK, 1=DEGRADED, 2=NO_SUCH_RULE, 3=CHAIN_DEAD,
     /// 4=RPC error.
     Canary(CanaryArgs),
+    /// Nudge the local chain client to abandon its current session and
+    /// re-handshake immediately. Operationally useful for "I just fixed
+    /// my home router; retry now" — without this nudge the client waits
+    /// out the ack-deadline (default ~30s) before deciding the session
+    /// is dead. Available on any node with a `[dial]` upstream
+    /// configured (terminals AND relays); gateways have no chain
+    /// client and refuse client-side.
+    Reconnect,
 }
 
 /// L4 transport selector for `chain canary --proto`.

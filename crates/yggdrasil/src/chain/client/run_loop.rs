@@ -22,6 +22,15 @@ use super::ChainClient;
 pub(super) enum SessionExit {
     Rekey,
     Cancelled,
+    /// The session was abandoned because an operator (or test
+    /// harness) called [`ChainClientHandle::reconnect_now`] via the
+    /// chain client's shared [`Notify`]. The outer `run()` treats
+    /// this like [`SessionExit::Rekey`] — re-handshake immediately,
+    /// reset backoff, no error log — except for an info-level
+    /// "operator-requested chain reconnect" trace.
+    ///
+    /// [`ChainClientHandle::reconnect_now`]: super::ChainClientHandle::reconnect_now
+    ReconnectRequested,
 }
 
 impl ChainClient {
@@ -114,6 +123,13 @@ impl ChainClient {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(SessionExit::Cancelled),
+                _ = self.reconnect_signal.notified() => {
+                    // Operator-triggered reconnect. Drain any extra
+                    // ticks that piled up while we were inside this
+                    // session so a single reconnect doesn't replay
+                    // immediately on the next iteration.
+                    return Ok(SessionExit::ReconnectRequested);
+                }
                 // Drain inbound before anything else: heartbeat acks must
                 // arrive promptly, and an unbounded outbound `control_rx`
                 // burst would otherwise starve this arm and bail the

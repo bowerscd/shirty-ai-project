@@ -1,4 +1,5 @@
-//! Async dispatchers for `Request::ChainApply` and `Request::ChainSummary`.
+//! Async dispatchers for `Request::ChainApply`, `Request::ChainSummary`,
+//! and `Request::ChainReconnect`.
 //!
 
 use ratatoskr::control::{
@@ -190,4 +191,34 @@ pub(in crate::control) async fn dispatch_chain_summary(
             })
         }
     }
+}
+
+/// Sync dispatch for [`ratatoskr::control::Request::ChainReconnect`].
+/// Available on any daemon with a chain upstream configured (terminals
+/// AND mid-chain relays); refused on gateways (no chain client) with
+/// [`error_codes::NO_CHAIN_UPSTREAM`].
+///
+/// The handler delivers the reconnect signal to the chain client's
+/// shared [`tokio::sync::Notify`] and returns immediately. The
+/// re-handshake itself happens asynchronously on the chain-client
+/// task; operators observe completion through `chain summary` once
+/// the new session is up. The signal is edge-triggered: two
+/// back-to-back invocations between scheduler ticks collapse to one.
+///
+/// We classify this as a "sync" dispatcher because it does no awaits
+/// — the [`super::super::ChainClientHandle::reconnect_now`] call is a
+/// non-blocking notify — but it lives here next to the other chain
+/// handlers to keep the chain-affined control surface in one place.
+pub(in crate::control) fn dispatch_chain_reconnect(state: &ControlState) -> Response {
+    let Some(handle) = state.chain_client_handle.as_ref() else {
+        return Response::Error {
+            code: error_codes::NO_CHAIN_UPSTREAM.into(),
+            message: "`chain reconnect` requires a chain upstream \
+                      ([dial] configured); this daemon has none"
+                .into(),
+        };
+    };
+    handle.reconnect_now();
+    tracing::info!("chain reconnect requested via control surface");
+    Response::ChainReconnected
 }

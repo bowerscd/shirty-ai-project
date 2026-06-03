@@ -232,6 +232,178 @@ async fn cancel_token_stops_client_promptly() {
 }
 
 #[tokio::test]
+async fn reconnect_now_triggers_immediate_rehandshake() {
+    // Reconnect signal must short-circuit the ack-deadline wait: a
+    // call to `ChainClientHandle::reconnect_now()` should cause the
+    // chain client to abandon its current session and re-handshake
+    // within ~1s, not wait out the ack-deadline (which at the test's
+    // 50ms heartbeat × default ACK_DEADLINE_MULTIPLIER=6 would still
+    // be 300ms — but the *signal-path* assertion is "the next
+    // handshake happens because we asked for it, not because
+    // detection fired").
+    let server_keys = StaticKeyPair::generate().unwrap();
+    let client_keys = StaticKeyPair::generate().unwrap();
+    let server_pub = server_keys.public_key();
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let handshakes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let handshakes_task = handshakes.clone();
+    let server_task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let mut session: Option<Session> = None;
+        loop {
+            let (n, from) = match sock.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let view = match wire::parse(&buf[..n]) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match view.packet_type {
+                PacketType::Handshake1 => {
+                    handshakes_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let half = Responder::process_handshake_1(&server_keys, &view).unwrap();
+                    let (s, reply) = half.complete().unwrap();
+                    sock.send_to(&reply, from).await.unwrap();
+                    session = Some(s);
+                }
+                PacketType::Heartbeat => {
+                    if let Some(s) = session.as_mut() {
+                        if let Ok(hb) = s.decode_heartbeat(&view) {
+                            let (_, ack) = s.encode_heartbeat_ack(hb.counter, 0).unwrap();
+                            sock.send_to(&ack, from).await.unwrap();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let cancel = CancellationToken::new();
+    let cfg = ChainClientConfig {
+        endpoint: addr.to_string(),
+        upstream_pubkey: server_pub,
+        local_keys: client_keys,
+        heartbeat_interval: Duration::from_millis(100),
+        // Rekey far enough out that it doesn't race the test.
+        rekey_interval: Duration::from_secs(60),
+        body_handler: None,
+        local_bind: None,
+    };
+    let client = ChainClient::new(cfg, cancel.clone());
+    let handle = client.handle();
+    let client_task = tokio::spawn(async move { client.run().await });
+
+    // Wait for the first handshake to complete + a heartbeat ack to
+    // come back; ensures the client is firmly in the steady-state
+    // session loop before we nudge.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while handshakes.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+        if Instant::now() > deadline {
+            panic!("first handshake never completed");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let one heartbeat round-trip so the client has a live
+    // `last_ack_at` (otherwise we're testing reconnect-mid-handshake,
+    // which is a different path).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        handshakes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "session should still be on its first handshake"
+    );
+
+    // Fire the reconnect signal. Expectation: the client returns
+    // SessionExit::ReconnectRequested from heartbeat_loop on its next
+    // scheduler tick, the outer run() resets backoff to BACKOFF_MIN
+    // (no sleep), and `run_session_once` issues handshake #2.
+    let nudge_at = Instant::now();
+    handle.reconnect_now();
+
+    let deadline = nudge_at + Duration::from_secs(2);
+    while handshakes.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+        if Instant::now() > deadline {
+            panic!(
+                "second handshake never fired (saw {} handshakes)",
+                handshakes.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let elapsed = nudge_at.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "second handshake took {elapsed:?} after nudge; \
+         expected near-instant (<500ms) — reconnect signal isn't \
+         short-circuiting the session loop"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn reconnect_now_during_backoff_loop_does_not_panic() {
+    // The reconnect signal lives on the chain client, which means
+    // `reconnect_now()` is safe to call regardless of whether the
+    // client is mid-session, mid-handshake, or mid-backoff. Edge case:
+    // calling it while the outer `run()` is parked in
+    // `sleep_or_cancel(&cancel, backoff)` should not panic and should
+    // not change behaviour (the signal is only consumed inside
+    // `heartbeat_loop`'s select; the outer sleep ignores it).
+    //
+    // We can't directly observe "backoff is in progress" — the
+    // existing `backoff_and_reconnect_when_endpoint_unresponsive`
+    // test asserts "task is still alive after 300ms" against the
+    // same setup. We piggyback on that pattern and assert that
+    // firing `reconnect_now()` mid-backoff doesn't panic the task.
+    let client_keys = StaticKeyPair::generate().unwrap();
+
+    let cancel = CancellationToken::new();
+    let cfg = ChainClientConfig {
+        endpoint: "127.0.0.1:1".to_string(),
+        upstream_pubkey: PubKey::x25519([0u8; 32]),
+        local_keys: client_keys,
+        heartbeat_interval: Duration::from_millis(50),
+        rekey_interval: Duration::from_secs(60),
+        body_handler: None,
+        local_bind: None,
+    };
+    let client = ChainClient::new(cfg, cancel.clone());
+    let handle = client.handle();
+    let client_task = tokio::spawn(async move { client.run().await });
+
+    // Let the client cycle through several failed handshake attempts
+    // so we're confidently inside the backoff path.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !client_task.is_finished(),
+        "client should still be retrying"
+    );
+
+    // Fire the signal repeatedly; each call must be a no-op (the
+    // outer sleep_or_cancel doesn't consume the signal, but the
+    // signal is also edge-triggered so multiple calls collapse).
+    for _ in 0..5 {
+        handle.reconnect_now();
+    }
+
+    // Task is still alive and well; cancel as the test finalizer.
+    assert!(
+        !client_task.is_finished(),
+        "client task crashed after reconnect_now during backoff"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(8), client_task).await;
+}
+
+#[tokio::test]
 async fn backoff_and_reconnect_when_endpoint_unresponsive() {
     let client_keys = StaticKeyPair::generate().unwrap();
 

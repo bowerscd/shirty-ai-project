@@ -346,6 +346,15 @@ fn print_human(request: &Request, response: &Response) -> Result<()> {
                  to local request {request:?}"
             );
         }
+        Response::ChainReconnected => {
+            // `ChainReconnected` belongs to the `chain reconnect`
+            // subcommand and is never produced for any request issued
+            // from the `local` scope. Treat as a routing bug.
+            bail!(
+                "server returned unexpected ChainReconnected response \
+                 to local request {request:?}"
+            );
+        }
     }
     Ok(())
 }

@@ -182,6 +182,18 @@ pub(super) fn dispatch(req: Request, state: &ControlState) -> Response {
                       hoisted by handle_connection)"
                 .to_string(),
         },
+        // `ChainReconnect` is itself sync (notify-only), but it's
+        // wired through `server::dispatch_request` alongside the
+        // other chain-affined methods so it can see the
+        // `chain_client_handle` presence check uniformly. Reaching
+        // here means that hoist is missing.
+        Request::ChainReconnect => Response::Error {
+            code: error_codes::INTERNAL_ERROR.into(),
+            message: "internal routing error: ChainReconnect reached \
+                      the synchronous dispatcher (should have been \
+                      hoisted by handle_connection)"
+                .to_string(),
+        },
         Request::TraceSet { directive } => match directive {
             Some(d) => match crate::log::set_trace_directive(&d) {
                 Ok(active) => {

@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use ratatoskr::control::{error_codes, Request, Response};
 
 use super::handlers::{
-    dispatch_chain_apply, dispatch_chain_canary, dispatch_chain_summary, dispatch_rules_reload,
+    dispatch_chain_apply, dispatch_chain_canary, dispatch_chain_reconnect, dispatch_chain_summary,
+    dispatch_rules_reload,
 };
 use super::{dispatch, ControlState};
 
@@ -105,6 +106,14 @@ async fn dispatch_request(req: Request, state: &ControlState) -> Response {
             // ChainSummary may walk via `ChainClientHandle::query_upstream`,
             // which is async; route it like ChainApply.
             dispatch_chain_summary(timeout_ms, state).await
+        }
+        Request::ChainReconnect => {
+            // Sync (notify-only) but lives in the async dispatcher so
+            // all chain-affined surface is wired in one place. The
+            // handler itself does no awaits — the per-request
+            // refusal-vs-deliver branch is the `chain_client_handle`
+            // presence check.
+            dispatch_chain_reconnect(state)
         }
         Request::RulesReload => {
             // CP31: block until the watcher has drained the trigger and

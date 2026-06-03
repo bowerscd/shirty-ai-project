@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 
 use ratatoskr::auth::StaticKeyPair;
@@ -118,6 +118,15 @@ pub struct ChainClient {
     /// the first handshake bumps to `1`. See
     /// [`ChainClientHandle::session_epoch_rx`] for the consumer side.
     pub(super) session_epoch_tx: watch::Sender<u64>,
+    /// Operator-facing "reconnect now" signal shared with every
+    /// [`ChainClientHandle`]. The heartbeat loop selects on
+    /// [`Notify::notified`]; firing causes the current session to be
+    /// abandoned and re-handshake to proceed immediately, bypassing
+    /// the ack-deadline detection wait (default ~30s). See
+    /// [`ChainClientHandle::reconnect_now`] for the operator surface
+    /// and [`ratatoskr::control::Request::ChainReconnect`] for the
+    /// control-plane RPC that fans into it.
+    pub(super) reconnect_signal: Arc<Notify>,
 }
 
 impl std::fmt::Debug for ChainClient {
@@ -133,6 +142,7 @@ impl ChainClient {
     pub fn new(config: ChainClientConfig, cancel: CancellationToken) -> Self {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (session_epoch_tx, _session_epoch_rx) = watch::channel(0u64);
+        let reconnect_signal = Arc::new(Notify::new());
         Self {
             config,
             cancel,
@@ -140,6 +150,7 @@ impl ChainClient {
             control_rx,
             router: QueryRouter::new(),
             session_epoch_tx,
+            reconnect_signal,
         }
     }
 
@@ -151,6 +162,7 @@ impl ChainClient {
             tx: self.control_tx.clone(),
             router: Arc::clone(&self.router),
             session_epoch_rx: self.session_epoch_tx.subscribe(),
+            reconnect_signal: Arc::clone(&self.reconnect_signal),
         }
     }
 
@@ -188,6 +200,17 @@ impl ChainClient {
             match self.run_session_once().await {
                 Ok(SessionExit::Rekey) => {
                     tracing::info!("rekey interval reached; renegotiating");
+                    backoff = BACKOFF_MIN;
+                }
+                Ok(SessionExit::ReconnectRequested) => {
+                    // Operator-initiated nudge (or test-harness nudge):
+                    // re-handshake immediately, skip the backoff sleep.
+                    // The session_epoch bump in run_session_once() will
+                    // poke the predicate publisher to re-push on the
+                    // new session — same recovery shape as a Rekey.
+                    tracing::info!(
+                        "operator-requested chain reconnect; re-handshaking immediately"
+                    );
                     backoff = BACKOFF_MIN;
                 }
                 Ok(SessionExit::Cancelled) => {
