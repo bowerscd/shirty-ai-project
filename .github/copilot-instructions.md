@@ -181,6 +181,67 @@ The pattern this prevents: workarounds that look like first-class
 code, findings lost to compaction, future readers (human or agent)
 re-deriving the bug from scratch.
 
+## Closing the loop on a fix
+
+Bug fixes have a tendency to be declared "done" at the first
+reproducer-passes point — but that's often the floor of the work,
+not the ceiling. Two complementary disciplines:
+
+1. **Trace the fix to the system's edge.** A reproducible local
+   repair frequently isn't enough: downstream consumers, peer state
+   machines, or upstream-facing components may also need updates
+   for the fix to actually deliver the user-visible behaviour.
+   Before declaring victory, list every state machine the bug
+   touches (sender, receiver, persisted state, monitoring view,
+   etc.) and verify each one. A single Rust function being correct
+   does not imply the system is correct; integration tests against
+   the realistic topology (multi-hop chains, multi-peer fan-out,
+   etc.) are the actual checkpoint.
+
+2. **Remove every workaround for the bug you just fixed.**
+   Workarounds — sentinel-rule writes, content-length completion
+   heuristics, alternate code paths, retry loops, timeout bumps —
+   that exist because of the bug should be removed in the same
+   commit as the fix, and the surrounding tests re-run to verify
+   the fix carries the full system without crutches. If you choose
+   to keep a workaround (for example, because it's still
+   functionally needed for an unrelated reason), explain why in
+   the commit body and update the workaround's comment so it
+   reflects the new, narrower justification — never leave a
+   comment claiming a workaround exists for a bug that has since
+   been fixed.
+
+The pattern this prevents: fixes that pass unit tests but don't
+actually help the user; workarounds that become permanent cruft
+because everyone assumes "someone else will clean them up later".
+
+## Don't unilaterally retire long-standing tracking entries
+
+End-of-session cleanup tempts you to close out blocked / pending
+todos, stale findings, and orphaned inbox entries that look
+obviously stale. **Resist.** Long-standing entries usually represent
+decisions or pieces of work that were waiting for a human owner's
+input — even when the work appears to have been completed by a
+later commit, the entry's existence is a signal that the human
+cared enough to write it down and wanted to be the one to close it.
+
+Before closing such an entry:
+
+1. Re-read the entry's original description in full. Often the
+   "blocked on X" reason is more specific than memory suggests.
+2. Cross-reference whatever you think superseded it against the
+   entry's actual ask. If the actual ask is not a strict subset of
+   what the later commit delivered, the entry is not yet done.
+3. **If you're going to close it, surface the decision explicitly
+   in the next turn**: list the entry, show your reasoning for
+   treating it as superseded, and let the human confirm BEFORE
+   marking it done. Don't bury "retired N stale entries" inside a
+   status summary.
+
+The pattern this prevents: silent decisions made unilaterally on
+the human's behalf at session-close that look like a clean-up but
+actually elide a real ask the human was tracking.
+
 ## Host-environment hygiene
 
 The host running the agent is not a sandbox. It is the operator's
