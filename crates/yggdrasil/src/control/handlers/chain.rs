@@ -53,16 +53,13 @@ pub(in crate::control) async fn dispatch_chain_apply(
     // when this terminal actually pushes upstream. Pure-local terminals
     // skip the projection and report `predicate_count = 0`.
     let predicate_count = if state.has_chain_upstream {
-        // The pre-check is sizing-only; the origin and version don't
-        // affect whether the body fits under the cap (origin is 32B,
-        // version is 8B; both are constant-sized regardless of value).
-        // The publisher will project again with the real origin and
-        // monotonic version on its next tick.
+        // The pre-check is sizing-only; the origin doesn't affect
+        // whether the body fits under the cap. The publisher will
+        // project again with the real origin on its next tick.
         let outcome = predicate_extractor::extract(
             &ruleset,
             predicate_extractor::HttpsPredicateMeta::default(),
             PubKey::x25519([0u8; 32]),
-            0,
         );
         let encoded = match postcard::to_allocvec(&outcome.set) {
             Ok(b) => b,

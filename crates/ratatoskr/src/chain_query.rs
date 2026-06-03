@@ -116,7 +116,6 @@ mod tests {
                     upstream: None,
                     downstream: None,
                     predicate_origin: None,
-                    predicate_version: None,
                     last_apply_unix: None,
                 },
             },

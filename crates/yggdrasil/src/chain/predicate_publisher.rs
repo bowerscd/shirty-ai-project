@@ -2,35 +2,31 @@
 //!
 //! Watches the proxy supervisor's `current_set` channel; on each applied
 //! [`RuleSet`] the publisher projects to a [`PredicateSet`], dedupes by
-//! the projected predicates list, and pushes the result to the upstream relay via
-//! [`ChainClientHandle::send_control`] as a
+//! encoded predicate-set content, and pushes the result to the relay this
+//! terminal dials via [`ChainClientHandle::send_control`] as a
 //! [`ControlBodyType::PredicateSetUpdate`] envelope.
 //!
-//! The publisher tracks a monotone `version: u64` counter that is
-//! persisted to `state_dir/chain-predicate-version.toml` after every
-//! successful upstream ack. On startup the counter is loaded from that
-//! file; the first push therefore uses `last_persisted + 1` rather than
-//! restarting at 1 and tripping the relay's `VERSION_STALE` invariant.
+//! The publisher keeps only in-memory dedup state. On session-epoch bumps it
+//! clears that snapshot and re-pushes the current set so a restarted relay
+//! rebuilds its predicate view.
 //!
 //! Run only on terminal nodes (mode = `terminal`). Spawned by
-//! [`crate::run_terminal`] when both a chain upstream *and* a supervisor
-//! are configured; relays do not author predicates — they only derive
-//! and forward what the terminal published.
+//! [`crate::run_terminal`] when both a chain peer *and* a supervisor are
+//! configured; relays do not author predicates — they only derive and
+//! forward what the terminal published.
 //!
 //! [`RuleSet`]: ratatoskr::rule::RuleSet
 //! [`PredicateSet`]: ratatoskr::predicate::PredicateSet
 //! [`ControlBodyType::PredicateSetUpdate`]: ratatoskr::control_frame::ControlBodyType::PredicateSetUpdate
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use blake2::{Blake2s256, Digest};
 use ratatoskr::control_frame::ControlBodyType;
-use ratatoskr::predicate::{predicate_reject, Predicate, PREDICATE_SET_MAX_WIRE_BYTES};
+use ratatoskr::predicate::PREDICATE_SET_MAX_WIRE_BYTES;
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::RuleSet;
-use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -39,18 +35,6 @@ use crate::chain::client::{ChainClientHandle, ChainClientShutDown};
 use crate::chain::introspection::IntrospectionState;
 use crate::chain::predicate_extractor::{self, HttpsPredicateMeta};
 use crate::chain::reliability::SendError;
-
-/// File name used to persist the publisher's monotone version under
-/// `state_dir`.
-const VERSION_FILE: &str = "chain-predicate-version.toml";
-
-/// On-disk shape. Wrapped in a struct so the TOML reads as
-/// `version = N` rather than a bare integer.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct PersistedVersion {
-    #[serde(default)]
-    version: u64,
-}
 
 /// How long to wait for an upstream ack before treating the in-flight
 /// push as failed and moving on. The reliability layer's own retransmit
@@ -63,11 +47,6 @@ const PUBLISH_ACK_DEADLINE: Duration = Duration::from_secs(30);
 /// Spawn the publisher task. Returns the join handle; the caller awaits
 /// it during shutdown.
 ///
-/// `state_dir` holds the persisted version counter (see
-/// [`VERSION_FILE`]). Loading errors are non-fatal: a corrupt or absent
-/// file resets the counter to `0` and emits a warn-level log so the
-/// operator notices.
-///
 /// `introspection` is the chain-introspection sink backing
 /// `Request::DerivedRules`: on every successful upstream-acked push the
 /// publisher calls [`IntrospectionState::record_apply`] with the
@@ -78,7 +57,6 @@ pub fn spawn(
     rules_rx: watch::Receiver<RuleSet>,
     chain_handle: ChainClientHandle,
     origin: PubKey,
-    state_dir: PathBuf,
     https_meta: HttpsPredicateMeta,
     introspection: Option<Arc<IntrospectionState>>,
     cancel: CancellationToken,
@@ -87,7 +65,6 @@ pub fn spawn(
         rules_rx,
         chain_handle,
         origin,
-        state_dir,
         https_meta,
         introspection,
         cancel,
@@ -98,24 +75,11 @@ async fn run(
     mut rules_rx: watch::Receiver<RuleSet>,
     chain_handle: ChainClientHandle,
     origin: PubKey,
-    state_dir: PathBuf,
     https_meta: HttpsPredicateMeta,
     introspection: Option<Arc<IntrospectionState>>,
     cancel: CancellationToken,
 ) {
-    let version_path = state_dir.join(VERSION_FILE);
-    let mut version: u64 = match load_version(&version_path) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %version_path.display(),
-                "failed to load persisted predicate version; restarting at 0"
-            );
-            0
-        }
-    };
-    let mut last_sent_predicates: Option<Vec<Predicate>> = None;
+    let mut last_sent_body_hash: Option<[u8; 32]> = None;
 
     // Session-epoch watch: bumps each time the chain client completes
     // a fresh handshake (upstream restart, network blip rekey, etc.).
@@ -131,7 +95,6 @@ async fn run(
 
     tracing::info!(
         origin = %origin,
-        version,
         "predicate publisher started"
     );
 
@@ -165,7 +128,7 @@ async fn run(
                 // the dedup snapshot and push the current set so a
                 // restarted upstream (which lost its in-memory
                 // predicate state) rebuilds its view from scratch.
-                if last_sent_predicates.is_none() {
+                if last_sent_body_hash.is_none() {
                     tracing::debug!(
                         epoch,
                         "chain session bumped; no prior push to resync"
@@ -181,18 +144,16 @@ async fn run(
                     "outcome" => "session_resync"
                 )
                 .increment(1);
-                last_sent_predicates = None;
+                last_sent_body_hash = None;
                 let set = rules_rx.borrow().clone();
-                publish_and_persist(
+                publish_and_remember(
                     &set,
                     origin,
-                    &mut version,
-                    &mut last_sent_predicates,
+                    &mut last_sent_body_hash,
                     https_meta,
                     &chain_handle,
                     introspection.as_deref(),
                     &cancel,
-                    &version_path,
                 )
                 .await;
             }
@@ -204,16 +165,14 @@ async fn run(
                     return;
                 }
                 let set = rules_rx.borrow_and_update().clone();
-                publish_and_persist(
+                publish_and_remember(
                     &set,
                     origin,
-                    &mut version,
-                    &mut last_sent_predicates,
+                    &mut last_sent_body_hash,
                     https_meta,
                     &chain_handle,
                     introspection.as_deref(),
                     &cancel,
-                    &version_path,
                 )
                 .await;
             }
@@ -222,29 +181,25 @@ async fn run(
 }
 
 /// Push one rule set's projection upstream, and on a successful ack
-/// update the in-memory version + dedup snapshot and persist the new
-/// version counter. Factored out so the main loop's normal-flow arm
-/// (`rules_rx.changed()`) and the session-resync arm
-/// (`session_epoch_rx.changed()`) share one implementation.
+/// update the in-memory content-dedup snapshot. Factored out so the
+/// main loop's normal-flow arm (`rules_rx.changed()`) and the
+/// session-resync arm (`session_epoch_rx.changed()`) share one
+/// implementation.
 #[allow(clippy::too_many_arguments)]
-async fn publish_and_persist(
+async fn publish_and_remember(
     set: &RuleSet,
     origin: PubKey,
-    version: &mut u64,
-    last_sent_predicates: &mut Option<Vec<Predicate>>,
+    last_sent_body_hash: &mut Option<[u8; 32]>,
     https_meta: HttpsPredicateMeta,
     chain_handle: &ChainClientHandle,
     introspection: Option<&IntrospectionState>,
     cancel: &CancellationToken,
-    version_path: &Path,
 ) {
-    let next_version = version.saturating_add(1);
     let Some(applied) = publish_one(
         set,
         origin,
-        next_version,
         https_meta,
-        last_sent_predicates.as_deref(),
+        last_sent_body_hash.as_ref(),
         chain_handle,
         introspection,
         cancel,
@@ -253,74 +208,31 @@ async fn publish_and_persist(
     else {
         return;
     };
-    *version = applied.version;
-    *last_sent_predicates = Some(applied.predicates);
-    if let Err(e) = persist_version(version_path, *version) {
-        // Persist failure does not roll the in-memory version back:
-        // the upstream has already accepted and a future restart that
-        // loses this write will only ever request a *lower* version,
-        // which the upstream will reject with VERSION_STALE. That is
-        // the safe failure mode.
-        tracing::error!(
-            error = %e,
-            path = %version_path.display(),
-            version = *version,
-            "failed to persist predicate version"
-        );
-        metrics::counter!(
-            "yggdrasil_chain_predicate_push_total",
-            "outcome" => "persist_error"
-        )
-        .increment(1);
-    }
+    *last_sent_body_hash = Some(applied.body_hash);
 }
 
-/// Result of a successful publish: the [`PredicateSet`] fields the
-/// publisher should remember for the next dedup comparison + monotone
-/// bump.
+/// Result of a successful publish: the encoded content hash the
+/// publisher should remember for the next dedup comparison.
 struct AppliedPush {
-    version: u64,
-    predicates: Vec<Predicate>,
+    body_hash: [u8; 32],
 }
 
 /// One push attempt. Returns `Some` only when the upstream acked `Ok`
 /// (or we deduped to a no-op). Skipped/rejected/timed-out pushes return
-/// `None` and the publisher carries the previous `(version,
-/// last_sent_predicates)` forward unchanged.
+/// `None` and the publisher carries the previous content hash forward
+/// unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn publish_one(
     set: &RuleSet,
     origin: PubKey,
-    next_version: u64,
     https_meta: HttpsPredicateMeta,
-    last_sent: Option<&[Predicate]>,
+    last_sent_hash: Option<&[u8; 32]>,
     chain_handle: &ChainClientHandle,
     introspection: Option<&IntrospectionState>,
     cancel: &CancellationToken,
 ) -> Option<AppliedPush> {
-    let outcome = predicate_extractor::extract(set, https_meta, origin, next_version);
+    let outcome = predicate_extractor::extract(set, https_meta, origin);
     let predicate_set = outcome.set;
-
-    // Dedup against the last successfully-sent predicates list. Identical
-    // predicates → no wire push; the persisted upstream state is already
-    // accurate. `last_sent == None` (first iteration after boot) always
-    // pushes, even when the projection happens to be empty: relays use
-    // the first push to learn that a terminal that previously held N
-    // rules has gone empty.
-    if let Some(prev) = last_sent {
-        if prev == predicate_set.predicates.as_slice() {
-            metrics::counter!(
-                "yggdrasil_chain_predicate_push_total",
-                "outcome" => "skip_dedup"
-            )
-            .increment(1);
-            tracing::debug!(
-                predicates = predicate_set.predicates.len(),
-                "skipping predicate push: identical to last accepted set"
-            );
-            return None;
-        }
-    }
 
     let body = match postcard::to_allocvec(&predicate_set) {
         Ok(b) => b,
@@ -349,6 +261,20 @@ async fn publish_one(
             "outcome" => "skip_oversize"
         )
         .increment(1);
+        return None;
+    }
+
+    let body_hash = predicate_body_hash(&body);
+    if last_sent_hash.is_some_and(|prev| prev == &body_hash) {
+        metrics::counter!(
+            "yggdrasil_chain_predicate_push_total",
+            "outcome" => "skip_dedup"
+        )
+        .increment(1);
+        tracing::debug!(
+            predicates = predicate_set.predicates.len(),
+            "skipping predicate push: identical to last accepted set"
+        );
         return None;
     }
 
@@ -382,7 +308,6 @@ async fn publish_one(
     match result {
         Ok(Ok(Ok(()))) => {
             tracing::info!(
-                version = predicate_set.version,
                 predicates = predicate_set.predicates.len(),
                 "predicate set accepted by upstream"
             );
@@ -391,47 +316,21 @@ async fn publish_one(
                 "outcome" => "ok"
             )
             .increment(1);
-            metrics::gauge!("yggdrasil_chain_predicate_version").set(predicate_set.version as f64);
             // Notify the introspection sink with the set we just
-            // successfully pushed. `predicate_set` is moved into
-            // `AppliedPush` below, so we record_apply BEFORE the
-            // destructure.
+            // successfully pushed.
             if let Some(ix) = introspection {
                 ix.record_apply(&predicate_set);
             }
-            Some(AppliedPush {
-                version: predicate_set.version,
-                predicates: predicate_set.predicates,
-            })
+            Some(AppliedPush { body_hash })
         }
         Ok(Ok(Err(SendError::Rejected(code)))) => {
-            tracing::warn!(
-                reject_code = code,
-                version = predicate_set.version,
-                "predicate set rejected by upstream"
-            );
+            tracing::warn!(reject_code = code, "predicate set rejected by upstream");
             metrics::counter!(
                 "yggdrasil_chain_predicate_push_total",
                 "outcome" => "reject",
                 "code" => code.to_string(),
             )
             .increment(1);
-            // VERSION_STALE means the upstream already has a higher
-            // version recorded under our `origin`. The persisted
-            // counter at `<state_dir>/chain-predicate-version.toml`
-            // is the recovery mechanism; this only fires when that
-            // file was lost or rolled back, or when the upstream
-            // recorded a higher version under our origin for any
-            // other reason (e.g. an operator-managed state copy
-            // across hosts).
-            if code == predicate_reject::VERSION_STALE {
-                tracing::warn!(
-                    "version-stale reject — persisted counter at \
-                     <state_dir>/chain-predicate-version.toml may have \
-                     been lost or rolled back, or upstream recorded a \
-                     higher version under our origin out-of-band"
-                );
-            }
             None
         }
         Ok(Ok(Err(SendError::Timeout(attempts)))) => {
@@ -448,8 +347,8 @@ async fn publish_one(
         }
         Ok(Ok(Err(SendError::UnknownBodyType))) => {
             tracing::error!(
-                "upstream does not recognise PredicateSetUpdate body type — \
-                 version skew between terminal and relay"
+                "peer does not recognise PredicateSetUpdate body type — \
+                 protocol mismatch between terminal and relay"
             );
             metrics::counter!(
                 "yggdrasil_chain_predicate_push_total",
@@ -496,30 +395,9 @@ async fn publish_one(
     }
 }
 
-fn load_version(path: &Path) -> Result<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let p: PersistedVersion =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    Ok(p.version)
-}
-
-fn persist_version(path: &Path, version: u64) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-    }
-    let text = toml::to_string_pretty(&PersistedVersion { version })
-        .context("serialise chain-predicate-version TOML")?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+fn predicate_body_hash(body: &[u8]) -> [u8; 32] {
+    let digest = Blake2s256::digest(body);
+    digest.into()
 }
 
 #[cfg(test)]
@@ -529,7 +407,7 @@ mod tests {
     use std::time::Duration;
 
     use ratatoskr::auth::X25519_PUBLIC_LEN;
-    use ratatoskr::predicate::PredicateSet;
+    use ratatoskr::predicate::{predicate_reject, PredicateSet};
     use ratatoskr::rule::{Protocol, Rule, RuleSet};
     use tokio::sync::Mutex;
 
@@ -596,12 +474,10 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
         let (tx, rx) = watch::channel(RuleSet::default());
-        let state_dir = tempfile::tempdir().unwrap();
         let publisher = spawn(
             rx,
             handle,
             origin(),
-            state_dir.path().to_path_buf(),
             HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
@@ -617,10 +493,9 @@ mod tests {
         assert_eq!(decoded1.predicates.len(), 1);
         assert_eq!(decoded1.predicates[0].name, "alpha");
         assert_eq!(decoded1.predicates[0].listen_port, 8080);
-        assert_eq!(decoded1.version, 1);
         assert_eq!(decoded1.origin, origin());
 
-        // Ack OK so the publisher bumps version + remembers the set.
+        // Ack OK so the publisher bumps remembers the set.
         op1.completion.send(Ok(())).unwrap();
 
         // Identical re-send — supervisor reapplies the same set (e.g.
@@ -644,7 +519,6 @@ mod tests {
             2,
             "first op after duplicate must be the DISTINCT set (proving the duplicate was deduped)"
         );
-        assert_eq!(decoded2.version, 2);
         op2.completion.send(Ok(())).unwrap();
 
         cancel.cancel();
@@ -652,16 +526,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_push_does_not_bump_version_or_dedup_state() {
+    async fn rejected_push_does_not_update_dedup_state() {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
         let (tx, rx) = watch::channel(RuleSet::default());
-        let state_dir = tempfile::tempdir().unwrap();
         let publisher = spawn(
             rx,
             handle,
             origin(),
-            state_dir.path().to_path_buf(),
             HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
@@ -672,7 +544,7 @@ mod tests {
 
         let op1 = next_op(&sink).await;
         let decoded1: PredicateSet = postcard::from_bytes(&op1.body).unwrap();
-        assert_eq!(decoded1.version, 1);
+        assert_eq!(decoded1.predicates[0].name, "alpha");
 
         // Relay says no.
         op1.completion
@@ -682,12 +554,11 @@ mod tests {
             .unwrap();
 
         // Resending the SAME set should produce a fresh attempt (publisher
-        // didn't remember anything because nothing was acked), still at
-        // version 1.
+        // didn't remember anything because nothing was acked), again.
         tx.send(set1.clone()).unwrap();
         let op2 = next_op(&sink).await;
         let decoded2: PredicateSet = postcard::from_bytes(&op2.body).unwrap();
-        assert_eq!(decoded2.version, 1, "version stays 1 after reject");
+        assert_eq!(decoded2.predicates[0].name, "alpha");
 
         op2.completion.send(Ok(())).unwrap();
         cancel.cancel();
@@ -701,12 +572,10 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, sink) = fake_handle();
         let (tx, rx) = watch::channel(RuleSet::default());
-        let state_dir = tempfile::tempdir().unwrap();
         let publisher = spawn(
             rx,
             handle,
             origin(),
-            state_dir.path().to_path_buf(),
             HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
@@ -726,77 +595,6 @@ mod tests {
             decoded.predicates[0].name, "marker",
             "first op must be the marker (proving initial default was NOT pushed)"
         );
-        assert_eq!(
-            decoded.version, 1,
-            "version must be 1 — the initial default value didn't bump it"
-        );
-
-        cancel.cancel();
-        let _ = publisher.await;
-    }
-
-    /// A second publisher instance pointed at the same `state_dir`
-    /// resumes counting from the persisted version, so the first push
-    /// after restart is `last + 1` rather than `1`.
-    #[tokio::test]
-    async fn persisted_version_survives_restart() {
-        let state_dir = tempfile::tempdir().unwrap();
-
-        // First publisher: accept 1 push, version becomes 1, persisted to disk.
-        {
-            let cancel = CancellationToken::new();
-            let (handle, sink) = fake_handle();
-            let (tx, rx) = watch::channel(RuleSet::default());
-            let publisher = spawn(
-                rx,
-                handle,
-                origin(),
-                state_dir.path().to_path_buf(),
-                HttpsPredicateMeta::default(),
-                None,
-                cancel.clone(),
-            );
-            tx.send(RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap())
-                .unwrap();
-            let op = next_op(&sink).await;
-            let decoded: PredicateSet = postcard::from_bytes(&op.body).unwrap();
-            assert_eq!(decoded.version, 1);
-            op.completion.send(Ok(())).unwrap();
-            // Synchronize on persist completion via the marker pattern:
-            // push a second update and wait for its op to land in the
-            // sink. Since the publisher processes events serially, the
-            // marker op landing means the previous push's persist
-            // call has already returned.
-            tx.send(RuleSet::from_rules(vec![tcp_rule("marker", 1)]).unwrap())
-                .unwrap();
-            let _ = next_op(&sink).await;
-            cancel.cancel();
-            let _ = publisher.await;
-        }
-
-        // Second publisher with the same state_dir: next push must be
-        // version 2.
-        let cancel = CancellationToken::new();
-        let (handle, sink) = fake_handle();
-        let (tx, rx) = watch::channel(RuleSet::default());
-        let publisher = spawn(
-            rx,
-            handle,
-            origin(),
-            state_dir.path().to_path_buf(),
-            HttpsPredicateMeta::default(),
-            None,
-            cancel.clone(),
-        );
-        tx.send(RuleSet::from_rules(vec![tcp_rule("beta", 9090)]).unwrap())
-            .unwrap();
-        let op = next_op(&sink).await;
-        let decoded: PredicateSet = postcard::from_bytes(&op.body).unwrap();
-        assert_eq!(
-            decoded.version, 2,
-            "expected v2 after restart with persisted v1"
-        );
-        op.completion.send(Ok(())).unwrap();
 
         cancel.cancel();
         let _ = publisher.await;
@@ -825,31 +623,28 @@ mod tests {
         let (handle, epoch_tx) = ChainClientHandle::__test_new_with_epoch(tx);
 
         let (rules_tx, rules_rx) = watch::channel(RuleSet::default());
-        let state_dir = tempfile::tempdir().unwrap();
         let publisher = spawn(
             rules_rx,
             handle,
             origin(),
-            state_dir.path().to_path_buf(),
             HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
         );
 
         // Initial push of a real rule, acked OK so the publisher
-        // remembers it (last_sent_predicates = Some(...)).
+        // remembers it (last_sent_body_hash = Some(...)).
         let set = RuleSet::from_rules(vec![tcp_rule("alpha", 8080)]).unwrap();
         rules_tx.send(set.clone()).unwrap();
         let op1 = next_op(&sink).await;
         let decoded1: PredicateSet = postcard::from_bytes(&op1.body).unwrap();
         assert_eq!(decoded1.predicates.len(), 1);
-        assert_eq!(decoded1.version, 1);
         op1.completion.send(Ok(())).unwrap();
 
         // Simulate a fresh handshake against a restarted upstream:
         // bump the session epoch. The publisher must observe the bump
-        // and re-push the current set as version 2, ignoring its
-        // dedup snapshot of version 1.
+        // and re-push the current set even though its
+        // dedup snapshot matches the current content.
         epoch_tx.send_modify(|e| {
             *e = e.saturating_add(1);
         });
@@ -862,21 +657,16 @@ mod tests {
             "resync push must contain the current rule set, not an empty/stale one"
         );
         assert_eq!(decoded2.predicates[0].name, "alpha");
-        assert_eq!(
-            decoded2.version, 2,
-            "resync push must bump the monotone version (was 1, now 2)"
-        );
         op2.completion.send(Ok(())).unwrap();
 
         // Verify subsequent epoch bumps continue to resync: bump
-        // again, expect a third push. Use a marker-set so dedup
-        // wouldn't accidentally produce the same result.
+        // again, expect another push. Use a marker-set so dedup
+        // would not accidentally produce the same result.
         let set2 =
             RuleSet::from_rules(vec![tcp_rule("alpha", 8080), tcp_rule("beta", 9090)]).unwrap();
         rules_tx.send(set2).unwrap();
         let op_set2 = next_op(&sink).await;
         let decoded_set2: PredicateSet = postcard::from_bytes(&op_set2.body).unwrap();
-        assert_eq!(decoded_set2.version, 3);
         assert_eq!(decoded_set2.predicates.len(), 2);
         op_set2.completion.send(Ok(())).unwrap();
 
@@ -885,7 +675,6 @@ mod tests {
         });
         let op4 = next_op(&sink).await;
         let decoded4: PredicateSet = postcard::from_bytes(&op4.body).unwrap();
-        assert_eq!(decoded4.version, 4);
         assert_eq!(decoded4.predicates.len(), 2);
         op4.completion.send(Ok(())).unwrap();
 
@@ -894,7 +683,7 @@ mod tests {
     }
 
     /// First-handshake case: when the publisher has never pushed yet
-    /// (`last_sent_predicates == None`), an epoch bump should NOT
+    /// (`last_sent_body_hash == None`), an epoch bump should NOT
     /// synthesise an empty push. The first rules_rx emission still
     /// drives the actual first push.
     #[tokio::test]
@@ -911,12 +700,10 @@ mod tests {
         let (handle, epoch_tx) = ChainClientHandle::__test_new_with_epoch(tx);
 
         let (rules_tx, rules_rx) = watch::channel(RuleSet::default());
-        let state_dir = tempfile::tempdir().unwrap();
         let publisher = spawn(
             rules_rx,
             handle,
             origin(),
-            state_dir.path().to_path_buf(),
             HttpsPredicateMeta::default(),
             None,
             cancel.clone(),
@@ -924,7 +711,7 @@ mod tests {
 
         // Bump the epoch BEFORE any rules_rx emission. The publisher
         // has never pushed, so there's no upstream state to resync.
-        // The resync arm should observe `last_sent_predicates =
+        // The resync arm should observe `last_sent_body_hash =
         // None` and skip silently. Then the first real rules_rx
         // emission should trigger the actual first push.
         epoch_tx.send_modify(|e| {
@@ -952,7 +739,6 @@ mod tests {
             1,
             "first push must be the real set, not an empty epoch-triggered resync"
         );
-        assert_eq!(decoded1.version, 1);
         op1.completion.send(Ok(())).unwrap();
 
         cancel.cancel();

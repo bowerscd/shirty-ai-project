@@ -540,7 +540,7 @@ echo "    [ok] recovery reload succeeded; new leaf fp ${fp4:0:16}…"
 # Drop a new tcp-echo-hot.toml directly into the host-side bind mount.
 # The terminal's inotify watcher (250 ms debounce per
 # docs/configuration.md hot-reload semantics) picks it up; the
-# predicate publisher emits a new version; the gateway's chain
+# predicate publisher emits a new predicate set; the gateway's chain
 # client acks and derives a matching listener. Independent client
 # probe to the new port verifies the whole flow. Then `rm` the file
 # and verify the listener stops accepting.

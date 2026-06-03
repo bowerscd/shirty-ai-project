@@ -117,7 +117,7 @@ probes.
 ### `local derived-rules`
 
 JSON snapshot of the daemon's current derived rule set plus the chain
-identity / predicate version that produced it. Equivalent to the data
+identity / predicate origin that produced it. Equivalent to the data
 that backs `chain diff` per hop. Loopback-only by virtue of running over
 the UDS.
 
@@ -211,7 +211,7 @@ on its next tick (if `[dial]` is set).
 ### `chain summary`
 
 One-line-per-hop overview of the chain (index, role, pubkey, uptime,
-rule count, predicate count, predicate version). "What's my chain?"
+rule count, predicate count). "What's my chain?"
 
 | Flag        | Type        | Default | Notes                                                                                            |
 | ----------- | ----------- | ------- | ------------------------------------------------------------------------------------------------ |

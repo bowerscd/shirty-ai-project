@@ -1,4 +1,59 @@
-//! Chain-introspection state backing `Request::DerivedRules` and the\n//! local hop of `Request::ChainSummary`.\n//!\n//! [`IntrospectionState`] is a small, cheap-to-clone view that captures\n//! everything the `local derived-rules` UDS handler (and, by\n//! extension, every per-hop record of `chain summary` / `chain diff`)\n//! needs to render:\n//!\n//! * The latest [`PredicateSet`] this node has either *received* (relay)\n//!   or *projected and pushed* (terminal). Held under a\n//!   [`parking_lot::RwLock`] so the control handler can read without\n//!   contending with the predicate-recv / predicate-publish tasks.\n//! * The active [`RuleSet`] \u2014 pulled from the [`SupervisorHandle`]'s\n//!   `current_set` watch on every snapshot. Always up to date and\n//!   guaranteed to be the set this node is currently *driving* (whether\n//!   that was loaded from rules.toml on a terminal or derived from\n//!   upstream predicates on a relay).\n//! * Chain identity: local pubkey plus optional upstream / downstream\n//!   pubkeys, copied at construction from\n//!   [`crate::config::ServerConfig`].\n//! * `last_apply_unix` \u2014 wall-clock seconds at which `record_apply`\n//!   last fired. Held in an [`AtomicI64`] so reads are lock-free; the\n//!   value `0` means \"no apply yet\" and surfaces as JSON `null` in the\n//!   snapshot.\n//!\n//! ## Wiring overview\n//!\n//! | Field | Who writes | Who reads |\n//! |-|-|-|\n//! | `latest_predicates` | [`crate::chain::ChainAcceptor::handle_predicate_set_update`] on a relay, [`crate::chain::predicate_publisher`] on a terminal | `Request::DerivedRules` handler |\n//! | `last_apply_unix` | Same writers as above | Same reader |\n//! | `derived_rules` (live) | Proxy supervisor | `Request::DerivedRules` handler via `current_set_rx().borrow()` |\n//! | `local_pubkey`, `upstream_pubkey`, `downstream_pubkey` | Constructor | `Request::DerivedRules` handler |\n//!\n//! ## JSON shape\n//!\n//! ```json\n//! {\n//!   \"predicates\": [ { \"name\": ..., \"listen_port\": ..., \"protocol\": ..., \"idle_timeout_ms\": ... }, ... ],\n//!   \"derived_rules\": [ ...Rule... ],\n//!   \"chain\": {\n//!     \"local\": \"x25519:...\",\n//!     \"upstream\": \"x25519:...\" | null,\n//!     \"downstream\": \"x25519:...\" | null,\n//!     \"predicate_origin\": \"x25519:...\" | null,\n//!     \"predicate_version\": 42 | null,\n//!     \"last_apply_unix\": 1737244800 | null\n//!   }\n//! }\n//! ```\n//!\n//! The `predicates` list and `chain.predicate_*` fields are siblings on\n//! purpose: that keeps the predicate-set version + origin attached to\n//! every snapshot without nesting an entire [`PredicateSet`] wrapper\n//! inside `predicates` (the plan called for a flat array there).\n//!\n//! ## Security\n//!\n//! The snapshot exposes the operator's effective rule set, which can\n//! leak hostnames + ports. Filesystem permissions on `[control].socket`\n//! are the access boundary: the daemon never serves derived rules over\n//! a network listener, and remote hops fetch each other's snapshots\n//! only via authenticated `ChainHopQuery` frames over the chain\n//! control plane.
+//! Chain-introspection state backing `Request::DerivedRules` and the
+//! local hop of `Request::ChainSummary`.
+//!
+//! [`IntrospectionState`] is a small, cheap-to-clone view that captures
+//! everything the `local derived-rules` UDS handler (and, by extension,
+//! every per-hop record of `chain summary` / `chain diff`) needs to render:
+//!
+//! * The latest [`PredicateSet`] this node has either *received* (relay)
+//!   or *projected and pushed* (terminal). Held under a
+//!   [`parking_lot::RwLock`] so the control handler can read without
+//!   contending with the predicate-recv / predicate-publish tasks.
+//! * The active [`RuleSet`] — pulled from the [`SupervisorHandle`]'s
+//!   `current_set` watch on every snapshot. Always up to date and
+//!   guaranteed to be the set this node is currently *driving*.
+//! * Chain identity: local pubkey plus optional upstream / downstream
+//!   pubkeys, copied at construction from [`crate::config::ServerConfig`].
+//! * `last_apply_unix` — wall-clock seconds at which `record_apply`
+//!   last fired. Held in an [`AtomicI64`] so reads are lock-free; the
+//!   value `0` means "no apply yet" and surfaces as JSON `null`.
+//!
+//! ## Wiring overview
+//!
+//! | Field | Who writes | Who reads |
+//! |-|-|-|
+//! | `latest_predicates` | [`crate::chain::ChainAcceptor::handle_predicate_set_update`] on a relay, [`crate::chain::predicate_publisher`] on a terminal | `Request::DerivedRules` handler |
+//! | `last_apply_unix` | Same writers as above | Same reader |
+//! | `derived_rules` (live) | Proxy supervisor | `Request::DerivedRules` handler via `current_set_rx().borrow()` |
+//! | `local_pubkey`, `upstream_pubkey`, `downstream_pubkey` | Constructor | `Request::DerivedRules` handler |
+//!
+//! ## JSON shape
+//!
+//! ```json
+//! {
+//!   "predicates": [ { "name": ..., "listen_port": ..., "protocol": ..., "idle_timeout_ms": ... }, ... ],
+//!   "derived_rules": [ ...Rule... ],
+//!   "chain": {
+//!     "local": "x25519:...",
+//!     "upstream": "x25519:..." | null,
+//!     "downstream": "x25519:..." | null,
+//!     "predicate_origin": "x25519:..." | null,
+//!     "last_apply_unix": 1737244800 | null
+//!   }
+//! }
+//! ```
+//!
+//! The `predicates` list and `chain.predicate_origin` field are siblings on
+//! purpose: that keeps the predicate origin attached to every snapshot
+//! without nesting an entire [`PredicateSet`] wrapper inside `predicates`.
+//!
+//! ## Security
+//!
+//! The snapshot exposes the operator's effective rule set, which can leak
+//! hostnames + ports. Filesystem permissions on `[control].socket` are the
+//! access boundary: the daemon never serves derived rules over a network
+//! listener, and remote hops fetch each other's snapshots only via
+//! authenticated `ChainHopQuery` frames over the chain control plane.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -31,8 +86,7 @@ pub struct IntrospectionState {
 impl IntrospectionState {
     /// Construct an empty state. `record_apply` has not been called
     /// yet, so the first snapshot will show empty `predicates`, no
-    /// `predicate_origin` / `predicate_version`, and `last_apply_unix
-    /// = null`.
+    /// `predicate_origin`, and `last_apply_unix = null`.
     pub fn new(
         local_pubkey: PubKey,
         upstream_pubkey: Option<PubKey>,
@@ -55,9 +109,8 @@ impl IntrospectionState {
     /// acks `Ok`. Both paths represent "this is the set my behaviour
     /// is now driven by", so the two writers share one slot.
     ///
-    /// Replaces any prior set unconditionally — versioning is the
-    /// upstream chain's concern; introspection only ever shows the
-    /// *most recently applied* set.
+    /// Replaces any prior set unconditionally; introspection only ever
+    /// shows the *most recently applied* set.
     pub fn record_apply(&self, set: &PredicateSet) {
         *self.latest_predicates.write() = Some(set.clone());
         let now = SystemTime::now()
@@ -73,9 +126,9 @@ impl IntrospectionState {
     /// rule set.
     pub fn snapshot(&self) -> DerivedRulesResponse {
         let predicates_holder = self.latest_predicates.read();
-        let (predicates, predicate_origin, predicate_version) = match predicates_holder.as_ref() {
-            Some(p) => (p.predicates.clone(), Some(p.origin), Some(p.version)),
-            None => (Vec::new(), None, None),
+        let (predicates, predicate_origin) = match predicates_holder.as_ref() {
+            Some(p) => (p.predicates.clone(), Some(p.origin)),
+            None => (Vec::new(), None),
         };
         drop(predicates_holder);
         let last_apply_raw = self.last_apply_unix.load(Ordering::Relaxed);
@@ -93,7 +146,6 @@ impl IntrospectionState {
                 upstream: self.upstream_pubkey,
                 downstream: self.downstream_pubkey,
                 predicate_origin,
-                predicate_version,
                 last_apply_unix,
             },
         }
@@ -159,7 +211,6 @@ mod tests {
         assert_eq!(snap.chain.upstream, Some(fake_pubkey(0xBB)));
         assert_eq!(snap.chain.downstream, None);
         assert_eq!(snap.chain.predicate_origin, None);
-        assert_eq!(snap.chain.predicate_version, None);
         assert_eq!(snap.chain.last_apply_unix, None);
         assert_eq!(
             snap.derived_rules.len(),
@@ -181,7 +232,6 @@ mod tests {
                 idle_timeout_ms: None,
                 https_http3: false,
             }],
-            version: 7,
             origin: fake_pubkey(0xEE),
         };
         state.record_apply(&set);
@@ -189,7 +239,6 @@ mod tests {
         assert_eq!(snap.predicates.len(), 1);
         assert_eq!(snap.predicates[0].name, "echo-tcp");
         assert_eq!(snap.chain.predicate_origin, Some(fake_pubkey(0xEE)));
-        assert_eq!(snap.chain.predicate_version, Some(7));
         assert!(
             snap.chain.last_apply_unix.unwrap() > 0,
             "last_apply_unix should be a real wall-clock value"
@@ -202,7 +251,6 @@ mod tests {
         let state = IntrospectionState::new(fake_pubkey(0x33), None, None, supervisor);
         let v1 = PredicateSet {
             predicates: vec![],
-            version: 1,
             origin: fake_pubkey(0xCC),
         };
         let v2 = PredicateSet {
@@ -213,13 +261,11 @@ mod tests {
                 idle_timeout_ms: None,
                 https_http3: false,
             }],
-            version: 2,
             origin: fake_pubkey(0xCC),
         };
         state.record_apply(&v1);
         state.record_apply(&v2);
         let snap = state.snapshot();
-        assert_eq!(snap.chain.predicate_version, Some(2));
         assert_eq!(snap.predicates.len(), 1);
     }
 
@@ -236,13 +282,11 @@ mod tests {
                 idle_timeout_ms: Some(60_000),
                 https_http3: false,
             }],
-            version: 42,
             origin: fake_pubkey(0xDD),
         });
         let json = state.render_json().expect("render_json");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse back");
         let chain = &parsed["chain"];
-        assert_eq!(chain["predicate_version"], 42);
         assert!(chain["last_apply_unix"].as_i64().unwrap_or(0) > 0);
         assert_eq!(parsed["predicates"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["derived_rules"].as_array().unwrap().len(), 1);

@@ -168,7 +168,7 @@ sudo journalctl -u yggdrasil -f
 sudo systemctl start yggdrasil
 sudo journalctl -u yggdrasil -f
 # look for: chain client handshake complete
-#           predicate publisher pushed set version=1
+#           predicate set accepted by upstream
 ```
 
 ## 7. Verify

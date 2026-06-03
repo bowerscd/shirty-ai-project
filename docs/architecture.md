@@ -109,9 +109,9 @@ relays additionally **forward the same predicate bytes verbatim** to
 their own upstream via the chain acceptor's mid-chain forwarding path
 (`chain/acceptor.rs::handle_predicate_set_update`); the gateway at the
 top of the chain receives them, derives its own `RuleSet`, and binds
-the public listeners. Forwarding is byte-identical: origin pubkey and
-monotone version are preserved so each hop applies the same
-version-staleness invariant against the terminal's identity.
+the public listeners. Forwarding is byte-identical: the origin pubkey
+and predicate content are preserved so each hop derives from the same
+terminal-authored set.
 
 Real client IPs propagate alongside the bytes: each hop that emits
 chain HTTPS PROXY-v2 (TCP prepend or UDP first-datagram) reads any

@@ -206,10 +206,8 @@ struct PredicateDiff {
     /// Predicates whose `name` matches on both sides but whose other
     /// fields (port / protocol / idle_timeout_ms) differ. Indicates an
     /// in-flight push where the upstream still has the previous
-    /// version's shape.
+    /// previous shape.
     changed: Vec<PredicateChange>,
-    local_version: Option<u64>,
-    upstream_version: Option<u64>,
     local_origin: Option<PubKey>,
     upstream_origin: Option<PubKey>,
 }
@@ -220,7 +218,6 @@ impl PredicateDiff {
         self.missing_upstream.is_empty()
             && self.extra_upstream.is_empty()
             && self.changed.is_empty()
-            && self.local_version == self.upstream_version
             && self.local_origin == self.upstream_origin
     }
 }
@@ -416,8 +413,6 @@ fn compute_diff(
         missing_upstream,
         extra_upstream,
         changed,
-        local_version: publisher.chain.predicate_version,
-        upstream_version: receiver.chain.predicate_version,
         local_origin: pub_origin,
         upstream_origin: recv_origin,
     })
@@ -428,17 +423,17 @@ fn compute_diff(
 /// One block per hop:
 ///
 /// ```text
-/// hop 0 (local x25519:abc…): predicates=2 v=12 origin=x25519:abc…
+/// hop 0 (local x25519:abc…): predicates=2 origin=x25519:abc…
 ///   derived_rules: 2 active
-/// hop 1 (upstream x25519:def…): predicates=2 v=12 origin=x25519:abc…
+/// hop 1 (upstream x25519:def…): predicates=2 origin=x25519:abc…
 ///   in sync with hop 0
-/// hop 2 (upstream x25519:fff…): predicates=2 v=12 origin=x25519:abc…
+/// hop 2 (upstream x25519:fff…): predicates=2 origin=x25519:abc…
 ///   in sync with hop 1
 /// ```
 ///
 /// Mid-chain relays forward the original push bytes verbatim upstream,
-/// so every settled hop reports the same origin + version + predicate
-/// content as the terminal at hop 0.
+/// so every settled hop reports the same origin + predicate content as
+/// the terminal at hop 0.
 fn render_human(report: &DiffReport) {
     let labels = hop_labels(
         report
@@ -449,18 +444,13 @@ fn render_human(report: &DiffReport) {
     for (idx, hop) in report.hops.iter().enumerate() {
         let role = if hop.index == 0 { "local" } else { "upstream" };
         let v = &hop.view;
-        let version_label = v
-            .chain
-            .predicate_version
-            .map(|n| format!(" v={n}"))
-            .unwrap_or_default();
         let origin_label = v
             .chain
             .predicate_origin
             .map(|p| format!(" origin={p}"))
             .unwrap_or_default();
         println!(
-            "hop {idx_disp} ({role} {label}): predicates={count}{version_label}{origin_label}",
+            "hop {idx_disp} ({role} {label}): predicates={count}{origin_label}",
             idx_disp = hop.index,
             label = labels[idx],
             count = v.predicates.len(),
@@ -489,12 +479,6 @@ fn render_human(report: &DiffReport) {
             }
             Some(d) => {
                 println!("  DRIFT vs hop {}:", hop.index - 1);
-                if d.local_version != d.upstream_version {
-                    println!(
-                        "    version: local={:?} upstream={:?}",
-                        d.local_version, d.upstream_version
-                    );
-                }
                 if d.local_origin != d.upstream_origin {
                     println!(
                         "    origin: local={:?} upstream={:?}",
@@ -571,8 +555,6 @@ struct SummaryHop {
     /// Number of accepted predicates (relays) or projected predicates
     /// (terminals).
     predicate_count: usize,
-    /// `PredicateSet.version` of the most recently applied push, if any.
-    predicate_version: Option<u64>,
 }
 
 /// Structured top-level summary report. The `--json` rendering serialises
@@ -608,7 +590,6 @@ async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result
             uptime_secs: h.uptime_secs,
             rule_count: h.view.derived_rules.len(),
             predicate_count: h.view.predicates.len(),
-            predicate_version: h.view.chain.predicate_version,
         })
         .collect();
     let report = SummaryReport {
@@ -628,19 +609,15 @@ async fn summary(socket: &Path, args: &SummaryArgs, json_output: bool) -> Result
 /// Render the report in the default human-readable form. Format:
 ///
 /// ```text
-/// hop 0  terminal  x25519:abc…  uptime=12s  rules=2  predicates=2 v=7
-/// hop 1  relay     x25519:def…  uptime=304s rules=2  predicates=2 v=7
-/// hop 2  gateway   x25519:fff…  uptime=304s rules=2  predicates=2 v=7
+/// hop 0  terminal  x25519:abc…  uptime=12s  rules=2  predicates=2
+/// hop 1  relay     x25519:def…  uptime=304s rules=2  predicates=2
+/// hop 2  gateway   x25519:fff…  uptime=304s rules=2  predicates=2
 /// ```
 fn render_summary_human(report: &SummaryReport) {
     let labels = hop_labels(report.hops.iter().map(|h| (h.name.as_deref(), &h.pubkey)));
     for (idx, hop) in report.hops.iter().enumerate() {
-        let version_label = hop
-            .predicate_version
-            .map(|v| format!(" v={v}"))
-            .unwrap_or_default();
         println!(
-            "hop {hop_idx}  {mode:<8}  {label}  uptime={uptime}s  rules={rules}  predicates={preds}{version_label}",
+            "hop {hop_idx}  {mode:<8}  {label}  uptime={uptime}s  rules={rules}  predicates={preds}",
             hop_idx = hop.index,
             mode = format!("{:?}", hop.mode).to_lowercase(),
             label = labels[idx],
@@ -1502,7 +1479,6 @@ target = "127.0.0.1:22"
         local: PubKey,
         upstream: Option<PubKey>,
         origin: Option<PubKey>,
-        version: Option<u64>,
     ) -> IntrospectionView {
         IntrospectionView {
             predicates,
@@ -1512,20 +1488,19 @@ target = "127.0.0.1:22"
                 upstream,
                 downstream: None,
                 predicate_origin: origin,
-                predicate_version: version,
                 last_apply_unix: None,
             },
         }
     }
 
     #[test]
-    fn diff_in_sync_when_predicates_versions_origins_all_match() {
+    fn diff_in_sync_when_predicates_origins_all_match() {
         let preds = vec![
             pred("a", 1000, Protocol::Tcp),
             pred("b", 1001, Protocol::Udp),
         ];
-        let local = view(preds.clone(), pk(1), Some(pk(2)), Some(pk(1)), Some(7));
-        let upstream = view(preds, pk(2), None, Some(pk(1)), Some(7));
+        let local = view(preds.clone(), pk(1), Some(pk(2)), Some(pk(1)));
+        let upstream = view(preds, pk(2), None, Some(pk(1)));
         let d = compute_diff(&local, &upstream).expect("comparable");
         assert!(d.is_in_sync(), "expected in sync, got {d:?}");
     }
@@ -1537,8 +1512,8 @@ target = "127.0.0.1:22"
             pred("b", 1001, Protocol::Udp),
         ];
         let upstream_preds = vec![pred("a", 1000, Protocol::Tcp)];
-        let local = view(local_preds, pk(1), Some(pk(2)), Some(pk(1)), Some(7));
-        let upstream = view(upstream_preds, pk(2), None, Some(pk(1)), Some(7));
+        let local = view(local_preds, pk(1), Some(pk(2)), Some(pk(1)));
+        let upstream = view(upstream_preds, pk(2), None, Some(pk(1)));
         let d = compute_diff(&local, &upstream).expect("comparable");
         assert!(!d.is_in_sync());
         assert_eq!(d.missing_upstream.len(), 1);
@@ -1554,8 +1529,8 @@ target = "127.0.0.1:22"
             pred("a", 1000, Protocol::Tcp),
             pred("ghost", 2000, Protocol::Tcp),
         ];
-        let local = view(local_preds, pk(1), Some(pk(2)), Some(pk(1)), Some(7));
-        let upstream = view(upstream_preds, pk(2), None, Some(pk(1)), Some(7));
+        let local = view(local_preds, pk(1), Some(pk(2)), Some(pk(1)));
+        let upstream = view(upstream_preds, pk(2), None, Some(pk(1)));
         let d = compute_diff(&local, &upstream).expect("comparable");
         assert!(!d.is_in_sync());
         assert!(d.missing_upstream.is_empty());
@@ -1570,14 +1545,12 @@ target = "127.0.0.1:22"
             pk(1),
             Some(pk(2)),
             Some(pk(1)),
-            Some(7),
         );
         let upstream = view(
             vec![pred("a", 1001, Protocol::Tcp)],
             pk(2),
             None,
             Some(pk(1)),
-            Some(7),
         );
         let d = compute_diff(&local, &upstream).expect("comparable");
         assert!(!d.is_in_sync());
@@ -1588,26 +1561,9 @@ target = "127.0.0.1:22"
     }
 
     #[test]
-    fn diff_detects_version_drift_with_matching_predicates() {
-        let preds = vec![pred("a", 1000, Protocol::Tcp)];
-        let local = view(preds.clone(), pk(1), Some(pk(2)), Some(pk(1)), Some(8));
-        let upstream = view(preds, pk(2), None, Some(pk(1)), Some(7));
-        let d = compute_diff(&local, &upstream).expect("comparable");
-        assert!(
-            !d.is_in_sync(),
-            "version drift alone should fail is_in_sync"
-        );
-        assert!(d.missing_upstream.is_empty());
-        assert!(d.extra_upstream.is_empty());
-        assert!(d.changed.is_empty());
-        assert_eq!(d.local_version, Some(8));
-        assert_eq!(d.upstream_version, Some(7));
-    }
-
-    #[test]
     fn diff_returns_none_when_no_predicates_on_either_side() {
-        let local = view(Vec::new(), pk(1), Some(pk(2)), None, None);
-        let upstream = view(Vec::new(), pk(2), None, None, None);
+        let local = view(Vec::new(), pk(1), Some(pk(2)), None);
+        let upstream = view(Vec::new(), pk(2), None, None);
         assert!(
             compute_diff(&local, &upstream).is_none(),
             "no predicates anywhere → no comparison performed"
@@ -1625,14 +1581,12 @@ target = "127.0.0.1:22"
             pk(1),
             Some(pk(2)),
             Some(pk(1)),
-            Some(7),
         );
         let upstream = view(
             vec![pred("b", 2000, Protocol::Tcp)],
             pk(2),
             None,
             Some(pk(99)), // different terminal authored this set
-            Some(3),
         );
         assert!(compute_diff(&local, &upstream).is_none());
     }
@@ -1662,7 +1616,6 @@ target = "127.0.0.1:22"
                 "upstream": "x25519:0202020202020202020202020202020202020202020202020202020202020202",
                 "downstream": null,
                 "predicate_origin": "x25519:0101010101010101010101010101010101010101010101010101010101010101",
-                "predicate_version": 42,
                 "last_apply_unix": 1737244800,
             }
         });
@@ -1672,7 +1625,6 @@ target = "127.0.0.1:22"
         assert_eq!(v.predicates[1].idle_timeout_ms, Some(60_000));
         assert_eq!(v.chain.local, pk(1));
         assert_eq!(v.chain.upstream, Some(pk(2)));
-        assert_eq!(v.chain.predicate_version, Some(42));
         assert_eq!(v.chain.last_apply_unix, Some(1737244800));
     }
 
@@ -1685,7 +1637,7 @@ target = "127.0.0.1:22"
             uptime_secs,
             name: None,
             query_rtt_ms: None,
-            view: view(Vec::new(), pk(1), None, None, None).pipe(|mut v| {
+            view: view(Vec::new(), pk(1), None, None).pipe(|mut v| {
                 v.chain.last_apply_unix = last_apply_unix;
                 v
             }),

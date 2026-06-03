@@ -22,9 +22,9 @@
 //! ## Determinism
 //!
 //! The output `predicates` list is sorted by `name`. Combined with the
-//! `version` counter, this gives byte-stable wire output for a given
-//! logical rule set so the push side can suppress redundant retransmits
-//! by comparing postcard digests.
+//! This gives byte-stable wire output for a given logical rule set so
+//! the push side can suppress redundant retransmits by comparing
+//! encoded predicate-set content.
 
 use ratatoskr::predicate::{Predicate, PredicateSet};
 use ratatoskr::pubkey::PubKey;
@@ -52,8 +52,7 @@ impl Default for HttpsPredicateMeta {
     }
 }
 
-/// Project a [`RuleSet`] into a [`PredicateSet`] stamped with `origin`
-/// and `version`.
+/// Project a [`RuleSet`] into a [`PredicateSet`] stamped with `origin`.
 ///
 /// L4 rules become L4 predicates. The top-level [[route]] collection
 /// emits a single HTTPS predicate (when non-empty) projecting the
@@ -62,7 +61,6 @@ pub fn extract(
     ruleset: &RuleSet,
     https_meta: HttpsPredicateMeta,
     origin: PubKey,
-    version: u64,
 ) -> ExtractOutcome {
     let mut predicates = Vec::with_capacity(ruleset.rules().len());
 
@@ -84,11 +82,7 @@ pub fn extract(
     predicates.sort_by(|a, b| a.name.cmp(&b.name));
 
     ExtractOutcome {
-        set: PredicateSet {
-            predicates,
-            version,
-            origin,
-        },
+        set: PredicateSet { predicates, origin },
     }
 }
 
@@ -190,7 +184,7 @@ mod tests {
             tcp_rule("ssh", 2222, 22),
             udp_rule("dns", 53, Some(Duration::from_secs(30))),
         ]);
-        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin(), 1);
+        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin());
         assert_eq!(out.set.predicates.len(), 2);
         // Sorted by name: dns < ssh.
         assert_eq!(out.set.predicates[0].name, "dns");
@@ -204,7 +198,7 @@ mod tests {
     fn routes_project_to_single_https_predicate() {
         let routes = vec![route("app1.example.com"), route("app2.example.com")];
         let ruleset = RuleSet::from_parts(Vec::new(), routes).unwrap();
-        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin(), 1);
+        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin());
         // One HTTPS predicate carrying the node-wide listener,
         // regardless of how many routes.
         assert_eq!(out.set.predicates.len(), 1);
@@ -217,7 +211,7 @@ mod tests {
     #[test]
     fn empty_routes_emit_no_https_predicate() {
         let ruleset = ruleset_from(vec![tcp_rule("ssh", 2222, 22)]);
-        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin(), 1);
+        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin());
         assert_eq!(out.set.predicates.len(), 1);
         assert_eq!(out.set.predicates[0].protocol, Protocol::Tcp);
     }
@@ -232,7 +226,7 @@ mod tests {
             listen_port: 8443,
             http3: false,
         };
-        let out = extract(&ruleset, meta, origin(), 1);
+        let out = extract(&ruleset, meta, origin());
         let p = out
             .set
             .predicates
@@ -250,7 +244,7 @@ mod tests {
             tcp_rule("a", 9002, 22),
             tcp_rule("m", 9003, 22),
         ]);
-        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin(), 7);
+        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin());
         let names: Vec<&str> = out.set.predicates.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["a", "m", "z"]);
     }
@@ -262,7 +256,7 @@ mod tests {
         let mut tcp = tcp_rule("ssh", 2222, 22);
         tcp.idle_timeout = None; // explicit
         let ruleset = ruleset_from(vec![tcp]);
-        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin(), 1);
+        let out = extract(&ruleset, HttpsPredicateMeta::default(), origin());
         assert_eq!(out.set.predicates[0].idle_timeout_ms, None);
     }
 }

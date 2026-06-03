@@ -8,7 +8,7 @@
 //!    `HeartbeatServer` backed by a `ChainAcceptor` + `ProxySupervisor`.
 //! 2. Driver sends a `PredicateSetUpdate` envelope; server acks `Ok`.
 //! 3. The introspection sink wired into the acceptor records the
-//!    apply (predicates, origin, version, last_apply_unix).
+//!    apply (predicates, origin, last_apply_unix).
 //! 4. Test calls `IntrospectionState::snapshot()` directly — same
 //!    `DerivedRulesResponse` shape the UDS handler serves.
 
@@ -63,8 +63,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     let client_keys = StaticKeyPair::generate().unwrap();
     let peer_state = PeerState::new(Some(client_keys.public_key()));
 
-    let pending_dir = tempfile::tempdir().unwrap();
-    let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+    let pending_store = Arc::new(PendingPeerStore::new());
 
     // 2. Real proxy supervisor over an empty rules dir.
     let rules_dir = tempfile::tempdir().unwrap();
@@ -83,7 +82,6 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     .expect("spawn supervisor");
 
     // 3. Acceptor.
-    let state_dir = tempfile::tempdir().unwrap();
     let derive_cfg = DeriveConfig {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
@@ -91,8 +89,7 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     let local_pubkey = server_keys.public_key();
     let upstream_pubkey = PubKey::x25519([0xAA; 32]);
     let downstream_pubkey = client_keys.public_key();
-    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path())
-        .expect("load acceptor");
+    let acceptor = ChainAcceptor::new(supervisor.handle(), derive_cfg);
 
     // 4. Introspection state wired into the acceptor.
     let introspection = IntrospectionState::new(
@@ -134,7 +131,6 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
             idle_timeout_ms: None,
             https_http3: false,
         }],
-        version: 1,
         origin,
     };
     let envelope = ControlEnvelope {
@@ -146,8 +142,8 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     assert_eq!(ack.status, AckStatus::Ok);
 
     // 7. Wait until the supervisor has applied the derived rule. Once
-    //    that completes, the introspection snapshot must reflect v=1
-    //    and the predicate list.
+    //    that completes, the introspection snapshot must reflect the
+    //    predicate list.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if supervisor
@@ -183,12 +179,11 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
         snap.derived_rules
     );
 
-    // Chain identity surfaces the configured pubkeys + applied version.
+    // Chain identity surfaces the configured pubkeys + applied origin.
     assert_eq!(snap.chain.local, local_pubkey);
     assert_eq!(snap.chain.upstream, Some(upstream_pubkey));
     assert_eq!(snap.chain.downstream, Some(downstream_pubkey));
     assert_eq!(snap.chain.predicate_origin, Some(origin));
-    assert_eq!(snap.chain.predicate_version, Some(1));
     assert!(
         snap.chain.last_apply_unix.unwrap_or(0) > 0,
         "last_apply_unix should be a wall-clock value, got {:?}",
@@ -199,6 +194,4 @@ async fn predicate_set_update_surfaces_in_introspection_snapshot() {
     supervisor.stop().await;
     let _ = hb_join.await;
     drop(rules_dir);
-    drop(state_dir);
-    drop(pending_dir);
 }

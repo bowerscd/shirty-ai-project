@@ -7,7 +7,7 @@
 //! resolve those locally from the heartbeat-discovered downstream peer
 //! address.
 //!
-//! A [`PredicateSet`] is a versioned, origin-stamped bundle of predicates
+//! A [`PredicateSet`] is an origin-stamped bundle of predicates
 //! pushed inside a [`ControlEnvelope`] body. The envelope's body type is
 //! [`ControlBodyType::PredicateSetUpdate`]. Reject reasons use the codes
 //! in [`predicate_reject`].
@@ -90,8 +90,7 @@ impl Predicate {
     }
 }
 
-/// A versioned bundle of predicates pushed from a downstream toward its
-/// upstream.
+/// A bundle of predicates pushed from a downstream toward its upstream.
 ///
 /// # Examples
 ///
@@ -111,7 +110,6 @@ impl Predicate {
 ///         idle_timeout_ms: None,
 ///         https_http3: false,
 ///     }],
-///     version: 1,
 ///     origin: PubKey::x25519([0x44; 32]),
 /// };
 /// let bytes = postcard::to_allocvec(&set).unwrap();
@@ -126,11 +124,6 @@ pub struct PredicateSet {
     ///
     /// [`origin`]: PredicateSet::origin
     pub predicates: Vec<Predicate>,
-    /// Monotone version assigned by the origin node. Bumped on every push
-    /// that follows a successful local rule reload. The receiver rejects
-    /// pushes whose `version` is not strictly greater than the last
-    /// accepted `version` from the same `origin`.
-    pub version: u64,
     /// Pubkey of the node that authored this predicate set. Always a
     /// terminal: relays cannot author predicates, they only forward or
     /// derive them.
@@ -149,7 +142,6 @@ struct LegacyPredicate {
 #[derive(Debug, Deserialize)]
 struct LegacyPredicateSet {
     predicates: Vec<LegacyPredicate>,
-    version: u64,
     origin: PubKey,
 }
 
@@ -167,7 +159,6 @@ impl LegacyPredicateSet {
                     https_http3: false,
                 })
                 .collect(),
-            version: self.version,
             origin: self.origin,
         }
     }
@@ -208,10 +199,6 @@ impl PredicateSet {
 /// `PredicateSetUpdate`. Codes live in the range `100..200`; future body
 /// types use disjoint ranges.
 pub mod predicate_reject {
-    /// The pushed `version` is not strictly greater than the receiver's
-    /// last accepted `version` for the same `origin`. The receiver's state
-    /// is already at-or-ahead.
-    pub const VERSION_STALE: u16 = 100;
     /// The postcard-encoded `PredicateSet` exceeds the per-message size
     /// limit (the chain control plane runs over UDP; payloads larger than
     /// the limit cannot be carried by a single frame).
@@ -335,7 +322,6 @@ mod tests {
         p.https_http3 = true;
         let set = PredicateSet {
             predicates: vec![p],
-            version: 1,
             origin: sample_origin(),
         };
         assert!(matches!(set.validate(), Err(Error::InvalidPredicate(_))));
@@ -366,13 +352,11 @@ mod tests {
                 sample_predicate("dns", 53, Protocol::Udp),
                 sample_predicate("ssh", 2222, Protocol::Tcp),
             ],
-            version: 7,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
         let back: PredicateSet = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(set, back);
-        assert_eq!(back.version, 7);
         assert_eq!(back.predicates.len(), 2);
     }
 
@@ -382,7 +366,6 @@ mod tests {
         https.https_http3 = true;
         let set = PredicateSet {
             predicates: vec![sample_predicate("ssh", 2222, Protocol::Tcp), https],
-            version: 8,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -402,7 +385,6 @@ mod tests {
     #[derive(Serialize)]
     struct LegacyPredicateSet {
         predicates: Vec<LegacyPredicate>,
-        version: u64,
         origin: PubKey,
     }
 
@@ -415,7 +397,6 @@ mod tests {
                 protocol: Protocol::Https,
                 idle_timeout_ms: None,
             }],
-            version: 9,
             origin: sample_origin(),
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
@@ -434,7 +415,6 @@ mod tests {
                 protocol: Protocol::Https,
                 idle_timeout_ms: None,
             }],
-            version: 9,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&legacy).unwrap();
@@ -453,15 +433,10 @@ mod tests {
                 protocol: Protocol::Https,
                 idle_timeout_ms: None,
             }],
-            version: 9,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&legacy).unwrap();
-        let err = postcard::from_bytes::<PredicateSet>(&bytes).unwrap_err();
-        assert!(
-            matches!(err, postcard::Error::DeserializeBadBool),
-            "unexpected legacy decode error: {err:?}"
-        );
+        assert!(postcard::from_bytes::<PredicateSet>(&bytes).is_err());
     }
 
     #[test]
@@ -470,7 +445,6 @@ mod tests {
         p.https_http3 = true;
         let set = PredicateSet {
             predicates: vec![p],
-            version: 10,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -484,7 +458,6 @@ mod tests {
     fn empty_predicate_set_roundtrips() {
         let set = PredicateSet {
             predicates: vec![],
-            version: 1,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -495,7 +468,6 @@ mod tests {
     #[test]
     fn reject_codes_are_stable() {
         // Pin the values so a future refactor can't silently shift them.
-        assert_eq!(predicate_reject::VERSION_STALE, 100);
         assert_eq!(predicate_reject::PREDICATE_SET_TOO_LARGE, 101);
         assert_eq!(predicate_reject::INVALID_PREDICATE, 102);
         assert_eq!(predicate_reject::LOCKED_PREDICATES_VIOLATION, 103);
@@ -516,7 +488,6 @@ mod tests {
                     https_http3: true,
                 })
                 .collect(),
-            version: u64::MAX,
             origin: sample_origin(),
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -568,14 +539,9 @@ mod tests {
     fn arb_predicate_set() -> impl Strategy<Value = PredicateSet> {
         (
             proptest::collection::vec(arb_predicate(), 0..10),
-            any::<u64>(),
             arb_pubkey(),
         )
-            .prop_map(|(predicates, version, origin)| PredicateSet {
-                predicates,
-                version,
-                origin,
-            })
+            .prop_map(|(predicates, origin)| PredicateSet { predicates, origin })
     }
 
     proptest! {

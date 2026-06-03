@@ -131,8 +131,7 @@ impl DeriveError {
 /// Derive a local [`RuleSet`] from a received [`PredicateSet`].
 ///
 /// The caller is responsible for sequencing: only invoke `derive` after
-/// the predicate set has passed the version-monotonicity check
-/// (otherwise the relay would happily reapply stale state).
+/// the predicate set has passed schema-level validation.
 pub fn derive(set: &PredicateSet, cfg: &DeriveConfig) -> Result<RuleSet, DeriveError> {
     let mut seen_names: HashSet<&str> = HashSet::with_capacity(set.predicates.len());
     let mut seen_rule_names: HashMap<String, String> =
@@ -417,7 +416,6 @@ mod tests {
     fn predicate_set(predicates: Vec<Predicate>) -> PredicateSet {
         PredicateSet {
             predicates,
-            version: 1,
             origin: origin(),
         }
     }
@@ -634,19 +632,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_non_initial_predicate_version() {
-        let mut set = predicate_set(vec![https_predicate("web", 443, true)]);
-        set.version = 42;
-
-        let ruleset = derive(&set, &cfg()).unwrap();
-
-        assert_eq!(set.version, 42);
-        assert_eq!(ruleset.rules().len(), 2);
-        assert!(ruleset.find("web-tcp").is_some());
-        assert!(ruleset.find("web-udp").is_some());
-    }
-
-    #[test]
     fn postcard_round_trip_preserves_mixed_https_derivation_bytes() {
         let cfg = cfg();
         let set = predicate_set(vec![
@@ -673,10 +658,9 @@ mod tests {
         let default_source = https_source_ruleset("web", 443, None);
         let explicit_source = https_source_ruleset("web", 443, Some(true));
         let meta = predicate_extractor::HttpsPredicateMeta::default();
-        let default_predicates =
-            predicate_extractor::extract(&default_source, meta, origin(), 7).set;
+        let default_predicates = predicate_extractor::extract(&default_source, meta, origin()).set;
         let explicit_predicates =
-            predicate_extractor::extract(&explicit_source, meta, origin(), 7).set;
+            predicate_extractor::extract(&explicit_source, meta, origin()).set;
 
         assert_eq!(default_predicates, explicit_predicates);
         assert!(default_predicates.predicates[0].https_http3);

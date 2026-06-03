@@ -1,45 +1,33 @@
 //! Relay-side chain receive dispatcher.
 //!
-//! Glues together the three steps a relay performs when an inbound
-//! `Control` envelope with body type [`ControlBodyType::PredicateSetUpdate`]
-//! arrives:
+//! Glues together the receive path for an inbound `Control` envelope with
+//! body type [`ControlBodyType::PredicateSetUpdate`]: decode the
+//! postcard-encoded [`PredicateSet`], project it to a [`RuleSet`] via
+//! [`chain::derive`], and hand the result to the proxy supervisor via
+//! [`SupervisorHandle::apply_ruleset`].
 //!
-//! 1. Decode the postcard-encoded [`PredicateSet`] body.
-//! 2. Enforce the per-origin monotone version invariant (the persisted
-//!    `chain-predicates.toml` carries the last accepted version per
-//!    `PredicateSet.origin`). Out-of-order pushes ack
-//!    [`predicate_reject::VERSION_STALE`].
-//! 3. Project the set to a [`RuleSet`] via [`chain::derive`] and hand it
-//!    to the proxy supervisor via [`SupervisorHandle::apply_ruleset`].
-//!
-//! All steps are wrapped in a single [`dispatch`](ChainAcceptor::dispatch)
-//! call that returns the [`AckStatus`] the receiver should encode into
-//! the outbound `ControlAck`.
-//!
-//! The acceptor is **shared** across heartbeat sessions: re-handshaking
-//! does not reset the persisted versions. The persistence layer uses an
-//! atomic tmp+rename write keyed off `state_dir/chain-predicates.toml`.
+//! The receiver applies every valid push from the authenticated peer. Noise
+//! IK is the security boundary; the reliability layer handles in-session
+//! ordering, and the terminal re-publishes on every session epoch. The
+//! acceptor therefore keeps no persistent predicate state.
 //!
 //! Terminals are the only authors of predicates, so `PredicateSet.origin`
-//! always identifies a terminal. The relay deliberately does not
-//! validate that `origin == downstream_pubkey`: in a multi-hop chain,
-//! a mid-chain relay receives the predicate set forwarded by the
-//! immediate downstream relay, whose body still carries the original
-//! terminal's pubkey as `origin` (forwarding is byte-identical; see
-//! `handle_predicate_set_update` below). Test drivers also rely on
-//! this looseness to push synthetic origins.
+//! always identifies a terminal. The relay deliberately does not validate
+//! that `origin == downstream_pubkey`: in a multi-hop chain, a mid-chain
+//! relay receives the predicate set forwarded by the immediate downstream
+//! relay, whose body still carries the original terminal's pubkey as
+//! `origin` (forwarding is byte-identical; see
+//! `handle_predicate_set_update` below). Test drivers also rely on this
+//! looseness to push synthetic origins.
 //!
 //! [`PredicateSet`]: ratatoskr::predicate::PredicateSet
 //! [`ControlBodyType::PredicateSetUpdate`]: ratatoskr::control_frame::ControlBodyType::PredicateSetUpdate
 //! [`RuleSet`]: ratatoskr::rule::RuleSet
-//! [`predicate_reject::VERSION_STALE`]: ratatoskr::predicate::predicate_reject::VERSION_STALE
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
 use ratatoskr::canary::{
     CanaryArm as CanaryArmFrame, CanaryHop, CanaryReply, CANARY_REPLY_MAX_WIRE_BYTES,
 };
@@ -49,7 +37,6 @@ use ratatoskr::control_frame::{AckStatus, ControlBodyType, ControlEnvelope};
 use ratatoskr::predicate::{predicate_reject, PredicateSet, PREDICATE_SET_MAX_WIRE_BYTES};
 use ratatoskr::pubkey::PubKey;
 use ratatoskr::rule::Protocol;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::chain::client::{ChainClientHandle, QueryError};
@@ -58,88 +45,12 @@ use crate::chain::introspection::IntrospectionState;
 use crate::proxy::canary::CanaryArmTable;
 use crate::proxy::supervisor::SupervisorHandle;
 
-/// State file name under `state_dir`. Single file regardless of how many
-/// origins the relay accepts predicates from.
-const STATE_FILE: &str = "chain-predicates.toml";
-
-/// On-disk envelope. `origins` ordered by serialised pubkey for stable
-/// diffs.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct PersistedState {
-    #[serde(default)]
-    origins: Vec<OriginRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OriginRecord {
-    pubkey: PubKey,
-    version: u64,
-}
-
-/// In-memory tracking state. Mirrors `PersistedState.origins` indexed by
-/// `PubKey` for O(1) lookup.
-#[derive(Debug, Default)]
-struct InMemoryState {
-    versions: HashMap<PubKey, u64>,
-    /// Origins for which the persisted `last_accepted` version was
-    /// loaded from disk on startup but has not yet been re-applied
-    /// this runtime. The supervisor's in-memory state is empty on
-    /// daemon restart, so a peer (relay or terminal) re-forwarding
-    /// the SAME version it pushed before our restart must be allowed
-    /// to land it once, re-populating the supervisor. After that
-    /// first re-apply per origin, strict monotone resumes.
-    ///
-    /// Without this, an upstream daemon restart in a multi-hop chain
-    /// is unrecoverable without operator intervention: the relay's
-    /// `last_forwarded` body still carries the pre-restart version,
-    /// and a same-version push would be rejected `VERSION_STALE`
-    /// while the supervisor stays empty. See finding
-    /// `publisher-dedup-after-upstream-restart` for the full path.
-    pending_reapply: HashSet<PubKey>,
-}
-
-impl InMemoryState {
-    fn from_persisted(p: &PersistedState) -> Self {
-        let mut versions = HashMap::new();
-        for r in &p.origins {
-            versions.insert(r.pubkey, r.version);
-        }
-        // Every origin that already had a persisted version on disk
-        // needs the chance to re-apply it once after the daemon
-        // starts (the supervisor's in-memory state has been wiped by
-        // the restart and the same version may arrive again from a
-        // peer's last_forwarded body — see finding
-        // `publisher-dedup-after-upstream-restart`).
-        let pending_reapply: HashSet<PubKey> = versions.keys().copied().collect();
-        Self {
-            versions,
-            pending_reapply,
-        }
-    }
-
-    fn to_persisted(&self) -> PersistedState {
-        let mut origins: Vec<OriginRecord> = self
-            .versions
-            .iter()
-            .map(|(k, v)| OriginRecord {
-                pubkey: *k,
-                version: *v,
-            })
-            .collect();
-        // Stable order for diffs / human inspection.
-        origins.sort_by_key(|a| a.pubkey.to_string());
-        PersistedState { origins }
-    }
-}
-
 /// Relay-side chain control-plane dispatcher. Construct via
-/// [`ChainAcceptor::load`] and pass into [`HeartbeatServer::bind`] (a
+/// [`ChainAcceptor::new`] and pass into [`HeartbeatServer::bind`] (a
 /// future signature change) or invoke directly from tests.
 pub struct ChainAcceptor {
     supervisor: SupervisorHandle,
     derive_cfg: DeriveConfig,
-    state_path: PathBuf,
-    state: Mutex<InMemoryState>,
     /// Late-bound chain-introspection sink. The `Request::DerivedRules`
     /// UDS handler reads from this. When unset (e.g. tests, or relays
     /// where the introspection endpoint is intentionally disabled),
@@ -185,38 +96,18 @@ pub struct ChainAcceptor {
     /// Per-origin snapshot of the last `PredicateSetUpdate` body bytes
     /// this relay forwarded upstream. Held verbatim (postcard-encoded)
     /// so the upstream-session-resync task can re-forward without
-    /// recoding from the in-memory derived RuleSet (which loses the
-    /// origin-pubkey ↔ version coupling). Empty on relays without an
+    /// recoding from the in-memory derived RuleSet. Empty on relays without an
     /// upstream; populated as the relay observes each origin for the
     /// first time. Keyed by `PredicateSet.origin`.
     last_forwarded: Mutex<HashMap<PubKey, Vec<u8>>>,
 }
 
 impl ChainAcceptor {
-    /// Load (or initialise) the per-origin version state from
-    /// `<state_dir>/chain-predicates.toml`. Missing file is treated as
-    /// empty state; malformed file is a hard error (operator action
-    /// required, same posture as `pending_peers.toml`).
-    pub fn load(
-        supervisor: SupervisorHandle,
-        derive_cfg: DeriveConfig,
-        state_dir: impl AsRef<Path>,
-    ) -> Result<Arc<Self>> {
-        let state_path = state_dir.as_ref().join(STATE_FILE);
-        let persisted = if state_path.exists() {
-            let text = std::fs::read_to_string(&state_path)
-                .with_context(|| format!("read {}", state_path.display()))?;
-            toml::from_str::<PersistedState>(&text)
-                .with_context(|| format!("parse {}", state_path.display()))?
-        } else {
-            PersistedState::default()
-        };
-        let state = InMemoryState::from_persisted(&persisted);
-        Ok(Arc::new(Self {
+    /// Construct an acceptor with empty in-memory transport buffers.
+    pub fn new(supervisor: SupervisorHandle, derive_cfg: DeriveConfig) -> Arc<Self> {
+        Arc::new(Self {
             supervisor,
             derive_cfg,
-            state_path,
-            state: Mutex::new(state),
             introspection: OnceLock::new(),
             started_at: Instant::now(),
             mode: OnceLock::new(),
@@ -225,7 +116,7 @@ impl ChainAcceptor {
             upstream: OnceLock::new(),
             arm_table: OnceLock::new(),
             last_forwarded: Mutex::new(HashMap::new()),
-        }))
+        })
     }
 
     /// Set the daemon mode reported on the local [`ChainHop`] of
@@ -487,42 +378,6 @@ impl ChainAcceptor {
             }
         };
 
-        // Version invariant: monotone per origin, with one exception.
-        //
-        // Steady state: strictly increasing. Equal-version pushes are
-        // rejected as `VERSION_STALE` — they signal a publisher bug.
-        //
-        // Exception: on daemon restart, the persisted per-origin
-        // version is loaded into `state.versions` but the supervisor's
-        // in-memory rule state is empty. A peer (relay or terminal)
-        // whose `last_forwarded` body still carries the pre-restart
-        // version may legitimately re-push the same version once
-        // post-restart to repopulate the supervisor; we allow this
-        // re-apply by tracking `pending_reapply` and clearing the
-        // origin's flag after the first acceptance per runtime. This
-        // closes the multi-hop upstream-restart recovery gap; see
-        // finding `publisher-dedup-after-upstream-restart`.
-        {
-            let state = self.state.lock().await;
-            if let Some(&last) = state.versions.get(&set.origin) {
-                let reapply_ok = set.version == last && state.pending_reapply.contains(&set.origin);
-                if set.version < last || (set.version == last && !reapply_ok) {
-                    tracing::warn!(
-                        origin = %set.origin,
-                        offered = set.version,
-                        last_accepted = last,
-                        "predicate set version is stale"
-                    );
-                    metrics::counter!(
-                        "yggdrasil_chain_predicate_recv_total",
-                        "outcome" => "stale",
-                    )
-                    .increment(1);
-                    return AckStatus::Reject(predicate_reject::VERSION_STALE);
-                }
-            }
-        }
-
         // Derive into a RuleSet. Errors here are operator-fault on the
         // sender (invalid name, duplicate listen, etc.).
         let rules = match derive(&set, &self.derive_cfg) {
@@ -531,7 +386,6 @@ impl ChainAcceptor {
                 let code = e.reject_code();
                 tracing::warn!(
                     origin = %set.origin,
-                    version = set.version,
                     error = %e,
                     reject_code = code,
                     "predicate set rejected by derive"
@@ -551,7 +405,6 @@ impl ChainAcceptor {
         if let Err(e) = self.supervisor.apply_ruleset(rules).await {
             tracing::error!(
                 origin = %set.origin,
-                version = set.version,
                 error = %e,
                 "supervisor refused predicate apply (shutting down?)"
             );
@@ -564,35 +417,8 @@ impl ChainAcceptor {
             return AckStatus::Reject(predicate_reject::INVALID_PREDICATE);
         }
 
-        // Persist the new accepted version. Hold the lock across the
-        // disk write so a concurrent dispatch cannot observe a stale
-        // in-memory state that hasn't been written yet.
-        {
-            let mut state = self.state.lock().await;
-            state.versions.insert(set.origin, set.version);
-            // First successful apply per origin per runtime clears
-            // the re-apply flag; subsequent equal-version pushes will
-            // be rejected as stale (steady-state strict-monotone).
-            state.pending_reapply.remove(&set.origin);
-            if let Err(e) = write_atomic(&self.state_path, &state.to_persisted()) {
-                tracing::error!(
-                    error = %e,
-                    "failed to persist chain-predicates state file"
-                );
-                // We already applied to the supervisor; reverting now
-                // would be worse than carrying on. Surface the failure
-                // in metrics so operators can alert.
-                metrics::counter!(
-                    "yggdrasil_chain_predicate_recv_total",
-                    "outcome" => "persist_error",
-                )
-                .increment(1);
-            }
-        }
-
         tracing::info!(
             origin = %set.origin,
-            version = set.version,
             predicates = set.predicates.len(),
             "predicate set accepted and applied"
         );
@@ -601,12 +427,6 @@ impl ChainAcceptor {
             "outcome" => "ok",
         )
         .increment(1);
-        metrics::gauge!(
-            "yggdrasil_chain_predicate_accepted_version",
-            "origin" => set.origin.to_string(),
-        )
-        .set(set.version as f64);
-
         // Notify the introspection sink, if one is attached. This
         // populates the `Request::DerivedRules` snapshot with the
         // predicate set we just applied. Skipped silently when no
@@ -617,9 +437,8 @@ impl ChainAcceptor {
 
         // Mid-chain forwarding: if this relay also has an upstream
         // (`[dial]` configured), forward the original body bytes
-        // verbatim up the chain. The wire-level origin/version is
-        // preserved so each hop applies the same monotone-version
-        // invariant against the terminal's pubkey. Failures here are
+        // verbatim up the chain. The wire-level origin and predicate
+        // content are preserved. Failures here are
         // logged but do not fail the downstream ack — the downstream
         // has already done its job by getting the predicate to us.
         if let Some(upstream) = self.upstream.get() {
@@ -650,8 +469,7 @@ impl ChainAcceptor {
                     .increment(1);
                     tracing::debug!(
                         origin = %set.origin,
-                        version = set.version,
-                        "predicate set forwarded upstream"
+                            "predicate set forwarded upstream"
                     );
                 }
                 Err(_) => {
@@ -662,20 +480,13 @@ impl ChainAcceptor {
                     .increment(1);
                     tracing::warn!(
                         origin = %set.origin,
-                        version = set.version,
-                        "chain client down; predicate set not forwarded upstream"
+                            "chain client down; predicate set not forwarded upstream"
                     );
                 }
             }
         }
 
         AckStatus::Ok
-    }
-
-    /// Test-only accessor for the last accepted version of `origin`.
-    #[cfg(test)]
-    pub(crate) async fn last_accepted_version(&self, origin: &PubKey) -> Option<u64> {
-        self.state.lock().await.versions.get(origin).copied()
     }
 
     /// Decode a `ChainHopQuery` body and spawn a background task to
@@ -1115,21 +926,6 @@ impl ChainAcceptor {
     }
 }
 
-fn write_atomic(path: &Path, state: &PersistedState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-    }
-    let text = toml::to_string_pretty(state).context("serialise chain-predicates TOML")?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1148,7 +944,7 @@ mod tests {
         PubKey::x25519([0xAAu8; X25519_PUBLIC_LEN])
     }
 
-    fn predicate_set(origin: PubKey, version: u64, ports: &[u16]) -> PredicateSet {
+    fn predicate_set(origin: PubKey, ports: &[u16]) -> PredicateSet {
         let mut predicates: Vec<Predicate> = ports
             .iter()
             .enumerate()
@@ -1161,11 +957,7 @@ mod tests {
             })
             .collect();
         predicates.sort_by(|a, b| a.name.cmp(&b.name));
-        PredicateSet {
-            predicates,
-            version,
-            origin,
-        }
+        PredicateSet { predicates, origin }
     }
 
     fn encode(set: &PredicateSet) -> Vec<u8> {
@@ -1213,6 +1005,25 @@ mod tests {
         });
     }
 
+    async fn await_snapshot_port(sup: &ProxySupervisor, target: u16) {
+        let mut rx = sup.snapshot_receiver();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !rx.borrow().iter().any(|p| p.listen.port() == target) {
+                rx.changed().await.expect("snapshot watch closed");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for snapshot port {target}; have {:?}",
+                sup.snapshot()
+                    .iter()
+                    .map(|p| p.listen.port())
+                    .collect::<Vec<_>>()
+            )
+        });
+    }
+
     fn derive_cfg() -> DeriveConfig {
         DeriveConfig {
             bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -1224,10 +1035,9 @@ mod tests {
     async fn accepts_fresh_set_and_applies_to_supervisor() {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
+        let acc = ChainAcceptor::new(handle, derive_cfg());
 
-        let set = predicate_set(origin_a(), 1, &[free_port(), free_port()]);
+        let set = predicate_set(origin_a(), &[free_port(), free_port()]);
         let bytes = encode(&set);
         let status = acc
             .dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &bytes)
@@ -1235,46 +1045,60 @@ mod tests {
         assert_eq!(status, AckStatus::Ok);
 
         await_snapshot_len(&sup, 2).await;
-        assert_eq!(acc.last_accepted_version(&origin_a()).await, Some(1));
-
-        // The state file should exist on disk and reflect the accepted version.
-        let written = std::fs::read_to_string(state_dir.path().join(STATE_FILE)).unwrap();
-        assert!(written.contains(&origin_a().to_string()));
-        assert!(written.contains("version = 1"));
 
         cancel.cancel();
         sup.stop().await;
     }
 
     #[tokio::test]
-    async fn rejects_stale_version() {
+    async fn accepts_reapplied_origin_regardless_of_prior_state() {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
+        let acc = ChainAcceptor::new(handle, derive_cfg());
 
-        let p = free_port();
-        let v2 = encode(&predicate_set(origin_a(), 2, &[p]));
+        let first_port = free_port();
+        let first = encode(&predicate_set(origin_a(), &[first_port]));
         assert_eq!(
-            acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v2)
+            acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &first)
                 .await,
             AckStatus::Ok
         );
+        await_snapshot_port(&sup, first_port).await;
 
-        // v1 < v2 → stale.
-        let v1 = encode(&predicate_set(origin_a(), 1, &[p]));
+        let replacement_port = free_port();
+        let replacement = encode(&predicate_set(origin_a(), &[replacement_port]));
         assert_eq!(
-            acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v1)
+            acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &replacement)
                 .await,
-            AckStatus::Reject(predicate_reject::VERSION_STALE),
+            AckStatus::Ok,
+            "receiver must apply a later authenticated push without consulting prior state"
         );
+        await_snapshot_port(&sup, replacement_port).await;
 
-        // v2 again is also stale (strict monotone, not just LE).
-        let v2_again = encode(&predicate_set(origin_a(), 2, &[p]));
-        assert_eq!(
-            acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v2_again)
-                .await,
-            AckStatus::Reject(predicate_reject::VERSION_STALE),
+        cancel.cancel();
+        sup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn does_not_write_acceptor_state_files() {
+        let cancel = CancellationToken::new();
+        let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let acc = ChainAcceptor::new(handle, derive_cfg());
+
+        for _ in 0..3 {
+            let set = encode(&predicate_set(origin_a(), &[free_port()]));
+            assert_eq!(
+                acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &set)
+                    .await,
+                AckStatus::Ok
+            );
+        }
+
+        let mut entries = std::fs::read_dir(state_dir.path()).unwrap();
+        assert!(
+            entries.next().is_none(),
+            "acceptor should not write files under the daemon state dir"
         );
 
         cancel.cancel();
@@ -1285,8 +1109,7 @@ mod tests {
     async fn rejects_oversize_body() {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
+        let acc = ChainAcceptor::new(handle, derive_cfg());
 
         let big = vec![0u8; PREDICATE_SET_MAX_WIRE_BYTES + 1];
         assert_eq!(
@@ -1303,8 +1126,7 @@ mod tests {
     async fn unknown_body_type_acks_unknown() {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
+        let acc = ChainAcceptor::new(handle, derive_cfg());
 
         // 0x7F is unassigned in the registry.
         let status = acc.dispatch(0x7F, &[]).await;
@@ -1318,8 +1140,7 @@ mod tests {
     async fn malformed_body_rejects_with_invalid_predicate() {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
+        let acc = ChainAcceptor::new(handle, derive_cfg());
 
         // Random bytes that aren't a valid postcard PredicateSet.
         let junk = b"this is not a predicate set";
@@ -1327,98 +1148,6 @@ mod tests {
             acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), junk)
                 .await,
             AckStatus::Reject(predicate_reject::INVALID_PREDICATE),
-        );
-
-        cancel.cancel();
-        sup.stop().await;
-    }
-
-    #[tokio::test]
-    async fn state_persists_across_load_reload() {
-        let cancel = CancellationToken::new();
-        let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-
-        let acc1 = ChainAcceptor::load(handle.clone(), derive_cfg(), state_dir.path()).unwrap();
-        let bytes = encode(&predicate_set(origin_a(), 7, &[free_port()]));
-        assert_eq!(
-            acc1.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &bytes)
-                .await,
-            AckStatus::Ok
-        );
-        drop(acc1);
-
-        let acc2 = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
-        assert_eq!(acc2.last_accepted_version(&origin_a()).await, Some(7));
-
-        cancel.cancel();
-        sup.stop().await;
-    }
-
-    /// Restart-recovery semantic: when a fresh acceptor loads a
-    /// persisted version, the first push from that origin AT THE
-    /// PERSISTED VERSION must be accepted (to re-populate the
-    /// supervisor that was wiped by the restart). Subsequent pushes
-    /// at the same version revert to strict-monotone reject. This
-    /// is the gateway-side of the upstream-restart resync path; the
-    /// relay's `last_forwarded` body still carries the pre-restart
-    /// version, and the gateway must let it land once.
-    #[tokio::test]
-    async fn allows_one_reapply_at_persisted_version_after_restart() {
-        let cancel = CancellationToken::new();
-        let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-
-        // Run 1: push v3, simulating pre-restart steady state.
-        let p = free_port();
-        let acc1 = ChainAcceptor::load(handle.clone(), derive_cfg(), state_dir.path()).unwrap();
-        let v3 = encode(&predicate_set(origin_a(), 3, &[p]));
-        assert_eq!(
-            acc1.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v3)
-                .await,
-            AckStatus::Ok
-        );
-        drop(acc1);
-
-        // Run 2: simulating the restart. Persisted version = 3. The
-        // relay's `last_forwarded` body still has version 3; we re-
-        // push it verbatim. The acceptor must allow exactly one re-
-        // apply at the persisted version per origin, then revert to
-        // strict monotone.
-        let acc2 = ChainAcceptor::load(handle, derive_cfg(), state_dir.path()).unwrap();
-        let v3_again = encode(&predicate_set(origin_a(), 3, &[p]));
-        assert_eq!(
-            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v3_again)
-                .await,
-            AckStatus::Ok,
-            "first re-apply at persisted version after restart must be allowed"
-        );
-
-        // A SECOND push at v3 must be rejected — the re-apply window
-        // is one shot per origin per runtime.
-        let v3_third = encode(&predicate_set(origin_a(), 3, &[p]));
-        assert_eq!(
-            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v3_third)
-                .await,
-            AckStatus::Reject(predicate_reject::VERSION_STALE),
-            "second push at persisted version must revert to strict-monotone reject"
-        );
-
-        // A strictly-older push must still be rejected — replay
-        // protection survives the re-apply window.
-        let v2 = encode(&predicate_set(origin_a(), 2, &[p]));
-        assert_eq!(
-            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v2)
-                .await,
-            AckStatus::Reject(predicate_reject::VERSION_STALE)
-        );
-
-        // A strictly-newer push must be accepted as normal.
-        let v4 = encode(&predicate_set(origin_a(), 4, &[p]));
-        assert_eq!(
-            acc2.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &v4)
-                .await,
-            AckStatus::Ok
         );
 
         cancel.cancel();

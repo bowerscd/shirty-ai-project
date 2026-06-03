@@ -48,7 +48,7 @@ async fn https_predicate_with_http3_derives_tcp_and_udp_on_relay() {
         listen_port,
         http3: true,
     };
-    let outcome = predicate_extractor::extract(&rules, meta, origin(), 1);
+    let outcome = predicate_extractor::extract(&rules, meta, origin());
 
     let predicates = outcome.set;
     assert_eq!(predicates.predicates.len(), 1);
@@ -104,7 +104,7 @@ async fn https_predicate_with_http3_disabled_derives_tcp_only() {
         listen_port,
         http3: false,
     };
-    let outcome = predicate_extractor::extract(&rules, meta, origin(), 1);
+    let outcome = predicate_extractor::extract(&rules, meta, origin());
 
     let predicates = outcome.set;
     assert_eq!(predicates.predicates.len(), 1);

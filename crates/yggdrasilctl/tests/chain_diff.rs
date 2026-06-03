@@ -14,7 +14,7 @@
 //! 1. `diff_single_hop_local_only_in_sync` — terminal-only chain
 //!    (single hop). CLI prints "in sync across 1 hop".
 //! 2. `diff_two_hops_in_sync` — terminal + one upstream relay; both
-//!    hops carry the same predicates / version / origin.
+//!    hops carry the same predicates / origin.
 //! 3. `diff_two_hops_drift_detected` — upstream is missing a
 //!    predicate; CLI exits non-zero with the missing predicate
 //!    surfaced.
@@ -34,7 +34,6 @@ fn chain_hop_json(
     local: &str,
     upstream: Option<&str>,
     predicates: &[(&str, u16, &str)],
-    version: Option<u64>,
     origin: Option<&str>,
 ) -> serde_json::Value {
     let preds: Vec<serde_json::Value> = predicates
@@ -53,7 +52,6 @@ fn chain_hop_json(
         "upstream": upstream,
         "downstream": null,
         "predicate_origin": origin,
-        "predicate_version": version,
         "last_apply_unix": null,
     });
     let view = serde_json::json!({
@@ -146,7 +144,6 @@ fn diff_single_hop_local_only_in_sync() {
             PK_LOCAL,
             None,
             &[("alpha", 9001, "tcp")],
-            Some(7),
             Some(PK_LOCAL),
         )],
         false,
@@ -189,7 +186,6 @@ fn diff_two_hops_in_sync() {
                 PK_LOCAL,
                 Some(PK_UPSTREAM),
                 &[("alpha", 9001, "tcp"), ("beta", 9002, "udp")],
-                Some(7),
                 Some(PK_LOCAL),
             ),
             chain_hop_json(
@@ -197,7 +193,6 @@ fn diff_two_hops_in_sync() {
                 PK_UPSTREAM,
                 None,
                 &[("alpha", 9001, "tcp"), ("beta", 9002, "udp")],
-                Some(7),
                 Some(PK_LOCAL),
             ),
         ],
@@ -246,7 +241,6 @@ fn diff_two_hops_drift_detected() {
                 PK_LOCAL,
                 Some(PK_UPSTREAM),
                 &[("alpha", 9001, "tcp"), ("beta", 9002, "udp")],
-                Some(7),
                 Some(PK_LOCAL),
             ),
             // Upstream is MISSING "beta" — drift!
@@ -255,7 +249,6 @@ fn diff_two_hops_drift_detected() {
                 PK_UPSTREAM,
                 None,
                 &[("alpha", 9001, "tcp")],
-                Some(7),
                 Some(PK_LOCAL),
             ),
         ],
@@ -299,7 +292,6 @@ fn diff_json_output_round_trips() {
             PK_LOCAL,
             None,
             &[("alpha", 9001, "tcp")],
-            Some(7),
             Some(PK_LOCAL),
         )],
         false,

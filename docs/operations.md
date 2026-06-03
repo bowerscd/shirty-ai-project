@@ -337,15 +337,15 @@ exposes the live `not_after` for "stuck renewal" alerts. See
 sudo yggdrasilctl chain diff
 ```
 
-Each hop reports its predicate version + origin + derived-rule count.
-"in sync" between hops means the terminal's published set matches what
-the relay accepted. Drift surfaces as a `~` (changed), `+` (missing
-upstream), or `-` (extra upstream) entry.
+Each hop reports its predicate origin + derived-rule count. "in sync"
+between hops means the terminal's published set matches what the relay
+accepted. Drift surfaces as a `~` (changed), `+` (missing upstream), or
+`-` (extra upstream) entry.
 
 Exit code is `1` if drift is detected on at least one hop. In a healthy
-steady-state chain every hop reports the same `origin` + `version` +
-predicate content: mid-chain relays forward the original push bytes
-verbatim upstream
+steady-state chain every hop reports the same `origin` + predicate
+content: mid-chain relays forward the original push bytes verbatim
+upstream
 (`crates/yggdrasil/src/chain/acceptor.rs::handle_predicate_set_update`),
 so the gateway sees byte-identically what the terminal published.
 
@@ -660,13 +660,12 @@ If a backend behind the terminal sees the relay's IP in
 
 ### "chain diff says origin mismatch with previous hop"
 
-Under v1, this is expected for canary / TOFU staging boundaries where
-the predicate version persisted by the upstream lags behind the
-downstream's just-applied set — `chain diff` flags it as a
-non-error. Mid-chain relays forward their downstream's predicates
-verbatim (preserving origin pubkey and monotone version) so steady-
-state diff is empty across the chain; transient mismatches resolve
-on the next predicate-publish cycle.
+Under v1, this is expected during transient propagation windows (for
+example, while a newly-authenticated terminal's first predicate push is
+walking the chain) — `chain diff` flags it as a non-error. Mid-chain
+relays forward predicates verbatim (preserving origin pubkey and
+predicate content) so steady-state diff is empty across the chain;
+transient mismatches resolve on the next predicate-publish cycle.
 
 ### NAT traversal won't establish or keeps backing off
 

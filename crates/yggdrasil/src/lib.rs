@@ -201,8 +201,7 @@ pub async fn run_relay(
     // 5b. Chain acceptor — receive-side dispatcher for inbound
     //     `PredicateSetUpdate` envelopes. Built only when a listener is
     //     configured: without a listener we never receive Control
-    //     packets, so the acceptor would be unused. Persists per-origin
-    //     versions under `state_dir/chain-predicates.toml`.
+    //     packets, so the acceptor would be unused.
     let chain_acceptor = if config.accept.is_some() {
         use std::net::{IpAddr, Ipv4Addr};
         let bind_addr = config
@@ -219,10 +218,7 @@ pub async fn run_relay(
             // ends of the chain HTTPS leg are yggdrasil.
             proxy_protocol: None,
         };
-        Some(
-            ChainAcceptor::load(supervisor.handle(), derive_cfg, &config.server.state_dir)
-                .context("loading chain acceptor state")?,
-        )
+        Some(ChainAcceptor::new(supervisor.handle(), derive_cfg))
     } else {
         None
     };
@@ -610,7 +606,6 @@ pub async fn run_terminal(
             supervisor_handle.current_set_rx(),
             handle.clone(),
             origin,
-            config.server.state_dir.clone(),
             https_meta,
             Some(introspection_state.clone()),
             shutdown.clone(),

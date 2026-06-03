@@ -516,11 +516,11 @@ pub struct DerivedRulesResponse {
     /// it. Always reflects the supervisor's `current_set` watch at
     /// snapshot time.
     pub derived_rules: Vec<Rule>,
-    /// Chain identity facts and predicate-set metadata for the hop.
+    /// Chain identity facts and predicate metadata for the hop.
     pub chain: ChainIdentity,
 }
 
-/// Chain-identity facts and predicate-set metadata. Carried inside
+/// Chain-identity facts and predicate metadata. Carried inside
 /// [`DerivedRulesResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainIdentity {
@@ -535,8 +535,6 @@ pub struct ChainIdentity {
     /// terminal this equals `local`; on a relay it equals the terminal
     /// further down the chain that authored the predicates.
     pub predicate_origin: Option<PubKey>,
-    /// `PredicateSet.version` of the most recently applied push.
-    pub predicate_version: Option<u64>,
     /// Wall-clock seconds since UNIX epoch of the most recent
     /// `record_apply`. `None` until the first push has been applied.
     pub last_apply_unix: Option<i64>,
@@ -1072,7 +1070,6 @@ mod tests {
                 upstream: None,
                 downstream: None,
                 predicate_origin: None,
-                predicate_version: None,
                 last_apply_unix: None,
             },
         };

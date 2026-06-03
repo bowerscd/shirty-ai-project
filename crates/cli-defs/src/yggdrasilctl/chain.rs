@@ -20,8 +20,8 @@ pub enum Cmd {
     /// Compare the local terminal's published predicate set with what
     /// each upstream node believes it accepted.
     Diff(DiffArgs),
-    /// One-line-per-hop overview of the chain (pubkey, role, version,
-    /// uptime, rule count). Pure projection of the same
+    /// One-line-per-hop overview of the chain (pubkey, role, uptime,
+    /// rule count, predicate count). Pure projection of the same
     /// `Request::ChainSummary` RPC that backs `chain diff`; no extra
     /// daemon plumbing.
     Summary(SummaryArgs),

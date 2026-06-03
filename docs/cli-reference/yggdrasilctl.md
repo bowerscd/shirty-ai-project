@@ -249,7 +249,7 @@ Chain-control plane operations
 
 * `apply` — Push a candidate rule set from a TOML file into the running terminal daemon without touching its rules directory on disk. The daemon validates the candidate, projects its predicate set, and (if a chain upstream is configured) publishes the projection on its next push tick
 * `diff` — Compare the local terminal's published predicate set with what each upstream node believes it accepted
-* `summary` — One-line-per-hop overview of the chain (pubkey, role, version, uptime, rule count). Pure projection of the same `Request::ChainSummary` RPC that backs `chain diff`; no extra daemon plumbing
+* `summary` — One-line-per-hop overview of the chain (pubkey, role, uptime, rule count, predicate count). Pure projection of the same `Request::ChainSummary` RPC that backs `chain diff`; no extra daemon plumbing
 * `health` — Per-hop health (healthy / degraded / down / starting), aggregated to a chain-wide worst-of-hops verdict. Exit code reflects the worst hop: 0=healthy/starting, 1=degraded, 2=down, 3=RPC error
 * `ping` — Per-hop control-plane round-trip time. Walks the chain via the same `Request::ChainSummary` RPC and prints each hop's measured query→reply RTT (or `-` for the local hop, which has no RTT to report). Useful for isolating "slow link" vs. "unreachable hop" during a chain incident
 * `canary` — Probe a rule's L4 forwarding path end-to-end through the chain and report per-direction throughput, loss, and latency. Routes a token-prefixed probe through the rule's listener so the terminal hop short-circuits to an in-process echo — testing the chain without depending on the rule's configured backend being reachable
@@ -290,7 +290,7 @@ Compare the local terminal's published predicate set with what each upstream nod
 
 ## `yggdrasilctl chain summary`
 
-One-line-per-hop overview of the chain (pubkey, role, version, uptime, rule count). Pure projection of the same `Request::ChainSummary` RPC that backs `chain diff`; no extra daemon plumbing
+One-line-per-hop overview of the chain (pubkey, role, uptime, rule count, predicate count). Pure projection of the same `Request::ChainSummary` RPC that backs `chain diff`; no extra daemon plumbing
 
 **Usage:** `yggdrasilctl chain summary [OPTIONS]`
 

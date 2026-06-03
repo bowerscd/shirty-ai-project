@@ -702,7 +702,6 @@ async fn derived_rules_endpoint_returns_snapshot_when_introspection_wired() {
             assert!(d.derived_rules.is_empty(), "no rules loaded");
             assert_eq!(d.chain.local, local);
             assert!(d.chain.predicate_origin.is_none());
-            assert!(d.chain.predicate_version.is_none());
             assert!(d.chain.last_apply_unix.is_none());
         }
         other => panic!("unexpected response: {other:?}"),

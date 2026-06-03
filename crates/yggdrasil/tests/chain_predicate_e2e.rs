@@ -6,19 +6,17 @@
 //! 1. Driver (acting as terminal) Noise_IK handshakes with a real
 //!    `HeartbeatServer` configured with a `ChainAcceptor` backed by a
 //!    real `ProxySupervisor`.
-//! 2. Driver postcard-encodes a `PredicateSet { version=1, … }` into a
+//! 2. Driver postcard-encodes a `PredicateSet` into a
 //!    `ControlEnvelope { body_type = PredicateSetUpdate, … }` and sends
 //!    the resulting `Control` packet.
 //! 3. Server decrypts, dedup-classifies, decodes the body, runs the
 //!    derive projection, hands the derived `RuleSet` to the supervisor,
-//!    persists the per-origin version, and acks `Ok` over `ControlAck`.
+//!    and acks `Ok` over `ControlAck`.
 //! 4. Test asserts:
 //!    * Ack is `Ok`.
 //!    * Supervisor's snapshot now contains a proxy bound on the
 //!      predicate's `listen_port`.
-//!    * `chain-predicates.toml` on disk records the accepted version.
-//!    * A second push at a stale version is rejected with
-//!      `VERSION_STALE`.
+//!    * A second authenticated push is accepted as well.
 
 mod common;
 
@@ -27,7 +25,7 @@ use std::time::Duration;
 
 use ratatoskr::auth::StaticKeyPair;
 use ratatoskr::control_frame::{AckStatus, ControlBodyType, ControlEnvelope};
-use ratatoskr::predicate::{predicate_reject, Predicate, PredicateSet};
+use ratatoskr::predicate::{Predicate, PredicateSet};
 use ratatoskr::rule::Protocol;
 use ratatoskr::wire;
 use tokio::net::UdpSocket;
@@ -69,8 +67,7 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
     let client_keys = StaticKeyPair::generate().unwrap();
     let peer_state = PeerState::new(Some(client_keys.public_key()));
 
-    let pending_dir = tempfile::tempdir().unwrap();
-    let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+    let pending_store = Arc::new(PendingPeerStore::new());
 
     // 2. Real proxy supervisor over an empty rules dir.
     let rules_dir = tempfile::tempdir().unwrap();
@@ -88,14 +85,12 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
     .await
     .expect("spawn supervisor");
 
-    // 3. ChainAcceptor backed by the supervisor + an empty state dir.
-    let state_dir = tempfile::tempdir().unwrap();
+    // 3. ChainAcceptor backed by the supervisor.
     let derive_cfg = DeriveConfig {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path())
-        .expect("load acceptor");
+    let acceptor = ChainAcceptor::new(supervisor.handle(), derive_cfg);
 
     // 4. HeartbeatServer bound to a random loopback port with the acceptor.
     let hb_cancel = cancel.clone();
@@ -127,7 +122,6 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
             idle_timeout_ms: None,
             https_http3: false,
         }],
-        version: 1,
         origin,
     };
     let envelope = ControlEnvelope {
@@ -166,9 +160,8 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // 8. Stale push at version 1 should be rejected. Re-handshake to get
-    //    a fresh seq space, then send.
-    let stale = PredicateSet {
+    // 8. A second authenticated push from the same origin is accepted as well.
+    let replayed = PredicateSet {
         predicates: vec![Predicate {
             name: "alpha".into(),
             listen_port,
@@ -176,40 +169,21 @@ async fn predicate_set_update_e2e_applies_to_supervisor() {
             idle_timeout_ms: None,
             https_http3: false,
         }],
-        version: 1,
         origin,
     };
     let envelope = ControlEnvelope {
         seq: 2,
         body_type: ControlBodyType::PredicateSetUpdate.as_byte(),
-        body: postcard::to_allocvec(&stale).unwrap(),
+        body: postcard::to_allocvec(&replayed).unwrap(),
     };
     let ack = send_control_and_await_ack(&mut session, &sock, &envelope).await;
     assert_eq!(ack.seq, 2);
-    assert_eq!(
-        ack.status,
-        AckStatus::Reject(predicate_reject::VERSION_STALE),
-        "second push at v=1 should be stale"
-    );
-
-    // 9. State file on disk reflects the accepted version.
-    let persisted = std::fs::read_to_string(state_dir.path().join("chain-predicates.toml"))
-        .expect("state file");
-    assert!(
-        persisted.contains("version = 1"),
-        "persisted state should record v=1, got: {persisted}"
-    );
-    assert!(
-        persisted.contains(&origin.to_string()),
-        "persisted state should record origin pubkey, got: {persisted}"
-    );
+    assert_eq!(ack.status, AckStatus::Ok, "second push should be accepted");
 
     cancel.cancel();
     supervisor.stop().await;
     let _ = hb_join.await;
     drop(rules_dir);
-    drop(state_dir);
-    drop(pending_dir);
 }
 
 #[tokio::test]
@@ -219,8 +193,7 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
     let peer_state = PeerState::new(Some(client_keys.public_key()));
-    let pending_dir = tempfile::tempdir().unwrap();
-    let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+    let pending_store = Arc::new(PendingPeerStore::new());
 
     let rules_dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
@@ -236,12 +209,11 @@ async fn unknown_body_type_acks_unknown_over_wire() {
     )
     .await
     .unwrap();
-    let state_dir = tempfile::tempdir().unwrap();
     let derive_cfg = DeriveConfig {
         bind_addr: "127.0.0.1".parse().unwrap(),
         proxy_protocol: None,
     };
-    let acceptor = ChainAcceptor::load(supervisor.handle(), derive_cfg, state_dir.path()).unwrap();
+    let acceptor = ChainAcceptor::new(supervisor.handle(), derive_cfg);
     let (hb, _outbound) = HeartbeatServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         server_keys.clone(),
