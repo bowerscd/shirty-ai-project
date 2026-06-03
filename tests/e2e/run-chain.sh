@@ -695,6 +695,17 @@ restart_and_reprobe() {
 
     "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
+    # No `chain reconnect` nudge in these restart phases — even
+    # though the RPC exists to short-circuit the ~30s detection
+    # wait, see finding
+    # `forwarding-broken-after-handshake-on-fresh-gateway`: when
+    # the nudge fires against a daemon that itself just restarted,
+    # the chain re-handshakes fast but the TCP data plane stays
+    # broken for tens of seconds afterward — net wall-clock change
+    # is worse than the baseline natural-detection path. Re-add the
+    # appropriate nudge (relay for gateway restart; terminal for
+    # relay restart) once that finding is closed.
+
     # Re-wait for full chain enrollment. For relay restart, both
     # hops re-handshake; wait for both gating predicates.
     WAIT_TIMEOUT=60 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
@@ -972,6 +983,8 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 # Restart gateway for the post-drain re-enrollment check (and to leave
 # the stack healthy for `KEEP_STACK=1` debugging).
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
+# No `chain reconnect` nudge here, same as restart_and_reprobe: see
+# finding `forwarding-broken-after-handshake-on-fresh-gateway`.
 WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
     relay_enrolled_at_gateway
 
@@ -980,6 +993,47 @@ WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain rest
 WAIT_TIMEOUT=20 wait_for "predicates re-derived at gateway post-drain" \
     predicates_landed
 echo "    [ok] gateway re-enrolled after graceful-drain SIGTERM"
+
+# -------- chain reconnect RPC (operator-triggered re-handshake) ------------
+#
+# Mechanically exercises `yggdrasilctl chain reconnect` against the
+# 3-node chain. Same shape as run-quickstart.sh's [chain-reconnect]
+# phase, with the extra-hop wrinkle that both the terminal AND the
+# relay can be nudged (both hold chain clients toward their
+# respective upstreams).
+
+echo "==> [chain-reconnect] operator nudge on both chain-client nodes"
+
+# Terminal -> relay direction.
+reconnect_out=$(dc_exec terminal yggdrasilctl chain reconnect 2>&1) \
+    || fail "chain reconnect rpc failed on terminal: $reconnect_out"
+echo "$reconnect_out" | grep -q "reconnect signal delivered" \
+    || fail "chain reconnect did not produce the expected ack line: $reconnect_out"
+echo "    [ok] terminal accepted chain reconnect RPC"
+
+# Relay -> gateway direction.
+reconnect_out=$(dc_exec relay yggdrasilctl chain reconnect 2>&1) \
+    || fail "chain reconnect rpc failed on relay: $reconnect_out"
+echo "$reconnect_out" | grep -q "reconnect signal delivered" \
+    || fail "chain reconnect did not produce the expected ack line: $reconnect_out"
+echo "    [ok] relay accepted chain reconnect RPC"
+
+# Gateway has no chain client (accept-only); must refuse client-side.
+if dc_exec gateway yggdrasilctl chain reconnect 2>/dev/null; then
+    fail "chain reconnect on gateway should have been refused (no chain client)"
+fi
+echo "    [ok] gateway correctly refuses chain reconnect"
+
+# Both nudges re-handshake async. Confirm externally that the chain
+# is still healthy across both implicit re-handshakes.
+WAIT_TIMEOUT=15 wait_for "terminal still enrolled at relay after reconnect rpc" \
+    terminal_enrolled_at_relay
+WAIT_TIMEOUT=15 wait_for "relay still enrolled at gateway after reconnect rpc" \
+    relay_enrolled_at_gateway
+WAIT_TIMEOUT=20 wait_for "predicates still derived at gateway after reconnect rpc" \
+    predicates_landed
+WAIT_TIMEOUT=15 wait_for "TCP echo still round-trips after reconnect rpc" run_tcp_echo
+echo "    [ok] chain reconnect rpc completed without disturbing live traffic"
 
 # -------- chain apply --file (ephemeral rule push) -------------------------
 #
