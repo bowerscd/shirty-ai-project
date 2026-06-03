@@ -131,10 +131,8 @@ pub async fn run_relay(
         );
     }
 
-    // 2b. TOFU staging store, persisted under state_dir.
-    let pending_store = Arc::new(
-        PendingPeerStore::load(&config.server.state_dir).context("loading pending peer store")?,
-    );
+    // 2b. In-memory TOFU staging store.
+    let pending_store = Arc::new(PendingPeerStore::new());
 
     // 3. One shutdown token rules them all.
     let shutdown = CancellationToken::new();

@@ -223,18 +223,12 @@ impl HeartbeatServer {
             } else {
                 // TOFU staging: record the candidate so the operator can
                 // approve it via `yggdrasilctl peer approve <fingerprint>`.
-                match self.pending_store.record_candidate(offered_pubkey) {
-                    Ok(()) => tracing::info!(
-                        src = %src,
-                        offered = %half.remote_fingerprint(),
-                        "staged TOFU candidate; awaiting operator approval"
-                    ),
-                    Err(e) => tracing::warn!(
-                        src = %src,
-                        error = %e,
-                        "failed to stage TOFU candidate"
-                    ),
-                }
+                self.pending_store.record_candidate(offered_pubkey);
+                tracing::info!(
+                    src = %src,
+                    offered = %half.remote_fingerprint(),
+                    "staged TOFU candidate; awaiting operator approval"
+                );
             }
             metrics::counter!(
                 "yggdrasil_heartbeats_received_total",
@@ -549,11 +543,7 @@ mod tests {
         let server_keys = StaticKeyPair::generate().unwrap();
         let client_keys = StaticKeyPair::generate().unwrap();
         let peer_state = PeerState::new(Some(client_keys.public_key()));
-        let pending_dir = tempfile::tempdir().unwrap();
-        let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
-        // Leak the tempdir so it lives as long as the test (avoids relying
-        // on drop order with the spawned server task).
-        std::mem::forget(pending_dir);
+        let pending_store = Arc::new(PendingPeerStore::new());
         let cancel = CancellationToken::new();
         let (server, _outbound) = HeartbeatServer::bind(
             "127.0.0.1:0".parse().unwrap(),

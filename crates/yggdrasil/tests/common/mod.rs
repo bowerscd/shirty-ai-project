@@ -222,12 +222,10 @@ target = "{target}"
     std::fs::write(rules_dir.join(filename), toml).unwrap();
 }
 
-/// Convenient bundle that owns the heartbeat server and its tempdir-backed
-/// pending-peer store so they outlive the spawned task.
+/// Convenient bundle that owns the heartbeat server task.
 pub struct HeartbeatHarness {
     pub addr: SocketAddr,
     pub handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    pub _pending_dir: tempfile::TempDir,
 }
 
 impl HeartbeatHarness {
@@ -236,8 +234,7 @@ impl HeartbeatHarness {
         peer_state: Arc<PeerState>,
         shutdown: CancellationToken,
     ) -> Self {
-        let pending_dir = tempfile::tempdir().unwrap();
-        let pending_store = Arc::new(PendingPeerStore::load(pending_dir.path()).unwrap());
+        let pending_store = Arc::new(PendingPeerStore::new());
         let (hb, _outbound) = HeartbeatServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             server_keys,
@@ -250,11 +247,7 @@ impl HeartbeatHarness {
         .unwrap();
         let addr = hb.local_addr().unwrap();
         let handle = tokio::spawn(hb.run());
-        Self {
-            addr,
-            handle,
-            _pending_dir: pending_dir,
-        }
+        Self { addr, handle }
     }
 }
 

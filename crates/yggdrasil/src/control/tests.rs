@@ -53,12 +53,9 @@ async fn make_supervisor_with_enrolled(
 }
 
 /// Build the supporting state needed by `ControlServer::bind`: a pending
-/// store rooted in `dir/state` and a writable placeholder config path
-/// rooted in `dir/yggdrasil.toml`.
+/// store and a writable placeholder config path rooted in `dir/yggdrasil.toml`.
 fn aux_state(dir: &Path) -> (Arc<PendingPeerStore>, PathBuf) {
-    let state_dir = dir.join("state");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    let store = Arc::new(PendingPeerStore::load(&state_dir).unwrap());
+    let store = Arc::new(PendingPeerStore::new());
     let config_path = dir.join("yggdrasil.toml");
     // Minimal valid TOML so `update_downstream_pubkey` has something
     // to round-trip if a test ends up approving.
@@ -426,12 +423,8 @@ async fn peer_pending_lists_staged_candidates() {
     let (supervisor, peer_state, shutdown) = make_supervisor(&rules).await;
     let socket = tmp.path().join("control.sock");
     let (pending, cfg) = aux_state(tmp.path());
-    pending
-        .record_candidate(ratatoskr::pubkey::PubKey::x25519([0xAAu8; 32]))
-        .unwrap();
-    pending
-        .record_candidate(ratatoskr::pubkey::PubKey::x25519([0xBBu8; 32]))
-        .unwrap();
+    pending.record_candidate(ratatoskr::pubkey::PubKey::x25519([0xAAu8; 32]));
+    pending.record_candidate(ratatoskr::pubkey::PubKey::x25519([0xBBu8; 32]));
     let server = bind_relay_control(
         socket.clone(),
         peer_state.clone(),
@@ -463,7 +456,7 @@ async fn downstream_approve_writes_config_and_swaps_live_key() {
     let (pending, cfg) = aux_state(tmp.path());
 
     let candidate = ratatoskr::pubkey::PubKey::x25519([0x42u8; 32]);
-    pending.record_candidate(candidate).unwrap();
+    pending.record_candidate(candidate);
     let fp = candidate.fingerprint();
 
     assert!(!peer_state.is_peer_enrolled());

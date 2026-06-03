@@ -18,16 +18,14 @@ pub(in crate::control) fn approve_downstream(state: &ControlState, fingerprint: 
         _ => return terminal_mode_unsupported("downstream approve"),
     };
     let (resolved_fp, key) = match pending_store.approve(fingerprint) {
-        Ok(crate::pending_peers::ApproveOutcome::Approved { fingerprint, key }) => {
-            (fingerprint, key)
-        }
-        Ok(crate::pending_peers::ApproveOutcome::NotFound) => {
+        crate::pending_peers::ApproveOutcome::Approved { fingerprint, key } => (fingerprint, key),
+        crate::pending_peers::ApproveOutcome::NotFound => {
             return Response::Error {
                 code: error_codes::NO_SUCH_FINGERPRINT.into(),
                 message: format!("no pending candidate matches fingerprint prefix {fingerprint:?}"),
             };
         }
-        Ok(crate::pending_peers::ApproveOutcome::Ambiguous { matches }) => {
+        crate::pending_peers::ApproveOutcome::Ambiguous { matches } => {
             return Response::Error {
                 code: error_codes::AMBIGUOUS_FINGERPRINT.into(),
                 message: format!(
@@ -38,19 +36,13 @@ pub(in crate::control) fn approve_downstream(state: &ControlState, fingerprint: 
                 ),
             };
         }
-        Ok(crate::pending_peers::ApproveOutcome::PrefixTooShort { provided, required }) => {
+        crate::pending_peers::ApproveOutcome::PrefixTooShort { provided, required } => {
             return Response::Error {
                 code: error_codes::AMBIGUOUS_FINGERPRINT.into(),
                 message: format!(
                     "fingerprint prefix {fingerprint:?} is too short ({provided} hex chars); \
                      a minimum of {required} hex chars is required to disambiguate."
                 ),
-            };
-        }
-        Err(e) => {
-            return Response::Error {
-                code: error_codes::INTERNAL_ERROR.into(),
-                message: format!("failed to pop staged candidate: {e:#}"),
             };
         }
     };
