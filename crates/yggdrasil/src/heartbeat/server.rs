@@ -222,7 +222,7 @@ impl HeartbeatServer {
                 );
             } else {
                 // TOFU staging: record the candidate so the operator can
-                // approve it via `yggdrasilctl peer approve <fingerprint>`.
+                // approve it via `yggdrasilctl local accept approve <fingerprint>`.
                 self.pending_store.record_candidate(offered_pubkey);
                 tracing::info!(
                     src = %src,
