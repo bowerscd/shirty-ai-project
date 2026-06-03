@@ -574,6 +574,59 @@ sys.exit(0 if d.get('body') == 'primary backend (app-nginx)' else 1)
 WAIT_TIMEOUT=15 wait_for "primary route restored to original target" route_restore_landed
 echo "    [ok] route file restored; original mapping back online"
 
+# -------- Cert-less route ---------------------------------------------------
+#
+# Same shape as run-quickstart.sh — see comment block there for the
+# full rationale. Cert-less route lands on companion :80 only; the
+# loopback probe inside the terminal qualifies as a lan_cidrs peer.
+
+echo "==> [cert-less] hot-load a route for a hostname outside the default cert's SANs"
+cert_less_rule="$RUNTIME_DIR/terminal/etc/rules/cert-less.toml"
+cat > "$cert_less_rule" <<'EOF'
+[[route]]
+hostname = "internal.test.local"
+target   = "http://app-nginx:80"
+EOF
+
+cert_less_serves() {
+    dc_exec terminal sh -c '
+        curl --max-time 3 --silent --fail \
+            -H "Host: internal.test.local" \
+            http://127.0.0.1:80/ | grep -q "primary backend (app-nginx)"
+    '
+}
+WAIT_TIMEOUT=15 wait_for "internal.test.local served plaintext on :80 to loopback (lan_cidrs)" \
+    cert_less_serves
+echo "    [ok] cert-less route serving plaintext on companion :80"
+
+cert_less_https_rejected() {
+    dc_exec client python3 - <<'PY'
+import socket, ssl, sys
+ctx = ssl.create_default_context(cafile="/etc/ssl/yggdrasil-test/server.pem")
+try:
+    sock = socket.create_connection(("172.31.10.20", 8443), timeout=3)
+    ssock = ctx.wrap_socket(sock, server_hostname="internal.test.local")
+    ssock.close()
+    sys.exit(1)
+except (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, OSError):
+    sys.exit(0)
+PY
+}
+WAIT_TIMEOUT=10 wait_for "cert-less route HTTPS rejected at SNI (not in :443 dispatch table)" \
+    cert_less_https_rejected
+echo "    [ok] cert-less route correctly absent from :443 SNI dispatch"
+
+rm "$cert_less_rule"
+cert_less_gone() {
+    ! dc_exec terminal sh -c '
+        curl --max-time 3 --silent --fail \
+            -H "Host: internal.test.local" \
+            http://127.0.0.1:80/ >/dev/null 2>&1
+    '
+}
+WAIT_TIMEOUT=15 wait_for "cert-less route removed after rule deletion" cert_less_gone
+echo "    [ok] cert-less route torn down cleanly"
+
 # -------- Init re-run idempotency ------------------------------------------
 
 echo "==> [init-idempotent] re-running init-chain container mid-test"

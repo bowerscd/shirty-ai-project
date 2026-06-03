@@ -109,10 +109,21 @@ impl CertStore {
             .server_default
             .as_ref()
             .map(|(c, k)| (c.as_path(), k.as_path()));
+        // Re-extract the default cert's SANs on every reload — the
+        // operator may have re-minted the default with different SANs
+        // since we loaded the original route. Propagate any parse
+        // error like `load_pem_pair` does, so the existing
+        // "malformed PEM keeps old cert in store" behaviour applies
+        // to SAN-extraction failures too.
+        let server_default_sans = match server_default {
+            Some((c, _)) => Some(crate::proxy::certs::loader::read_default_cert_sans(c)?),
+            None => None,
+        };
         let ctx = CertContext {
             rule_name: &spec.rule_name,
             server_cert_dir: &spec.server_cert_dir,
             server_default,
+            server_default_sans,
         };
         match load_route_cert(&spec.route, &ctx) {
             Ok(Some(entry)) => {

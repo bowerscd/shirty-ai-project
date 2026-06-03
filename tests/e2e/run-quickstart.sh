@@ -658,6 +658,88 @@ sys.exit(0 if d.get('body') == 'primary backend (app-nginx)' else 1)
 WAIT_TIMEOUT=15 wait_for "primary route restored to original target" route_restore_landed
 echo "    [ok] route file restored; original mapping back online"
 
+# -------- Cert-less route ---------------------------------------------------
+#
+# Regression for finding `default-cert-bypasses-cert-less`: a route
+# whose hostname isn't covered by any loaded cert (no convention-dir
+# match, no default_cert SAN match) should fall through to the
+# **cert-less** rung. Cert-less routes do NOT register on the :443
+# SNI dispatch table; they're served as plain HTTP on the companion
+# :80 listener to peers in `[server].lan_cidrs`.
+#
+# The default cert minted at init covers `app.test.local` and
+# `alt.test.local`. A hot-loaded route for `internal.test.local`
+# falls outside both SANs, so it must be cert-less. We probe from
+# the terminal's own loopback (127.0.0.1 is in the default
+# `lan_cidrs` of `127.0.0.0/8`) — that's the only available
+# in-lan_cidrs probe point in this topology since the client lives
+# on `client_wan` (172.31.0.0/24), which is also in lan_cidrs by
+# the 172.16/12 catch-all but doesn't naturally reach the
+# terminal's :80 listener (no chain rule forwards :80).
+#
+# Pre-fix, `load_route_cert` returned the default cert as a
+# fallback for ANY hostname regardless of SAN coverage; the
+# cert-less serving path was effectively dead in any config with
+# `default_cert` set.
+
+echo "==> [cert-less] hot-load a route for a hostname outside the default cert's SANs"
+cert_less_rule="$RUNTIME_DIR/terminal/etc/rules/cert-less.toml"
+cat > "$cert_less_rule" <<'EOF'
+[[route]]
+hostname = "internal.test.local"
+target   = "http://app-nginx:80"
+EOF
+
+# Wait for the cert-less route to land on the companion :80
+# listener. We poll the actual probe (the cert-less route isn't in
+# the derived-rules view, which is L4-only) using the terminal's
+# own loopback as a lan_cidrs peer.
+cert_less_serves() {
+    dc_exec terminal sh -c '
+        curl --max-time 3 --silent --fail \
+            -H "Host: internal.test.local" \
+            http://127.0.0.1:80/ | grep -q "primary backend (app-nginx)"
+    '
+}
+WAIT_TIMEOUT=15 wait_for "internal.test.local served plaintext on :80 to loopback (lan_cidrs)" \
+    cert_less_serves
+echo "    [ok] cert-less route serving plaintext on companion :80"
+
+# HTTPS to the same hostname must be REJECTED at the TLS handshake:
+# cert-less routes don't register on the :443 SNI dispatch table,
+# and there's no covering cert in the store. The client gets a
+# handshake failure (cert resolver returns None).
+cert_less_https_rejected() {
+    dc_exec client python3 - <<'PY'
+import socket, ssl, sys
+ctx = ssl.create_default_context(cafile="/etc/ssl/yggdrasil-test/server.pem")
+try:
+    sock = socket.create_connection(("172.31.0.20", 8443), timeout=3)
+    ssock = ctx.wrap_socket(sock, server_hostname="internal.test.local")
+    ssock.close()
+    sys.exit(1)  # accepted = test fail
+except (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, OSError):
+    sys.exit(0)  # rejected = pass
+PY
+}
+WAIT_TIMEOUT=10 wait_for "cert-less route HTTPS rejected at SNI (not in :443 dispatch table)" \
+    cert_less_https_rejected
+echo "    [ok] cert-less route correctly absent from :443 SNI dispatch"
+
+# Hot-remove the cert-less rule file and verify the companion :80
+# stops serving (route-only reload also exercises the
+# `route-only-reload-noop` fix on the removal direction).
+rm "$cert_less_rule"
+cert_less_gone() {
+    ! dc_exec terminal sh -c '
+        curl --max-time 3 --silent --fail \
+            -H "Host: internal.test.local" \
+            http://127.0.0.1:80/ >/dev/null 2>&1
+    '
+}
+WAIT_TIMEOUT=15 wait_for "cert-less route removed after rule deletion" cert_less_gone
+echo "    [ok] cert-less route torn down cleanly"
+
 # -------- Init re-run idempotency ------------------------------------------
 #
 # init-quickstart is idempotent at the bash level (skips when all
