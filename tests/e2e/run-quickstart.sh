@@ -836,14 +836,24 @@ restart_and_reprobe() {
     # Restart and let the daemon come back up. Default --time is 10s.
     "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
-    # No `chain reconnect` nudge here, even though the RPC exists to
-    # short-circuit the ~30s detection wait. See finding
-    # `forwarding-broken-after-handshake-on-fresh-gateway`: when the
-    # nudge fires against a gateway that itself just restarted, the
-    # chain re-handshakes fast (~2s) but the TCP data plane stays
-    # broken for another ~50s — net wall-clock change is *worse*
-    # than the natural-detection path the baseline test follows.
-    # Re-add the nudge here once that finding is closed.
+    # No `chain reconnect` nudge here. The RPC exists (and works
+    # cleanly — see the dedicated [chain-reconnect] phase below) but
+    # it can't shorten this phase's wall-clock under the podman test
+    # environment. When the gateway container restarts, the host's
+    # Linux conntrack holds stale state for the old client →
+    # gateway:client_wan TCP path until per-state timers expire
+    # (~30-60s, depending on
+    # nf_conntrack_tcp_timeout_unacked / close_wait). UDP control
+    # plane is unaffected, so chain re-handshake completes in ~1-2s
+    # either way — but client-side TCP/UDP probes through the new
+    # gateway listener fail until conntrack lets the new SYN
+    # through. See session finding
+    # `forwarding-broken-after-handshake-on-fresh-gateway` (mis-
+    # named at creation, corrected to "tcp probes from client
+    # container to gateway:client_wan take ~50s to recover after
+    # gateway restart (container-networking artifact, not a
+    # yggdrasil bug)"). In production the nudge IS the right speedup;
+    # in this test environment it's wasted effort.
 
     # Re-wait for enrollment. The gating predicate is the same one
     # used at startup — what we want to assert is that the post-
@@ -1130,10 +1140,8 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 
 # Restart gateway for the negative-isolation phase that follows.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-# No `chain reconnect` nudge here, same reason as restart_and_reprobe:
-# finding `forwarding-broken-after-handshake-on-fresh-gateway` makes
-# the nudge a net wall-clock pessimization vs the natural-detection
-# path. Re-add once that finding is closed.
+# No `chain reconnect` nudge here; same conntrack-floor caveat as
+# restart_and_reprobe above.
 WAIT_TIMEOUT=90 wait_for "gateway re-enrolled after graceful-drain restart" terminal_enrolled
 # The publisher's session-epoch watch auto-resyncs after the gateway
 # comes back, so no post-restart sentinel is needed here.

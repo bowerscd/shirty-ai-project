@@ -695,16 +695,19 @@ restart_and_reprobe() {
 
     "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
-    # No `chain reconnect` nudge in these restart phases — even
-    # though the RPC exists to short-circuit the ~30s detection
-    # wait, see finding
-    # `forwarding-broken-after-handshake-on-fresh-gateway`: when
-    # the nudge fires against a daemon that itself just restarted,
-    # the chain re-handshakes fast but the TCP data plane stays
-    # broken for tens of seconds afterward — net wall-clock change
-    # is worse than the baseline natural-detection path. Re-add the
-    # appropriate nudge (relay for gateway restart; terminal for
-    # relay restart) once that finding is closed.
+    # No `chain reconnect` nudge here; same reason as
+    # run-quickstart.sh's restart_and_reprobe — the host's
+    # Linux conntrack holds stale TCP state for the client →
+    # gateway:client_wan path for ~30-60s after a container
+    # restart, so client-side TCP probes can't reach the new
+    # listener until those timers expire regardless of how fast
+    # the chain control plane re-handshakes. UDP control plane
+    # is unaffected. See session finding
+    # `forwarding-broken-after-handshake-on-fresh-gateway`
+    # (corrected diagnosis: container-networking artifact, not a
+    # yggdrasil bug). The dedicated [chain-reconnect] phase below
+    # exercises the RPC against a healthy chain where conntrack
+    # doesn't interfere.
 
     # Re-wait for full chain enrollment. For relay restart, both
     # hops re-handshake; wait for both gating predicates.
@@ -983,8 +986,8 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 # Restart gateway for the post-drain re-enrollment check (and to leave
 # the stack healthy for `KEEP_STACK=1` debugging).
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-# No `chain reconnect` nudge here, same as restart_and_reprobe: see
-# finding `forwarding-broken-after-handshake-on-fresh-gateway`.
+# No `chain reconnect` nudge here; same conntrack-floor caveat as
+# restart_and_reprobe above.
 WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
     relay_enrolled_at_gateway
 
