@@ -99,10 +99,30 @@ pub struct ServerSection {
     /// Directory containing `*.toml` rule files. Defaults to `/etc/yggdrasil/conf.d`.
     #[serde(default = "default_rules_dir")]
     pub rules_dir: PathBuf,
-    /// Hard-override for every rule's `listen` IP. When set, each rule binds on
-    /// `(default_bind, rule.listen.port())` regardless of what the rule's TOML
-    /// `listen` field specifies (the port is preserved). Use to share one
-    /// config across hosts with different network interfaces.
+    /// Daemon-wide listener-bind / source-IP default. Three
+    /// distinct listener constructions consume this:
+    ///
+    /// * **Terminal-mode `[[rule]]` listeners.** Only rules whose
+    ///   `listen` IP is the wildcard for its family (`0.0.0.0` or
+    ///   `::`) AND whose wildcard family matches `default_bind`
+    ///   get rewritten — explicit non-wildcard `listen`s and
+    ///   different-family wildcards are preserved. See
+    ///   [`Rule::with_bind_override`](ratatoskr::rule::Rule::with_bind_override).
+    /// * **Gateway/relay predicate-derived listeners.** Predicates
+    ///   carry only `(listen_port, protocol)`, so the derived
+    ///   listener's bind IP comes straight from this field
+    ///   (defaulting to `0.0.0.0` when unset). Setting this to
+    ///   `::` is how an operator turns on dual-stack ingress on a
+    ///   gateway — derived listeners then bind `[::]:port` and
+    ///   the kernel serves both v4 and v6 SNI clients.
+    /// * **Outbound chain UDP socket (`[dial]` side).** Used as the
+    ///   source IP when the family matches the resolved upstream
+    ///   address; a family mismatch silently falls back to the
+    ///   wildcard (kernel picks the source by routing table).
+    ///
+    /// See `docs/configuration.md` `[server].default_bind`
+    /// (interface selection) for the full operator-facing
+    /// treatment.
     #[serde(default)]
     pub default_bind: Option<IpAddr>,
     /// Per-host default frontend worker count for SO_REUSEPORT fan-out

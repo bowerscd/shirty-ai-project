@@ -32,7 +32,7 @@ hex is rejected on parse.
 | ------------------ | ---------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `name`             | string (≤ 32 bytes, no whitespace / control chars) | `gethostname(3)` | Human-readable label propagated through every `chain {summary,ping,diff,health}` response. Lets `yggdrasilctl` render hops as e.g. `vps` / `midbox` / `home` instead of pubkey soup. Falls back to the kernel hostname when unset; empty string is treated as unset. Captured at startup; not hot-reloadable. |
 | `rules_dir`        | path                   | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
-| `default_bind`     | IP                     | unset                            | If set, hard-rewrites every rule's `listen` IP to this address (the port is preserved). Used to share one config across hosts with different network interfaces. |
+| `default_bind`     | IP                     | unset                            | Daemon-wide listener-bind / source-IP default. Behaviour depends on which listener is being constructed — terminal rules, gateway/relay predicate-derived rules, and the outbound chain UDP socket each apply this differently. See [`[server].default_bind`](#server-default_bind-interface-selection) below. |
 | `workers`          | optional positive integer | unset (`None` → `available_parallelism()` at proxy spawn) | Daemon-wide default for SO_REUSEPORT accept-loop fan-out across the proxy's TCP listeners and UDP frontend sockets. `0` is rejected. Per-rule overrides aren't exposed — fan-out is a kernel-level concern (the kernel hash-distributes incoming SYNs / datagrams across the workers sharing an `addr:port`), so a per-rule knob would buy nothing a global default doesn't already provide. |
 | `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
 | `identity_file`    | path                   | `/etc/yggdrasil/identity.key`    | Long-term identity in the tagged on-disk format (5-byte `b"YGGID"` magic + 1-byte version + 1-byte algorithm discriminator + algorithm-specific payload; X25519 payload is 32 secret ++ 32 public = 64 bytes, for a 71-byte file). Mode 0600. Auto-generated on first start if missing. |
@@ -462,6 +462,70 @@ hostname = "internal.lan"
 target   = "http://192.168.1.50:8080"
 # Intentionally cert-less: served on :80 plaintext to LAN peers only
 # (no SNI match on :443). `hsts` would be rejected by the validator.
+```
+
+### `[server].default_bind` (interface selection)
+
+A single `IpAddr` knob (also exposed as the `--bind` CLI flag) that
+selects which interface the daemon binds on. Three distinct
+listener constructions consume it; each applies a *different* rule
+because each has different prior information about the desired bind:
+
+**1. Terminal-mode `[[rule]]` listen rewrites.** For each rule
+loaded from `rules_dir`, the supervisor calls
+`Rule::with_bind_override(default_bind)` before spawning the
+listener. The override rewrites the rule's `listen` IP only when:
+
+* The rule's `listen` IP is the **wildcard** for its family
+  (`0.0.0.0` or `::`), AND
+* The wildcard family matches `default_bind`'s family
+  (v4-wildcard + v4-default → rewrite; v6-wildcard + v4-default
+  → leave alone; explicit `192.168.1.10:443` → always leave alone).
+
+The port is always preserved. Operator intent always wins: an
+explicit non-wildcard rule listen is never rewritten, and a rule
+whose wildcard family disagrees with the daemon-wide default is
+left at the wildcard so the operator can fix the mismatch
+explicitly rather than have the daemon silently coerce v4-only
+into v6-only or vice versa.
+
+**2. Gateway / mid-chain-relay predicate-derived rules.** Nodes
+that receive predicates from downstream (any node with `[accept]`)
+derive a `Rule` per predicate. Predicates carry only `(listen_port,
+protocol)` — no bind-address family — so the derived rule's
+`listen` IP comes straight from `default_bind` (defaulting to
+`0.0.0.0` when unset). This is the IPv6-ingress knob for gateways:
+**setting `default_bind = "::"` on the gateway makes every
+predicate-derived listener bind `[::]:port`**, which (with kernel
+`net.ipv6.bindv6only = 0`, the default on most distros) serves
+both v4 and v6 SNI clients on the same socket. There is no
+predicate-level way to express "this hostname needs v6 ingress at
+the gateway" — that's a node-local operator choice.
+
+**3. Outbound chain UDP socket (`[dial]` side).** When the chain
+client opens its UDP socket toward the configured upstream, it
+binds `(default_bind, 0)` so the upstream observes packets coming
+from that source IP, *as long as the family matches the resolved
+upstream address*. A family mismatch (e.g. v4 `default_bind`,
+upstream resolves to v6) silently falls back to the wildcard
+(`0.0.0.0:0` / `[::]:0`) and lets the kernel pick the source by
+its routing table — same posture as setting `default_bind`
+unset. This matches the rule-listen override's same-family rule.
+
+Common deployment patterns:
+
+```toml
+# Gateway that needs both v4 and v6 ingress on predicate-derived
+# listeners (the canonical homelab pattern: public IPv4 plus
+# public IPv6 prefix delegated by the ISP):
+[server]
+default_bind = "::"
+
+# Terminal pinned to a specific LAN interface for chain dial AND
+# for any wildcard-listening rules. Non-wildcard rules in the
+# rules_dir are unaffected.
+[server]
+default_bind = "192.168.10.5"
 ```
 
 ### `[server].lan_cidrs` (private-peer set)
