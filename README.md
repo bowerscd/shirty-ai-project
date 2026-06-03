@@ -57,7 +57,7 @@ cargo build --release --workspace
 
 # Install (on each host).
 sudo install -m 0755 target/release/{yggdrasil,yggdrasilctl} /usr/local/bin/
-sudo mkdir -p /etc/yggdrasil/conf.d /var/lib/yggdrasil /run/yggdrasil
+sudo mkdir -p /etc/yggdrasil/conf.d /etc/yggdrasil/certs /run/yggdrasil
 ```
 
 ### Relay side (VPS)

@@ -50,17 +50,22 @@ if you want to deviate.
 | `/etc/yggdrasil/identity.key`     | root:root 0600  | Long-term identity in tagged on-disk format (`b"YGGID"` magic + version + algorithm + key payload; X25519 today). Never copy off the host.  |
 | `/etc/yggdrasil/conf.d/*.toml`    | root:root 0644  | Rule files. Hot-reloaded. Terminal nodes only — relays derive rules from the chain. |
 | `/etc/yggdrasil/certs/`           | root:root 0755  | HTTPS-only. Per-hostname certs the convention rung looks under. |
-| `/var/lib/yggdrasil/`             | root:root 0755  | Per-host state (TOFU candidates, runtime markers).               |
+| `/var/lib/yggdrasil/`             | yggdrasil:yggdrasil 0750 | Terminal-only optional storage for ACME account / renewed cert material when configured there. Intermediaries do not need it. |
 | `/run/yggdrasil/control.sock`     | root:admin 0660 | Unix socket for `yggdrasilctl`. Restrict to admin group.         |
 
-Create them once:
+Create the always-needed paths once:
 
 ```bash
 sudo install -m 0755 target/release/yggdrasil    /usr/local/bin/
 sudo install -m 0755 target/release/yggdrasilctl /usr/local/bin/
-sudo mkdir -p /etc/yggdrasil/conf.d /var/lib/yggdrasil /run/yggdrasil
-sudo chmod 0755 /etc/yggdrasil /etc/yggdrasil/conf.d /var/lib/yggdrasil
+sudo mkdir -p /etc/yggdrasil/conf.d /etc/yggdrasil/certs /run/yggdrasil
+sudo chmod 0755 /etc/yggdrasil /etc/yggdrasil/conf.d /etc/yggdrasil/certs
 ```
+
+Terminals that keep ACME state under `/var/lib/yggdrasil` should create
+that terminal-only storage after creating the service user, or override
+`[acme].account_key_path` / `[acme].storage_dir` to another writable
+location.
 
 The identity file at `/etc/yggdrasil/identity.key` is auto-generated on
 first daemon start. If you'd rather pre-generate it (e.g. to copy the
@@ -77,7 +82,7 @@ and is installed automatically by the distro packages. For
 source-build deployments that don't use a package:
 
 ```bash
-# Create the unprivileged user + state dirs the unit expects.
+# Create the unprivileged user + config/runtime directories the unit expects.
 sudo install -m 0644 contrib/sysusers.d/yggdrasil.conf /etc/sysusers.d/
 sudo install -m 0644 contrib/tmpfiles.d/yggdrasil.conf /etc/tmpfiles.d/
 sudo systemd-sysusers
@@ -102,6 +107,17 @@ for `[server].https_listen`). Every hardening flag from
 is on by default. Drop `AmbientCapabilities` /
 `CapabilityBoundingSet` via `systemctl edit yggdrasil` if every rule
 binds a port ≥ 1024.
+
+The packaged unit does not create a daemon state directory: gateways and
+mid-chain relays hold only `identity.key` plus `config.toml`. Terminals
+using ACME with paths under `/var/lib/yggdrasil` should create that
+terminal-only storage and add a drop-in that grants it write access, for
+example:
+
+```ini
+[Service]
+ReadWritePaths=/var/lib/yggdrasil
+```
 
 To restrict the control socket to a dedicated admin group (recommended),
 add the operator login(s) to the `yggdrasil` group — the socket lands

@@ -113,6 +113,26 @@ the public listeners. Forwarding is byte-identical: the origin pubkey
 and predicate content are preserved so each hop derives from the same
 terminal-authored set.
 
+### State distribution
+
+The terminal is the configuration node; gateways and mid-chain relays
+are transport. The split is structural:
+
+| Terminal holds | Intermediaries hold |
+| -------------- | ------------------- |
+| `identity.key` and `config.toml`. | `identity.key` and `config.toml`. |
+| The rules directory (`[server].rules_dir`). | No operator-authored rules directory. Derived rules are rebuilt from authenticated predicate pushes. |
+| TLS certificate material under `[server].cert_dir` and any ACME account / renewed-cert storage. | No received predicate state, no pending-peer file, and no chain predicate counter on disk. |
+
+A terminal publishes its current projection on rules changes and on each
+fresh chain-session epoch. An intermediary applies whatever its
+authenticated peer delivers, derives listeners from that body, and keeps
+only in-memory transport buffers such as `last_forwarded` so a fresh
+session can be resynchronised without waiting for the next terminal-side
+change. If an intermediary loses its disk and the operator restores
+`identity.key` plus `config.toml`, the next terminal heartbeat and
+predicate push re-establish the live state.
+
 Real client IPs propagate alongside the bytes: each hop that emits
 chain HTTPS PROXY-v2 (TCP prepend or UDP first-datagram) reads any
 PROXY-v2 the upstream hop wrote and forwards the original client
@@ -198,20 +218,25 @@ sized to that constant.
 
 ### Replay protection
 
-Each post-handshake packet carries an 8-byte big-endian counter in
-cleartext, prefixed to the AEAD ciphertext. The receiver:
+Replay protection is defense-in-depth below mutual Noise_IK
+authentication, not an application-layer freshness invariant. Two
+mechanisms are load-bearing in the current code:
 
-1. Reads the counter without touching crypto state.
-2. **Rejects strictly-less-than-or-equal counters** before decryption.
-3. If decryption succeeds, advances `last_seen_counter`.
-4. If decryption fails, the counter is **not** advanced — so an attacker
-   replaying a real packet plus a fake counter cannot ratchet us past
-   genuine traffic.
+1. **Wire-level replay rejection.** Each post-handshake packet carries an
+   8-byte big-endian counter in cleartext, prefixed to the AEAD
+   ciphertext. The receiver rejects counters less than or equal to the
+   last accepted value before decryption. If decryption fails, the
+   counter is not advanced, so an attacker replaying a real packet plus a
+   fake counter cannot ratchet the receiver past genuine traffic.
+2. **In-session control-frame dedup.** The chain reliability layer keeps
+   a small sliding window of body-sequence numbers for the current Noise
+   session and drops duplicate control frames before dispatch.
 
-Strict-monotonic replay (rather than a window) is fine here: UDP delivery
-between the two endpoints is over a single path with one sender per
-session, and the in-process retransmit layer (see "Reliability" below)
-handles loss above the crypto layer.
+There is no receiver-side predicate-version comparison and no persisted
+cross-restart replay filter. A restarted intermediary accepts the next
+valid update from its authenticated peer; session epochs cause the
+terminal to re-publish, and mid-chain relays re-forward their in-memory
+`last_forwarded` bodies on a fresh session.
 
 ## Identity & enrollment
 
@@ -250,7 +275,7 @@ chars after the `x25519:` prefix, for 39 chars total). The hash family
 used for a given variant is fixed at the variant level so future
 variants may pick a different hash family without colliding. Used for
 downstream TOFU approval and out-of-band confirmation; operators
-typing fingerprints into `yggdrasilctl peer approve` may paste either
+typing fingerprints into `yggdrasilctl local accept approve` may paste either
 the full tagged form or just the hex tail.
 
 ### Request / grant handshake
@@ -266,7 +291,7 @@ scope of `yggdrasilctl`:
    `yggdrasilctl identity add-accept --from request.txt
    --my-endpoint vps.example.net:51820 --out grant.txt`
    writes `[accept]` into the upstream's config (pinning the
-   downstream's pubkey) and emits an grant file containing both pubkeys
+   downstream's pubkey) and emits a grant file containing both pubkeys
    plus the upstream's reachable endpoint.
 
 3. **Downstream applies the grant.** Back on the downstream:
@@ -284,16 +309,17 @@ boundary; if you skip it, you trust whoever transported the files.
 
 ### TOFU fallback
 
-If a downstream attempts a handshake whose pubkey isn't pinned in
-`[accept]`, the upstream stages it in the **pending peer
-store** and refuses traffic. The operator inspects candidates with
-`yggdrasilctl local accept pending`, verifies the fingerprint
-out-of-band, and approves with `yggdrasilctl local accept approve
-<fingerprint>`. Approval writes `[accept].pubkey` into the
-upstream's config.
+If no pubkey is pinned in `[accept]` and a downstream attempts a
+handshake, the receiver records the offered pubkey in an **in-memory
+pending peer queue** and refuses the handshake. The operator inspects
+candidates with `yggdrasilctl local accept pending`, verifies the
+fingerprint out-of-band, and approves with `yggdrasilctl local accept
+approve <fingerprint>`. Approval writes `[accept].pubkey` into the
+receiver's config and updates the live peer state.
 
 TOFU staging never accepts data on its own — it only collects candidates
-for human review.
+for human review. The queue is not persisted; across daemon restart,
+pending candidates are dropped and legitimate peers re-knock.
 
 ## Heartbeats and the peer-IP source of truth
 
@@ -537,9 +563,9 @@ three-step:
 
 Step 1's peer-IP filter is the trust boundary for cert-less routes.
 The default `lan_cidrs` set is loopback + RFC 1918 + RFC 4193 (see
-`crates/yggdrasil/src/lan_cidrs.rs`); operators on multi-tenant
-private networks override it via `[server].lan_cidrs`. See
-[security.md](security.md#cert-less-https-routes--the-lan-only-trust-boundary).
+`crates/yggdrasil/src/lan_cidrs.rs`); operators on shared or
+provider-managed private networks override it via `[server].lan_cidrs`.
+See [security.md](security.md#cert-less-https-routes--the-lan-only-trust-boundary).
 
 Cert-less routes are filtered out of the `:443` SNI table at
 `HttpFrontend::spawn` time, so a TLS handshake for a cert-less
@@ -617,7 +643,11 @@ transport and the body-type dispatcher and provides:
 * Receiver-side dedup using a small sliding window.
 
 The retransmit + dedup machinery lets us treat the chain as a reliable
-ordered byte-channel above the per-datagram Noise layer.
+ordered byte-channel above the per-datagram Noise layer. `PredicateSet`
+has no wire version field: receivers apply authenticated predicate
+updates in the order the reliability layer delivers them. Reconnect
+re-synchronisation comes from session epochs and in-memory resend
+buffers, not an application-level version gate.
 
 ### Components
 
@@ -640,15 +670,17 @@ ordered byte-channel above the per-datagram Noise layer.
 ```
 
 * **`acceptor`** — relay-side dispatcher. Receives `PredicateSetUpdate`,
-  validates version monotonicity, runs `derive::derive` to project it
-  back into a local `RuleSet`, hands the result to the proxy
-  supervisor. Also handles `ChainHopQuery`: appends a local `ChainHop`
-  record, optionally forwards the query one hop further upstream, and
-  returns the aggregated `ChainHopReply` with `query_rtt_ms` stamped on
-  the next-hop record.
+  decodes and validates the `PredicateSet`, runs `derive::derive` to
+  project it back into a local `RuleSet`, and hands the result to the
+  proxy supervisor. When the node also dials another relay, it forwards
+  the original predicate bytes verbatim and keeps the last forwarded body
+  in memory for session-epoch resync. It does not compare versions and
+  does not persist received predicates.
 * **`predicate_publisher`** — terminal-side task. Subscribes to the
-  supervisor's `current_set` channel and emits `PredicateSetUpdate` on
-  the next tick after a real change.
+  supervisor's `current_set` channel, projects the current `RuleSet`,
+  and emits `PredicateSetUpdate` on the next tick after a real content
+  change or a fresh chain-session epoch. Content-hash dedup is in memory;
+  there is no persisted counter and no wire version.
 * **`client`** — chain-client state machine. Owns the Noise handshake,
   the heartbeat tick, and dispatch of inbound body types to the
   combined handler stack.

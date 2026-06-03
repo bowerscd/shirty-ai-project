@@ -136,13 +136,14 @@ Print the currently-enrolled downstream's tagged pubkey and fingerprint.
 ### `local accept pending`
 
 List staged TOFU candidates — peers that have attempted a handshake but
-aren't yet enrolled in `[accept]`.
+aren't yet enrolled in `[accept]`. The queue is in memory only; daemon
+restart drops it and legitimate peers re-knock.
 
 ### `local accept approve <fingerprint>`
 
-Approve a staged TOFU candidate. After approval the candidate is written
-into `[accept].pubkey` and the next heartbeat from that key is
-accepted.
+Approve a staged TOFU candidate. Approval writes the verified key into
+`[accept].pubkey`, updates the live peer state, and accepts the next
+heartbeat from that key without a daemon restart.
 
 | Positional        | Notes                                                                                |
 | ----------------- | ------------------------------------------------------------------------------------ |
@@ -260,19 +261,19 @@ on at least one hop, `2` for protocol-level errors.
 Human-readable output:
 
 ```
-hop 0 (local x25519:abc…): predicates=2 v=12 origin=x25519:abc…
+hop 0 (local x25519:abc…): predicates=2 origin=x25519:abc…
   derived_rules: 2 active
-hop 1 (upstream x25519:def…): predicates=2 v=12 origin=x25519:abc…
+hop 1 (upstream x25519:def…): predicates=2 origin=x25519:abc…
   in sync with hop 0
-hop 2 (upstream x25519:fff…): predicates=2 v=12 origin=x25519:abc…
+hop 2 (upstream x25519:fff…): predicates=2 origin=x25519:abc…
   in sync with hop 1
 
 in sync across 3 hop(s).
 ```
 
 Mid-chain relays forward the original push bytes verbatim upstream, so
-every settled hop reports the same origin + version + predicate content
-as the terminal at hop 0.
+every settled hop reports the same origin + predicate content as the
+terminal at hop 0.
 
 With `--json`, the same data is emitted as a structured `DiffReport`
 suitable for piping into `jq`.
@@ -342,7 +343,7 @@ against a new upstream.
 ### `identity remove-accept`
 
 Remove `[accept]` from the daemon config. The next downstream
-that handshakes lands in the pending-peer TOFU store.
+that handshakes lands in the in-memory pending-peer TOFU queue.
 
 ---
 

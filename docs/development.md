@@ -172,8 +172,8 @@ Three serde codecs, three purposes:
 - **`toml`** — human-edited config (`/etc/yggdrasil/config.toml`,
   `conf.d/*.toml`). Every config struct uses
   `#[serde(deny_unknown_fields)]` so typos are hard parse errors.
-- **`serde_json`** — operator-facing CLI output and a few
-  state-persistence files. Never used on the wire.
+- **`serde_json`** — operator-facing CLI output and control-socket
+  NDJSON. Never used on the wire.
 
 [postcard format spec](https://postcard.jamesmunns.com/) /
 [serde data model](https://serde.rs/data-model.html).
@@ -358,12 +358,13 @@ terms (TLS, QUIC, HTTP/3, ACME, SO_REUSEPORT, etc.) are not redefined here.
   documents live in
   [`crates/ratatoskr/src/enrollment.rs`](../crates/ratatoskr/src/enrollment.rs).
 
-- **TOFU candidate** — a pubkey observed but not yet enrolled. A relay
-  receiving an inbound handshake from an unknown pubkey records it as a
-  candidate in `state_dir`; the operator decides whether to approve it via
-  `yggdrasilctl local accept pending` → `yggdrasilctl local accept approve`.
-  TOFU = Trust On First Use; we deliberately surface the choice rather than
-  auto-trusting.
+- **TOFU candidate** — a pubkey observed but not yet enrolled. A relay or
+  gateway with no enrolled `[accept].pubkey` records an inbound handshake
+  in an in-memory pending queue; the operator decides whether to approve it
+  via `yggdrasilctl local accept pending` → `yggdrasilctl local accept
+  approve`. The queue is dropped on daemon restart and legitimate peers
+  re-knock. TOFU = Trust On First Use; we deliberately surface the choice
+  rather than auto-trusting.
 
 - **Heartbeat** — short authenticated UDP packet sent from terminal to
   relay (and at each subsequent hop) on a short interval (`[dial].heartbeat_interval`,
@@ -735,9 +736,10 @@ Runtime-state operations belong on the **signal-handler path**, not in
 `yggdrasilctl`. The CLI is for:
 
 - **Introspection** (read-only): `local status`, `local metrics`,
-  `local health`, `local derived-rules`, `chain {summary,ping,health,diff}`.
+  `local health`, `local derived-rules`, `local accept pending`,
+  `chain {summary,ping,health,diff}`.
 - **One-shot config-file mutations** (operator-managed state, not daemon
-  runtime): `identity rotate`, `local accept approve`, `local accept pending`.
+  runtime): `identity rotate`, `local accept approve`.
 
 Things that affect what the running daemon is *doing* hook signals:
 

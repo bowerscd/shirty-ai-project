@@ -12,7 +12,7 @@ matters.
 | Long-term keypair       | X25519, 32 bytes each side (modelled as the X25519 variant of `ratatoskr::auth::StaticKeyPair`, a `#[non_exhaustive]` tagged enum) | Node identity. Pinned at every chain hop.         |
 | Handshake               | `Noise_IK_25519_ChaChaPoly_BLAKE2s` (`snow` crate), selected via the `X25519ChaChaPolyBlake2s` variant of `ratatoskr::auth::NoiseSuite` | Authenticated key agreement per session. The Noise *pattern* (IK) is fixed; the cipher suite is `#[non_exhaustive]` so new suites can be added without breaking parsing. |
 | Symmetric AEAD          | ChaCha20-Poly1305 (16-byte tag) — part of the suite above | Payload confidentiality + integrity.              |
-| Strict-monotonic replay | 8-byte counter, rejected on `<= last_accepted`      | Replay prevention.                                |
+| Strict-monotonic replay | 8-byte counter, rejected on `<= last_accepted`      | Wire-level replay defense after Noise_IK.         |
 | Fingerprint             | Tagged `<algo>:<hex hash>` via `PubKey::fingerprint()`. For X25519: BLAKE2s-128, rendered as `x25519:` + 32 hex chars (39 chars total). The hash family is fixed per variant so new variants may pick differently without colliding. | Human-checkable identifier for request/grant.      |
 
 The Noise pattern is **IK**: the initiator already knows the responder's
@@ -44,14 +44,19 @@ Don't grow it above 17 KiB without auditing every UDP path.
 
 ### TOFU at the responder
 
-When a previously-unseen pubkey attempts a handshake, the relay's
-acceptor caches the candidate in `[server].state_dir`, completes the
-handshake (no traffic is forwarded yet), and waits for an operator to
-explicitly approve via `yggdrasilctl local accept approve <fingerprint>`.
+When no `[accept].pubkey` is enrolled and a previously-unseen pubkey
+attempts a handshake, the responder records the offered pubkey in an
+in-memory pending queue and refuses the handshake. The operator inspects
+candidates with `yggdrasilctl local accept pending`, cross-checks the
+fingerprint out of band, and approves with `yggdrasilctl local accept
+approve <fingerprint>`. Approval writes
+`[accept].pubkey` to config and updates the live peer state; the config
+is the durable security boundary, not the transient queue.
+
 A persistent attacker who watches you boot a relay for the first time
-*can* land in the pending-peer store. The boundary is the operator
-running `approve` — never approve a fingerprint you haven't cross-checked
-against the downstream node directly.
+*can* land in the pending queue. Across daemon restart the queue is
+dropped, and legitimate peers re-knock. Never approve a fingerprint you
+haven't cross-checked against the downstream node directly.
 
 ### Request / grant handshake
 
@@ -79,7 +84,7 @@ out-of-band:
 This buys you **two** things over TOFU:
 
 1. The pubkeys cross the air-gap before any network traffic flows, so
-   a passive attacker cannot land in the pending-peer store.
+   a passive attacker cannot land in the in-memory pending queue.
 2. The downstream's `add-dial` rejects a grant that targets a
    different node, preventing a misrouted grant from compromising a
    sibling terminal.
@@ -95,7 +100,7 @@ you don't trust the transport.
 | Hop                                | State                                                                                              |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
 | Internet ↔ relay's public port      | Whatever the application protocol carries: cleartext TCP/UDP, or TLS/QUIC for HTTPS / HTTP/3.       |
-| Relay ↔ next hop ↔ … ↔ terminal     | Encrypted under Noise_IK + ChaCha20-Poly1305. Strict-monotonic replay window.                       |
+| Relay ↔ next hop ↔ … ↔ terminal     | Encrypted under Noise_IK + ChaCha20-Poly1305. The AEAD counter rejects wire-level replays.            |
 | Terminal ↔ application backend       | Cleartext from the terminal to whatever the rule's `target` resolves to (a literal IP, or the DNS resolver's most recent answer). |
 | `yggdrasilctl` ↔ daemon              | Unix domain socket, no encryption. Restrict via filesystem permissions.                              |
 
@@ -140,15 +145,19 @@ addresses, ports, byte counts, and timing.
 * **Passive eavesdropping between chain hops.** The chain transport is
   fully encrypted with ChaCha20-Poly1305; the wire is opaque without
   the long-term keys.
-* **Replay of captured traffic.** Strict-monotonic counters mean any
-  re-transmitted packet is dropped at the receiver.
+* **Replay of captured traffic.** The Noise transport's strict-monotonic
+  AEAD counter drops wire-level replays, and the chain reliability layer
+  deduplicates repeated control frames within a live session. This is
+  defense-in-depth; mutual Noise_IK authentication and the pinned
+  `[accept].pubkey` are the primary boundary.
 * **Off-path injection.** Without the long-term key, an attacker cannot
   forge a valid Noise_IK handshake, so they cannot inject frames into
   an established session.
 * **Trivial impersonation.** Every neighbour is pinned by pubkey; a
   handshake from a wrong static key is rejected.
-* **Pending-peer takeover.** Until an operator approves, a candidate's
-  traffic is not forwarded — the boundary is your operator process.
+* **Pending-peer takeover.** Until an operator approves, a candidate is
+  only an in-memory queue entry and cannot complete an accepted session.
+  The boundary is writing the verified key to `[accept].pubkey`.
 
 ## What yggdrasil does NOT protect against
 
@@ -172,10 +181,6 @@ addresses, ports, byte counts, and timing.
   out-of-band rotation by your peers; you'd notice only when the
   Noise handshake stops succeeding. Pin fingerprints in an out-of-band
   ledger and watch them.
-* **Real client IP for multi-hop HTTP/3 traffic.** Covered above under
-  HTTP/3 attack surface; until UDP/QUIC client-IP propagation lands, h3
-  rules behind a relay should not be used by applications that rely on
-  client-IP-based authorisation or rate-limiting.
 * **Side channels.** ChaCha20-Poly1305 is hardware-friendly and
   constant-time on every platform we care about, but the surrounding
   Rust code is not audited for timing side channels.
@@ -297,10 +302,10 @@ cause WAN traffic to *originate* from an RFC1918 address — the
 private ranges are non-routable on the public internet by definition
 ([RFC 1918 §3](https://datatracker.ietf.org/doc/html/rfc1918#section-3)).
 
-Operators on multi-tenant private networks (a hosted server reached by
-the hosting provider's RFC1918 management network, an office network
-shared with untrusted clients) **should narrow the set** with an
-explicit `[server].lan_cidrs` override. The `_denied_total` counter
+Operators on shared private networks (a hosted server reached by the
+hosting provider's RFC1918 management network, an office network shared
+with untrusted clients) **should narrow the set** with an explicit
+`[server].lan_cidrs` override. The `_denied_total` counter
 (`yggdrasil_certless_requests_denied_total{reason="peer_not_in_lan_cidrs"}`)
 surfaces external probes against cert-less hostnames.
 

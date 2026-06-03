@@ -34,11 +34,12 @@ Group=yggdrasil
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# systemd manages these directories: created on start with the right
-# ownership (User=/Group=), preserved across restarts (StateDirectory)
-# or wiped on stop (RuntimeDirectory).
-StateDirectory=yggdrasil
-StateDirectoryMode=0750
+# systemd manages the runtime directory: created on start with the right
+# ownership (User=/Group=), wiped on stop. There is intentionally no
+# package-managed state directory: gateways and mid-chain relays have no
+# daemon state on disk. Terminals that store ACME material under
+# /var/lib/yggdrasil should create that directory and add a
+# ReadWritePaths= drop-in for it.
 RuntimeDirectory=yggdrasil
 RuntimeDirectoryMode=0750
 

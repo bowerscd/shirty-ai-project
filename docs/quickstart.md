@@ -192,9 +192,9 @@ sudo yggdrasilctl local derived-rules
 # }
 
 sudo yggdrasilctl chain diff
-# hop 0 (local x25519:9d2f04a3…): predicates=1 v=1 origin=x25519:9d2f04a3…
+# hop 0 (local x25519:9d2f04a3…): predicates=1 origin=x25519:9d2f04a3…
 #   derived_rules: 1 active
-# hop 1 (upstream x25519:6c5a30bb…): predicates=1 v=1 origin=x25519:9d2f04a3…
+# hop 1 (upstream x25519:6c5a30bb…): predicates=1 origin=x25519:9d2f04a3…
 #   in sync with hop 0
 #
 # in sync across 2 hop(s).
@@ -240,7 +240,7 @@ EOF
 ```
 
 Within ~250 ms the terminal re-validates, the predicate publisher emits
-a fresh version, the relay derives the new listeners, and
+a fresh predicate set, the relay derives the new listeners, and
 `yggdrasilctl local derived-rules` on the VPS shows all three rules.
 
 ## What to read next

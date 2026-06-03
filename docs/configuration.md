@@ -14,10 +14,10 @@ instead of `target`, say) surfaces at validation rather than parse.
 | `/etc/yggdrasil/config.toml`          | every node           | Top-level yggdrasil daemon config.       |
 | `/etc/yggdrasil/conf.d/*.toml`        | terminal nodes       | One or more files defining proxy rules.  |
 
-Relay nodes derive their rule set from a downstream terminal's published
-predicate set; they do not normally hold `conf.d/*.toml` files. (The
-relay's `[server].rules_dir` still has to be a valid path — pointing at
-an empty directory is fine.)
+Gateway and mid-chain relay nodes derive their rule set from a terminal's
+published predicate set; they do not normally hold `conf.d/*.toml` files.
+Their on-disk surface is `identity_file` plus `config.toml`; received
+predicates and TOFU candidates are in-memory only.
 
 Defaults below are what you get when a field is omitted. `humantime`
 values accept the usual `1h`, `30s`, `250ms`, etc. Public keys use the
@@ -34,7 +34,6 @@ hex is rejected on parse.
 | `rules_dir`        | path                   | `/etc/yggdrasil/conf.d`          | Watched for `*.toml`. Non-recursive. Missing dir is a hard error at startup.                   |
 | `default_bind`     | IP                     | unset                            | Daemon-wide listener-bind / source-IP default. Behaviour depends on which listener is being constructed — terminal rules, gateway/relay predicate-derived rules, and the outbound chain UDP socket each apply this differently. See [`[server].default_bind`](#server-default_bind-interface-selection) below. |
 | `workers`          | optional positive integer | unset (`None` → `available_parallelism()` at proxy spawn) | Daemon-wide default for SO_REUSEPORT accept-loop fan-out across the proxy's TCP listeners and UDP frontend sockets. `0` is rejected. Per-rule overrides aren't exposed — fan-out is a kernel-level concern (the kernel hash-distributes incoming SYNs / datagrams across the workers sharing an `addr:port`), so a per-rule knob would buy nothing a global default doesn't already provide. |
-| `state_dir`        | path                   | `/var/lib/yggdrasil`             | Per-host state — TOFU candidates, runtime markers.                                             |
 | `identity_file`    | path                   | `/etc/yggdrasil/identity.key`    | Long-term identity in the tagged on-disk format (5-byte `b"YGGID"` magic + 1-byte version + 1-byte algorithm discriminator + algorithm-specific payload; X25519 payload is 32 secret ++ 32 public = 64 bytes, for a 71-byte file). Mode 0600. Auto-generated on first start if missing. |
 | `cert_dir`         | path                   | `/etc/yggdrasil/certs`           | HTTPS only. Directory consulted by the **convention** cert-source rung (`<cert_dir>/<hostname>/{fullchain,privkey}.pem`). Rung 1: takes precedence over `default_cert` when present. |
 | `default_cert`     | path                   | unset                            | HTTPS only. **Fallback** certificate PEM, served only for routes whose hostname is actually covered by a Subject Alternative Name in the cert (exact match or single-label `*.parent` wildcard per RFC 6125). Routes outside that SAN coverage fall through to rung 3 (cert-less LAN serving on `:80`) rather than being served the wrong cert. Must be set together with `default_key`. The ACME wildcard issuance pipeline (when `[acme]` is configured) writes its renewed PEMs to `<storage_dir>/<domain>/{fullchain,privkey}.pem`; operators point `default_cert`/`default_key` at those files so the renewer's writes are picked up by the cert watcher without further wiring. |
@@ -285,12 +284,12 @@ Rule files describe proxy rules. They live as `*.toml` files in the
 daemon's `[server].rules_dir`. Files are loaded sorted by filename,
 non-recursive. A `*.toml` extension is required; anything else is ignored.
 
-Rules normally live on the **terminal** node. On a relay running in
-single-hop mode, the proxy supervisor is fed exclusively from the
-predicate-derived rule set; manual `conf.d` files there would be
-overwritten on the next downstream push. (Pushing a candidate rule set
-directly without writing to disk is `yggdrasilctl chain apply --file
-rules.toml`.)
+Rules normally live on the **terminal** node. On gateway and mid-chain
+relay nodes, the proxy supervisor is fed from the predicate-derived rule
+set; manual `conf.d` files there are not operator-meaningful and the next
+authenticated predicate push replaces the live derived listeners. (Pushing
+a candidate rule set directly without writing to disk is `yggdrasilctl
+chain apply --file rules.toml`.)
 
 A rule file contains two kinds of top-level table:
 

@@ -21,7 +21,7 @@
 # rules_dir          = "/etc/yggdrasil/conf.d"
 # identity_file      = "/etc/yggdrasil/identity.key"
 # cert_dir           = "/etc/yggdrasil/certs"
-# workers            = 0                   # 0 / unset → available_parallelism()
+# workers            = 4                   # unset → available_parallelism(); 0 is rejected
 # default_bind       = "0.0.0.0"           # rewrites every rule's listen IP
 # default_cert       = "/etc/yggdrasil/certs/default/fullchain.pem"
 # default_key        = "/etc/yggdrasil/certs/default/privkey.pem"

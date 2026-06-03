@@ -141,22 +141,26 @@ To roll up UDP counters across workers, use Prometheus
 
 ### Approving a TOFU candidate
 
-When a downstream contacts the relay but `[accept]` is unset,
-the relay caches the candidate pubkey in `[server].state_dir` and waits
-for an operator to bless it. Workflow:
+When a downstream contacts a relay or gateway before `[accept].pubkey` is
+set, the daemon records the offered pubkey in an in-memory pending queue
+and rejects the handshake. The queue is not durable; if the daemon
+restarts during enrollment, the candidate is dropped and the legitimate
+peer re-knocks. Workflow:
 
 ```bash
 sudo yggdrasilctl local accept pending
-# fingerprint        first_seen          peer_endpoint
-# 1234abcd...        2024-03-12T18:43Z   203.0.113.42:51820
+# fingerprint                         attempts  first_seen
+# x25519:1234abcd5678efef1234abcd...  1         1710268980000
 
 sudo yggdrasilctl local accept approve 1234abcd5678efef...
-# wrote [accept].pubkey = x25519:9d2f04a3...4b7c
+# approved x25519:1234abcd5678efef1234abcd...
 ```
 
-After approve, restart the daemon for `[accept]` to take effect.
-The same effect can also be produced offline via `yggdrasilctl identity
-add-accept` against an request file — see [quickstart.md](quickstart.md).
+Approval writes `[accept].pubkey` to `config.toml` and updates the live
+peer state, so the next heartbeat from that key is accepted without a
+daemon restart. The same durable enrollment can also be produced offline
+via `yggdrasilctl identity add-accept` against a request file — see
+[quickstart.md](quickstart.md).
 
 ### Hot-reloading rules
 
@@ -360,8 +364,8 @@ down. Origin mismatch between adjacent hops should only appear
 transiently while a terminal rotation propagates; persistent mismatch
 means the chain is in an inconsistent state.
 
-If a hop genuinely diverges (different version + same origin, or
-content drift) after the chain has settled, investigate the publisher /
+If a hop genuinely diverges (same origin but different predicate
+content) after the chain has settled, investigate the publisher /
 acceptor metrics on that hop.
 
 ### Debugging a rule end-to-end with `chain canary`
@@ -604,8 +608,8 @@ The relay shows a pending candidate but no `accept` is wired.
 
 * Run `yggdrasilctl local accept pending` to confirm the fingerprint.
 * Cross-check with `yggdrasilctl identity show` on the downstream.
-* If they match, `yggdrasilctl local accept approve <fingerprint>`,
-  then restart the relay.
+* If they match, `yggdrasilctl local accept approve <fingerprint>`.
+  The key is written to config and becomes live immediately.
 
 ### "rules don't show up on the relay after I edit them on the terminal"
 
@@ -718,15 +722,26 @@ Metrics worth scraping:
 
 ## Backups
 
-You only need to back up two files per host:
+Back up the terminal as the authority for operator-meaningful state:
 
 * `/etc/yggdrasil/identity.key` — the long-term key. Lose it and you'll
   have to re-run the request/grant ceremony with every neighbour.
-* `/etc/yggdrasil/config.toml` — the daemon config (which embeds the
-  enrolled chain neighbour pubkeys).
+* `/etc/yggdrasil/config.toml` — the daemon config, including enrolled
+  chain-neighbour pubkeys and ACME settings.
+* `/etc/yggdrasil/conf.d/*.toml` — terminal rule files. These are often
+  tracked in a deploy repo, but they are still terminal state.
+* `/etc/yggdrasil/certs/` or whatever `[server].cert_dir` points at —
+  convention TLS material.
+* ACME account and storage paths (`[acme].account_key_path` and
+  `[acme].storage_dir` when set, otherwise the defaults documented in
+  [configuration.md](configuration.md#acme--optional-terminal-mode-only)).
 
-`/etc/yggdrasil/conf.d/*.toml` are also worth backing up but they're
-typically tracked in version control as part of a deploy repo.
+Restoring those files on a terminal restores the complete operator state;
+once the daemon starts, it republishes the current predicate set to the
+chain.
 
-`/var/lib/yggdrasil/` contains only TOFU candidates and runtime markers —
-safe to lose; the next handshake re-populates it.
+For intermediaries (gateway and mid-chain relay), back up only
+`identity.key` and `config.toml`. They have no received-predicate file,
+no pending-peer file, and no chain predicate counter on disk. After
+restore, start the daemon; the next terminal heartbeat and predicate push
+rebuild the live derived listeners.

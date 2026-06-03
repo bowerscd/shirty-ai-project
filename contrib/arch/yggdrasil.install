@@ -3,10 +3,8 @@
 # pacman invokes these functions around install / upgrade / remove
 # events. systemd integration (daemon-reload, sysusers, tmpfiles) is
 # already handled by pacman's built-in libalpm hooks shipped with
-# systemd, so the scriptlet here only deals with concerns that pacman
-# can't infer automatically: stopping a running service before its
-# files vanish, and (on full removal) tidying up daemon-managed
-# runtime state under /var/lib/yggdrasil.
+# systemd, so the scriptlet here only handles the concern pacman can't
+# infer automatically: stopping a running service before its files vanish.
 
 pre_remove() {
     # About to remove the package files. If the service is up, stop
@@ -19,11 +17,10 @@ pre_remove() {
 }
 
 post_remove() {
-    # Final uninstall. Clean up daemon-managed runtime state. We
-    # deliberately leave /etc/yggdrasil intact so the operator can
-    # preserve identity.key and rules across a reinstall — pacman
-    # itself won't touch /etc files we didn't own.
-    rm -rf /var/lib/yggdrasil
+    # Final uninstall. Deliberately leave /etc/yggdrasil and any
+    # operator-created /var/lib/yggdrasil ACME storage intact so identity,
+    # rules, and terminal cert state survive a reinstall — pacman itself
+    # won't touch files we didn't own.
 
     # Remove the system user/group created by sysusers.d. systemd's
     # sysusers framework does not auto-remove on package uninstall.
