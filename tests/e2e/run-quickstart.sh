@@ -766,9 +766,9 @@ echo "    [ok] init re-run was a no-op and live traffic kept flowing"
 # Restart each yggdrasil node in turn; assert the chain re-converges
 # and probes succeed against the same surface. Implicitly tests:
 #
-#   - state_dir persistence (TOFU enrollment survives a process
-#     restart — the daemon comes back up with the same [accept]/[dial]
-#     pubkey it had before, not as an unenrolled fresh node).
+#   - Config-backed enrollment survives a process restart: the daemon
+#     comes back up with the same [accept]/[dial] pubkey it had before,
+#     not as an unenrolled fresh node.
 #   - Noise rekey on reconnection (the chain client's handshake
 #     re-runs against the surviving peer; same for the chain acceptor
 #     when the dialing peer reconnects).

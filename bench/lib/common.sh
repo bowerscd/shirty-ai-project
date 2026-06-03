@@ -311,7 +311,7 @@ bench_spin_yggdrasil_terminal() {
     [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
     [[ -x "$ctl_bin" ]] || die "missing $ctl_bin — run: cargo build --release -p yggdrasilctl"
 
-    mkdir -p "$tmp"/{terminal,rules,tm-state,tm-run,logs}
+    mkdir -p "$tmp"/{terminal,rules,tm-run,logs}
     local tm_bind="127.0.0.1"
 
     # The daemon's config validator requires a [dial] OR [accept] section
@@ -337,7 +337,6 @@ bench_spin_yggdrasil_terminal() {
     cat > "$tm_cfg" <<EOF
 [server]
 rules_dir     = "$tmp/rules"
-state_dir     = "$tmp/tm-state"
 identity_file = "$tm_key"
 default_bind  = "$tm_bind"
 
@@ -388,7 +387,7 @@ bench_spin_yggdrasil_chain() {
     [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
     [[ -x "$ctl_bin" ]] || die "missing $ctl_bin — run: cargo build --release -p yggdrasilctl"
 
-    mkdir -p "$tmp"/{gateway,terminal,rules,gw-rules,gw-state,tm-state,gw-run,tm-run,logs}
+    mkdir -p "$tmp"/{gateway,terminal,rules,gw-rules,gw-run,tm-run,logs}
     local accept_port; accept_port="$(pick_free_udp_port)"
 
     # Pin gateway and terminal to distinct loopback addresses so they don't
@@ -407,7 +406,6 @@ bench_spin_yggdrasil_chain() {
     cat > "$gw_cfg" <<EOF
 [server]
 rules_dir     = "$tmp/gw-rules"
-state_dir     = "$tmp/gw-state"
 identity_file = "$gw_key"
 default_bind  = "$gw_bind"
 
@@ -424,7 +422,6 @@ EOF
     cat > "$tm_cfg" <<EOF
 [server]
 rules_dir     = "$tmp/rules"
-state_dir     = "$tmp/tm-state"
 identity_file = "$tm_key"
 default_bind  = "$tm_bind"
 
@@ -959,7 +956,7 @@ bench_spin_yggdrasil_https() {
     [[ -x "$ygg_bin" ]] || die "missing $ygg_bin — run: cargo build --release -p yggdrasil"
     [[ -x "$ctl_bin" ]] || die "missing $ctl_bin — run: cargo build --release -p yggdrasilctl"
 
-    mkdir -p "$tmp"/{terminal,rules,tm-state,tm-run,certs,logs}
+    mkdir -p "$tmp"/{terminal,rules,tm-run,certs,logs}
     local tm_bind="127.0.0.1"
 
     # Synthesise a [dial] section so the validator accepts a
@@ -976,7 +973,6 @@ bench_spin_yggdrasil_https() {
     cat > "$tm_cfg" <<EOF
 [server]
 rules_dir     = "$tmp/rules"
-state_dir     = "$tmp/tm-state"
 identity_file = "$tm_key"
 default_bind  = "$tm_bind"
 cert_dir      = "$tmp/certs"

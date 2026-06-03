@@ -136,9 +136,6 @@ pub struct ServerSection {
     /// not buy anything that a global default doesn't already provide.
     #[serde(default)]
     pub workers: Option<usize>,
-    /// Per-host state directory (TOFU staging, runtime markers).
-    #[serde(default = "default_state_dir")]
-    pub state_dir: PathBuf,
     /// Path to the node's static X25519 identity. Auto-generated on first
     /// start if the file does not exist.
     #[serde(default = "default_identity_file")]
@@ -371,9 +368,6 @@ pub struct AcmeDnsProviderConfig {
     pub api_token_env: Option<String>,
 }
 
-fn default_state_dir() -> PathBuf {
-    PathBuf::from("/var/lib/yggdrasil")
-}
 fn default_identity_file() -> PathBuf {
     PathBuf::from("/etc/yggdrasil/identity.key")
 }
@@ -831,6 +825,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.server.rules_dir, PathBuf::from("/srv/yggdrasil/rules"));
+    }
+
+    #[test]
+    fn removed_state_dir_field_is_rejected() {
+        let err = parse(
+            r#"
+            [server]
+            state_dir = "/var/lib/yggdrasil"
+
+            [accept]
+            pubkey = "x25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            listen = "0.0.0.0:51820"
+            "#,
+        )
+        .err()
+        .unwrap();
+
+        let ConfigError::Proto(ProtoError::TomlParse { source, .. }) = err else {
+            panic!("expected TOML parse error for removed state_dir field");
+        };
+        let msg = source.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("state_dir"),
+            "expected state_dir unknown-field error, got: {msg}"
+        );
     }
 
     #[test]

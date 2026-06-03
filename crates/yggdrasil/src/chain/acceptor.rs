@@ -1080,32 +1080,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_write_acceptor_state_files() {
-        let cancel = CancellationToken::new();
-        let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;
-        let state_dir = tempfile::tempdir().unwrap();
-        let acc = ChainAcceptor::new(handle, derive_cfg());
-
-        for _ in 0..3 {
-            let set = encode(&predicate_set(origin_a(), &[free_port()]));
-            assert_eq!(
-                acc.dispatch(ControlBodyType::PredicateSetUpdate.as_byte(), &set)
-                    .await,
-                AckStatus::Ok
-            );
-        }
-
-        let mut entries = std::fs::read_dir(state_dir.path()).unwrap();
-        assert!(
-            entries.next().is_none(),
-            "acceptor should not write files under the daemon state dir"
-        );
-
-        cancel.cancel();
-        sup.stop().await;
-    }
-
-    #[tokio::test]
     async fn rejects_oversize_body() {
         let cancel = CancellationToken::new();
         let (sup, handle, _rules_dir) = spawn_supervisor(cancel.clone()).await;

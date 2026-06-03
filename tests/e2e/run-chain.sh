@@ -644,9 +644,9 @@ echo "    [ok] init re-run was a no-op and live traffic kept flowing"
 
 # -------- Restart / rehydration -------------------------------------------
 #
-# Restart each yggdrasil node in turn. Implicitly tests state_dir
-# persistence + Noise rekey-on-reconnect + the daemon's startup path
-# at each node. See run-quickstart.sh for the deeper rationale.
+# Restart each yggdrasil node in turn. Implicitly tests Noise
+# rekey-on-reconnect + the daemon's startup path at each node. See
+# run-quickstart.sh for the deeper rationale.
 #
 # Chain-specific notes:
 #

@@ -63,7 +63,6 @@ cat >"$GW_CFG" <<EOF
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
-state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
 # Bind all derived rules dual-stack (v4 + v6) so the IPv6 e2e
 # phase has a v6 ingress at the gateway. Realistic homelab posture
@@ -99,7 +98,6 @@ cat >"$RL_CFG" <<EOF
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
-state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
 
 [control]
@@ -123,7 +121,6 @@ cat >"$TM_CFG" <<EOF
 [server]
 rules_dir     = "/etc/yggdrasil/rules"
 cert_dir      = "/etc/yggdrasil/certs"
-state_dir     = "/var/lib/yggdrasil"
 identity_file = "/etc/yggdrasil/identity.key"
 default_cert  = "/etc/yggdrasil/certs/server.pem"
 default_key   = "/etc/yggdrasil/certs/server.key"
