@@ -6,10 +6,22 @@
 #
 #   client ─client_wan─► gateway ─inet_link─► relay ─chain_link─► terminal ─home_lan─► {nginx, nginx-alt, tcp-echo, udp-echo}
 #
-# Same scenario suite as run-quickstart.sh, with the extra hop:
-#   - Predicate propagation must traverse two hops (terminal -> relay -> gateway).
-#   - `chain diff` from terminal must report 3 hops, no drift.
-#   - `chain canary` must report 3 chain hops armed.
+# Same phase set as run-quickstart.sh (see that script's docstring
+# for the full list); the chain-specific differences are:
+#
+#   - Enrollment gates on BOTH terminal->relay AND relay->gateway.
+#   - Predicate propagation traverses 2 hops (terminal -> relay ->
+#     gateway) rather than 1.
+#   - `chain diff` from the terminal reports 3 hops, no drift;
+#     `chain canary` reports 3 chain hops armed.
+#   - Restart / rehydration cycles all 3 nodes (gateway and terminal
+#     first, mid-chain relay last — the relay restart breaks BOTH
+#     chain sessions and exercises re-handshake on both sides).
+#   - Two-way isolation asserts BOTH the gateway AND the mid-chain
+#     relay cannot reach home_lan directly.
+#   - Key rotation targets the RELAY (the only node whose key change
+#     affects both upstream and downstream enrollments) and runs both
+#     ceremonies (relay->gateway and terminal->relay).
 #
 # Usage:
 #   ./tests/e2e/run-chain.sh                # build + run + verify + teardown
@@ -614,7 +626,22 @@ PY
 }
 WAIT_TIMEOUT=10 wait_for "cert-less route HTTPS rejected at SNI (not in :443 dispatch table)" \
     cert_less_https_rejected
-echo "    [ok] cert-less route correctly absent from :443 SNI dispatch"
+echo "    [ok] cert-less route correctly absent from :8443/tcp h1 SNI dispatch"
+
+# h3 path: cert-less routes must ALSO be absent from the :8443/udp
+# QUIC SNI dispatch table. Same shape as run-quickstart.sh's cert-
+# less h3 assertion — the cert resolver returns None for the
+# uncovered SNI, so the QUIC TLS handshake fails before any HTTP/3
+# stream opens. h3_probe.py exits 1 on handshake reject; we invert
+# via `!` so wait_for treats "probe failed" as success.
+cert_less_h3_rejected() {
+    ! dc_exec client python3 /tests/h3_probe.py \
+        --sni internal.test.local --host 172.31.10.20 --port 8443 \
+        2>/dev/null
+}
+WAIT_TIMEOUT=15 wait_for "cert-less route h3 rejected at SNI (not in :8443/udp dispatch table)" \
+    cert_less_h3_rejected
+echo "    [ok] cert-less route correctly absent from :8443/udp h3 SNI dispatch"
 
 rm "$cert_less_rule"
 cert_less_gone() {

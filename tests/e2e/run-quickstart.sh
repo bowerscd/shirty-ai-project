@@ -6,25 +6,58 @@
 #
 #   client ──client_wan──► gateway ──chain_link──► terminal ──home_lan──► {nginx, nginx-alt, tcp-echo, udp-echo}
 #
-# What the driver exercises, in order:
+# Phases, in order (each ~1-15s; whole suite ~3-5 min cold):
 #
-#   1. Build + init (one-shot key/cert/config setup).
-#   2. Enrollment + heartbeat: gateway sees the terminal.
-#   3. Predicate propagation: TCP, UDP, and HTTPS predicates land at gateway.
-#   4. `chain diff` from terminal: 2 hops, no drift.
-#   5. `chain canary` for each rule (tcp / udp / https-as-tcp): status=ok, 2 hops.
-#   6. TCP echo client -> gateway:7100 -> chain -> app-tcp:7100, byte-for-byte.
-#   7. UDP echo client -> gateway:7101 -> chain -> app-udp:7101, byte-for-byte.
-#   8. HTTPS GET SNI=app.test.local: terminal terminates TLS, routes to app-nginx,
-#      asserts the leaf-cert fingerprint matches what init minted.
-#   9. HTTPS GET SNI=alt.test.local: routes to app-nginx-alt (distinct body).
-#  10. HTTPS GET SNI=bogus.test.local: asserts 404 (no [[route]] matches).
-#  11. Cert hot-reload: re-mint the cert in-place, fingerprint must change, body still 200.
-#  12. Malformed-cert rollback: write garbage PEM, old cert keeps serving.
-#  13. Recovery: restoring a valid cert reloads cleanly.
-#  14. Negative isolation: client cannot reach any home_lan app directly
-#      (would-pass-on-regression check that the gateway bypassed the chain).
-#  15. Teardown.
+#   1.  Build + init (one-shot key/cert/config setup).
+#   2.  Enrollment + heartbeat: gateway sees the terminal.
+#   3.  Predicate propagation: TCP, UDP, and HTTPS predicates land at gateway.
+#   4.  `chain diff` from terminal: 2 hops, no drift.
+#   5.  `chain canary` per rule (tcp / udp / https-as-tcp): status=ok, 2 hops.
+#   6.  TCP echo client -> gateway:7100 -> chain -> app-tcp:7100, byte-for-byte.
+#   7.  UDP echo client -> gateway:7101 -> chain -> app-udp:7101, byte-for-byte.
+#   8.  HTTPS GET trio over h1: SNI=app.test.local (-> app-nginx, fp matches
+#       init-minted cert), SNI=alt.test.local (-> app-nginx-alt, distinct
+#       body, same multi-SAN cert), SNI=bogus.test.local (rejected at
+#       TLS handshake — no [[route]] matches and no cert covers the SNI).
+#   9.  HSTS + [route.headers] stamped on the primary route only (the
+#       alt route stays bare for comparison).
+#  10.  Cert hot-reload (in-place re-mint): fp must change, body still 200.
+#  11.  Concurrent flow survival: 6 long-lived HTTPS keep-alive sessions
+#       complete cleanly across a mid-stream cert reload.
+#  12.  Malformed-cert rollback: garbage PEM lands on disk, rustls
+#       rejects it, the in-memory cert keeps serving.
+#  13.  Recovery: restoring a valid cert reloads cleanly.
+#  14.  L4 rule hot-add/remove (inotify-driven; gateway derives + drops
+#       the new rule without restart).
+#  15.  Route-only hot-reload (regression for finding `route-only-reload-noop`):
+#       rewriting `https-routes.toml` without touching `[[rule]]` blocks
+#       must still flip the supervisor's HTTPS route table.
+#  16.  Cert-less route (regression for finding `default-cert-bypasses-cert-less`):
+#       a route whose hostname is outside the default cert's SANs serves
+#       plaintext on the companion :80 to lan_cidrs peers, and is absent
+#       from BOTH the :8443/tcp (h1) and :8443/udp (h3) SNI dispatch tables.
+#  17.  Init re-run idempotency: re-running the init container mid-test
+#       skips and live traffic keeps flowing.
+#  18.  Restart / rehydration: each yggdrasil node restarts in turn;
+#       chain reconverges. Covers config-backed re-enrollment + Noise
+#       rekey on reconnect.
+#  19.  Negative isolation: client cannot reach any home_lan app directly
+#       (regression check that the gateway hadn't bypassed the chain).
+#  20.  Two-way isolation: the gateway also cannot bypass the chain.
+#  21.  Key rotation (gateway): rotate identity, redo the request/grant
+#       ceremony, expect recovery on restart.
+#  22.  graceful_drain_timeout: slow-drip TCP across gateway SIGTERM
+#       completes within the configured drain window (proves the knob
+#       is wired through the full forwarding path).
+#  23.  chain apply --file: push an ephemeral rule into the supervisor
+#       without touching rules_dir; verify the next rules_dir reload
+#       clobbers it (documented "apply REPLACES the set" semantics).
+#  24.  IPv6 path: hot-load a `[::]:7102` rule, probe over v6 on client_wan.
+#  25.  HTTP/3 SNI dispatch trio + h3-only body limit: end-to-end QUIC
+#       from client through the gateway's :8443/udp listener; h3 POST
+#       over the limit returns 413, same POST over h1 reaches the
+#       backend uncapped.
+#  26.  Teardown.
 #
 # Usage:
 #   ./tests/e2e/run-quickstart.sh                # build + run + verify + teardown
@@ -724,7 +757,21 @@ PY
 }
 WAIT_TIMEOUT=10 wait_for "cert-less route HTTPS rejected at SNI (not in :443 dispatch table)" \
     cert_less_https_rejected
-echo "    [ok] cert-less route correctly absent from :443 SNI dispatch"
+echo "    [ok] cert-less route correctly absent from :8443/tcp h1 SNI dispatch"
+
+# h3 path: cert-less routes must ALSO be absent from the :8443/udp
+# QUIC SNI dispatch table. The cert resolver returns None for the
+# uncovered SNI, so the QUIC TLS handshake fails before any HTTP/3
+# stream opens. h3_probe.py exits 1 on handshake reject (which is
+# the success signal here); we invert via `!`.
+cert_less_h3_rejected() {
+    ! dc_exec client python3 /tests/h3_probe.py \
+        --sni internal.test.local --host 172.31.0.20 --port 8443 \
+        2>/dev/null
+}
+WAIT_TIMEOUT=15 wait_for "cert-less route h3 rejected at SNI (not in :8443/udp dispatch table)" \
+    cert_less_h3_rejected
+echo "    [ok] cert-less route correctly absent from :8443/udp h3 SNI dispatch"
 
 # Hot-remove the cert-less rule file and verify the companion :80
 # stops serving (route-only reload also exercises the
@@ -986,10 +1033,10 @@ dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
 # takes effect. Gateway is already restarted above.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" restart terminal >/dev/null
 
-# Re-wait for enrollment + the sentinel-rule re-push workaround for
-# the publisher-dedup behaviour (the terminal's publisher comes back
-# fresh after its own restart so this is technically redundant, but
-# explicit is good).
+# Re-wait for enrollment. The publisher's session-epoch watch
+# auto-resyncs on the fresh handshake post-restart (fix for finding
+# `publisher-dedup-after-upstream-restart`), so no sentinel-rule
+# workaround is needed here.
 WAIT_TIMEOUT=60 wait_for "post-rotation re-enrollment" terminal_enrolled
 WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
 WAIT_TIMEOUT=60 wait_for "TCP echo recovers post-rotation" run_tcp_echo
@@ -1344,15 +1391,10 @@ status_h1_big=$(echo "$probe_h1_big" | python3 -c "import json,sys; print(json.l
     || fail "h1 body-limit: expected 200/405 (uncapped reached backend), got $status_h1_big — h1 path incorrectly enforced h3-only body limit"
 echo "    [ok] same 2048-byte POST over h1 reached backend (status $status_h1_big), h3-only limit honoured"
 
-# Note: cert-less route phase intentionally omitted. With
-# [server].default_cert set, the cert loader uses it as a fallback
-# for every route at load time (default-cert-bypasses-cert-less
-# finding), so the cert-less serving path on the companion :80
-# listener never fires under our current bootstrap. Validating
-# cert-less requires either (a) dropping default_cert from the
-# terminal config (would break every other HTTPS phase that depends
-# on it) or (b) the cert loader gaining SAN coverage check before
-# treating default_cert as a fallback. Both are out of scope here.
+# Note: cert-less h3 dispatch-absence coverage lives in the
+# Cert-less route phase above (companion :80 serves + :8443/tcp and
+# :8443/udp SNI both reject), which exercises the same finding
+# `default-cert-bypasses-cert-less` regression on the h3 path.
 
 # -------- done --------------------------------------------------------------
 
