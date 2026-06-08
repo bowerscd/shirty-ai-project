@@ -743,35 +743,56 @@ restart_and_reprobe relay    relay
 # -------- Negative isolation check -----------------------------------------
 
 echo "==> [isolation] client cannot reach home_lan app IPs directly"
-isolation_probe_from() {
-    local from_container="$1" target_ip="$2" target_port="$3" proto="$4"
-    dc_exec "$from_container" python3 - "$target_ip" "$target_port" "$proto" <<'PY'
-import socket, sys
-ip, port, proto = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-fam = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
-s = socket.socket(socket.AF_INET, fam)
-s.settimeout(2)
-try:
-    if proto == "tcp":
-        s.connect((ip, port))
-        sys.exit(1)
-    else:
-        s.sendto(b"isolation-probe", (ip, port))
-        try:
-            s.recvfrom(4096)
-            sys.exit(1)
-        except (socket.timeout, OSError):
-            sys.exit(0)
-except (socket.timeout, ConnectionRefusedError, OSError):
-    sys.exit(0)
-finally:
-    s.close()
+# Run all probes for a container in a single Python invocation with
+# threading so the per-probe 2s socket timeout overlaps. With 4
+# probes per phase (3 phases in chain), this turns ~8s of sequential
+# timeouts plus 4× dc_exec overhead into ~2s of overlapped timeouts
+# plus 1× exec.
+isolation_probes_all_isolated() {
+    local from_container="$1"; shift
+    dc_exec "$from_container" python3 - "$@" <<'PY'
+import socket, sys, threading
+args = sys.argv[1:]
+assert len(args) % 3 == 0, "expected ip port proto triples"
+probes = [(args[i], int(args[i+1]), args[i+2]) for i in range(0, len(args), 3)]
+results = [None] * len(probes)
+
+def check(idx, ip, port, proto):
+    fam = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
+    s = socket.socket(socket.AF_INET, fam)
+    s.settimeout(2)
+    try:
+        if proto == "tcp":
+            s.connect((ip, port))
+            results[idx] = f"{ip}:{port}/{proto} REACHABLE (connect succeeded)"
+        else:
+            s.sendto(b"isolation-probe", (ip, port))
+            try:
+                s.recvfrom(4096)
+                results[idx] = f"{ip}:{port}/{proto} REACHABLE (UDP reply received)"
+            except (socket.timeout, OSError):
+                results[idx] = None
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        results[idx] = None
+    finally:
+        s.close()
+
+threads = [threading.Thread(target=check, args=(i, *p)) for i, p in enumerate(probes)]
+for t in threads: t.start()
+for t in threads: t.join()
+reachable = [r for r in results if r is not None]
+if reachable:
+    for r in reachable: print(r, file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
 PY
 }
-isolation_probe_from client 172.31.13.20 80   tcp || fail "isolation: client could reach app-nginx directly"
-isolation_probe_from client 172.31.13.30 80   tcp || fail "isolation: client could reach app-nginx-alt directly"
-isolation_probe_from client 172.31.13.40 7100 tcp || fail "isolation: client could reach app-tcp directly"
-isolation_probe_from client 172.31.13.50 7101 udp || fail "isolation: client could reach app-udp directly"
+isolation_probes_all_isolated client \
+    172.31.13.20 80   tcp \
+    172.31.13.30 80   tcp \
+    172.31.13.40 7100 tcp \
+    172.31.13.50 7101 udp \
+    || fail "isolation: client reached one or more home_lan endpoints (see stderr)"
 echo "    [ok] all four home_lan app endpoints unreachable from client"
 
 # -------- Two-way isolation: gateway + relay also can't bypass the chain ---
@@ -782,17 +803,21 @@ echo "    [ok] all four home_lan app endpoints unreachable from client"
 # isolation check still passed.
 
 echo "==> [isolation] gateway cannot reach home_lan app IPs directly"
-isolation_probe_from gateway 172.31.13.20 80   tcp || fail "isolation: gateway could reach app-nginx directly"
-isolation_probe_from gateway 172.31.13.30 80   tcp || fail "isolation: gateway could reach app-nginx-alt directly"
-isolation_probe_from gateway 172.31.13.40 7100 tcp || fail "isolation: gateway could reach app-tcp directly"
-isolation_probe_from gateway 172.31.13.50 7101 udp || fail "isolation: gateway could reach app-udp directly"
+isolation_probes_all_isolated gateway \
+    172.31.13.20 80   tcp \
+    172.31.13.30 80   tcp \
+    172.31.13.40 7100 tcp \
+    172.31.13.50 7101 udp \
+    || fail "isolation: gateway reached one or more home_lan endpoints (see stderr)"
 echo "    [ok] all four home_lan app endpoints unreachable from gateway"
 
 echo "==> [isolation] relay cannot reach home_lan app IPs directly"
-isolation_probe_from relay 172.31.13.20 80   tcp || fail "isolation: relay could reach app-nginx directly"
-isolation_probe_from relay 172.31.13.30 80   tcp || fail "isolation: relay could reach app-nginx-alt directly"
-isolation_probe_from relay 172.31.13.40 7100 tcp || fail "isolation: relay could reach app-tcp directly"
-isolation_probe_from relay 172.31.13.50 7101 udp || fail "isolation: relay could reach app-udp directly"
+isolation_probes_all_isolated relay \
+    172.31.13.20 80   tcp \
+    172.31.13.30 80   tcp \
+    172.31.13.40 7100 tcp \
+    172.31.13.50 7101 udp \
+    || fail "isolation: relay reached one or more home_lan endpoints (see stderr)"
 echo "    [ok] all four home_lan app endpoints unreachable from relay"
 
 # -------- Key rotation (mid-chain relay) -----------------------------------
@@ -836,7 +861,11 @@ echo "    [ok] relay identity rotated (${relay_pubkey_before:0:24}… -> ${relay
 
 # Restart relay; both chain links are now broken.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" restart relay >/dev/null
-sleep 5
+# Wait for the relay's control socket to come back so the subsequent
+# rotation ceremonies (add-accept / add-dial RPCs) land cleanly.
+# Replaces a `sleep 5` placeholder.
+WAIT_TIMEOUT=15 wait_for "relay control socket responsive after rotation+restart" \
+    ctl_on relay status
 
 # --- Ceremony 1: relay -> gateway (re-bind gateway's [accept].pubkey)
 local_req1="$RUNTIME_DIR/relay/etc/rotation-request.txt"
@@ -997,47 +1026,6 @@ WAIT_TIMEOUT=20 wait_for "predicates re-derived at gateway post-drain" \
     predicates_landed
 echo "    [ok] gateway re-enrolled after graceful-drain SIGTERM"
 
-# -------- chain reconnect RPC (operator-triggered re-handshake) ------------
-#
-# Mechanically exercises `yggdrasilctl chain reconnect` against the
-# 3-node chain. Same shape as run-quickstart.sh's [chain-reconnect]
-# phase, with the extra-hop wrinkle that both the terminal AND the
-# relay can be nudged (both hold chain clients toward their
-# respective upstreams).
-
-echo "==> [chain-reconnect] operator nudge on both chain-client nodes"
-
-# Terminal -> relay direction.
-reconnect_out=$(dc_exec terminal yggdrasilctl chain reconnect 2>&1) \
-    || fail "chain reconnect rpc failed on terminal: $reconnect_out"
-echo "$reconnect_out" | grep -q "reconnect signal delivered" \
-    || fail "chain reconnect did not produce the expected ack line: $reconnect_out"
-echo "    [ok] terminal accepted chain reconnect RPC"
-
-# Relay -> gateway direction.
-reconnect_out=$(dc_exec relay yggdrasilctl chain reconnect 2>&1) \
-    || fail "chain reconnect rpc failed on relay: $reconnect_out"
-echo "$reconnect_out" | grep -q "reconnect signal delivered" \
-    || fail "chain reconnect did not produce the expected ack line: $reconnect_out"
-echo "    [ok] relay accepted chain reconnect RPC"
-
-# Gateway has no chain client (accept-only); must refuse client-side.
-if dc_exec gateway yggdrasilctl chain reconnect 2>/dev/null; then
-    fail "chain reconnect on gateway should have been refused (no chain client)"
-fi
-echo "    [ok] gateway correctly refuses chain reconnect"
-
-# Both nudges re-handshake async. Confirm externally that the chain
-# is still healthy across both implicit re-handshakes.
-WAIT_TIMEOUT=15 wait_for "terminal still enrolled at relay after reconnect rpc" \
-    terminal_enrolled_at_relay
-WAIT_TIMEOUT=15 wait_for "relay still enrolled at gateway after reconnect rpc" \
-    relay_enrolled_at_gateway
-WAIT_TIMEOUT=20 wait_for "predicates still derived at gateway after reconnect rpc" \
-    predicates_landed
-WAIT_TIMEOUT=15 wait_for "TCP echo still round-trips after reconnect rpc" run_tcp_echo
-echo "    [ok] chain reconnect rpc completed without disturbing live traffic"
-
 # -------- chain apply --file (ephemeral rule push) -------------------------
 #
 # `yggdrasilctl chain apply --file <path>` pushes a pre-validated rule
@@ -1144,6 +1132,55 @@ WAIT_TIMEOUT=10 wait_for "ephemeral-tcp port no longer accepts" ephemeral_tcp_de
 # Confirm the disk-defined rules are back online (one of them suffices).
 WAIT_TIMEOUT=15 wait_for "original tcp-echo rule restored after reload" run_tcp_echo
 echo "    [ok] chain apply ephemeral lifetime (push -> serve -> clobber) verified"
+
+# -------- chain reconnect RPC (operator-triggered re-handshake) ------------
+#
+# Mechanically exercises `yggdrasilctl chain reconnect` against the
+# 3-node chain. Same shape as run-quickstart.sh's [chain-reconnect]
+# phase, with the extra-hop wrinkle that both the terminal AND the
+# relay can be nudged (both hold chain clients toward their
+# respective upstreams).
+#
+# Positioned after [chain-apply] (matching run-quickstart.sh's
+# ordering) so the client → gateway:7100 conntrack state has had
+# time to clear after graceful-drain's gateway restart. Placing this
+# phase immediately after [graceful-drain] makes the TCP-echo probe
+# bump into the container-networking conntrack floor (see finding
+# `forwarding-broken-after-handshake-on-fresh-gateway`) and time
+# out spuriously even though the chain control plane recovers fast.
+
+echo "==> [chain-reconnect] operator nudge on both chain-client nodes"
+
+# Terminal -> relay direction.
+reconnect_out=$(dc_exec terminal yggdrasilctl chain reconnect 2>&1) \
+    || fail "chain reconnect rpc failed on terminal: $reconnect_out"
+echo "$reconnect_out" | grep -q "reconnect signal delivered" \
+    || fail "chain reconnect did not produce the expected ack line: $reconnect_out"
+echo "    [ok] terminal accepted chain reconnect RPC"
+
+# Relay -> gateway direction.
+reconnect_out=$(dc_exec relay yggdrasilctl chain reconnect 2>&1) \
+    || fail "chain reconnect rpc failed on relay: $reconnect_out"
+echo "$reconnect_out" | grep -q "reconnect signal delivered" \
+    || fail "chain reconnect did not produce the expected ack line: $reconnect_out"
+echo "    [ok] relay accepted chain reconnect RPC"
+
+# Gateway has no chain client (accept-only); must refuse client-side.
+if dc_exec gateway yggdrasilctl chain reconnect 2>/dev/null; then
+    fail "chain reconnect on gateway should have been refused (no chain client)"
+fi
+echo "    [ok] gateway correctly refuses chain reconnect"
+
+# Both nudges re-handshake async. Confirm externally that the chain
+# is still healthy across both implicit re-handshakes.
+WAIT_TIMEOUT=15 wait_for "terminal still enrolled at relay after reconnect rpc" \
+    terminal_enrolled_at_relay
+WAIT_TIMEOUT=15 wait_for "relay still enrolled at gateway after reconnect rpc" \
+    relay_enrolled_at_gateway
+WAIT_TIMEOUT=20 wait_for "predicates still derived at gateway after reconnect rpc" \
+    predicates_landed
+WAIT_TIMEOUT=15 wait_for "TCP echo still round-trips after reconnect rpc" run_tcp_echo
+echo "    [ok] chain reconnect rpc completed without disturbing live traffic"
 
 # -------- IPv6 path (hot-load v6 rule, probe over v6) ----------------------
 #

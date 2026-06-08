@@ -903,36 +903,58 @@ restart_and_reprobe terminal terminal
 # itself is broken and every other assertion above is suspect.
 
 echo "==> [isolation] client cannot reach home_lan app IPs directly"
-isolation_probe_from() {
-    local from_container="$1" target_ip="$2" target_port="$3" proto="$4"
-    dc_exec "$from_container" python3 - "$target_ip" "$target_port" "$proto" <<'PY'
-import socket, sys
-ip, port, proto = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-fam = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
-s = socket.socket(socket.AF_INET, fam)
-s.settimeout(2)
-try:
-    if proto == "tcp":
-        s.connect((ip, port))
-        sys.exit(1)  # connect succeeded = isolation broken
-    else:
-        # UDP is connectionless; "isolation" for UDP means no response.
-        s.sendto(b"isolation-probe", (ip, port))
-        try:
-            s.recvfrom(4096)
-            sys.exit(1)  # got a reply = isolation broken
-        except (socket.timeout, OSError):
-            sys.exit(0)
-except (socket.timeout, ConnectionRefusedError, OSError):
-    sys.exit(0)  # unreachable = good
-finally:
-    s.close()
+# Run all probes for a container in a single Python invocation with
+# threading so the per-probe 2s socket timeout overlaps. With 4
+# probes per phase, this turns ~8s of sequential timeouts plus 4×
+# dc_exec overhead into ~2s of overlapped timeouts plus 1× exec.
+# Probes argv shape: ip port proto [ip port proto ...]; the helper
+# returns non-zero with reachable destinations on stderr if any
+# probe completed successfully (which would mean isolation broke).
+isolation_probes_all_isolated() {
+    local from_container="$1"; shift
+    dc_exec "$from_container" python3 - "$@" <<'PY'
+import socket, sys, threading
+args = sys.argv[1:]
+assert len(args) % 3 == 0, "expected ip port proto triples"
+probes = [(args[i], int(args[i+1]), args[i+2]) for i in range(0, len(args), 3)]
+results = [None] * len(probes)
+
+def check(idx, ip, port, proto):
+    fam = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
+    s = socket.socket(socket.AF_INET, fam)
+    s.settimeout(2)
+    try:
+        if proto == "tcp":
+            s.connect((ip, port))
+            results[idx] = f"{ip}:{port}/{proto} REACHABLE (connect succeeded)"
+        else:
+            s.sendto(b"isolation-probe", (ip, port))
+            try:
+                s.recvfrom(4096)
+                results[idx] = f"{ip}:{port}/{proto} REACHABLE (UDP reply received)"
+            except (socket.timeout, OSError):
+                results[idx] = None
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        results[idx] = None
+    finally:
+        s.close()
+
+threads = [threading.Thread(target=check, args=(i, *p)) for i, p in enumerate(probes)]
+for t in threads: t.start()
+for t in threads: t.join()
+reachable = [r for r in results if r is not None]
+if reachable:
+    for r in reachable: print(r, file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
 PY
 }
-isolation_probe_from client 172.31.2.20 80   tcp || fail "isolation: client could reach app-nginx directly"
-isolation_probe_from client 172.31.2.30 80   tcp || fail "isolation: client could reach app-nginx-alt directly"
-isolation_probe_from client 172.31.2.40 7100 tcp || fail "isolation: client could reach app-tcp directly"
-isolation_probe_from client 172.31.2.50 7101 udp || fail "isolation: client could reach app-udp directly"
+isolation_probes_all_isolated client \
+    172.31.2.20 80   tcp \
+    172.31.2.30 80   tcp \
+    172.31.2.40 7100 tcp \
+    172.31.2.50 7101 udp \
+    || fail "isolation: client reached one or more home_lan endpoints (see stderr)"
 echo "    [ok] all four home_lan app endpoints unreachable from client"
 
 # -------- Two-way isolation: gateway also can't bypass the chain -----------
@@ -946,10 +968,12 @@ echo "    [ok] all four home_lan app endpoints unreachable from client"
 # pass.
 
 echo "==> [isolation] gateway cannot reach home_lan app IPs directly"
-isolation_probe_from gateway 172.31.2.20 80   tcp || fail "isolation: gateway could reach app-nginx directly"
-isolation_probe_from gateway 172.31.2.30 80   tcp || fail "isolation: gateway could reach app-nginx-alt directly"
-isolation_probe_from gateway 172.31.2.40 7100 tcp || fail "isolation: gateway could reach app-tcp directly"
-isolation_probe_from gateway 172.31.2.50 7101 udp || fail "isolation: gateway could reach app-udp directly"
+isolation_probes_all_isolated gateway \
+    172.31.2.20 80   tcp \
+    172.31.2.30 80   tcp \
+    172.31.2.40 7100 tcp \
+    172.31.2.50 7101 udp \
+    || fail "isolation: gateway reached one or more home_lan endpoints (see stderr)"
 echo "    [ok] all four home_lan app endpoints unreachable from gateway"
 
 # -------- Key rotation -----------------------------------------------------
@@ -1007,7 +1031,12 @@ echo "    [ok] gateway identity rotated (${gw_pubkey_before:0:24}… -> ${gw_pub
 # Restart gateway so the new identity is loaded. Chain will be DOWN
 # because the terminal's [dial].pubkey still pins the OLD key.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" restart gateway >/dev/null
-sleep 5
+# Wait for the gateway's control socket to come back so the
+# subsequent rotation ceremony (add-accept RPC) lands cleanly.
+# Replaces a `sleep 5` placeholder. `ctl_on gateway status` is
+# the cheapest "daemon ready" observable.
+WAIT_TIMEOUT=15 wait_for "gateway control socket responsive after rotation+restart" \
+    ctl_on gateway status
 
 # Confirm the chain is genuinely down (handshakes against the new
 # gateway should fail; TCP echo should not work). We don't fail the
