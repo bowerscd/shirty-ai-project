@@ -83,7 +83,7 @@ async-trait     = { workspace = true }
 # investigation: capture a flamegraph or pprof file during a bench
 # run, inspect with `inferno`/`go tool pprof` to see where the
 # accept loop / copy_bidirectional path is actually spending time.
-pprof           = { version = "0.13", features = ["flamegraph", "prost-codec", "frame-pointer"], optional = true }
+pprof           = { version = "0.15", features = ["flamegraph", "prost-codec", "frame-pointer"], optional = true }
 
 [features]
 default = []
