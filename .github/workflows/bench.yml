@@ -62,7 +62,7 @@ jobs:
 
       - name: download baseline (if provided)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline_sha != '' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bench-results-${{ inputs.baseline_sha }}
           path: bench/results/${{ inputs.baseline_sha }}
