@@ -43,6 +43,20 @@ else
 fi
 
 teardown() {
+    local ec=$?
+    # On a failing exit, dump every service's logs BEFORE removing the
+    # stack. This trap fires for both explicit fail() calls and bare
+    # `wait_for` timeouts (which return non-zero under `set -e`), so it is
+    # the single reliable place to capture a daemon-log trail. The CI
+    # workflow cannot do this itself: this teardown removes the containers,
+    # so any post-job "dump logs" step would find nothing left.
+    if (( ec != 0 )) && [[ "${KEEP_STACK:-0}" != "1" ]]; then
+        echo "==> [teardown] run failed (exit $ec); dumping container logs"
+        for svc in gateway relay terminal app-nginx app-nginx-alt app-tcp app-udp init-chain; do
+            echo "----- logs: $svc -----"
+            "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 200 "$svc" 2>&1 || true
+        done
+    fi
     if [[ "${KEEP_STACK:-0}" == "1" ]]; then
         echo "==> KEEP_STACK=1 set; leaving stack up (runtime tree at $RUNTIME_DIR)"
         return
@@ -138,9 +152,8 @@ wait_for() {
 
 fail() {
     echo "FAIL: $*"
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 120 gateway  || true
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 120 relay    || true
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 120 terminal || true
+    # Container logs are dumped by the teardown trap on non-zero exit,
+    # so a failing wait_for and an explicit fail() produce the same trail.
     exit 1
 }
 

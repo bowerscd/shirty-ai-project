@@ -74,17 +74,11 @@ jobs:
             ${{ runner.os }}-e2e-cargo-
 
       - name: Run quickstart end-to-end tests
-        # `run-quickstart.sh` handles its own build + bootstrap + teardown.
+        # `run-quickstart.sh` handles its own build + bootstrap + teardown,
+        # and dumps every service's logs on failure before tearing the
+        # stack down (see its teardown trap), so no separate log-dump step
+        # is needed here.
         run: bash tests/e2e/run-quickstart.sh
-
-      - name: Dump container logs on failure
-        if: failure()
-        run: |
-          for svc in gateway terminal app-nginx app-nginx-alt app-tcp app-udp init-quickstart; do
-            echo "--- $svc ---"
-            podman-compose -f docker/compose.e2e.quickstart.yml -p yggdrasil-e2e-quickstart \
-              logs --tail 200 "$svc" || true
-          done
 
       - name: Tear down
         if: always()
@@ -121,16 +115,10 @@ jobs:
             ${{ runner.os }}-e2e-cargo-
 
       - name: Run chain end-to-end tests
+        # `run-chain.sh` dumps every service's logs on failure before
+        # tearing the stack down (see its teardown trap), so no separate
+        # log-dump step is needed here.
         run: bash tests/e2e/run-chain.sh
-
-      - name: Dump container logs on failure
-        if: failure()
-        run: |
-          for svc in gateway relay terminal app-nginx app-nginx-alt app-tcp app-udp init-chain; do
-            echo "--- $svc ---"
-            podman-compose -f docker/compose.e2e.chain.yml -p yggdrasil-e2e-chain \
-              logs --tail 200 "$svc" || true
-          done
 
       - name: Tear down
         if: always()
