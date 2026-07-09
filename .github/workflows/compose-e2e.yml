@@ -12,7 +12,7 @@ name: e2e
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
