@@ -104,8 +104,14 @@ mkdir -p "$RUNTIME_DIR"/{gateway,terminal}/{etc,run,state}
 # memory after rustls rejects the bad on-disk PEM.
 mkdir -p "$RUNTIME_DIR/client-trust"
 
-echo "==> building images"
-"${DC[@]}" "${COMPOSE_ARGS[@]}" build
+echo "==> building the shared e2e image (once)"
+# Every yggdrasil-role service uses the same image (`yggdrasil-e2e:latest`,
+# pinned on the compose anchor). Build it exactly once via a single service.
+# `podman-compose build` (no args) would build it once PER service and in
+# parallel — 6+ concurrent cold `cargo build --release` runs that thrash a
+# CI runner and blow the job timeout. See finding
+# `e2e-chain-redundant-parallel-builds`.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" build init-quickstart
 
 echo "==> running bootstrap (init-quickstart)"
 if ! "${DC[@]}" "${COMPOSE_ARGS[@]}" run --rm init-quickstart; then
@@ -119,7 +125,9 @@ fi
 cp "$RUNTIME_DIR/terminal/etc/certs/server.pem" "$RUNTIME_DIR/client-trust/server.pem"
 
 echo "==> bringing app + daemons up"
-"${DC[@]}" "${COMPOSE_ARGS[@]}" up -d \
+# --no-build: the shared image was already built above; without this,
+# `up` would trigger the same per-service parallel rebuild.
+"${DC[@]}" "${COMPOSE_ARGS[@]}" up -d --no-build \
     app-nginx app-nginx-alt app-tcp app-udp \
     gateway terminal client
 

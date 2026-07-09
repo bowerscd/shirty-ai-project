@@ -39,6 +39,13 @@
 # before bringing the daemons up.
 
 x-yggdrasil-image: &yggdrasil-image
+  # All yggdrasil-role services share one identical image (they differ only
+  # by `command:`/mounts at runtime). Pin a single explicit tag so the image
+  # is built once and reused: podman-compose does NOT dedupe builds by image
+  # name and builds services in parallel, so without this every service would
+  # trigger its own cold `cargo build --release` concurrently. The run scripts
+  # build this tag once, then `up --no-build` reuses it.
+  image: yggdrasil-e2e:latest
   build:
     context: ..
     dockerfile: docker/Dockerfile.e2e
