@@ -10,6 +10,7 @@ repository.workspace   = true
 [[bin]]
 name = "yggdrasilctl"
 path = "src/main.rs"
+bench = false  # exclude from `cargo bench` (libtest harness rejects criterion's --quick)
 
 [dependencies]
 ratatoskr = { workspace = true }

@@ -10,10 +10,12 @@ repository.workspace   = true
 [[bin]]
 name = "loadgen"
 path = "src/main.rs"
+bench = false  # exclude from `cargo bench` (libtest harness rejects criterion's --quick)
 
 [[bin]]
 name = "bench-echo"
 path = "src/bin/echo.rs"
+bench = false  # exclude from `cargo bench` (libtest harness rejects criterion's --quick)
 
 [dependencies]
 tokio        = { workspace = true }
