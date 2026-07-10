@@ -78,6 +78,7 @@ type, labels, meaning.
 | Metric                                            | Type    | Labels                              | Notes                                                                       |
 | ------------------------------------------------- | ------- | ----------------------------------- | --------------------------------------------------------------------------- |
 | `yggdrasil_handshakes_completed_total`            | counter | (none)                              | Noise_IK responder-side handshake completions.                              |
+| `yggdrasil_heartbeat_datagrams_received_total`    | counter | (none)                              | Every UDP datagram delivered to the heartbeat socket, counted before parse/auth. Flat while a peer is failing to (re-)enroll ⇒ datagrams are not reaching the socket (transport/routing); climbing ⇒ they arrive but are dropped pre-handshake (see the per-drop debug logs). |
 | `yggdrasil_heartbeats_received_total`             | counter | `result` (`accepted`/`rejected`)    | Inbound heartbeats classified by replay/auth verdict.                       |
 | `yggdrasil_last_heartbeat_timestamp_seconds`      | gauge   | (none)                              | UNIX timestamp of the last accepted heartbeat. Inactive heartbeats freeze this value. |
 | `yggdrasil_peer_ip_changes_total`                 | counter | (none)                              | Number of times the relay's view of the downstream IP changed.              |

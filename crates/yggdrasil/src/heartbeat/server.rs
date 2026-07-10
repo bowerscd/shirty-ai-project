@@ -149,7 +149,20 @@ impl HeartbeatServer {
                 }
                 res = self.socket.recv_from(&mut buf) => {
                     match res {
-                        Ok((n, src)) => self.handle_packet(&buf[..n], src).await,
+                        Ok((n, src)) => {
+                            // Receive-path visibility: count and (at debug)
+                            // trace every datagram the socket delivers,
+                            // BEFORE any parse/auth. This is what lets an
+                            // operator distinguish "no datagrams reached the
+                            // socket" (transport/routing) from "arrived but
+                            // dropped pre-handshake" (parse/key/session) when
+                            // a peer fails to (re-)enroll — the per-drop
+                            // reasons below are otherwise debug-only.
+                            metrics::counter!("yggdrasil_heartbeat_datagrams_received_total")
+                                .increment(1);
+                            tracing::debug!(src = %src, bytes = n, "heartbeat datagram received");
+                            self.handle_packet(&buf[..n], src).await;
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "heartbeat recv_from failed");
                         }
