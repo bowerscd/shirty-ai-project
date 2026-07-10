@@ -785,59 +785,41 @@ restart_and_reprobe() {
     local service="$1" role_desc="$2"
     echo "==> [restart-$role_desc] restart $service, expect chain recovers"
 
-    # >>> TEMPORARY DIAGNOSTIC (revert to: `"${DC[@]}" "${COMPOSE_ARGS[@]}"
-    # restart "$service" >/dev/null`): A/B the gateway restart METHOD. Run #21
-    # showed a ~30.5s post-`restart` UDP delivery gap. Here the gateway is
-    # stopped, left down for 35s (> the observed gap, so any time-based
-    # neigh/NAT staleness for its address can expire during the downtime),
-    # then started — measuring the post-`start` gap via the recv-datagram log.
-    # If the gap is small, `stop;sleep;start` is a better test pattern than a
-    # bigger timeout. See finding e2e-chain-restart-gateway-relay-reenroll-timeout.
-    if [[ "$role_desc" == "gateway" ]]; then
-        echo "    [diag] stop gateway; sleep 35; start gateway (A/B vs restart)"
-        "${DC[@]}" "${COMPOSE_ARGS[@]}" stop "$service" >/dev/null
-        sleep 35
-        "${DC[@]}" "${COMPOSE_ARGS[@]}" start "$service" >/dev/null
-    else
-        "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
-    fi
-    # <<< END TEMPORARY DIAGNOSTIC
+    "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
-    # No `chain reconnect` nudge here; same reason as
-    # run-quickstart.sh's restart_and_reprobe — the host's
-    # Linux conntrack holds stale TCP state for the client →
-    # gateway:client_wan path for ~30-60s after a container
-    # restart, so client-side TCP probes can't reach the new
-    # listener until those timers expire regardless of how fast
-    # the chain control plane re-handshakes. UDP control plane
-    # is unaffected. See session finding
-    # `forwarding-broken-after-handshake-on-fresh-gateway`
-    # (corrected diagnosis: container-networking artifact, not a
-    # yggdrasil bug). The dedicated [chain-reconnect] phase below
-    # exercises the RPC against a healthy chain where conntrack
-    # doesn't interfere.
+    # Nudge the node that DIALS the just-restarted service so it drops the
+    # now-dead session and re-handshakes immediately, instead of coasting
+    # ~15-20s on the old session's heartbeat-liveness detection. The nudge
+    # also resets the chain client's reconnect backoff to its minimum
+    # (chain/client/mod.rs: ReconnectRequested => backoff = BACKOFF_MIN), so
+    # retries stay frequent through the ~30s post-restart UDP delivery gap
+    # this container environment exhibits — landing the re-handshake shortly
+    # after the gap clears rather than up to 30s later on a maxed-out backoff.
+    local dialer=""
+    case "$service" in
+        gateway) dialer=relay ;;     # relay dials the gateway
+        relay)   dialer=terminal ;;  # terminal dials the relay
+        # terminal is the chain origin: nothing dials it and its own client
+        # restarts fresh, so no nudge applies.
+    esac
+    if [[ -n "$dialer" ]]; then
+        dc_exec "$dialer" yggdrasilctl chain reconnect >/dev/null 2>&1 \
+            || echo "    [warn] chain reconnect nudge on $dialer failed (continuing)"
+    fi
+
+    # Note: the data-plane TCP/UDP echo probes below still bump into the
+    # separate client -> gateway:client_wan conntrack floor for ~30-60s after
+    # a container restart (finding `forwarding-broken-after-handshake-on-fresh
+    # -gateway`: a container-networking artifact, not a yggdrasil bug). The
+    # reconnect nudge above speeds the *control-plane* re-enroll; it does not
+    # and is not meant to shorten the data-plane probe recovery.
 
     # Re-wait for full chain enrollment. For relay restart, both
     # hops re-handshake; wait for both gating predicates.
-    WAIT_TIMEOUT=60 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
-    # >>> TEMPORARY DIAGNOSTIC (revert this whole block back to the single
-    # line: `WAIT_TIMEOUT=60 wait_for "relay re-enrolled at gateway after
-    # $role_desc restart" relay_enrolled_at_gateway`):
-    # For the gateway restart, wait generously so the FULL control-plane
-    # recovery is captured — detection latency, the moment datagrams start
-    # reaching the restarted gateway again (new yggdrasil_heartbeat_datagrams
-    # _received_total / "heartbeat datagram received" debug lines), and the
-    # handshake completion — then halt so teardown dumps the gateway recv-path
-    # log + relay pcap. Characterises the post-restart delivery gap for
-    # finding e2e-chain-restart-gateway-relay-reenroll-timeout.
-    local reenroll_timeout=60
-    [[ "$role_desc" == "gateway" ]] && reenroll_timeout=150
-    WAIT_TIMEOUT=$reenroll_timeout wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
-    if [[ "$role_desc" == "gateway" ]]; then
-        echo "DIAGNOSTIC STOP: captured full restart-gateway recovery; halting to collect artifacts"
-        exit 1
-    fi
-    # <<< END TEMPORARY DIAGNOSTIC
+    # 90s (up from 60s) gives margin over the nudged recovery (~30-35s: the
+    # ~30s delivery gap + a couple of low-backoff retries) plus CI variance.
+    WAIT_TIMEOUT=90 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
+    WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
 
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
         predicates_landed
@@ -1061,8 +1043,8 @@ dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
 sleep 3
 "${DC[@]}" "${COMPOSE_ARGS[@]}" restart terminal >/dev/null
 
-WAIT_TIMEOUT=60 wait_for "post-rotation terminal->relay re-enrollment" terminal_enrolled_at_relay
-WAIT_TIMEOUT=60 wait_for "post-rotation relay->gateway re-enrollment" relay_enrolled_at_gateway
+WAIT_TIMEOUT=90 wait_for "post-rotation terminal->relay re-enrollment" terminal_enrolled_at_relay
+WAIT_TIMEOUT=90 wait_for "post-rotation relay->gateway re-enrollment" relay_enrolled_at_gateway
 # Publisher's session-epoch watch auto-resyncs on the fresh handshake,
 # no sentinel workaround needed.
 WAIT_TIMEOUT=20 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
@@ -1140,8 +1122,13 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 # Restart gateway for the post-drain re-enrollment check (and to leave
 # the stack healthy for `KEEP_STACK=1` debugging).
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-# No `chain reconnect` nudge here; same conntrack-floor caveat as
-# restart_and_reprobe above.
+# Nudge the relay (which dials the gateway) to re-handshake immediately and
+# reset its reconnect backoff, instead of coasting on the drained session;
+# same rationale as restart_and_reprobe above. The control plane sees the
+# same ~30s post-restart UDP delivery gap, so a low, frequently-retried
+# backoff recovers fastest.
+dc_exec relay yggdrasilctl chain reconnect >/dev/null 2>&1 \
+    || echo "    [warn] chain reconnect nudge on relay failed (continuing)"
 WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
     relay_enrolled_at_gateway
 

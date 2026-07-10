@@ -930,30 +930,36 @@ restart_and_reprobe() {
     # Restart and let the daemon come back up. Default --time is 10s.
     "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
 
-    # No `chain reconnect` nudge here. The RPC exists (and works
-    # cleanly — see the dedicated [chain-reconnect] phase below) but
-    # it can't shorten this phase's wall-clock under the podman test
-    # environment. When the gateway container restarts, the host's
-    # Linux conntrack holds stale state for the old client →
-    # gateway:client_wan TCP path until per-state timers expire
-    # (~30-60s, depending on
-    # nf_conntrack_tcp_timeout_unacked / close_wait). UDP control
-    # plane is unaffected, so chain re-handshake completes in ~1-2s
-    # either way — but client-side TCP/UDP probes through the new
-    # gateway listener fail until conntrack lets the new SYN
-    # through. See session finding
-    # `forwarding-broken-after-handshake-on-fresh-gateway` (mis-
-    # named at creation, corrected to "tcp probes from client
-    # container to gateway:client_wan take ~50s to recover after
-    # gateway restart (container-networking artifact, not a
-    # yggdrasil bug)"). In production the nudge IS the right speedup;
-    # in this test environment it's wasted effort.
+    # Nudge the terminal (which dials the gateway) after a gateway restart so
+    # its chain client drops the now-dead session and re-handshakes
+    # immediately instead of coasting ~15-20s on heartbeat-liveness detection.
+    # The nudge also resets the reconnect backoff to its minimum
+    # (chain/client/mod.rs: ReconnectRequested => backoff = BACKOFF_MIN), so
+    # retries stay frequent through the ~30s post-restart UDP delivery gap.
+    # NOTE: contrary to an earlier belief that "the UDP control plane is
+    # unaffected", the control plane IS affected — measured, the gateway's
+    # yggdrasil_heartbeat_datagrams_received_total stays flat for ~30s after
+    # `podman-compose restart gateway`, then the first arriving datagram
+    # completes the handshake instantly. A terminal restart needs no nudge —
+    # its own client restarts fresh.
+    #
+    # The data-plane TCP/UDP echo probes below still bump into the SEPARATE
+    # client -> gateway:client_wan conntrack floor for ~30-60s (finding
+    # `forwarding-broken-after-handshake-on-fresh-gateway`, a
+    # container-networking artifact, not a yggdrasil bug); the nudge speeds
+    # the control-plane re-enroll, not those.
+    if [[ "$service" == "gateway" ]]; then
+        dc_exec terminal yggdrasilctl chain reconnect >/dev/null 2>&1 \
+            || echo "    [warn] chain reconnect nudge on terminal failed (continuing)"
+    fi
 
     # Re-wait for enrollment. The gating predicate is the same one
     # used at startup — what we want to assert is that the post-
     # restart state matches the pre-restart state, not that some
     # restart-specific signal fires.
-    WAIT_TIMEOUT=60 wait_for "chain re-enrolled after $role_desc restart" terminal_enrolled
+    # 90s (up from 60s) gives margin over the nudged recovery (~30-35s: the
+    # ~30s delivery gap + a couple of low-backoff retries) plus CI variance.
+    WAIT_TIMEOUT=90 wait_for "chain re-enrolled after $role_desc restart" terminal_enrolled
 
     # The terminal's predicate publisher now subscribes to the chain
     # client's session-epoch watch and automatically resyncs on each
@@ -1182,7 +1188,7 @@ dc_exec terminal yggdrasilctl --config /etc/yggdrasil/config.toml \
 # auto-resyncs on the fresh handshake post-restart (fix for finding
 # `publisher-dedup-after-upstream-restart`), so no sentinel-rule
 # workaround is needed here.
-WAIT_TIMEOUT=60 wait_for "post-rotation re-enrollment" terminal_enrolled
+WAIT_TIMEOUT=90 wait_for "post-rotation re-enrollment" terminal_enrolled
 WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
 WAIT_TIMEOUT=60 wait_for "TCP echo recovers post-rotation" run_tcp_echo
 echo "    [ok] gateway key rotation + re-enrollment cycle succeeded"
@@ -1263,8 +1269,12 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 
 # Restart gateway for the negative-isolation phase that follows.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-# No `chain reconnect` nudge here; same conntrack-floor caveat as
-# restart_and_reprobe above.
+# Nudge the terminal to re-handshake immediately (resets reconnect backoff to
+# its minimum) instead of coasting on the drained session; same rationale as
+# restart_and_reprobe above. The control plane sees the same ~30s post-restart
+# UDP delivery gap, so a low, frequently-retried backoff recovers fastest.
+dc_exec terminal yggdrasilctl chain reconnect >/dev/null 2>&1 \
+    || echo "    [warn] chain reconnect nudge on terminal failed (continuing)"
 WAIT_TIMEOUT=90 wait_for "gateway re-enrolled after graceful-drain restart" terminal_enrolled
 # The publisher's session-epoch watch auto-resyncs after the gateway
 # comes back, so no post-restart sentinel is needed here.
