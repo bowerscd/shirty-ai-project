@@ -1269,13 +1269,17 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 
 # Restart gateway for the negative-isolation phase that follows.
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-# Nudge the terminal to re-handshake immediately (resets reconnect backoff to
-# its minimum) instead of coasting on the drained session; same rationale as
-# restart_and_reprobe above. The control plane sees the same ~30s post-restart
-# UDP delivery gap, so a low, frequently-retried backoff recovers fastest.
+# Best-effort nudge (see run-chain.sh's graceful-drain note): the drain keeps
+# the gateway down long enough that the terminal's session usually dies before
+# this fires, leaving the client in its reconnect-backoff loop where
+# `chain reconnect` is a no-op. Post-drain recovery is therefore bound by the
+# client's exponential reconnect backoff (BACKOFF_MAX=30s) racing the ~30s
+# post-restart UDP delivery gap; hence the larger 150s wait. Interrupting the
+# backoff on a nudge (or lowering BACKOFF_MAX) is an owner-reserved product
+# decision.
 dc_exec terminal yggdrasilctl chain reconnect >/dev/null 2>&1 \
     || echo "    [warn] chain reconnect nudge on terminal failed (continuing)"
-WAIT_TIMEOUT=90 wait_for "gateway re-enrolled after graceful-drain restart" terminal_enrolled
+WAIT_TIMEOUT=150 wait_for "gateway re-enrolled after graceful-drain restart" terminal_enrolled
 # The publisher's session-epoch watch auto-resyncs after the gateway
 # comes back, so no post-restart sentinel is needed here.
 WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway post-drain" \

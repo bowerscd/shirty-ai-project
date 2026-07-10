@@ -1122,14 +1122,21 @@ echo "    [ok] slow-drip TCP client round-tripped all 7 bytes across SIGTERM"
 # Restart gateway for the post-drain re-enrollment check (and to leave
 # the stack healthy for `KEEP_STACK=1` debugging).
 "${DC[@]}" "${COMPOSE_ARGS[@]}" start gateway >/dev/null
-# Nudge the relay (which dials the gateway) to re-handshake immediately and
-# reset its reconnect backoff, instead of coasting on the drained session;
-# same rationale as restart_and_reprobe above. The control plane sees the
-# same ~30s post-restart UDP delivery gap, so a low, frequently-retried
-# backoff recovers fastest.
+# Best-effort nudge: if the relay's session is still active it re-handshakes
+# immediately with reset backoff. But unlike restart_and_reprobe (where the
+# gateway is down only ~2-5s), the graceful drain keeps the gateway down long
+# enough that the relay's session usually dies FIRST and the client is already
+# in its reconnect-backoff loop — where `chain reconnect` is a no-op (the
+# reconnect signal is only observed inside an active session, chain/client/
+# run_loop.rs). So post-drain recovery is bound by the client's exponential
+# reconnect backoff (BACKOFF_MAX=30s) racing the ~30s post-restart UDP
+# delivery gap; hence the larger 150s wait below. Making the reconnect RPC
+# interrupt the backoff sleep, or lowering BACKOFF_MAX, is a product-design
+# question left for the owner (finding
+# e2e-chain-restart-gateway-relay-reenroll-timeout).
 dc_exec relay yggdrasilctl chain reconnect >/dev/null 2>&1 \
     || echo "    [warn] chain reconnect nudge on relay failed (continuing)"
-WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
+WAIT_TIMEOUT=150 wait_for "relay re-enrolled at gateway after graceful-drain restart" \
     relay_enrolled_at_gateway
 
 # Publisher's session-epoch watch auto-resyncs on the fresh handshake,
