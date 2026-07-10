@@ -11,16 +11,12 @@ name: e2e
 # crates or the compose definitions, plus nightly for drift detection.
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**"
-      - "docker/**"
-      - "tests/e2e/**"
-      - ".github/workflows/compose-e2e.yml"
+  # Reusable: the Release workflow calls this as the master/tag gate
+  # (workflow_call ignores the paths filters below, so a release always
+  # runs the full e2e regardless of what changed). Master pushes go
+  # through release.yml, so there is no standalone push trigger here —
+  # that would double every master run.
+  workflow_call:
   pull_request:
     paths:
       - "Cargo.toml"
@@ -39,7 +35,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: e2e-${{ github.ref }}
+  # Include the workflow name so a release-driven call (github.workflow =
+  # "Release") does not share a group with the standalone scheduled /
+  # dispatch runs (github.workflow = "e2e") on the same ref — otherwise the
+  # 04:17 UTC schedule could cancel an in-flight release gate.
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

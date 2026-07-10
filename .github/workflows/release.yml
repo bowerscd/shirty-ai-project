@@ -1,0 +1,171 @@
+name: Release
+
+# Continuous release pipeline.
+#
+# Every push to master publishes a rolling **release candidate**
+# (prerelease); pushing a bare `X.Y.Z` tag publishes the corresponding
+# **stable** release. In both cases the full test gate — the CI suite
+# and the podman e2e suite, reused via `workflow_call` — must pass
+# before any package is built or uploaded.
+#
+# Versioning (see .github/scripts/compute-release-version.sh):
+#   * master push  → `<Cargo.toml version>-rc<N>`, prerelease. The rc is
+#     a preview of the NEXT release, so the Cargo.toml version must be
+#     strictly greater than the last stable tag; N is monotonic per
+#     base version (0.1.0-rc1, 0.1.0-rc2, … independently 0.2.0-rc1, …).
+#   * `X.Y.Z` tag  → `X.Y.Z`, stable. The tag must equal the Cargo.toml
+#     version (which CMake stamps into the packages).
+#
+# End users therefore always have a clear "latest stable" (the newest
+# non-prerelease) and a "latest preview" (the newest prerelease) to
+# download from the Releases page.
+
+on:
+  push:
+    branches: [master]
+    tags:
+      # Bare semver only. In GitHub's tag-filter glob syntax `+` means
+      # "one or more of the preceding character" (verified against the
+      # filter-pattern cheat sheet), so this matches 0.1.0, 1.10.25, …
+      # and NOT prerelease tags like 0.1.0-rc7 (the trailing `-rc7` is
+      # unmatched). rc tags are created by this workflow via GITHUB_TOKEN
+      # and so never re-trigger it in any case.
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+# Serialise releases. On master, cancel an in-flight rc build when a
+# newer commit lands (only the latest master matters, and the rc
+# counter stays dense). Never cancel a stable tag build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- gate: reuse the exact CI + e2e suites that guard PRs ----------
+  gate-ci:
+    uses: ./.github/workflows/ci.yml
+
+  gate-e2e:
+    uses: ./.github/workflows/compose-e2e.yml
+
+  # ---- build packages + publish the GitHub Release ------------------
+  release:
+    needs: [gate-ci, gate-e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # Needed to create the Release and (for rc builds) its tag.
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # Full history + all tags: the version script reads existing
+          # stable tags (guard) and rc tags (monotonic counter).
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        # Pinned to a commit SHA (not @master) because this job runs with
+        # `contents: write` and creates tags/releases — a floating action
+        # ref is a supply-chain risk at that privilege. SHA is dtolnay/
+        # rust-toolchain master @ 2026-06-30; bump deliberately.
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging toolchain
+        # cmake drives the build + CPack; `rpm` provides rpmbuild for the
+        # RPM generator; `dpkg-dev` provides dpkg-shlibdeps for the DEB
+        # generator's automatic library dependencies.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake rpm dpkg-dev file
+
+      - name: Compute version
+        id: ver
+        # The script prints `version=…` and `prerelease=…`; capture into
+        # step outputs. `$( )` propagates a non-zero exit (a failed
+        # guard) so the job stops before building anything.
+        run: |
+          out="$(.github/scripts/compute-release-version.sh)"
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries + packages
+        env:
+          YGG_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # -DCMAKE_INSTALL_PREFIX=/usr routes config to /etc and systemd
+          # units to /usr/lib (the layout the DEB/RPM scriptlets expect).
+          cmake -B build \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCARGO_LOCKED=ON \
+            -DYGGDRASIL_PACKAGE_VERSION="$YGG_VERSION"
+          cmake --build build
+          ( cd build && cpack -G "TGZ;DEB;RPM" -B "$PWD/packages" )
+
+      - name: Checksums
+        working-directory: build/packages
+        run: |
+          set -euo pipefail
+          # Package files use two name shapes: yggdrasil-<ver>… (TGZ/RPM)
+          # and yggdrasil_<ver>… (DEB). Match both, exclude any prior sum.
+          sha256sum yggdrasil-* yggdrasil_* > SHA256SUMS
+          echo "----- packages -----"
+          ls -la
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # RELEASE_VERSION (not VERSION) to avoid shadowing the OS-release
+          # VERSION variable if the explicit mapping is ever refactored out.
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flag=()
+          kind="stable release"
+          if [[ "$PRERELEASE" == "true" ]]; then
+            flag=(--prerelease)
+            kind="release candidate (preview)"
+          fi
+          # Dynamic first line (no backticks → safe in an expanding heredoc).
+          cat > release-notes.md <<EOF
+          Automated ${kind} ${RELEASE_VERSION}, built from commit ${GITHUB_SHA}.
+          EOF
+          # Static body via a quoted heredoc: the backticks are literal
+          # markdown code spans, not command substitutions, and the quoted
+          # delimiter keeps them from being expanded or executed.
+          cat >> release-notes.md <<'EOF'
+
+          ## Downloads
+
+          | Target | Asset |
+          | --- | --- |
+          | Debian / Ubuntu | `yggdrasil_*_amd64.deb` |
+          | Fedora / RHEL / openSUSE | `yggdrasil-*.x86_64.rpm` |
+          | Other Linux (tarball, /usr layout) | `yggdrasil-*-x86_64.tar.gz` |
+          | Arch | build from `contrib/arch/PKGBUILD` |
+
+          Verify downloads against `SHA256SUMS`.
+
+          Prereleases (`-rcN`) preview the next stable release and are marked
+          accordingly; the newest non-prerelease is the current stable version.
+          EOF
+          # For a stable build the tag already exists (it triggered this
+          # run); for an rc the tag is created here at this commit.
+          gh release create "$RELEASE_VERSION" "${flag[@]}" \
+            --title "$RELEASE_VERSION" \
+            --target "$GITHUB_SHA" \
+            --notes-file release-notes.md \
+            build/packages/*.tar.gz \
+            build/packages/*.deb \
+            build/packages/*.rpm \
+            build/packages/SHA256SUMS

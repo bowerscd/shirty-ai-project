@@ -6,7 +6,7 @@
 
 # ---------------------------------------------------------- identity
 set(CPACK_RPM_PACKAGE_NAME    "yggdrasil")
-set(CPACK_RPM_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_RPM_PACKAGE_VERSION "${YGGDRASIL_NATIVE_PACKAGE_VERSION}")
 set(CPACK_RPM_PACKAGE_RELEASE "1"
     CACHE STRING "RPM Release: tag (1, 2, ... bumped on packaging-only fixes)")
 

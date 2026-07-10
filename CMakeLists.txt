@@ -49,6 +49,29 @@ project(yggdrasil
     LANGUAGES NONE   # pure-Rust workspace; no C / C++ compilation
 )
 
+# ----------------------------------------------------- package version
+#
+# `project(VERSION ...)` must be strictly numeric (X.Y.Z), so a
+# semver prerelease suffix like `-rc3` can never live in PROJECT_VERSION.
+# The release workflow injects the FULL version string (e.g. 0.1.0-rc3
+# for a prerelease, or 0.1.0 for a stable tag) via
+# `-DYGGDRASIL_PACKAGE_VERSION=...`; it defaults to the numeric
+# PROJECT_VERSION for plain local builds. Everything the packages expose
+# downstream — the TGZ file name, the CPack version fields — derives from
+# this, keeping Cargo.toml the single source of truth for the numeric
+# base while letting the workflow stamp the rc suffix.
+set(YGGDRASIL_PACKAGE_VERSION "${PROJECT_VERSION}"
+    CACHE STRING "Full package version string (override for prerelease/rc builds)")
+
+# Debian and RPM require `~` (not semver's `-`) as the prerelease
+# separator so that 0.1.0~rc3 sorts BEFORE the final 0.1.0 in
+# `dpkg --compare-versions` / `rpmdev-vercmp`. semver uses `-`. Translate
+# for the native-package version fields; a stable version with no suffix
+# is unaffected (the REPLACE is a no-op).
+string(REPLACE "-" "~"
+    YGGDRASIL_NATIVE_PACKAGE_VERSION "${YGGDRASIL_PACKAGE_VERSION}")
+message(STATUS "Package version: ${YGGDRASIL_PACKAGE_VERSION} "
+               "(native: ${YGGDRASIL_NATIVE_PACKAGE_VERSION})")
 # GNUInstallDirs normally special-cases CMAKE_INSTALL_PREFIX=/usr to
 # put SYSCONFDIR at /etc and LOCALSTATEDIR at /var (the Linux distro
 # convention — distro packages install binaries under /usr but config
@@ -235,7 +258,7 @@ endif()
 # layout, which the PR-gate CI uses as a packaging smoke check.
 
 set(CPACK_PACKAGE_NAME "yggdrasil")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VERSION "${YGGDRASIL_PACKAGE_VERSION}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
 set(CPACK_PACKAGE_HOMEPAGE_URL "${PROJECT_HOMEPAGE_URL}")
 set(CPACK_PACKAGE_VENDOR "yggdrasil maintainers")

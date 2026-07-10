@@ -6,7 +6,7 @@
 
 # ---------------------------------------------------------- identity
 set(CPACK_DEBIAN_PACKAGE_NAME    "yggdrasil")
-set(CPACK_DEBIAN_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_DEBIAN_PACKAGE_VERSION "${YGGDRASIL_NATIVE_PACKAGE_VERSION}")
 set(CPACK_DEBIAN_PACKAGE_RELEASE "1"
     CACHE STRING "Debian package release suffix (1, 2, ... bumped on packaging-only fixes)")
 
