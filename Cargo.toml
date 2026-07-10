@@ -60,8 +60,8 @@ notify        = "6"
 notify-debouncer-mini = "0.4"
 
 # Metrics
-metrics                    = "0.23"
-metrics-exporter-prometheus = { version = "0.15", default-features = false }
+metrics                    = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Misc
 humantime-serde = "1"
