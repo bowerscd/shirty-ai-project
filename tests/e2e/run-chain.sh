@@ -1044,7 +1044,23 @@ sleep 3
 "${DC[@]}" "${COMPOSE_ARGS[@]}" restart terminal >/dev/null
 
 WAIT_TIMEOUT=90 wait_for "post-rotation terminal->relay re-enrollment" terminal_enrolled_at_relay
-WAIT_TIMEOUT=90 wait_for "post-rotation relay->gateway re-enrollment" relay_enrolled_at_gateway
+# The gateway restart above puts the relay's dial in the same
+# backoff-bound recovery race as the [restart-gateway] and
+# [graceful-drain] phases: the relay's session dies while the gateway is
+# down, so the client is already in its reconnect-backoff loop where
+# `chain reconnect` is a no-op (the reconnect signal is only observed
+# inside an active session, chain/client/run_loop.rs). Recovery is then
+# bound by the client's exponential reconnect backoff (BACKOFF_MAX=30s)
+# racing the ~30s post-restart UDP delivery gap. The terminal->relay
+# direction restarts fresh (no accumulated backoff) so 90s is fine, but
+# relay->gateway needs the larger 150s wait — matching [graceful-drain].
+# Making the reconnect RPC interrupt the backoff sleep, or lowering
+# BACKOFF_MAX, is a product-design question left for the owner (findings
+# chain-recovery-bound-by-backoff-max-30s,
+# chain-reconnect-rpc-ignored-during-backoff).
+dc_exec relay yggdrasilctl chain reconnect >/dev/null 2>&1 \
+    || echo "    [warn] chain reconnect nudge on relay failed (continuing)"
+WAIT_TIMEOUT=150 wait_for "post-rotation relay->gateway re-enrollment" relay_enrolled_at_gateway
 # Publisher's session-epoch watch auto-resyncs on the fresh handshake,
 # no sentinel workaround needed.
 WAIT_TIMEOUT=20 wait_for "predicates re-derived at gateway post-rotation" predicates_landed
