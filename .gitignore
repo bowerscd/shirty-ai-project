@@ -25,6 +25,10 @@ identity.key
 # config never bleeds across runs. See tests/e2e/run-*.sh.
 /tests/e2e/runtime/
 
+# e2e diagnostic artifacts — packet captures collected on a failing run
+# and uploaded by CI. Regenerated per run; never committed.
+/tests/e2e/artifacts/
+
 # Isolated CARGO_TARGET_DIR used by bench/profile.sh for `--features
 # profile` builds. Keeps pprof + its transitive dep graph out of the
 # main /target/ — see .github/copilot-instructions.md for rationale.

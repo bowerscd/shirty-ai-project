@@ -80,6 +80,16 @@ jobs:
         # is needed here.
         run: bash tests/e2e/run-quickstart.sh
 
+      - name: Upload packet captures on failure
+        # The run script collects per-node udp/51820 pcaps into
+        # tests/e2e/artifacts/ on a failing run (before teardown).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-quickstart-pcaps-${{ github.sha }}
+          path: tests/e2e/artifacts/quickstart/*.pcap
+          if-no-files-found: ignore
+
       - name: Tear down
         if: always()
         run: |
@@ -119,6 +129,16 @@ jobs:
         # tearing the stack down (see its teardown trap), so no separate
         # log-dump step is needed here.
         run: bash tests/e2e/run-chain.sh
+
+      - name: Upload packet captures on failure
+        # The run script collects per-node udp/51820 pcaps into
+        # tests/e2e/artifacts/ on a failing run (before teardown).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-chain-pcaps-${{ github.sha }}
+          path: tests/e2e/artifacts/chain/*.pcap
+          if-no-files-found: ignore
 
       - name: Tear down
         if: always()

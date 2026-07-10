@@ -80,6 +80,7 @@ RUN apt-get update \
         openssl \
         python3 \
         python3-pip \
+        tcpdump \
         tini \
  && rm -rf /var/lib/apt/lists/* \
  # aioquic is needed by the HTTP/3 e2e probe (tests/e2e/h3_probe.py),

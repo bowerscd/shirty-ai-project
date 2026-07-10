@@ -31,6 +31,13 @@ set -euo pipefail
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 COMPOSE_FILE="$REPO_ROOT/docker/compose.e2e.chain.yml"
 RUNTIME_DIR="$REPO_ROOT/tests/e2e/runtime/chain"
+# Diagnostic packet captures (udp/51820) are written inside each node to
+# its bind-mounted state dir, then copied here on failure for CI upload.
+# ARTIFACT_DIR lives OUTSIDE RUNTIME_DIR so the teardown `rm -rf` of the
+# runtime tree does not delete the collected pcaps.
+ARTIFACT_DIR="$REPO_ROOT/tests/e2e/artifacts/chain"
+CAPTURE_NODES=(gateway relay terminal)
+CAPTURES_STARTED=0
 COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p yggdrasil-e2e-chain)
 
 if command -v podman-compose >/dev/null 2>&1; then
@@ -56,6 +63,7 @@ teardown() {
             echo "----- logs: $svc -----"
             "${DC[@]}" "${COMPOSE_ARGS[@]}" logs --tail 200 "$svc" 2>&1 || true
         done
+        collect_captures
     fi
     if [[ "${KEEP_STACK:-0}" == "1" ]]; then
         echo "==> KEEP_STACK=1 set; leaving stack up (runtime tree at $RUNTIME_DIR)"
@@ -67,10 +75,67 @@ teardown() {
 }
 trap teardown EXIT
 
+# Start a UDP :51820 packet capture inside each yggdrasil node. Purpose:
+# when a re-enrollment stalls, the pcap shows whether the dialer's
+# Handshake1 physically reaches the receiver's netns (=> app-level drop)
+# or never arrives (=> transport). tcpdump taps at the interface (AF_PACKET,
+# before netfilter), so "seen in pcap but not in the daemon log" pinpoints
+# an app/netfilter drop. Needs CAP_NET_RAW (granted via cap_add in the
+# compose file). Non-fatal: a capture that fails to start only loses its
+# pcap; the test still runs and reports its real result.
+start_captures() {
+    echo "==> starting diagnostic packet captures (udp/51820) on: ${CAPTURE_NODES[*]}"
+    local node
+    for node in "${CAPTURE_NODES[@]}"; do
+        # `echo $$` then `exec tcpdump` makes tcpdump inherit the shell PID,
+        # so the pidfile holds tcpdump's own PID and teardown can SIGINT it
+        # for a clean flush without needing pgrep/pkill (absent in slim).
+        podman exec -d "${CTR_PREFIX}-${node}" sh -c \
+            'echo $$ > /var/lib/yggdrasil/tcpdump.pid; exec tcpdump -p -i any -n -U -w /var/lib/yggdrasil/e2e-capture.pcap udp port 51820' \
+            >/dev/null 2>&1 || true
+    done
+    CAPTURES_STARTED=1
+    sleep 1
+    for node in "${CAPTURE_NODES[@]}"; do
+        if podman exec "${CTR_PREFIX}-${node}" sh -c \
+            'kill -0 "$(cat /var/lib/yggdrasil/tcpdump.pid 2>/dev/null)" 2>/dev/null'; then
+            echo "    [ok] capture running in $node"
+        else
+            echo "    WARN: capture did NOT start in $node (tcpdump/NET_RAW?); continuing without its pcap" >&2
+        fi
+    done
+}
+
+# Flush + collect the pcaps into ARTIFACT_DIR. Called from teardown on a
+# failing run, before the stack is removed.
+collect_captures() {
+    [[ "${CAPTURES_STARTED:-0}" == "1" ]] || return 0
+    echo "==> [teardown] collecting diagnostic packet captures"
+    mkdir -p "$ARTIFACT_DIR"
+    local node src
+    for node in "${CAPTURE_NODES[@]}"; do
+        podman exec "${CTR_PREFIX}-${node}" sh -c \
+            'kill -INT "$(cat /var/lib/yggdrasil/tcpdump.pid 2>/dev/null)" 2>/dev/null' \
+            >/dev/null 2>&1 || true
+    done
+    sleep 1
+    for node in "${CAPTURE_NODES[@]}"; do
+        src="$RUNTIME_DIR/$node/state/e2e-capture.pcap"
+        if [[ -f "$src" ]]; then
+            cp "$src" "$ARTIFACT_DIR/${node}.pcap" 2>/dev/null || true
+            chmod +r "$ARTIFACT_DIR/${node}.pcap" 2>/dev/null || true
+            echo "    saved $ARTIFACT_DIR/${node}.pcap"
+        else
+            echo "    (no pcap for $node — capture may not have started)"
+        fi
+    done
+}
+
 cd "$REPO_ROOT"
 
 echo "==> preparing fresh runtime tree at tests/e2e/runtime/chain"
 rm -rf "$RUNTIME_DIR"
+rm -rf "$ARTIFACT_DIR"
 mkdir -p "$RUNTIME_DIR"/{gateway,relay,terminal}/{etc,run,state}
 # Separate dir for the client's trust store; see run-quickstart.sh
 # for why this is split from the terminal's live cert dir.
@@ -174,6 +239,12 @@ relay_enrolled_at_gateway() {
         echo "$out" | grep -q '"downstream_ip": "172.31.11.20"'
 }
 WAIT_TIMEOUT=60 wait_for "relay enrolled at gateway" relay_enrolled_at_gateway
+
+# Containers are confirmed up and enrolled; start the diagnostic packet
+# captures now (before the restart/rotation/drain phases that intermittently
+# fail to re-enroll). Steady-state heartbeats also give a baseline of what a
+# healthy handshake looks like on the wire.
+start_captures
 
 # -------- predicate propagation (terminal -> relay -> gateway) -------------
 

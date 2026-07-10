@@ -103,13 +103,24 @@ services:
   gateway:
     <<: *yggdrasil-image
     container_name: e2e-chain-gateway
+    # CAP_NET_RAW: lets the diagnostic tcpdump capture (started by
+    # run-chain.sh) open its AF_PACKET socket; rootless podman drops it
+    # from the default capability set. e2e-only, isolated test network —
+    # deliberately absent from any production compose.
+    cap_add:
+      - NET_RAW
     command:
       - yggdrasil
       - run
       - --config
       - /etc/yggdrasil/config.toml
     environment:
-      YGGDRASIL_LOG: info
+      # Narrow debug on the handshake path only (heartbeat receiver +
+      # chain dialer) so the [restart-*]/[key-rotation] re-enroll
+      # failures are diagnosable without burying the key lines under a
+      # blanket chain=debug. See finding
+      # e2e-gateway-receive-path-undiagnosable-at-info.
+      YGGDRASIL_LOG: "info,yggdrasil::heartbeat::server=debug,yggdrasil::chain::client=debug"
       YGGDRASIL_LOG_FORMAT: pretty
     volumes:
       - ../tests/e2e/runtime/chain/gateway/etc:/etc/yggdrasil
@@ -131,6 +142,8 @@ services:
   relay:
     <<: *yggdrasil-image
     container_name: e2e-chain-relay
+    cap_add:
+      - NET_RAW  # diagnostic tcpdump capture; see gateway note above
     depends_on:
       gateway:
         condition: service_started
@@ -140,7 +153,7 @@ services:
       - --config
       - /etc/yggdrasil/config.toml
     environment:
-      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG: "info,yggdrasil::heartbeat::server=debug,yggdrasil::chain::client=debug"
       YGGDRASIL_LOG_FORMAT: pretty
     volumes:
       - ../tests/e2e/runtime/chain/relay/etc:/etc/yggdrasil
@@ -157,6 +170,8 @@ services:
   terminal:
     <<: *yggdrasil-image
     container_name: e2e-chain-terminal
+    cap_add:
+      - NET_RAW  # diagnostic tcpdump capture; see gateway note above
     depends_on:
       relay:
         condition: service_started
@@ -166,7 +181,7 @@ services:
       - --config
       - /etc/yggdrasil/config.toml
     environment:
-      YGGDRASIL_LOG: info
+      YGGDRASIL_LOG: "info,yggdrasil::heartbeat::server=debug,yggdrasil::chain::client=debug"
       YGGDRASIL_LOG_FORMAT: pretty
     volumes:
       - ../tests/e2e/runtime/chain/terminal/etc:/etc/yggdrasil
