@@ -816,10 +816,24 @@ restart_and_reprobe() {
 
     # Re-wait for full chain enrollment. For relay restart, both
     # hops re-handshake; wait for both gating predicates.
-    # 90s (up from 60s) gives margin over the nudged recovery (~30-35s: the
-    # ~30s delivery gap + a couple of low-backoff retries) plus CI variance.
-    WAIT_TIMEOUT=90 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
-    WAIT_TIMEOUT=90 wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
+    #
+    # 150s (up from 90s), matching the [graceful-drain] and [key-rotation]
+    # phases which restart the gateway the same way. The one-time nudge
+    # above resets the backoff to MIN *once*, but it is not a sustained low
+    # backoff: each failed handshake regrows it (500ms→1s→…→30s), and the
+    # nudge cannot be re-applied to help — the reconnect signal is only
+    # observed inside an active session, never during the outer backoff
+    # sleep (chain/client/backoff.rs sleep_or_cancel selects on `cancel`
+    # only; finding chain-reconnect-rpc-ignored-during-backoff). So once the
+    # variable ~30s+ post-restart UDP delivery gap outlasts the first few
+    # low-backoff retries, recovery is bound by BACKOFF_MAX=30s racing that
+    # gap (finding chain-recovery-bound-by-backoff-max-30s) and can exceed
+    # 90s. The gateway itself is healthy throughout (rebinds enrolled with
+    # the correct peer key, drops nothing); this is a podman netavark
+    # reconvergence artifact, not a yggdrasil bug. Both waits fast-pass on
+    # success, so the larger timeout only adds patience for the flaky case.
+    WAIT_TIMEOUT=150 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
+    WAIT_TIMEOUT=150 wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
 
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
         predicates_landed
