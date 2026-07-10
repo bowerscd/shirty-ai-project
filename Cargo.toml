@@ -56,8 +56,8 @@ dashmap      = "6"
 parking_lot  = "0.12"
 
 # File watching
-notify        = "6"
-notify-debouncer-mini = "0.4"
+notify        = "8"
+notify-debouncer-mini = "0.7"
 
 # Metrics
 metrics                    = "0.24"
