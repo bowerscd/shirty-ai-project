@@ -60,13 +60,24 @@ RUN set -eux; \
         mkdir -p crates/$bin/src; \
         echo "fn main() {}" > crates/$bin/src/main.rs; \
     done; \
-    echo "pub fn _stub() {}" > crates/yggdrasil/src/lib.rs; \
-    # Stubs for [[bench]] entries — names match crates/*/Cargo.toml.
-    mkdir -p crates/ratatoskr/benches crates/yggdrasil/benches; \
-    echo "fn main() {}" > crates/ratatoskr/benches/noise.rs; \
-    echo "fn main() {}" > crates/ratatoskr/benches/rule_parse.rs; \
-    echo "fn main() {}" > crates/yggdrasil/benches/flow_table.rs; \
-    echo "fn main() {}" > crates/yggdrasil/benches/h3_forward.rs
+    echo "pub fn _stub() {}" > crates/yggdrasil/src/lib.rs
+
+# Stub every declared [[bench]] target so cargo can parse the workspace
+# manifests during the dep-cache build below. Derived from each crate's
+# Cargo.toml (not a hardcoded list) so adding a [[bench]] never silently
+# breaks this cache layer — the previous hardcoded list drifted when
+# udp_fast_path was added. The release workflow now builds this
+# Dockerfile, so any future drift surfaces in CI.
+RUN set -eux; \
+    for crate_toml in crates/*/Cargo.toml; do \
+        crate_dir="$(dirname "$crate_toml")"; \
+        awk -F'"' '/^\[\[bench\]\]/{f=1;next} f&&/^name/{print $2;f=0}' \
+            "$crate_toml" \
+        | while read -r bench; do \
+            mkdir -p "$crate_dir/benches"; \
+            echo "fn main() {}" > "$crate_dir/benches/$bench.rs"; \
+        done; \
+    done
 
 # Warm the cargo dep cache against stubbed sources. Build via cargo
 # directly here (not CMake) because we don't have the real CMakeLists.txt
