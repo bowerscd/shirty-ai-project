@@ -282,11 +282,25 @@ fn map_recvmmsg_error(errno: i32, err: io::Error) -> io::Result<usize> {
 }
 
 fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> SocketAddr {
-    // SAFETY: `addr` and `len` come from the kernel-populated `msg_name` and
-    // `msg_namelen` fields for a successfully received datagram. The storage
-    // value is copied into `SockAddr`, and `len` is the exact initialized
-    // socket-address length reported by the kernel for that storage.
-    unsafe { socket2::SockAddr::new(*addr, len) }
+    // `addr` and `len` come from the kernel-populated `msg_name` and
+    // `msg_namelen` fields for a successfully received datagram. Copy the
+    // storage into socket2's `SockAddrStorage` and hand it to `SockAddr::new`
+    // with `len`, the exact initialized socket-address length reported by the
+    // kernel for that storage.
+    let mut storage = socket2::SockAddrStorage::zeroed();
+    debug_assert!(
+        len as usize <= mem::size_of::<libc::sockaddr_storage>(),
+        "kernel-reported msg_namelen exceeds sockaddr_storage",
+    );
+    // SAFETY: on Unix, `SockAddrStorage` is `repr(transparent)` over
+    // `libc::sockaddr_storage`, so viewing it as that type and overwriting it
+    // with the kernel-populated value is sound.
+    unsafe {
+        *storage.view_as::<libc::sockaddr_storage>() = *addr;
+    }
+    // SAFETY: `storage` now holds the kernel-populated address whose
+    // `ss_family` and initialized length (`len`) match, as required.
+    unsafe { socket2::SockAddr::new(storage, len) }
         .as_socket()
         .expect("recvmmsg returned a non-IP socket address")
 }
