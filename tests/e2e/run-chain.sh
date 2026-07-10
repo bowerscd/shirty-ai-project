@@ -804,16 +804,23 @@ restart_and_reprobe() {
     # Re-wait for full chain enrollment. For relay restart, both
     # hops re-handshake; wait for both gating predicates.
     WAIT_TIMEOUT=60 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
-    # >>> TEMPORARY DIAGNOSTIC (revert to WAIT_TIMEOUT=60): force the
-    # [restart-gateway] relay->gateway re-enroll to fail below the observed
-    # ~49s recovery so the teardown collects the surviving relay pcap +
-    # gateway/relay debug logs of the in-flight handshake window (the relay
-    # is NOT restarted in this phase, so its capture stays intact). This is
-    # a one-shot probe to distinguish transport-drop vs app-drop for finding
-    # e2e-chain-restart-gateway-relay-reenroll-timeout. Restore to 60 after.
+    # >>> TEMPORARY DIAGNOSTIC (revert this whole block back to the single
+    # line: `WAIT_TIMEOUT=60 wait_for "relay re-enrolled at gateway after
+    # $role_desc restart" relay_enrolled_at_gateway`):
+    # For the gateway restart, wait generously so the FULL control-plane
+    # recovery is captured — detection latency, the moment datagrams start
+    # reaching the restarted gateway again (new yggdrasil_heartbeat_datagrams
+    # _received_total / "heartbeat datagram received" debug lines), and the
+    # handshake completion — then halt so teardown dumps the gateway recv-path
+    # log + relay pcap. Characterises the post-restart delivery gap for
+    # finding e2e-chain-restart-gateway-relay-reenroll-timeout.
     local reenroll_timeout=60
-    [[ "$role_desc" == "gateway" ]] && reenroll_timeout=25
+    [[ "$role_desc" == "gateway" ]] && reenroll_timeout=150
     WAIT_TIMEOUT=$reenroll_timeout wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
+    if [[ "$role_desc" == "gateway" ]]; then
+        echo "DIAGNOSTIC STOP: captured full restart-gateway recovery; halting to collect artifacts"
+        exit 1
+    fi
     # <<< END TEMPORARY DIAGNOSTIC
 
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
