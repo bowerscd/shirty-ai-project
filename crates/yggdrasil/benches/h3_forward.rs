@@ -7,8 +7,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use http::{HeaderMap, HeaderValue, Request, Uri, Version};
+use std::hint::black_box;
 use url::Url;
 
 use yggdrasil::proxy::forward;

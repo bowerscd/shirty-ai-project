@@ -12,7 +12,8 @@
 //!
 //! Targets (from plan): ≥ 50k handshakes/sec, ≥ 1 GB/s AEAD per core.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 
 use ratatoskr::auth::{Initiator, Responder, Session, StaticKeyPair};
 use ratatoskr::wire::{self, SessionId};

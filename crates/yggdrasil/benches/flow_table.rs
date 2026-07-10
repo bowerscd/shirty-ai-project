@@ -193,7 +193,7 @@ fn bench_insert(c: &mut Criterion) {
                                 case.workers,
                                 case.inserts_per_shard,
                             ));
-                            let _ = criterion::black_box(len);
+                            let _ = std::hint::black_box(len);
                         },
                         criterion::BatchSize::LargeInput,
                     );
@@ -209,7 +209,7 @@ fn bench_insert(c: &mut Criterion) {
                         |shards| {
                             let len = rt
                                 .block_on(insert_per_worker_shards(shards, case.inserts_per_shard));
-                            let _ = criterion::black_box(len);
+                            let _ = std::hint::black_box(len);
                         },
                         criterion::BatchSize::LargeInput,
                     );
@@ -246,7 +246,7 @@ fn bench_reap_sweep(c: &mut Criterion) {
                 // Don't actually remove — we want to keep the table size
                 // stable for the next iteration. The cost of `.remove()` is
                 // bench-equivalent to `.insert()` and already covered.
-                criterion::black_box(victims);
+                std::hint::black_box(victims);
             });
         });
     }
