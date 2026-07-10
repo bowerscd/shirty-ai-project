@@ -79,7 +79,7 @@ socket2         = { version = "0.6", features = ["all"] }
 instant-acme    = { version = "0.7", default-features = false, features = ["hyper-rustls", "ring"] }
 reqwest         = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
-x509-parser     = "0.16"
+x509-parser     = "0.18"
 async-trait     = "0.1"
 
 # L7 HTTP frontend
