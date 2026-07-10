@@ -75,9 +75,8 @@ pub(in crate::control) fn approve_downstream(state: &ControlState, fingerprint: 
 fn update_downstream_pubkey(config_path: &Path, tagged_pubkey: &str) -> Result<()> {
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
-    let mut doc: toml::Value = text
-        .parse()
-        .with_context(|| format!("parse {}", config_path.display()))?;
+    let mut doc: toml::Value =
+        toml::from_str(&text).with_context(|| format!("parse {}", config_path.display()))?;
     let table = doc
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a TOML table", config_path.display()))?;

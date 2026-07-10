@@ -65,7 +65,7 @@ fn resolve_identity_file(explicit: Option<PathBuf>, config_path: &Path) -> Resul
     if config_path.exists() {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("read {}", config_path.display()))?;
-        if let Ok(doc) = text.parse::<toml::Value>() {
+        if let Ok(doc) = toml::from_str::<toml::Value>(&text) {
             if let Some(p) = doc
                 .get("server")
                 .and_then(|s| s.get("identity_file"))
@@ -86,8 +86,7 @@ fn load_config_doc(path: &Path) -> Result<toml::Value> {
         return Ok(toml::Value::Table(toml::value::Table::new()));
     }
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    text.parse::<toml::Value>()
-        .with_context(|| format!("parse {}", path.display()))
+    toml::from_str::<toml::Value>(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Atomically write `doc` back to `path` (tmp + rename). Creates parent
@@ -291,7 +290,7 @@ fn list_chain_enrollments(config_path: &Path) -> Vec<EnrollmentEntry> {
     let Ok(text) = std::fs::read_to_string(config_path) else {
         return out;
     };
-    let Ok(doc) = text.parse::<toml::Value>() else {
+    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
         return out;
     };
     if let Some(dial) = doc.get("dial").and_then(|v| v.as_table()) {
