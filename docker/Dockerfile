@@ -83,11 +83,19 @@ RUN find crates -name '*.rs' -exec touch {} +
 
 # Build via the same CMake/CPack flow distro packagers use.
 # CARGO_LOCKED=ON enforces Cargo.lock — keep production reproducible.
+#
+# YGGDRASIL_VERSION, when passed by the release workflow, stamps the full
+# version string (e.g. 0.1.0-rc1) into the package so the .deb inside the
+# image matches the published image tag. Left empty for plain local
+# builds, in which case CMake falls back to the numeric Cargo.toml
+# version (the `:+` expansion omits the flag entirely when unset).
+ARG YGGDRASIL_VERSION=
 RUN set -eux; \
     cmake -B build -S . \
         -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=Release \
         -DCARGO_LOCKED=ON \
+        ${YGGDRASIL_VERSION:+-DYGGDRASIL_PACKAGE_VERSION=$YGGDRASIL_VERSION} \
         -Wno-dev; \
     cmake --build build --parallel; \
     cd build; \

@@ -50,14 +50,19 @@ jobs:
   gate-e2e:
     uses: ./.github/workflows/compose-e2e.yml
 
-  # ---- build packages + publish the GitHub Release ------------------
-  release:
-    needs: [gate-ci, gate-e2e]
+  # ---- resolve the version ONCE, shared by every publishing job -----
+  #
+  # Both `release` (which creates the rc git tag) and `container` (which
+  # tags the image) must agree on the exact version. If each recomputed
+  # it independently, the `container` job running AFTER `release` created
+  # tag X.Y.Z-rcN would see that tag and compute X.Y.Z-rc(N+1) — a drift.
+  # Computing here once and fanning the value out avoids that race.
+  version:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      # Needed to create the Release and (for rc builds) its tag.
-      contents: write
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -65,6 +70,32 @@ jobs:
           # Full history + all tags: the version script reads existing
           # stable tags (guard) and rc tags (monotonic counter).
           fetch-depth: 0
+      - name: Compute version
+        id: ver
+        # The script prints `version=…` and `prerelease=…`; capture into
+        # job outputs. `$( )` propagates a non-zero exit (a failed guard)
+        # so the run stops before anything is published.
+        run: |
+          out="$(.github/scripts/compute-release-version.sh)"
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
+
+  # ---- build packages + publish the GitHub Release ------------------
+  release:
+    needs: [gate-ci, gate-e2e, version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # Needed to create the Release and (for rc builds) its tag.
+      contents: write
+    env:
+      # RELEASE_VERSION (not VERSION) to avoid shadowing the OS-release
+      # VERSION variable that ubuntu-latest exports via /etc/os-release.
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         # Pinned to a commit SHA (not @master) because this job runs with
@@ -85,19 +116,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake rpm dpkg-dev file
 
-      - name: Compute version
-        id: ver
-        # The script prints `version=…` and `prerelease=…`; capture into
-        # step outputs. `$( )` propagates a non-zero exit (a failed
-        # guard) so the job stops before building anything.
-        run: |
-          out="$(.github/scripts/compute-release-version.sh)"
-          echo "$out"
-          echo "$out" >> "$GITHUB_OUTPUT"
-
       - name: Build binaries + packages
         env:
-          YGG_VERSION: ${{ steps.ver.outputs.version }}
+          YGG_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           # -DCMAKE_INSTALL_PREFIX=/usr routes config to /etc and systemd
@@ -124,10 +145,6 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          # RELEASE_VERSION (not VERSION) to avoid shadowing the OS-release
-          # VERSION variable if the explicit mapping is ever refactored out.
-          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
-          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
         run: |
           set -euo pipefail
           flag=()
@@ -169,3 +186,65 @@ jobs:
             build/packages/*.deb \
             build/packages/*.rpm \
             build/packages/SHA256SUMS
+
+  # ---- build + push the container image to GHCR ---------------------
+  #
+  # One role-agnostic image (matching docker/Dockerfile): gateway, relay
+  # and terminal all run it, differing only by the mounted config.toml
+  # and the `command:` — same as the e2e compose stacks. The image is
+  # tagged with the resolved version plus a moving alias:
+  #   * rc     → :<version> and :edge   (newest preview)
+  #   * stable → :<version> and :latest (newest stable)
+  #
+  # Depends on `release` (not just the gates) so the image publishes only
+  # AFTER the rc git tag is durably created. The rc counter is derived
+  # from git tags; if the image were pushed in parallel and `release`
+  # then failed to create the tag, a later run would reuse the same rc
+  # number and overwrite the image bits. Serialising behind `release`
+  # keeps every published `:<version>` image backed by a matching tag +
+  # GitHub Release.
+  container:
+    needs: [gate-ci, gate-e2e, version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Push the image to GitHub Container Registry (ghcr.io).
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          # GHCR requires a lowercase image path; github.repository can be
+          # mixed-case for some owners, so normalise it.
+          image="${IMAGE,,}"
+          # Stamp the resolved version into the image's internal .deb so it
+          # matches the image tag (docker/Dockerfile passes it to CPack).
+          docker build \
+            -f docker/Dockerfile \
+            --build-arg "YGGDRASIL_VERSION=${RELEASE_VERSION}" \
+            -t "${image}:${RELEASE_VERSION}" \
+            .
+          docker push "${image}:${RELEASE_VERSION}"
+          # Moving alias: :edge tracks the newest rc, :latest the newest
+          # stable, so end users can pull a predictable channel.
+          if [[ "$PRERELEASE" == "true" ]]; then
+            alias="edge"
+          else
+            alias="latest"
+          fi
+          docker tag "${image}:${RELEASE_VERSION}" "${image}:${alias}"
+          docker push "${image}:${alias}"
