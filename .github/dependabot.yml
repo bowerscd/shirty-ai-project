@@ -13,7 +13,6 @@ updates:
       prefix: "ci"
     labels:
       - "ci"
-      - "dependencies"
 
   - package-ecosystem: "cargo"
     directory: "/"
@@ -23,8 +22,6 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps"
-    labels:
-      - "dependencies"
     # The crypto crates pin tightly to specific versions for audit; let
     # operators decide whether to bump them. Other updates are routine.
     ignore:
