@@ -84,7 +84,7 @@ jobs:
         # The run script collects per-node udp/51820 pcaps into
         # tests/e2e/artifacts/ on a failing run (before teardown).
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-quickstart-pcaps-${{ github.sha }}
           path: tests/e2e/artifacts/quickstart/*.pcap
@@ -134,7 +134,7 @@ jobs:
         # The run script collects per-node udp/51820 pcaps into
         # tests/e2e/artifacts/ on a failing run (before teardown).
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-chain-pcaps-${{ github.sha }}
           path: tests/e2e/artifacts/chain/*.pcap

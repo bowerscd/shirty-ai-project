@@ -140,7 +140,7 @@ jobs:
           cargo bench --workspace --benches -- --quick --warm-up-time 1 --measurement-time 3
       - name: upload reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-${{ github.sha }}
           path: target/criterion/**/report/index.html
