@@ -47,7 +47,13 @@
 /// accidentally inherit the socket and confuse systemd by sending its own
 /// ready signal.
 pub fn notify_ready() {
-    match sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
+    // SAFETY: `notify_and_unset_env` calls `env::remove_var(NOTIFY_SOCKET)`,
+    // which is `unsafe` because a concurrent `getenv` in another thread is a
+    // data race. This preserves the prior behaviour (sd-notify 0.4's
+    // `notify(true, ..)`); it runs at a controlled point during startup and
+    // only removes the systemd-provided socket var so spawned children can't
+    // inherit it. No yggdrasil thread reads `NOTIFY_SOCKET` concurrently.
+    match unsafe { sd_notify::notify_and_unset_env(&[sd_notify::NotifyState::Ready]) } {
         Ok(()) => tracing::debug!("sent sd_notify READY=1"),
         Err(e) => tracing::warn!(error = %e, "sd_notify READY=1 failed; continuing"),
     }
@@ -56,13 +62,14 @@ pub fn notify_ready() {
 /// Send `STATUS=...` and `READY=1` together so `systemctl status` shows the
 /// effective runtime shape (`mode=..., dial=..., accept=...`) at startup.
 pub fn notify_ready_with_status(status: &str) {
-    match sd_notify::notify(
-        true,
-        &[
+    // SAFETY: see `notify_ready` — same controlled-startup unset of
+    // `NOTIFY_SOCKET`, preserving sd-notify 0.4's `notify(true, ..)` behaviour.
+    match unsafe {
+        sd_notify::notify_and_unset_env(&[
             sd_notify::NotifyState::Status(status),
             sd_notify::NotifyState::Ready,
-        ],
-    ) {
+        ])
+    } {
         Ok(()) => tracing::debug!(status, "sent sd_notify STATUS + READY=1"),
         Err(e) => tracing::warn!(error = %e, "sd_notify STATUS + READY=1 failed; continuing"),
     }
@@ -84,7 +91,7 @@ pub fn notify_reloading() {
             return;
         }
     };
-    match sd_notify::notify(false, &[sd_notify::NotifyState::Reloading, usec]) {
+    match sd_notify::notify(&[sd_notify::NotifyState::Reloading, usec]) {
         Ok(()) => tracing::debug!("sent sd_notify RELOADING=1 + MONOTONIC_USEC"),
         Err(e) => tracing::warn!(error = %e, "sd_notify RELOADING failed; continuing"),
     }
@@ -96,7 +103,7 @@ pub fn notify_reloading() {
 ///
 /// No-op when `NOTIFY_SOCKET` is unset.
 pub fn notify_ready_after_reload() {
-    match sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+    match sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         Ok(()) => tracing::debug!("sent sd_notify READY=1 (post-reload)"),
         Err(e) => tracing::warn!(error = %e, "sd_notify READY=1 (post-reload) failed; continuing"),
     }
@@ -114,13 +121,10 @@ pub fn notify_ready_after_reload() {
 ///
 /// No-op when `NOTIFY_SOCKET` is unset.
 pub fn notify_stopping(status: &str) {
-    match sd_notify::notify(
-        false,
-        &[
-            sd_notify::NotifyState::Stopping,
-            sd_notify::NotifyState::Status(status),
-        ],
-    ) {
+    match sd_notify::notify(&[
+        sd_notify::NotifyState::Stopping,
+        sd_notify::NotifyState::Status(status),
+    ]) {
         Ok(()) => tracing::debug!(status, "sent sd_notify STOPPING=1 + STATUS"),
         Err(e) => tracing::warn!(error = %e, "sd_notify STOPPING=1 failed; continuing"),
     }
