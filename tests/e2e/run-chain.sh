@@ -804,7 +804,17 @@ restart_and_reprobe() {
     # Re-wait for full chain enrollment. For relay restart, both
     # hops re-handshake; wait for both gating predicates.
     WAIT_TIMEOUT=60 wait_for "terminal re-enrolled at relay after $role_desc restart" terminal_enrolled_at_relay
-    WAIT_TIMEOUT=60 wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
+    # >>> TEMPORARY DIAGNOSTIC (revert to WAIT_TIMEOUT=60): force the
+    # [restart-gateway] relay->gateway re-enroll to fail below the observed
+    # ~49s recovery so the teardown collects the surviving relay pcap +
+    # gateway/relay debug logs of the in-flight handshake window (the relay
+    # is NOT restarted in this phase, so its capture stays intact). This is
+    # a one-shot probe to distinguish transport-drop vs app-drop for finding
+    # e2e-chain-restart-gateway-relay-reenroll-timeout. Restore to 60 after.
+    local reenroll_timeout=60
+    [[ "$role_desc" == "gateway" ]] && reenroll_timeout=25
+    WAIT_TIMEOUT=$reenroll_timeout wait_for "relay re-enrolled at gateway after $role_desc restart" relay_enrolled_at_gateway
+    # <<< END TEMPORARY DIAGNOSTIC
 
     WAIT_TIMEOUT=15 wait_for "predicates re-derived at gateway after $role_desc restart" \
         predicates_landed
