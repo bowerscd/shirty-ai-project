@@ -785,7 +785,23 @@ restart_and_reprobe() {
     local service="$1" role_desc="$2"
     echo "==> [restart-$role_desc] restart $service, expect chain recovers"
 
-    "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
+    # >>> TEMPORARY DIAGNOSTIC (revert to: `"${DC[@]}" "${COMPOSE_ARGS[@]}"
+    # restart "$service" >/dev/null`): A/B the gateway restart METHOD. Run #21
+    # showed a ~30.5s post-`restart` UDP delivery gap. Here the gateway is
+    # stopped, left down for 35s (> the observed gap, so any time-based
+    # neigh/NAT staleness for its address can expire during the downtime),
+    # then started — measuring the post-`start` gap via the recv-datagram log.
+    # If the gap is small, `stop;sleep;start` is a better test pattern than a
+    # bigger timeout. See finding e2e-chain-restart-gateway-relay-reenroll-timeout.
+    if [[ "$role_desc" == "gateway" ]]; then
+        echo "    [diag] stop gateway; sleep 35; start gateway (A/B vs restart)"
+        "${DC[@]}" "${COMPOSE_ARGS[@]}" stop "$service" >/dev/null
+        sleep 35
+        "${DC[@]}" "${COMPOSE_ARGS[@]}" start "$service" >/dev/null
+    else
+        "${DC[@]}" "${COMPOSE_ARGS[@]}" restart "$service" >/dev/null
+    fi
+    # <<< END TEMPORARY DIAGNOSTIC
 
     # No `chain reconnect` nudge here; same reason as
     # run-quickstart.sh's restart_and_reprobe — the host's
