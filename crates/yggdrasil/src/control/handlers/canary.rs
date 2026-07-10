@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hdrhistogram::Histogram;
-use rand::RngCore;
+use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -103,7 +103,7 @@ pub(in crate::control) async fn dispatch_chain_canary(
     // 2. Arm phase. Build the canary frame, install locally when
     //    we're the terminal hop for the rule, and recurse upstream.
     let mut token = [0u8; CANARY_TOKEN_LEN];
-    rand::thread_rng().fill_bytes(&mut token);
+    rand::rng().fill_bytes(&mut token);
 
     let duration = Duration::from_millis(duration_ms.max(1) as u64);
     let arm_ttl = duration + ARM_GRACE;

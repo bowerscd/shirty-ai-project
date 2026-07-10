@@ -47,7 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 
 # Crypto
 snow         = { version = "0.9", default-features = false, features = ["default-resolver"] }
-rand         = "0.8"
+rand         = "0.10"
 blake2       = "0.10"
 zeroize      = { version = "1.8", features = ["zeroize_derive"] }
 

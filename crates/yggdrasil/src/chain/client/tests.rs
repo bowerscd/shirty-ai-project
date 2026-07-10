@@ -615,14 +615,19 @@ async fn backoff_and_reconnect_when_endpoint_unresponsive() {
 /// drop a configurable fraction of inbound and outbound packets to
 /// exercise the retransmit + dedup paths.
 ///
-/// Loss decisions use a seeded [`StdRng`] so the drop pattern is
-/// deterministic for a given `(loss_pct, seed)` pair — running the
-/// lossy test twice yields the same dropped-packet sequence. This
-/// matters because at 10% per-direction loss with the production
-/// 5-attempt retransmit budget, the round-trip failure probability
-/// per envelope is `(1 - 0.9 * 0.9)^5 ≈ 2.5e-4`; over 1000 envelopes,
-/// `P(≥1 timeout) ≈ 22%`. Non-deterministic loss makes the test flake
-/// roughly one run in five.
+/// Loss decisions use a seeded [`StdRng`], which pins the *sequence*
+/// of drop draws for a given `(loss_pct, seed)` pair. The draws are
+/// consumed as packets arrive at the server, and heartbeats plus
+/// retransmits interleave with test traffic, so the draw→packet
+/// mapping — and thus the exact dropped-packet set — is timing
+/// dependent and varies slightly run-to-run. The seed lowers, but
+/// does not fully eliminate, that variance. This matters because at
+/// 10% per-direction loss with the production 5-attempt retransmit
+/// budget, the round-trip failure probability per envelope is
+/// `(1 - 0.9 * 0.9)^5 ≈ 2.5e-4`; over 1000 envelopes,
+/// `P(≥1 timeout) ≈ 22%`. An unlucky seed makes the test flake
+/// roughly one run in five (see the seed-selection note on
+/// [`control_send_converges_under_10_percent_packet_loss`]).
 ///
 /// [`ControlChannel`]: crate::chain::reliability::ControlChannel
 /// [`StdRng`]: rand::rngs::StdRng
@@ -634,7 +639,7 @@ struct ControlTestServer {
 impl ControlTestServer {
     async fn start_with_loss(server_keys: StaticKeyPair, loss_pct: u32, seed: u64) -> Self {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use ratatoskr::control_frame::{ControlBodyType, ControlEnvelope};
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
@@ -649,7 +654,7 @@ impl ControlTestServer {
                     Err(_) => return,
                 };
                 // Inbound loss injection.
-                if loss_pct > 0 && rng.gen_range(0..100) < loss_pct {
+                if loss_pct > 0 && rng.random_range(0..100) < loss_pct {
                     continue;
                 }
                 let view = match wire::parse(&buf[..n]) {
@@ -672,7 +677,7 @@ impl ControlTestServer {
                             if let Ok(hb) = s.decode_heartbeat(&view) {
                                 if let Ok((_, ack)) = s.encode_heartbeat_ack(hb.counter, 0) {
                                     // Outbound loss injection.
-                                    if loss_pct > 0 && rng.gen_range(0..100) < loss_pct {
+                                    if loss_pct > 0 && rng.random_range(0..100) < loss_pct {
                                         continue;
                                     }
                                     let _ = sock.send_to(&ack, from).await;
@@ -698,7 +703,7 @@ impl ControlTestServer {
                         };
                         let ack = ControlAck { seq, status };
                         if let Ok((_, packet)) = s.encode_control_ack(&ack) {
-                            if loss_pct > 0 && rng.gen_range(0..100) < loss_pct {
+                            if loss_pct > 0 && rng.random_range(0..100) < loss_pct {
                                 continue;
                             }
                             let _ = sock.send_to(&packet, from).await;
@@ -785,20 +790,26 @@ async fn control_send_handle_resolves_one_thousand_noop_envelopes() {
 /// dedup must converge to "all 1000 sends report `Ok`" within the
 /// deadline.
 ///
-/// **Determinism.** Loss decisions use a seeded [`StdRng`] inside
-/// the test server (see [`ControlTestServer::start_with_loss`]), so
-/// the drop pattern is identical on every run for a given seed.
-/// Without that, the math runs the other way: at 10% per-direction
-/// loss with the production 5-attempt retransmit budget, the
-/// round-trip failure probability per envelope is
+/// **Seeded loss, not fully deterministic.** Loss decisions use a
+/// seeded [`StdRng`] inside the test server (see
+/// [`ControlTestServer::start_with_loss`]), which pins the *sequence*
+/// of drop draws for a given seed. The mapping of draws to packets is
+/// still timing-dependent: heartbeats and retransmits interleave with
+/// the 1000 control sends, so which packet each draw lands on varies
+/// slightly run-to-run. The seed therefore lowers, but does not fully
+/// eliminate, variance. Without any seed the math is stark: at 10%
+/// per-direction loss with the production 5-attempt retransmit budget,
+/// the round-trip failure probability per envelope is
 /// `(1 - 0.9 * 0.9)^5 ≈ 2.5e-4`, so for 1000 envelopes
 /// `P(≥1 timeout) ≈ 22%` — a roughly one-in-five flake rate.
 ///
-/// If you bump `RETX_MAX_ATTEMPTS` or change the loss percentage,
-/// re-verify the chosen seed still converges — or pick a new one.
-/// Seed 1 has been verified to converge for `(loss_pct = 10,
-/// N = 1000)` against the production reliability constants in this
-/// tree.
+/// If you bump `RETX_MAX_ATTEMPTS`, change the loss percentage, or
+/// change the RNG (e.g. a `rand` major bump alters `StdRng`'s stream),
+/// re-verify the chosen seed still converges — or pick a new one by
+/// running this test many times per candidate seed. Seed 7 has been
+/// verified to converge for `(loss_pct = 10, N = 1000)` against the
+/// production reliability constants and the `rand` 0.10 `StdRng`
+/// stream in this tree (28/28 runs).
 ///
 /// [`StdRng`]: rand::rngs::StdRng
 #[tokio::test]
@@ -807,8 +818,8 @@ async fn control_send_converges_under_10_percent_packet_loss() {
     let server_keys = StaticKeyPair::generate().unwrap();
     let client_keys = StaticKeyPair::generate().unwrap();
     let server_pub = server_keys.public_key();
-    // 10% loss in each direction, deterministic drop pattern.
-    let server = ControlTestServer::start_with_loss(server_keys, 10, 1).await;
+    // 10% loss in each direction; seeded drop pattern (see docstring).
+    let server = ControlTestServer::start_with_loss(server_keys, 10, 7).await;
 
     let cancel = CancellationToken::new();
     let cfg = ChainClientConfig {

@@ -82,11 +82,11 @@ pub const MAX_PACKET_LEN: usize =
 pub struct SessionId(pub [u8; 4]);
 
 impl SessionId {
-    /// Generate a random session ID using [`rand::thread_rng`].
+    /// Generate a random session ID using [`rand::rng`].
     pub fn random() -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut b = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut b);
+        rand::rng().fill_bytes(&mut b);
         Self(b)
     }
 

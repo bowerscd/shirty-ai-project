@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use parking_lot::RwLock;
-use rand::RngCore;
+use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -1007,7 +1007,7 @@ impl Reconciler {
         // doesn't, but generating one is harmless.
         let nonce = *self.nonces.entry(key).or_insert_with(|| {
             let mut n = [0u8; pcp::PCP_NONCE_LEN];
-            rand::thread_rng().fill_bytes(&mut n);
+            rand::rng().fill_bytes(&mut n);
             n
         });
 
@@ -1241,7 +1241,7 @@ impl Reconciler {
         let key = (target.protocol, target.internal_port);
         let nonce = *self.nonces.entry(key).or_insert_with(|| {
             let mut n = [0u8; pcp::PCP_NONCE_LEN];
-            rand::thread_rng().fill_bytes(&mut n);
+            rand::rng().fill_bytes(&mut n);
             n
         });
         let proto = self.current_protocol.unwrap_or(NatProtocol::Pcp);

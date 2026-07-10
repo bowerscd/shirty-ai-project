@@ -16,7 +16,7 @@
 //!    reads back from.
 //! 4. Schedules the next renewal.
 
-use rand::Rng;
+use rand::RngExt;
 
 use super::client::AcmeClient;
 use super::{storage, AcmeError, AcmeManager, AcmeRouteConfig, HostState, HostStatus, KickRequest};
@@ -277,7 +277,7 @@ fn sleep_until_renewal(
     let jitter_secs = if renew_jitter.as_secs() == 0 {
         0
     } else {
-        rand::thread_rng().gen_range(0..renew_jitter.as_secs())
+        rand::rng().random_range(0..renew_jitter.as_secs())
     };
     renew_target.checked_sub(std::time::Duration::from_secs(jitter_secs))
 }
